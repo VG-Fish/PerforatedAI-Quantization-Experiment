@@ -3,6 +3,10 @@ from __future__ import annotations
 import importlib.util
 import os
 from dataclasses import dataclass
+import builtins
+
+# Module-level flag to ensure the PAI config-saved message is emitted only once
+_PAI_CONFIG_SAVED_PRINTED = False
 from pathlib import Path
 from typing import Any
 
@@ -103,7 +107,27 @@ def perforate_model(
 ) -> Any:
     if not has_perforatedai():
         return model
+
+    # Wrap builtins.print temporarily to filter repeated PerforatedAI config
+    # messages that look like: "[PAI Config] Saved ...". Keep a module-level
+    # flag so only the first such message is printed across the process.
+    global _PAI_CONFIG_SAVED_PRINTED
+    original_print = builtins.print
+
+    def _filtered_print(*args, **kwargs):
+        global _PAI_CONFIG_SAVED_PRINTED
+        try:
+            text = " ".join(str(a) for a in args)
+        except Exception:
+            return original_print(*args, **kwargs)
+        if text.startswith("[PAI Config] Saved"):
+            if _PAI_CONFIG_SAVED_PRINTED:
+                return
+            _PAI_CONFIG_SAVED_PRINTED = True
+        return original_print(*args, **kwargs)
+
     try:  # pragma: no cover - optional dependency
+        builtins.print = _filtered_print
         _mirror_env_aliases()
         from perforatedai import globals_perforatedai as GPA
         from perforatedai import utils_perforatedai as UPA
@@ -137,6 +161,8 @@ def perforate_model(
         )
     except Exception:
         return model
+    finally:
+        builtins.print = original_print
 
 
 def choose_device() -> Any:
