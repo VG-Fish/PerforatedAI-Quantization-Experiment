@@ -6,7 +6,12 @@ from typing import Any
 from .compat import choose_device, nn, perforate_model, require_torch
 from .data import build_task_bundle
 from .models import build_model
-from .results import save_training_record, write_comparison_reports, write_manifest, write_model_reports
+from .results import (
+    save_training_record,
+    write_comparison_reports,
+    write_manifest,
+    write_model_reports,
+)
 from .specs import CONDITION_SPECS, MODEL_SPECS, condition_by_key, model_by_key
 from .training import train_and_evaluate
 
@@ -14,13 +19,19 @@ EPOCH_MULTIPLIER = 10
 
 
 class BenchmarkRunner:
-    def __init__(self, results_root: Path | str = "results", comparison_root: Path | str = "comparison"):
+    def __init__(
+        self,
+        results_root: Path | str = "results",
+        comparison_root: Path | str = "comparison",
+    ):
         self.results_root = Path(results_root)
         self.comparison_root = Path(comparison_root)
         self.results_root.mkdir(parents=True, exist_ok=True)
         self.comparison_root.mkdir(parents=True, exist_ok=True)
 
-    def _load_state(self, model: Any, checkpoint_path: Path, *, strict: bool = True) -> Any:
+    def _load_state(
+        self, model: Any, checkpoint_path: Path, *, strict: bool = True
+    ) -> Any:
         torch = require_torch()
         if checkpoint_path.exists():
             state = torch.load(checkpoint_path, map_location=choose_device())
@@ -65,7 +76,9 @@ class BenchmarkRunner:
             model = self._configure_perforated_model(model, model_key)
         return model
 
-    def _artifact_path(self, condition_dir: Path, prefer_dendritic: bool = False) -> Path:
+    def _artifact_path(
+        self, condition_dir: Path, prefer_dendritic: bool = False
+    ) -> Path:
         candidates = ["model.pt"]
         if prefer_dendritic:
             candidates = ["final_clean_pai", "best_model", "model.pt"]
@@ -121,7 +134,11 @@ class BenchmarkRunner:
         return []
 
     def _configure_perforated_model(self, model: Any, model_key: str) -> Any:
-        if model_key == "gcn" and hasattr(model, "conv2") and hasattr(model.conv2, "linear"):
+        if (
+            model_key == "gcn"
+            and hasattr(model, "conv2")
+            and hasattr(model.conv2, "linear")
+        ):
             linear = model.conv2.linear
             if hasattr(linear, "set_this_output_dimensions"):
                 linear.set_this_output_dimensions([-1, 0])
@@ -135,8 +152,15 @@ class BenchmarkRunner:
             max_epochs = condition.fine_tune_epochs or 2
         return max_epochs * EPOCH_MULTIPLIER
 
-    def run(self, model_keys: list[str] | None = None, condition_keys: list[str] | None = None) -> list[dict[str, Any]]:
-        selected_models = [model_by_key(key) for key in (model_keys or [spec.key for spec in MODEL_SPECS])]
+    def run(
+        self,
+        model_keys: list[str] | None = None,
+        condition_keys: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        selected_models = [
+            model_by_key(key)
+            for key in (model_keys or [spec.key for spec in MODEL_SPECS])
+        ]
         selected_condition_keys = self._expand_condition_keys(condition_keys)
         selected_conditions = [condition_by_key(key) for key in selected_condition_keys]
         all_records: list[dict[str, Any]] = []
@@ -146,14 +170,39 @@ class BenchmarkRunner:
             model_records: list[dict[str, Any]] = []
             saved_dirs: dict[str, Path] = {}
             for condition in selected_conditions:
-                record = self._run_condition(model_spec.key, model_spec.display_name, model_spec.metric_name, model_spec.metric_direction, bundle, condition, saved_dirs)
+                record = self._run_condition(
+                    model_spec.key,
+                    model_spec.display_name,
+                    model_spec.metric_name,
+                    model_spec.metric_direction,
+                    bundle,
+                    condition,
+                    saved_dirs,
+                )
                 model_records.append(record.to_dict())
                 all_records.append(record.to_dict())
                 condition_dir = self.results_root / model_spec.key / condition.key
                 save_training_record(record, condition_dir)
                 saved_dirs[condition.key] = condition_dir
-            write_model_reports(model_spec.display_name, model_records, self.results_root / model_spec.key)
+            write_model_reports(
+                model_spec.display_name,
+                model_records,
+                self.results_root / model_spec.key,
+            )
 
+            # Eagerly regenerate comparison outputs as soon as at least 2 models have
+            # finished training, so results are visible without waiting for all models.
+            completed_model_keys = {r["model_key"] for r in all_records}
+            if len(completed_model_keys) >= 2:
+                print(
+                    f"[compare] {len(completed_model_keys)} models complete — "
+                    "regenerating comparison reports…"
+                )
+                write_manifest(all_records, self.results_root / "manifest.csv")
+                write_comparison_reports(all_records, self.comparison_root)
+
+        # Final write covers the single-model case and ensures the manifest and
+        # comparison outputs always reflect every completed model.
         write_manifest(all_records, self.results_root / "manifest.csv")
         write_comparison_reports(all_records, self.comparison_root)
         return all_records
@@ -171,7 +220,10 @@ class BenchmarkRunner:
         torch = require_torch()
         model = build_model(model_key, **self._model_kwargs(model_key))
         if condition.source_key in saved_dirs:
-            checkpoint = self._artifact_path(saved_dirs[condition.source_key], prefer_dendritic="dendrites" in condition.source_key)
+            checkpoint = self._artifact_path(
+                saved_dirs[condition.source_key],
+                prefer_dendritic="dendrites" in condition.source_key,
+            )
             model = self._load_source_checkpoint(
                 model,
                 model_key,
@@ -208,4 +260,5 @@ class BenchmarkRunner:
             use_qat=condition.use_qat,
             fine_tune_epochs=condition.fine_tune_epochs,
             max_epochs=self._base_epoch_budget(condition),
+            source_condition_key=condition.source_key,
         )

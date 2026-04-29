@@ -4,13 +4,19 @@ import csv
 import json
 import math
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from tqdm.auto import tqdm
 
-from .compat import binary_quantize_tensor, choose_device, require_torch, symmetric_quantize_tensor, ternary_quantize_tensor
+from .compat import (
+    binary_quantize_tensor,
+    choose_device,
+    require_torch,
+    symmetric_quantize_tensor,
+    ternary_quantize_tensor,
+)
 
 
 @dataclass
@@ -28,6 +34,10 @@ class TrainingRecord:
     file_size_mb: float
     train_seconds: float
     artifact_dir: str
+    # Set to True when max_epochs==0 (post-training quantization — no gradient updates).
+    training_skipped: bool = False
+    # Human-readable explanation of why training was skipped (empty string when training ran).
+    skip_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -90,7 +100,9 @@ def _binary_or_multi_loss(model_key: str):
     return torch.nn.CrossEntropyLoss()
 
 
-def _collapse_metric(model_key: str, outputs: Any, targets: Any, metric_targets: Any | None = None) -> float:
+def _collapse_metric(
+    model_key: str, outputs: Any, targets: Any, metric_targets: Any | None = None
+) -> float:
     if model_key == "actor_critic":
         outputs = outputs[0]
     if model_key == "lstm_forecaster":
@@ -118,7 +130,9 @@ def _batch_size(targets: Any) -> int:
     return 1
 
 
-def _detach_metric_payload(model_key: str, outputs: Any, targets: Any, metric_targets: Any | None) -> tuple[Any, Any, Any | None]:
+def _detach_metric_payload(
+    model_key: str, outputs: Any, targets: Any, metric_targets: Any | None
+) -> tuple[Any, Any, Any | None]:
     if model_key == "actor_critic":
         outputs = outputs[0]
     outputs = outputs.detach().cpu()
@@ -145,7 +159,9 @@ def _average_precision(scores: Any, targets: Any) -> float:
     return float(precision[positive_positions].sum().item() / positives)
 
 
-def _best_f1_threshold(scores: Any, targets: Any) -> tuple[float, float, float, float, float]:
+def _best_f1_threshold(
+    scores: Any, targets: Any
+) -> tuple[float, float, float, float, float]:
     torch = require_torch()
     scores = scores.flatten().float()
     targets = targets.flatten().long()
@@ -194,20 +210,39 @@ def _classification_metrics(logits: Any, targets: Any) -> dict[str, float]:
     metrics["confidence_mean"] = float(probs.max(dim=-1).values.mean().item())
     if num_classes >= 2:
         metrics["top2_accuracy"] = float(
-            (torch.topk(logits, k=min(2, num_classes), dim=-1).indices == targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
+            (
+                torch.topk(logits, k=min(2, num_classes), dim=-1).indices
+                == targets.unsqueeze(-1)
+            )
+            .any(dim=-1)
+            .float()
+            .mean()
+            .item()
         )
     if num_classes >= 3:
         metrics["top3_accuracy"] = float(
-            (torch.topk(logits, k=3, dim=-1).indices == targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
+            (torch.topk(logits, k=3, dim=-1).indices == targets.unsqueeze(-1))
+            .any(dim=-1)
+            .float()
+            .mean()
+            .item()
         )
     if num_classes >= 5:
         metrics["top5_accuracy"] = float(
-            (torch.topk(logits, k=5, dim=-1).indices == targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
+            (torch.topk(logits, k=5, dim=-1).indices == targets.unsqueeze(-1))
+            .any(dim=-1)
+            .float()
+            .mean()
+            .item()
         )
 
     confusion = torch.zeros((num_classes, num_classes), dtype=torch.float64)
     indices = targets * num_classes + predictions
-    confusion += torch.bincount(indices, minlength=num_classes * num_classes).reshape(num_classes, num_classes).to(torch.float64)
+    confusion += (
+        torch.bincount(indices, minlength=num_classes * num_classes)
+        .reshape(num_classes, num_classes)
+        .to(torch.float64)
+    )
     total = float(confusion.sum().item())
     diag = confusion.diag()
     supports = confusion.sum(dim=1)
@@ -215,7 +250,9 @@ def _classification_metrics(logits: Any, targets: Any) -> dict[str, float]:
     precisions = diag / predicted_counts.clamp_min(1.0)
     recalls = diag / supports.clamp_min(1.0)
     f1_scores = 2 * precisions * recalls / (precisions + recalls).clamp_min(1e-12)
-    class_accuracy = (diag + (total - supports - predicted_counts + diag)) / max(total, 1.0)
+    class_accuracy = (diag + (total - supports - predicted_counts + diag)) / max(
+        total, 1.0
+    )
 
     metrics["precision_macro"] = float(precisions.mean().item())
     metrics["recall_macro"] = float(recalls.mean().item())
@@ -227,27 +264,37 @@ def _classification_metrics(logits: Any, targets: Any) -> dict[str, float]:
     metrics["f1_weighted"] = float((f1_scores * support_weights).sum().item())
     metrics["balanced_accuracy"] = float(recalls.mean().item())
 
-    expected = float((supports * predicted_counts).sum().item() / max(total * total, 1.0))
+    expected = float(
+        (supports * predicted_counts).sum().item() / max(total * total, 1.0)
+    )
     observed = float(diag.sum().item() / max(total, 1.0))
     metrics["cohens_kappa"] = _safe_ratio(observed - expected, 1.0 - expected)
 
-    cov_ytyp = float(diag.sum().item() * total - (supports * predicted_counts).sum().item())
+    cov_ytyp = float(
+        diag.sum().item() * total - (supports * predicted_counts).sum().item()
+    )
     cov_ypyp = float(total * total - (predicted_counts * predicted_counts).sum().item())
     cov_ytyt = float(total * total - (supports * supports).sum().item())
     metrics["mcc"] = _safe_ratio(cov_ytyp, math.sqrt(max(cov_ypyp * cov_ytyt, 1e-12)))
 
     for class_index in range(num_classes):
         metrics[f"class_{class_index}_support"] = float(supports[class_index].item())
-        metrics[f"class_{class_index}_precision"] = float(precisions[class_index].item())
+        metrics[f"class_{class_index}_precision"] = float(
+            precisions[class_index].item()
+        )
         metrics[f"class_{class_index}_recall"] = float(recalls[class_index].item())
         metrics[f"class_{class_index}_f1"] = float(f1_scores[class_index].item())
-        metrics[f"class_{class_index}_accuracy"] = float(class_accuracy[class_index].item())
+        metrics[f"class_{class_index}_accuracy"] = float(
+            class_accuracy[class_index].item()
+        )
 
     if num_classes == 2:
         positive_scores = probs[:, 1]
         metrics["roc_auc"] = _auc(positive_scores, targets)
         metrics["average_precision"] = _average_precision(positive_scores, targets)
-        threshold, best_f1, best_precision, best_recall, best_specificity = _best_f1_threshold(positive_scores, targets)
+        threshold, best_f1, best_precision, best_recall, best_specificity = (
+            _best_f1_threshold(positive_scores, targets)
+        )
         metrics["best_threshold"] = threshold
         metrics["best_f1"] = best_f1
         metrics["best_precision"] = best_precision
@@ -259,10 +306,17 @@ def _classification_metrics(logits: Any, targets: Any) -> dict[str, float]:
         false_positive = float((positive_preds & ~positive_targets).sum().item())
         false_negative = float((~positive_preds & positive_targets).sum().item())
         true_negative = float((~positive_preds & ~positive_targets).sum().item())
-        metrics["precision"] = _safe_ratio(true_positive, true_positive + false_positive)
+        metrics["precision"] = _safe_ratio(
+            true_positive, true_positive + false_positive
+        )
         metrics["recall"] = _safe_ratio(true_positive, true_positive + false_negative)
-        metrics["f1"] = _safe_ratio(2 * metrics["precision"] * metrics["recall"], metrics["precision"] + metrics["recall"])
-        metrics["specificity_at_argmax"] = _safe_ratio(true_negative, true_negative + false_positive)
+        metrics["f1"] = _safe_ratio(
+            2 * metrics["precision"] * metrics["recall"],
+            metrics["precision"] + metrics["recall"],
+        )
+        metrics["specificity_at_argmax"] = _safe_ratio(
+            true_negative, true_negative + false_positive
+        )
 
     return metrics
 
@@ -284,13 +338,19 @@ def _regression_metrics(preds: Any, targets: Any) -> dict[str, float]:
         "median_ae": float(abs_errors.median().item()),
     }
     denominator = float(centered_targets.square().sum().item())
-    metrics["r2"] = 1.0 - _safe_ratio(float(squared_errors.sum().item()), denominator, default=0.0)
+    metrics["r2"] = 1.0 - _safe_ratio(
+        float(squared_errors.sum().item()), denominator, default=0.0
+    )
     variance_targets = float(targets.var(unbiased=False).item())
     variance_residual = float(errors.var(unbiased=False).item())
-    metrics["explained_variance"] = 1.0 - _safe_ratio(variance_residual, variance_targets, default=0.0)
+    metrics["explained_variance"] = 1.0 - _safe_ratio(
+        variance_residual, variance_targets, default=0.0
+    )
     nonzero_mask = targets.abs() > 1e-8
     if bool(nonzero_mask.any().item()):
-        metrics["mape"] = float((abs_errors[nonzero_mask] / targets[nonzero_mask].abs()).mean().item())
+        metrics["mape"] = float(
+            (abs_errors[nonzero_mask] / targets[nonzero_mask].abs()).mean().item()
+        )
     else:
         metrics["mape"] = 0.0
     denominator_smape = (preds.abs() + targets.abs()).clamp_min(1e-8)
@@ -298,14 +358,20 @@ def _regression_metrics(preds: Any, targets: Any) -> dict[str, float]:
     return metrics
 
 
-def _anomaly_metrics(reconstructions: Any, targets: Any, labels: Any | None) -> dict[str, float]:
+def _anomaly_metrics(
+    reconstructions: Any, targets: Any, labels: Any | None
+) -> dict[str, float]:
     torch = require_torch()
     reductions = tuple(range(1, reconstructions.dim()))
-    reconstruction_error = ((reconstructions.float() - targets.float()) ** 2).mean(dim=reductions)
+    reconstruction_error = ((reconstructions.float() - targets.float()) ** 2).mean(
+        dim=reductions
+    )
     metrics: dict[str, float] = {
         "reconstruction_mse": float(reconstruction_error.mean().item()),
         "reconstruction_rmse": float(torch.sqrt(reconstruction_error.mean()).item()),
-        "reconstruction_mae": float((reconstructions.float() - targets.float()).abs().mean().item()),
+        "reconstruction_mae": float(
+            (reconstructions.float() - targets.float()).abs().mean().item()
+        ),
         "error_std": float(reconstruction_error.std(unbiased=False).item()),
         "error_max": float(reconstruction_error.max().item()),
     }
@@ -314,7 +380,9 @@ def _anomaly_metrics(reconstructions: Any, targets: Any, labels: Any | None) -> 
     labels = labels.long().flatten()
     metrics["auc"] = _auc(reconstruction_error, labels)
     metrics["average_precision"] = _average_precision(reconstruction_error, labels)
-    threshold, best_f1, best_precision, best_recall, best_specificity = _best_f1_threshold(reconstruction_error, labels)
+    threshold, best_f1, best_precision, best_recall, best_specificity = (
+        _best_f1_threshold(reconstruction_error, labels)
+    )
     metrics["best_threshold"] = threshold
     metrics["precision"] = best_precision
     metrics["recall"] = best_recall
@@ -394,7 +462,9 @@ def _forward(model_key: str, model: Any, batch: tuple[Any, ...]) -> tuple[Any, A
     return model(x), targets
 
 
-def _make_quantized_copy(model: Any, bit_width: int | None, mode: str | None = None) -> Any:
+def _make_quantized_copy(
+    model: Any, bit_width: int | None, mode: str | None = None
+) -> Any:
     torch = require_torch()
     if bit_width is None or bit_width >= 32:
         return model
@@ -454,7 +524,9 @@ def _write_dendritic_sidecars(
             writer.writeheader()
             writer.writerows(best_arch_rows)
     with (output_dir / "paramCounts.csv").open("w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["epoch", "param_count", "nonzero_params"])
+        writer = csv.DictWriter(
+            fh, fieldnames=["epoch", "param_count", "nonzero_params"]
+        )
         writer.writeheader()
         for row in history:
             writer.writerow(
@@ -484,6 +556,7 @@ def train_and_evaluate(
     use_qat: bool = False,
     fine_tune_epochs: int = 0,
     max_epochs: int = 8,
+    source_condition_key: str | None = None,
 ) -> TrainingRecord:
     torch = require_torch()
     device = choose_device()
@@ -491,7 +564,12 @@ def train_and_evaluate(
     model = model.to(device)
     primary_metric_key = _PRIMARY_METRIC_KEY.get(model_key, "accuracy")
 
-    if use_dendrites and model_key == "gcn" and hasattr(model, "conv2") and hasattr(model.conv2, "linear"):
+    if (
+        use_dendrites
+        and model_key == "gcn"
+        and hasattr(model, "conv2")
+        and hasattr(model.conv2, "linear")
+    ):
         linear = model.conv2.linear
         if hasattr(linear, "set_this_output_dimensions"):
             linear.set_this_output_dimensions(torch.tensor([-1, 0], device=device))
@@ -503,10 +581,16 @@ def train_and_evaluate(
             parameters_to_prune = [
                 (module, "weight")
                 for module in model.modules()
-                if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d, torch.nn.Conv2d))
+                if isinstance(
+                    module, (torch.nn.Linear, torch.nn.Conv1d, torch.nn.Conv2d)
+                )
             ]
             if parameters_to_prune:
-                prune.global_unstructured(parameters_to_prune, pruning_method=prune.L1Unstructured, amount=prune_amount)
+                prune.global_unstructured(
+                    parameters_to_prune,
+                    pruning_method=prune.L1Unstructured,
+                    amount=prune_amount,
+                )
                 for module, _ in parameters_to_prune:
                     if hasattr(module, "weight_orig"):
                         prune.remove(module, "weight")
@@ -524,6 +608,21 @@ def train_and_evaluate(
     best_state = None
     start_time = time.perf_counter()
     run_label = f"{model_key} | {condition_key}"
+
+    # Determine whether the training loop will be skipped entirely (PTQ conditions).
+    training_skipped = max_epochs == 0
+    if training_skipped:
+        if bit_width is not None and bit_width < 32 and not use_qat:
+            _quant_desc = f"{bit_width}-bit {quantization_mode or 'int'}"
+            skip_reason = (
+                f"post-training quantization ({_quant_desc})"
+                " — weights are quantized without any gradient updates"
+            )
+        else:
+            skip_reason = "no training epochs configured"
+    else:
+        skip_reason = ""
+
     if max_epochs > 0:
         epoch_progress = tqdm(
             range(max_epochs),
@@ -564,8 +663,8 @@ def train_and_evaluate(
                 average_loss = running_loss / max(1, train_examples)
                 batch_progress.set_postfix(loss=f"{average_loss:.4f}")
                 metric_targets = rest[0] if rest else None
-                detached_outputs, detached_targets, detached_metric_targets = _detach_metric_payload(
-                    model_key, outputs, targets, metric_targets
+                detached_outputs, detached_targets, detached_metric_targets = (
+                    _detach_metric_payload(model_key, outputs, targets, metric_targets)
                 )
                 train_outputs.append(detached_outputs)
                 train_targets.append(detached_targets)
@@ -582,7 +681,9 @@ def train_and_evaluate(
                     model_key,
                     torch.cat(train_outputs, dim=0),
                     torch.cat(train_targets, dim=0),
-                    torch.cat(train_metric_targets, dim=0) if train_metric_targets else None,
+                    torch.cat(train_metric_targets, dim=0)
+                    if train_metric_targets
+                    else None,
                     metric_name=metric_name,
                 )
 
@@ -604,8 +705,10 @@ def train_and_evaluate(
                     batch_examples = _batch_size(targets)
                     val_running_loss += float(loss.detach().item()) * batch_examples
                     val_examples += batch_examples
-                    detached_outputs, detached_targets, detached_metric_targets = _detach_metric_payload(
-                        model_key, outputs, targets, metric_targets
+                    detached_outputs, detached_targets, detached_metric_targets = (
+                        _detach_metric_payload(
+                            model_key, outputs, targets, metric_targets
+                        )
                     )
                     val_outputs.append(detached_outputs)
                     val_targets.append(detached_targets)
@@ -619,7 +722,9 @@ def train_and_evaluate(
                     model_key,
                     torch.cat(val_outputs, dim=0),
                     torch.cat(val_targets, dim=0),
-                    torch.cat(val_metric_targets, dim=0) if val_metric_targets else None,
+                    torch.cat(val_metric_targets, dim=0)
+                    if val_metric_targets
+                    else None,
                     metric_name=metric_name,
                 )
             val_metric = float(val_metrics.get(primary_metric_key, 0.0))
@@ -632,7 +737,9 @@ def train_and_evaluate(
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "epoch_seconds": time.perf_counter() - epoch_start,
                 "train_loss": train_loss,
-                "train_primary_metric": float(train_metrics.get(primary_metric_key, 0.0)),
+                "train_primary_metric": float(
+                    train_metrics.get(primary_metric_key, 0.0)
+                ),
                 "val_loss": val_loss,
                 "val_primary_metric": val_metric,
                 "val_metric": val_metric,
@@ -640,10 +747,14 @@ def train_and_evaluate(
             history_row.update(_prefix_metrics("train", train_metrics))
             history_row.update(_prefix_metrics("val", val_metrics))
             history.append(history_row)
-            if best_state is None or _metric_is_better(val_metric, best_metric, metric_direction):
+            if best_state is None or _metric_is_better(
+                val_metric, best_metric, metric_direction
+            ):
                 best_metric = val_metric
                 best_epoch = epoch + 1
-                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                best_state = {
+                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                }
             epoch_progress.set_postfix(
                 val_metric=_format_metric_value(val_metric),
                 best_metric=_format_metric_value(best_metric),
@@ -651,7 +762,25 @@ def train_and_evaluate(
             )
         epoch_progress.close()
     else:
-        print(f"{run_label}: evaluating existing checkpoint without additional training")
+        _source_info = (
+            f"condition '{source_condition_key}'"
+            if source_condition_key and source_condition_key != condition_key
+            else "the current model state"
+        )
+        _quant_info = (
+            f"{bit_width}-bit {quantization_mode or 'int'} quantization"
+            if bit_width is not None and bit_width < 32
+            else "no quantization"
+        )
+        print(
+            f"\n{'─' * 64}\n"
+            f"[SKIP TRAINING]  {run_label}\n"
+            f"  Reason  : {skip_reason.capitalize()}\n"
+            f"  Source  : checkpoint loaded from {_source_info}\n"
+            f"  Quant.  : {_quant_info} will be applied to the loaded weights\n"
+            f"  Next    : proceeding directly to test-set evaluation\n"
+            f"{'─' * 64}\n"
+        )
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -677,8 +806,8 @@ def train_and_evaluate(
             batch_examples = _batch_size(targets)
             test_running_loss += float(loss.detach().item()) * batch_examples
             test_examples += batch_examples
-            detached_outputs, detached_targets, detached_metric_targets = _detach_metric_payload(
-                model_key, outputs, targets, metric_targets
+            detached_outputs, detached_targets, detached_metric_targets = (
+                _detach_metric_payload(model_key, outputs, targets, metric_targets)
             )
             test_outputs.append(detached_outputs)
             test_targets.append(detached_targets)
@@ -760,6 +889,8 @@ def train_and_evaluate(
                 "use_qat": use_qat,
                 "fine_tune_epochs": fine_tune_epochs,
                 "artifact_path": str(artifact_path),
+                "training_skipped": training_skipped,
+                "skip_reason": skip_reason,
             },
             indent=2,
         )
@@ -784,4 +915,6 @@ def train_and_evaluate(
         file_size_mb=file_size_mb,
         train_seconds=time.perf_counter() - start_time,
         artifact_dir=str(output_dir),
+        training_skipped=training_skipped,
+        skip_reason=skip_reason,
     )

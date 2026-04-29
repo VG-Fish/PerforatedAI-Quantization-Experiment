@@ -5,7 +5,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .plots import bar_chart, grouped_bar_chart, heatmap, scatter, line_chart, multi_line_chart
+from .plots import (
+    bar_chart,
+    grouped_bar_chart,
+    heatmap,
+    line_chart,
+    multi_line_chart,
+    scatter,
+)
 from .specs import CONDITION_SPECS, MODEL_SPECS, condition_by_key
 from .training import TrainingRecord
 
@@ -70,19 +77,61 @@ def write_manifest(records: list[dict[str, Any]], output_path: Path) -> None:
         writer.writerows(records)
 
 
-def write_model_reports(model_display_name: str, records: list[dict[str, Any]], output_dir: Path) -> None:
+def write_model_reports(
+    model_display_name: str, records: list[dict[str, Any]], output_dir: Path
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     condition_order = [spec.key for spec in CONDITION_SPECS]
     by_condition = {record["condition_key"]: record for record in records}
-    metric_values = [float(by_condition[key]["metric_value"]) if key in by_condition else 0.0 for key in condition_order]
-    param_values = [float(by_condition[key]["param_count"]) if key in by_condition else 0.0 for key in condition_order]
-    size_values = [float(by_condition[key]["file_size_mb"]) if key in by_condition else 0.0 for key in condition_order]
+    metric_values = [
+        float(by_condition[key]["metric_value"]) if key in by_condition else 0.0
+        for key in condition_order
+    ]
+    param_values = [
+        float(by_condition[key]["param_count"]) if key in by_condition else 0.0
+        for key in condition_order
+    ]
+    size_values = [
+        float(by_condition[key]["file_size_mb"]) if key in by_condition else 0.0
+        for key in condition_order
+    ]
     labels = [condition_by_key(key).display_name for key in condition_order]
-    colors = ["#2b6cb0" if index < 6 else "#2f855a" for index in range(len(condition_order))]
+    colors = [
+        "#2b6cb0" if index < 6 else "#2f855a" for index in range(len(condition_order))
+    ]
+    # Hatch bars for conditions where training was skipped (PTQ — no gradient updates).
+    hatches = [
+        "////" if by_condition.get(key, {}).get("training_skipped", False) else None
+        for key in condition_order
+    ]
     metric_name = records[0]["metric_name"] if records else "Metric"
-    bar_chart(output_dir / "metric_comparison.svg", f"{model_display_name}: {metric_name}", labels, metric_values, metric_name, colors=colors)
-    bar_chart(output_dir / "parameter_count.svg", f"{model_display_name}: Parameter Count", labels, param_values, "Parameters", colors=colors)
-    bar_chart(output_dir / "model_size.svg", f"{model_display_name}: File Size", labels, size_values, "MB", colors=colors)
+    bar_chart(
+        output_dir / "metric_comparison.svg",
+        f"{model_display_name}: {metric_name}",
+        labels,
+        metric_values,
+        metric_name,
+        colors=colors,
+        hatches=hatches,
+    )
+    bar_chart(
+        output_dir / "parameter_count.svg",
+        f"{model_display_name}: Parameter Count",
+        labels,
+        param_values,
+        "Parameters",
+        colors=colors,
+        hatches=hatches,
+    )
+    bar_chart(
+        output_dir / "model_size.svg",
+        f"{model_display_name}: File Size",
+        labels,
+        size_values,
+        "MB",
+        colors=colors,
+        hatches=hatches,
+    )
 
 
 def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) -> None:
@@ -103,13 +152,19 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
     tradeoff_points: list[dict[str, Any]] = []
     summary_rows: list[dict[str, Any]] = []
     for model_key in model_order:
-        model_records = [record for record in records if record["model_key"] == model_key]
+        model_records = [
+            record for record in records if record["model_key"] == model_key
+        ]
         by_condition = {record["condition_key"]: record for record in model_records}
         baseline = baselines.get(model_key, {})
-        retention_rows.append([
-            _normalization_score(by_condition[key], baseline) if key in by_condition else 0.0
-            for key in condition_order
-        ])
+        retention_rows.append(
+            [
+                _normalization_score(by_condition[key], baseline)
+                if key in by_condition
+                else 0.0
+                for key in condition_order
+            ]
+        )
         best_quant_rows.append(
             [
                 max(
@@ -141,13 +196,22 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
                     "nonzero_params": record["nonzero_params"],
                 }
             )
+            # PTQ conditions (training_skipped=True) get their own marker shape so
+            # they are visually distinct from normally-trained conditions in the scatter.
+            _is_ptq = record.get("training_skipped", False)
             tradeoff_points.append(
                 {
                     "x": size_reduction,
                     "y": retention,
                     "label": f"{model_key}:{condition_key}",
-                    "color": "#2b6cb0" if "dendrites" not in condition_key else "#2f855a",
-                    "shape": "square" if "dendrites" in condition_key else "circle",
+                    "color": "#2b6cb0"
+                    if "dendrites" not in condition_key
+                    else "#2f855a",
+                    "shape": (
+                        "ptq"
+                        if _is_ptq
+                        else ("square" if "dendrites" in condition_key else "circle")
+                    ),
                 }
             )
 
@@ -246,7 +310,9 @@ def generate_training_graphs(results_root: Path) -> None:
             try:
                 metrics_data = json.loads(metrics_file.read_text())
                 metric_name = metrics_data.get("metric_name", "Validation Metric")
-                primary_metric_key = metrics_data.get("primary_metric_key", primary_metric_key)
+                primary_metric_key = metrics_data.get(
+                    "primary_metric_key", primary_metric_key
+                )
             except Exception:
                 pass
 
@@ -254,7 +320,9 @@ def generate_training_graphs(results_root: Path) -> None:
             values: list[float] = []
             for row in history:
                 value = row.get(column)
-                values.append(float(value) if isinstance(value, (int, float)) else float("nan"))
+                values.append(
+                    float(value) if isinstance(value, (int, float)) else float("nan")
+                )
             return values
 
         def has_real_values(values: list[float]) -> bool:
@@ -337,7 +405,13 @@ def generate_training_graphs(results_root: Path) -> None:
                 values = numeric_series(key)
                 if not has_real_values(values):
                     continue
-                grouped_suffixes.setdefault(suffix, []).append((f"{label_prefix} {suffix.replace('_', ' ').title()}", values, color))
+                grouped_suffixes.setdefault(suffix, []).append(
+                    (
+                        f"{label_prefix} {suffix.replace('_', ' ').title()}",
+                        values,
+                        color,
+                    )
+                )
                 break
 
         for suffix, series in sorted(grouped_suffixes.items()):

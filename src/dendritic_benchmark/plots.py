@@ -12,8 +12,8 @@ matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from matplotlib.patches import Patch
 from matplotlib.transforms import Bbox
-
 
 BACKGROUND = "#fbfaf7"
 GRID = "#d9d2c3"
@@ -102,7 +102,9 @@ def _autosize_axis_labels(fig: Figure, ax: Axes, *, min_font: int = 7) -> None:
             return
 
 
-def _annotate_bars_without_overlap(fig: Figure, ax: Axes, bars: Any, values: list[float]) -> None:
+def _annotate_bars_without_overlap(
+    fig: Figure, ax: Axes, bars: Any, values: list[float]
+) -> None:
     _draw(fig)
     renderer = fig.canvas.get_renderer()
     accepted: list[Bbox] = []
@@ -146,7 +148,12 @@ def _annotate_bars_without_overlap(fig: Figure, ax: Axes, bars: Any, values: lis
 
 def _save(fig: Figure, path: Path) -> None:
     _ensure_parent(path)
-    fig.savefig(path, format=path.suffix.lstrip(".") or "svg", facecolor=BACKGROUND, bbox_inches="tight")
+    fig.savefig(
+        path,
+        format=path.suffix.lstrip(".") or "svg",
+        facecolor=BACKGROUND,
+        bbox_inches="tight",
+    )
     plt.close(fig)
 
 
@@ -157,12 +164,32 @@ def bar_chart(
     values: list[float],
     y_label: str,
     colors: list[str] | None = None,
+    hatches: list[str | None] | None = None,
 ) -> None:
+    """Draw a bar chart.
+
+    ``hatches`` is an optional per-bar hatch pattern list (same length as
+    ``values``).  Pass ``"////"`` for bars where training was skipped (PTQ)
+    and ``None`` for normally-trained bars.  When at least one hatch is
+    present a small legend entry is added to the chart.
+    """
     fig_width = max(12.0, 0.72 * len(labels) + 4.0)
     fig, ax = _setup_figure(fig_width, 7.2)
     x_positions = list(range(len(values)))
-    bar_colors = [colors[index] if colors and index < len(colors) else _palette(index) for index in x_positions]
-    bars = ax.bar(x_positions, values, color=bar_colors, edgecolor="white", linewidth=0.8)
+    bar_colors = [
+        colors[index] if colors and index < len(colors) else _palette(index)
+        for index in x_positions
+    ]
+    effective_hatches = hatches if hatches is not None else [None] * len(values)
+    bars = ax.bar(
+        x_positions, values, color=bar_colors, edgecolor="white", linewidth=0.8
+    )
+
+    # Apply per-bar hatching for PTQ (no-training) conditions.
+    for bar, hatch in zip(bars, effective_hatches):
+        if hatch:
+            bar.set_hatch(hatch)
+            bar.set_edgecolor(MUTED)  # hatch lines are drawn in the edge colour
 
     ax.set_title(title, fontsize=18, color=TEXT, pad=18)
     ax.set_ylabel(y_label, color=TEXT)
@@ -175,6 +202,25 @@ def bar_chart(
     ax.set_ylim(top=max_value * 1.18)
     _autosize_axis_labels(fig, ax)
     _annotate_bars_without_overlap(fig, ax, bars, values)
+
+    # Add a legend entry when any bar has been hatched.
+    if any(h is not None for h in effective_hatches):
+        legend_handles = [
+            Patch(
+                facecolor="lightgray",
+                hatch="////",
+                edgecolor=MUTED,
+                label="PTQ — no re-training (checkpoint quantized & evaluated)",
+            )
+        ]
+        ax.legend(
+            handles=legend_handles,
+            loc="upper right",
+            frameon=False,
+            labelcolor=TEXT,
+            fontsize=9,
+        )
+
     _save(fig, path)
 
 
@@ -194,7 +240,9 @@ def grouped_bar_chart(
 
     for series_index, (series_name, values, color) in enumerate(series):
         offset = -group_width / 2 + bar_width / 2 + series_index * bar_width
-        plotted_values = [values[index] if index < len(values) else 0.0 for index in x_positions]
+        plotted_values = [
+            values[index] if index < len(values) else 0.0 for index in x_positions
+        ]
         all_values.extend(plotted_values)
         ax.bar(
             [position + offset for position in x_positions],
@@ -210,7 +258,12 @@ def grouped_bar_chart(
     ax.set_ylabel(y_label, color=TEXT)
     ax.set_xticks(x_positions, [_wrap_label(label, width=12) for label in labels])
     ax.grid(axis="y", color=GRID, linewidth=0.8, alpha=0.75)
-    ax.legend(loc="upper left", frameon=False, labelcolor=TEXT, ncols=min(3, max(1, len(series))))
+    ax.legend(
+        loc="upper left",
+        frameon=False,
+        labelcolor=TEXT,
+        ncols=min(3, max(1, len(series))),
+    )
     ax.set_ylim(top=max(all_values or [1.0]) * 1.18)
     _autosize_axis_labels(fig, ax)
     _save(fig, path)
@@ -232,7 +285,12 @@ def heatmap(
     values = matrix or [[0.0]]
     image = ax.imshow(values, aspect="auto", cmap="RdYlBu_r")
 
-    ax.set_title(title if subtitle is None else f"{title}\n{subtitle}", fontsize=18, color=TEXT, pad=18)
+    ax.set_title(
+        title if subtitle is None else f"{title}\n{subtitle}",
+        fontsize=18,
+        color=TEXT,
+        pad=18,
+    )
     ax.set_xticks(range(cols), [_wrap_label(label, width=10) for label in col_labels])
     ax.set_yticks(range(rows), row_labels)
     ax.tick_params(axis="x", labeltop=True, labelbottom=False, colors=TEXT, pad=4)
@@ -246,8 +304,20 @@ def heatmap(
     span = (max(cell_values) - min(cell_values)) if cell_values else 0
     for row_index, row in enumerate(matrix):
         for col_index, value in enumerate(row):
-            color = "white" if span and value < (min(cell_values) + span * 0.42) else "#111827"
-            ax.text(col_index, row_index, f"{value:.2f}", ha="center", va="center", fontsize=8, color=color)
+            color = (
+                "white"
+                if span and value < (min(cell_values) + span * 0.42)
+                else "#111827"
+            )
+            ax.text(
+                col_index,
+                row_index,
+                f"{value:.2f}",
+                ha="center",
+                va="center",
+                fontsize=8,
+                color=color,
+            )
 
     colorbar = fig.colorbar(image, ax=ax, shrink=0.82)
     colorbar.ax.tick_params(colors=TEXT)
@@ -255,10 +325,15 @@ def heatmap(
     _save(fig, path)
 
 
-def _place_scatter_labels(fig: Figure, ax: Axes, annotations: list[tuple[float, float, str]]) -> int:
+def _place_scatter_labels(
+    fig: Figure, ax: Axes, annotations: list[tuple[float, float, str]]
+) -> int:
     _draw(fig)
     renderer = fig.canvas.get_renderer()
-    accepted = [tick.get_window_extent(renderer=renderer) for tick in ax.get_xticklabels() + ax.get_yticklabels()]
+    accepted = [
+        tick.get_window_extent(renderer=renderer)
+        for tick in ax.get_xticklabels() + ax.get_yticklabels()
+    ]
     accepted.extend(
         artist.get_window_extent(renderer=renderer)
         for artist in (ax.title, ax.xaxis.label, ax.yaxis.label)
@@ -396,7 +471,13 @@ def multi_line_chart(
     _save(fig, path)
 
 
-def scatter(path: Path, title: str, points: list[dict[str, Any]], x_label: str = "X", y_label: str = "Y") -> None:
+def scatter(
+    path: Path,
+    title: str,
+    points: list[dict[str, Any]],
+    x_label: str = "X",
+    y_label: str = "Y",
+) -> None:
     fig, ax = _setup_figure(13.5, 8.5)
     if not points:
         ax.set_title(title, fontsize=18, color=TEXT, pad=18)
@@ -405,21 +486,34 @@ def scatter(path: Path, title: str, points: list[dict[str, Any]], x_label: str =
         _save(fig, path)
         return
 
-    circles = [point for point in points if point.get("shape", "circle") != "square"]
+    # "ptq" shape = post-training quantization (no gradient updates).
+    circles = [point for point in points if point.get("shape", "circle") == "circle"]
     squares = [point for point in points if point.get("shape") == "square"]
-    for group, marker, label in ((circles, "o", "Base"), (squares, "s", "Dendritic")):
+    ptq_points = [point for point in points if point.get("shape") == "ptq"]
+    for group, marker, label in (
+        (circles, "o", "Base"),
+        (squares, "s", "Dendritic"),
+        (ptq_points, "x", "PTQ — no re-training"),
+    ):
         if not group:
             continue
+        scatter_kwargs: dict[str, Any] = dict(
+            c=[point.get("color", BASE_BLUE) for point in group],
+            marker=marker,
+            alpha=0.88,
+            label=label,
+        )
+        if marker == "x":
+            scatter_kwargs["s"] = 70
+            scatter_kwargs["linewidths"] = 1.8
+        else:
+            scatter_kwargs["s"] = 44
+            scatter_kwargs["edgecolors"] = "white"
+            scatter_kwargs["linewidths"] = 0.6
         ax.scatter(
             [float(point["x"]) for point in group],
             [float(point["y"]) for point in group],
-            c=[point.get("color", BASE_BLUE) for point in group],
-            marker=marker,
-            s=44,
-            alpha=0.84,
-            edgecolors="white",
-            linewidths=0.6,
-            label=label,
+            **scatter_kwargs,
         )
 
     ax.set_title(title, fontsize=18, color=TEXT, pad=18)
