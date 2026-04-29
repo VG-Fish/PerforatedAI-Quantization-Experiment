@@ -81,7 +81,7 @@
   "reset_best_score_on_switch": false,
   "retain_all_dendrites": false,
   "running_average_pb": true,
-  "save_name": "m5_dendrites_pruned_q2",
+  "save_name": "m5_dendrites_pruned_q1_58",
   "save_old_graph_scores": true,
   "silent": false,
   "switch_mode": 1,

@@ -342,6 +342,60 @@ def line_chart(
     _save(fig, path)
 
 
+def multi_line_chart(
+    path: Path,
+    title: str,
+    x_label: str,
+    y_label: str,
+    x_values: list[int | float],
+    series: list[tuple[str, list[float], str | None]],
+) -> None:
+    fig, ax = _setup_figure(10.6, 6.2)
+
+    if not x_values or not series:
+        ax.set_title(title, fontsize=16, color=TEXT, pad=18)
+        ax.set_xlabel(x_label, color=TEXT)
+        ax.set_ylabel(y_label, color=TEXT)
+        _save(fig, path)
+        return
+
+    finite_values: list[float] = []
+    for index, (label, y_values, color) in enumerate(series):
+        if not y_values:
+            continue
+        plotted_color = color or _palette(index)
+        ax.plot(
+            x_values[: len(y_values)],
+            y_values,
+            color=plotted_color,
+            linewidth=2.0,
+            marker="o",
+            markersize=3.6,
+            markerfacecolor=plotted_color,
+            markeredgecolor="white",
+            markeredgewidth=0.7,
+            label=label,
+        )
+        finite_values.extend(value for value in y_values if math.isfinite(value))
+
+    ax.set_title(title, fontsize=16, color=TEXT, pad=18)
+    ax.set_xlabel(x_label, color=TEXT)
+    ax.set_ylabel(y_label, color=TEXT)
+    ax.grid(color=GRID, linewidth=0.8, alpha=0.75)
+    ax.tick_params(colors=TEXT)
+    if all(isinstance(x, int) or x.is_integer() for x in x_values):
+        ax.set_xticks(sorted(set(x_values)))
+    if finite_values:
+        value_min = min(finite_values)
+        value_max = max(finite_values)
+        span = max(value_max - value_min, 1e-6)
+        ax.set_ylim(value_min - 0.06 * span, value_max + 0.12 * span)
+    if len(series) > 1:
+        ax.legend(loc="best", frameon=False, labelcolor=TEXT)
+
+    _save(fig, path)
+
+
 def scatter(path: Path, title: str, points: list[dict[str, Any]], x_label: str = "X", y_label: str = "Y") -> None:
     fig, ax = _setup_figure(13.5, 8.5)
     if not points:

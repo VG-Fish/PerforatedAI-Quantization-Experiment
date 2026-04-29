@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .plots import bar_chart, grouped_bar_chart, heatmap, scatter, line_chart
+from .plots import bar_chart, grouped_bar_chart, heatmap, scatter, line_chart, multi_line_chart
 from .specs import CONDITION_SPECS, MODEL_SPECS, condition_by_key
 from .training import TrainingRecord
 
@@ -193,6 +193,8 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
 
 def generate_training_graphs(results_root: Path) -> None:
     """Generate training curves from saved history.csv files in all model/condition directories."""
+    import shutil
+
     results_root = Path(results_root)
     if not results_root.exists():
         print(f"Results root {results_root} does not exist")
@@ -204,20 +206,30 @@ def generate_training_graphs(results_root: Path) -> None:
         model_key = condition_dir.parent.name
         condition_key = condition_dir.name
         plots_dir = condition_dir / "plots"
-        plots_dir.mkdir(parents=True, exist_ok=True)
 
-        # Load history data
-        history = []
+        # Clean and recreate the plots directory
+        if plots_dir.exists():
+            shutil.rmtree(plots_dir)
+        plots_dir.mkdir(parents=True)
+
+        history: list[dict[str, Any]] = []
         try:
             with history_file.open("r", newline="") as fh:
                 reader = csv.DictReader(fh)
                 for row in reader:
-                    history.append(
-                        {
-                            "epoch": int(row["epoch"]),
-                            "val_metric": float(row["val_metric"]),
-                        }
-                    )
+                    parsed_row: dict[str, Any] = {}
+                    for key, value in row.items():
+                        if value is None or value == "":
+                            parsed_row[key] = None
+                            continue
+                        if key == "epoch":
+                            parsed_row[key] = int(float(value))
+                            continue
+                        try:
+                            parsed_row[key] = float(value)
+                        except ValueError:
+                            parsed_row[key] = value
+                    history.append(parsed_row)
         except Exception as e:
             print(f"Error reading {history_file}: {e}")
             continue
@@ -225,33 +237,120 @@ def generate_training_graphs(results_root: Path) -> None:
         if not history:
             continue
 
-        # Extract epochs and metrics
         epochs = [row["epoch"] for row in history]
-        val_metrics = [row["val_metric"] for row in history]
 
-        # Try to load metrics.json for additional metadata
         metrics_file = condition_dir / "metrics.json"
         metric_name = "Validation Metric"
+        primary_metric_key = "metric"
         if metrics_file.exists():
             try:
                 metrics_data = json.loads(metrics_file.read_text())
                 metric_name = metrics_data.get("metric_name", "Validation Metric")
+                primary_metric_key = metrics_data.get("primary_metric_key", primary_metric_key)
             except Exception:
                 pass
 
-        # Generate training curve
-        title = f"{model_key.upper()} - {condition_key}: Training {metric_name}"
-        line_chart(
-            plots_dir / "training_curve.svg",
-            title,
-            "Epoch",
-            metric_name,
-            epochs,
-            val_metrics,
-        )
-        graph_count += 1
+        def numeric_series(column: str) -> list[float]:
+            values: list[float] = []
+            for row in history:
+                value = row.get(column)
+                values.append(float(value) if isinstance(value, (int, float)) else float("nan"))
+            return values
 
-        # Generate additional plots if dendritic data exists
+        def has_real_values(values: list[float]) -> bool:
+            return any(value == value for value in values)
+
+        def slugify(name: str) -> str:
+            cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in name)
+            while "__" in cleaned:
+                cleaned = cleaned.replace("__", "_")
+            return cleaned.strip("_") or "metric"
+
+        if "val_metric" in history[0] and "val_primary_metric" not in history[0]:
+            val_metrics = numeric_series("val_metric")
+            title = f"{model_key.upper()} - {condition_key}: Training {metric_name}"
+            line_chart(
+                plots_dir / "training_curve.svg",
+                title,
+                "Epoch",
+                metric_name,
+                epochs,
+                val_metrics,
+            )
+            graph_count += 1
+            continue
+
+        primary_series: list[tuple[str, list[float], str | None]] = []
+        for column, label, color in (
+            ("train_primary_metric", f"Train {metric_name}", "#2b6cb0"),
+            ("val_primary_metric", f"Validation {metric_name}", "#2f855a"),
+            ("test_primary_metric", f"Test {metric_name}", "#c05621"),
+        ):
+            if any(column in row for row in history):
+                values = numeric_series(column)
+                if has_real_values(values):
+                    primary_series.append((label, values, color))
+        if primary_series:
+            multi_line_chart(
+                plots_dir / "primary_metric.svg",
+                f"{model_key.upper()} - {condition_key}: Primary Metric ({primary_metric_key})",
+                "Epoch",
+                metric_name,
+                epochs,
+                primary_series,
+            )
+            graph_count += 1
+
+        loss_series: list[tuple[str, list[float], str | None]] = []
+        for column, label, color in (
+            ("train_loss", "Train Loss", "#2b6cb0"),
+            ("val_loss", "Validation Loss", "#2f855a"),
+            ("test_loss", "Test Loss", "#c05621"),
+        ):
+            if any(column in row for row in history):
+                values = numeric_series(column)
+                if has_real_values(values):
+                    loss_series.append((label, values, color))
+        if loss_series:
+            multi_line_chart(
+                plots_dir / "loss_curves.svg",
+                f"{model_key.upper()} - {condition_key}: Loss Curves",
+                "Epoch",
+                "Loss",
+                epochs,
+                loss_series,
+            )
+            graph_count += 1
+
+        grouped_suffixes: dict[str, list[tuple[str, list[float], str | None]]] = {}
+        for key in sorted({column for row in history for column in row.keys()}):
+            for prefix, color, label_prefix in (
+                ("train_", "#2b6cb0", "Train"),
+                ("val_", "#2f855a", "Validation"),
+                ("test_", "#c05621", "Test"),
+            ):
+                if not key.startswith(prefix):
+                    continue
+                suffix = key[len(prefix) :]
+                if suffix in {"loss", "primary_metric", "metric"}:
+                    continue
+                values = numeric_series(key)
+                if not has_real_values(values):
+                    continue
+                grouped_suffixes.setdefault(suffix, []).append((f"{label_prefix} {suffix.replace('_', ' ').title()}", values, color))
+                break
+
+        for suffix, series in sorted(grouped_suffixes.items()):
+            multi_line_chart(
+                plots_dir / f"metric_{slugify(suffix)}.svg",
+                f"{model_key.upper()} - {condition_key}: {suffix.replace('_', ' ').title()}",
+                "Epoch",
+                suffix.replace("_", " ").title(),
+                epochs,
+                series,
+            )
+            graph_count += 1
+
         best_arch_file = condition_dir / "best_arch_scores.csv"
         if best_arch_file.exists():
             try:
@@ -268,10 +367,9 @@ def generate_training_graphs(results_root: Path) -> None:
                 if arch_history:
                     cycles = [row["cycle"] for row in arch_history]
                     best_metrics = [row["best_metric_value"] for row in arch_history]
-                    title = f"{model_key.upper()} - {condition_key}: Architecture Evolution"
                     line_chart(
                         plots_dir / "architecture_evolution.svg",
-                        title,
+                        f"{model_key.upper()} - {condition_key}: Architecture Evolution",
                         "Cycle",
                         f"Best {metric_name}",
                         cycles,
