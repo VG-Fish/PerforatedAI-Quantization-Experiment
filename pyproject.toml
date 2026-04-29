@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dendritic-quantization-benchmark"
+version = "0.1.0"
+description = "Benchmark runner for perforated backpropagation and quantization experiments."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Codex" }]
+dependencies = [
+    "datasets>=3.0.0",
+    "gymnasium[classic-control]>=1.0.0",
+    "matplotlib>=3.10.9",
+    "python-dotenv>=1.0.1",
+    "perforatedai>=3.2.0",
+    "torch>=2.11.0",
+    "torchao>=0.17.0",
+    "torchaudio",
+    "torchvision",
+    "tqdm>=4.67.1",
+    "wfdb>=4.1.2",
+    "torchcodec>=0.11.1",
+]
+
+[project.scripts]
+dqb = "dendritic_benchmark.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
