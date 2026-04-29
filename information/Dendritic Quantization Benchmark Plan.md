@@ -295,6 +295,18 @@ model = model.to(device)
 
 ---
 
+## Repository Implementation
+
+The benchmark command-line implementation is located under `src/dendritic_benchmark/`.
+
+- `cli.py` exposes the `dqb` entry point and parses global options.
+- `specs.py` defines model and condition keys used by the benchmark.
+- `pipeline.py` orchestrates dataset loading, checkpoint chaining, model construction, and condition execution.
+- `training.py` runs each condition, evaluates metrics, and saves model artifacts.
+- `results.py` writes `record.json`/`record.csv`, regenerates manifest files, and creates summary plots.
+- `plots.py` renders SVG charts with Matplotlib.
+- `compat.py` isolates optional dependencies, device selection, and PerforatedAI wrapping.
+
 ## References
 
 1. [torch.nn.utils.prune.l1_unstructured — PyTorch 2.11 documentation](https://docs.pytorch.org/docs/stable/generated/torch.nn.utils.prune.l1_unstructured.html) - Prunes tensor corresponding to parameter called name in module by removing the specified amount of (...

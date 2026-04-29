@@ -25,13 +25,22 @@ PAITOKEN=your-token-here
 PAIEMAIL=you@example.com
 ```
 
-The loader also recognizes `PERFORATEDAI_API_KEY`, `PERFORATEDAI_TOKEN`, `PERFORATEDBP_API_KEY`, and `PERFORATEDBP_TOKEN` as aliases for the token, and `PERFORATEDAI_EMAIL` / `PERFORATEDBP_EMAIL` as aliases for the email.
+The loader also recognizes the following aliases:
+
+- `PERFORATEDAI_API_KEY`
+- `PERFORATEDAI_TOKEN`
+- `PERFORATEDBP_API_KEY`
+- `PERFORATEDBP_TOKEN`
+- `PERFORATEDAI_EMAIL`
+- `PERFORATEDBP_EMAIL`
+- `PAITOKEN`
+- `PAIEMAIL`
 
 ## Commands
 
 ### `dqb run`
 
-Runs the benchmark pipeline for all configured models and conditions.
+Runs the benchmark pipeline for selected models and conditions.
 
 ```bash
 uv run dqb run
@@ -48,15 +57,15 @@ uv run dqb run --comparison-root comparison
 
 What it does:
 
-- Downloads and caches the real benchmark datasets on first use.
-- Builds task bundles for each model from those cached datasets.
-- Trains/evaluates each selected condition.
-- Saves one result folder per model and condition.
-- Writes per-model charts and cross-model comparison charts.
+- Downloads and caches datasets under `data/` by default.
+- Builds task bundles for each selected model.
+- Trains and evaluates each requested condition.
+- Saves per-condition results under `results/<model>/<condition>/`.
+- Writes per-model charts and cross-model comparison outputs.
 
 ### `dqb compare`
 
-Rebuilds comparison outputs from previously saved records without re-running training.
+Rebuilds comparison outputs from previously saved records.
 
 ```bash
 uv run dqb compare
@@ -72,14 +81,14 @@ uv run dqb compare --comparison-root comparison
 
 What it does:
 
-- Loads all saved `record.json` files under the results directory.
-- Rewrites the manifest CSV if requested.
-- Regenerates per-model plots in each `results/<model>/` directory.
-- Regenerates the cross-model plots in the comparison directory.
+- Loads saved `record.json` files from the results directory.
+- Optionally rewrites `manifest.csv` when `--manifest` is provided.
+- Regenerates per-model charts from the loaded records.
+- Regenerates cross-model comparison charts in the comparison directory.
 
 ### `dqb generate_graphs`
 
-Generates training loss/metric curves from saved training data without re-running training.
+Generates training curves from saved result histories without retraining.
 
 ```bash
 uv run dqb generate_graphs
@@ -93,11 +102,10 @@ uv run dqb generate_graphs --results-root results
 
 What it does:
 
-- Scans all `results/<model>/<condition>/` directories for `history.csv` files.
-- Creates a `plots/` subdirectory in each model-condition folder.
-- Generates training curves showing validation metrics over epochs.
-- For dendritic models, also generates architecture evolution plots from `best_arch_scores.csv`.
-- Saves SVG plots to `results/<model>/<condition>/plots/`.
+- Scans all `results/<model>/<condition>/history.csv` files.
+- Recreates `plots/` directories in each condition folder.
+- Writes metric and loss curves for each history file.
+- For dendritic runs, also generates architecture evolution plots from `best_arch_scores.csv`.
 
 ## Output Layout
 
@@ -114,10 +122,12 @@ results/
       model.pt
       best_model              # dendritic runs only
       final_clean_pai         # dendritic runs only
-      best_arch_scores.csv     # dendritic runs only
-      paramCounts.csv          # dendritic runs only
+      best_arch_scores.csv    # dendritic runs only
+      paramCounts.csv         # dendritic runs only
       plots/
         training_curve.svg
+        primary_metric.svg
+        loss_curves.svg
         architecture_evolution.svg  # dendritic runs only
 comparison/
   accuracy_retention_heatmap.svg
@@ -172,14 +182,9 @@ uv run dqb run --models lenet5 --conditions base_fp32 base_q8
 uv run dqb compare --manifest
 ```
 
-### Inspect saved records
-
-Look at the JSON and CSV files in each `results/<model>/<condition>/` folder. They contain the metric value, parameter count, file size, and the artifact path used for that run.
-
 ## Notes
 
 - Real datasets are downloaded automatically into `data/` by default. Set `DQB_DATA_ROOT` to keep the cache outside the repository.
-- First runs need network access for the selected datasets; later runs reuse the local cache.
-- Dendritic runs are expected to produce extra sidecar files.
-- If you add new models or conditions later, update `src/dendritic_benchmark/specs.py` and rerun the CLI.
-- If your beta credentials unlock additional PerforatedAI capabilities, the code will pick them up through the loaded environment automatically.
+- The CLI accepts the same `--results-root` and `--comparison-root` options across most commands.
+- Dendritic runs are expected to produce additional PerforatedAI sidecar artifacts.
+- If you add new models or conditions, update `src/dendritic_benchmark/specs.py` and rerun the CLI.

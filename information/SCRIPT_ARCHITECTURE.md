@@ -1,93 +1,69 @@
 # Script Architecture Guide
 
-This guide explains how the benchmark code is organized and how data moves from the CLI to training, saved records, and plots.
+This guide explains how the benchmark code is organized and how data moves from the CLI to training, saved results, and plots.
 
 ## Entry Point
 
 ### `src/dendritic_benchmark/cli.py`
 
-Defines the `dqb` command exposed by `pyproject.toml`.
+The package exposes the `dqb` entry point via `pyproject.toml`.
 
-- `uv run dqb run` creates a `BenchmarkRunner` and runs selected models and conditions.
-- `uv run dqb compare` loads existing `record.json` files and rebuilds per-model and comparison outputs.
-- `--results-root` controls where per-model artifacts are read or written.
-- `--comparison-root` controls where cross-model plots and `summary.csv` are written.
-- `.env` credentials are loaded before running so PerforatedAI can use local beta credentials when available.
+- `uv run dqb run` constructs a `BenchmarkRunner` and executes the selected models and conditions.
+- `uv run dqb compare` loads saved `record.json` files and rebuilds per-model and cross-model comparison outputs.
+- `uv run dqb generate_graphs` regenerates training plots from existing `history.csv` files.
+- `--results-root` controls where per-model results are read from or written to.
+- `--comparison-root` controls where comparison outputs are written.
+- `.env` credentials are loaded before running so PerforatedAI aliases and API variables are mirrored into the environment.
 
 ## Experiment Configuration
 
 ### `src/dendritic_benchmark/specs.py`
 
-Contains the declarative model and condition lists.
+This file declares benchmark model and condition metadata.
 
-- `MODEL_SPECS` lists the 10 benchmark models, their display names, domains, datasets, metric names, and whether each metric should be maximized or minimized.
-- `CONDITION_SPECS` lists the 13 experimental conditions, including quantization bit width, source checkpoint, dendrite usage, pruning, QAT, and fine-tuning settings.
-- `model_by_key()` and `condition_by_key()` validate CLI keys and return the matching spec.
-
-Update this file first when adding a new model or condition.
+- `MODEL_SPECS` defines the 10 benchmark models and their evaluation metrics.
+- `CONDITION_SPECS` defines the 13 experimental conditions, including source checkpoint dependencies, quantization settings, dendrite usage, pruning, and QAT.
+- `model_by_key()` and `condition_by_key()` look up valid keys and raise on unknown values.
 
 ## Pipeline Orchestration
 
 ### `src/dendritic_benchmark/pipeline.py`
 
-Coordinates complete benchmark runs.
+`BenchmarkRunner` orchestrates the full benchmark run.
 
-- Creates result and comparison directories.
-- Expands condition dependencies so requested quantized conditions have their source checkpoints available.
-- Downloads/caches real datasets and builds model instances.
-- Loads checkpoints from previous conditions when a condition depends on another condition.
-- Applies PerforatedAI wrapping when dendritic conditions are requested.
-- Calls `train_and_evaluate()` for each model-condition pair.
-- Saves records and regenerates per-model and cross-model reports.
+- It creates the results and comparison directories.
+- It expands requested condition keys into a dependency-resolved order.
+- It builds dataset bundles via `data.py` and models via `models.py`.
+- It loads source checkpoints when a condition depends on a previous result.
+- It perforates models with PerforatedAI for dendritic conditions and configures them as needed.
+- It calls `train_and_evaluate()` for every model-condition pair.
+- It writes per-condition training records and regenerates comparison outputs during the run.
 
-The important class is `BenchmarkRunner`.
+The run method also computes `max_epochs` from `_base_epoch_budget()` so baseline and dendritic FP32 conditions receive larger budgets than post-training quantized conditions.
 
 ## Real Data
 
 ### `src/dendritic_benchmark/data.py`
 
-Builds task bundles from the public datasets named in the benchmark plan and stores downloaded assets under `data/` by default. Set `DQB_DATA_ROOT` to move the cache.
-
-- TorchVision/Torchaudio download MNIST and SpeechCommands.
-- Hugging Face Datasets caches AG News and SST-2.
-- Direct URL downloaders cache ETTh1, Adult Income, Cora, and ESOL.
-- Gymnasium creates CartPole-v1 rollouts and caches the resulting observations.
-- WFDB downloads MIT-BIH ECG records from PhysioNet.
-
-Each bundle returns train, validation, and test data loaders plus metric metadata.
+Builds task bundles for each benchmark task and caches datasets under `data/` by default. Set `DQB_DATA_ROOT` to move the cache location.
 
 ## Models
 
 ### `src/dendritic_benchmark/models.py`
 
-Defines compact PyTorch implementations for every benchmark slot.
-
-- `LeNet5` for image classification.
-- `M5` for 1D audio classification.
-- `LSTMForecaster` for sequence forecasting.
-- `TextCNN` for text classification.
-- `GCN` for graph classification.
-- `TabNetLite` for tabular classification.
-- `MPNN` for graph regression.
-- `ActorCritic` for the reinforcement-learning proxy task.
-- `LSTMAutoencoder` for anomaly detection.
-- `DistilBertFallback` as a lightweight DistilBERT-style sequence classifier stand-in.
-
-`build_model()` selects the factory by model key.
+Defines the compact PyTorch model implementations used by the benchmark and exposes `build_model()` to construct each architecture by key.
 
 ## Compatibility Helpers
 
 ### `src/dendritic_benchmark/compat.py`
 
-Isolates optional or environment-sensitive dependencies.
+Isolates optional dependencies and PerforatedAI integration.
 
-- Safely imports PyTorch and dotenv.
-- Chooses `mps`, CUDA, or CPU at runtime.
-- Loads `.env` credentials and mirrors PerforatedAI token/email aliases.
-- Wraps models with PerforatedAI when installed, otherwise returns the original model.
-- Provides simple symmetric, ternary, and binary weight quantization helpers.
-
-Keeping this logic centralized lets the rest of the package stay readable and import safely before optional ML dependencies are available.
+- Safely imports PyTorch and optional `dotenv`.
+- Detects MPS, CUDA, or CPU at runtime.
+- Mirrors PerforatedAI token and email aliases from environment variables.
+- Wraps and configures models with PerforatedAI when available.
+- Provides simple symmetric, ternary, and binary quantization helpers.
 
 ## Training And Evaluation
 
@@ -97,41 +73,38 @@ Runs each individual condition.
 
 - Moves the model to the selected device.
 - Applies pruning for pruned conditions.
-- Applies fake quantization or QAT-style weight projection for low-bit conditions.
-- Trains for the condition-specific number of epochs.
+- Applies quantization for low-bit conditions and optionally QAT-style weight projection.
+- Compiles non-dendritic MPS models with `torch.compile(..., backend='aot_eager')` when available.
+- Trains for the condition-specific epoch budget, or skips training for post-training quantization conditions.
 - Evaluates validation and test metrics.
-- Saves `model.pt`, and dendritic sidecars such as `best_model`, `final_clean_pai`, `best_arch_scores.csv`, and `paramCounts.csv`.
-- Writes `metrics.json`, `history.csv`, and returns a `TrainingRecord`.
+- Saves `model.pt`, and for dendritic runs also writes `best_model` and `final_clean_pai`.
+- Writes `metrics.json`, `history.csv`, and returns a normalized `TrainingRecord`.
 
-`TrainingRecord` is the normalized record format used by plotting and manifests.
+For dendritic runs, the module also writes `best_arch_scores.csv` and `paramCounts.csv`.
 
 ## Results And Reports
 
 ### `src/dendritic_benchmark/results.py`
 
-Reads and writes benchmark records and dispatches plot generation.
+Reads and writes benchmark records and generates final visualizations.
 
-- `save_training_record()` writes `record.json` and `record.csv`.
-- `load_training_records()` scans `results/*/*/record.json`.
-- `write_manifest()` writes the combined `results/manifest.csv`.
-- `write_model_reports()` creates each model's metric, parameter, and file-size charts.
-- `write_comparison_reports()` creates cross-model heatmaps, scatter plots, dendrite delta bars, and `summary.csv`.
-
-This module computes normalized score retention and file-size reduction before handing data to the plotting layer.
+- `save_training_record()` writes `record.json` and `record.csv` for each condition.
+- `load_training_records()` scans saved records under `results/*/*/record.json`.
+- `write_manifest()` writes `results/manifest.csv`.
+- `write_model_reports()` generates per-model metric, parameter, and size comparison charts.
+- `write_comparison_reports()` generates cross-model heatmaps, a tradeoff scatter plot, a dendrite delta chart, and `summary.csv`.
+- `generate_training_graphs()` regenerates training plots from `history.csv` and architecture evolution plots from `best_arch_scores.csv`.
 
 ## Plotting
 
 ### `src/dendritic_benchmark/plots.py`
 
-Creates all charts using Matplotlib's non-interactive `Agg` backend.
+Creates charts using Matplotlib's non-interactive `Agg` backend.
 
-- Bar charts use wrapped tick labels, adaptive rotation, and renderer-based overlap detection.
-- Value labels above bars are only kept when their measured bounding boxes do not collide.
-- Heatmaps rotate or shrink labels when needed and use dynamic figure sizes.
-- Scatter labels are placed using multiple candidate offsets; labels that still collide are hidden and counted in a small note.
-- Existing output filenames remain `.svg`, so `uv run dqb compare` can regenerate plots from completed training records without retraining.
-
-The overlap detection uses Matplotlib's actual rendered text extents instead of guessing from string length.
+- Bar charts are drawn with adaptive label sizing and optional hatch patterns for PTQ conditions.
+- Line charts plot metric and loss series over epochs.
+- Heatmaps and scatter plots are used for cross-model comparison outputs.
+- Plot label overlap detection uses rendered text extents to avoid collisions.
 
 ## Typical Flows
 
@@ -143,13 +116,13 @@ uv run dqb run
 
 Flow:
 
-1. `cli.py` parses the command.
-2. `pipeline.py` loops over models and conditions.
-3. `data.py` downloads missing datasets and builds real-data loaders.
-4. `models.py` builds each PyTorch model.
+1. `cli.py` parses the command and global options.
+2. `pipeline.py` loops over selected models and conditions.
+3. `data.py` downloads missing datasets and builds task bundles.
+4. `models.py` builds the requested model architecture.
 5. `training.py` trains, evaluates, and saves artifacts.
 6. `results.py` writes records and reports.
-7. `plots.py` writes Matplotlib SVG charts.
+7. `plots.py` writes SVG charts.
 
 ### Regenerate plots after training
 
@@ -159,10 +132,20 @@ uv run dqb compare --manifest
 
 Flow:
 
-1. `cli.py` loads saved records.
+1. `cli.py` loads saved record files.
 2. `results.py` optionally rewrites `manifest.csv`.
 3. `results.py` rewrites per-model charts from saved records.
-4. `results.py` recomputes normalized comparison data.
-5. `plots.py` rewrites the comparison SVG files.
+4. `results.py` rewrites comparison charts in the comparison directory.
 
-This is the fastest way to refresh charts after changing plot logic.
+### Generate training graphs
+
+```bash
+uv run dqb generate_graphs --results-root results
+```
+
+Flow:
+
+1. `cli.py` loads the results root.
+2. `results.py` scans existing `history.csv` files.
+3. `results.py` recreates `plots/` directories and writes metric and loss curves.
+4. For dendritic conditions, it also generates architecture evolution plots from `best_arch_scores.csv`.
