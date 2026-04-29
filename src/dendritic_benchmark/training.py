@@ -600,6 +600,27 @@ def train_and_evaluate(
     if bit_width is not None and bit_width < 32 and use_qat:
         model = _make_quantized_copy(model, bit_width, quantization_mode)
 
+    # Compile non-dendritic models on MPS to fuse operators and cut Python-dispatch
+    # overhead.  The "aot_eager" backend is used because the default "inductor"
+    # backend requires Triton, which is not available on macOS / Apple Silicon.
+    # PerforatedAI-wrapped (dendritic) models are excluded since their custom
+    # forward logic may not be fully traceable by the compiler.
+    if (
+        not use_dendrites
+        and hasattr(torch, "compile")
+        and getattr(device, "type", "") == "mps"
+    ):
+        try:
+            model = torch.compile(model, backend="aot_eager", fullgraph=False)
+            print(
+                f"[compile] torch.compile(aot_eager) applied to {model_key}/{condition_key}"
+            )
+        except Exception as _compile_exc:
+            print(
+                f"[compile] torch.compile skipped for {model_key}/{condition_key}: "
+                f"{_compile_exc}"
+            )
+
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = _binary_or_multi_loss(model_key)
     history: list[dict[str, Any]] = []
@@ -635,7 +656,9 @@ def train_and_evaluate(
         for epoch in epoch_progress:
             epoch_start = time.perf_counter()
             model.train()
-            running_loss = 0.0
+            # Keep the loss sum on-device to eliminate one CPU–GPU sync per batch.
+            # A single .item() call at epoch-end materialises the value.
+            running_loss_t = torch.zeros(1, device=device)
             train_examples = 0
             train_outputs: list[Any] = []
             train_targets: list[Any] = []
@@ -646,10 +669,17 @@ def train_and_evaluate(
                 unit="batch",
                 leave=False,
                 dynamic_ncols=True,
+                # Refresh at most ~10 times per epoch to reduce tqdm Python overhead.
+                miniters=max(1, len(bundle.train_loader) // 10),
             )
-            for batch_index, batch in enumerate(batch_progress, start=1):
-                batch = tuple(item.to(device) for item in batch)
-                optimizer.zero_grad()
+            for batch in batch_progress:
+                # non_blocking=True lets the CPU queue the next transfer while the
+                # GPU is still computing the current batch (no-op for MPS unified
+                # memory, but harmless and future-proof for CUDA).
+                batch = tuple(item.to(device, non_blocking=True) for item in batch)
+                # set_to_none=True skips the memset and lets the allocator reuse
+                # gradient buffers, saving a small but consistent amount of work.
+                optimizer.zero_grad(set_to_none=True)
                 outputs, targets, *rest = _forward(model_key, model, batch)
                 if model_key == "actor_critic":
                     loss = criterion(outputs[0], targets)
@@ -658,10 +688,9 @@ def train_and_evaluate(
                 loss.backward()
                 optimizer.step()
                 batch_examples = _batch_size(targets)
-                running_loss += float(loss.detach().item()) * batch_examples
+                # Accumulate on-device — no CPU–GPU sync in the hot path.
+                running_loss_t = running_loss_t + loss.detach() * batch_examples
                 train_examples += batch_examples
-                average_loss = running_loss / max(1, train_examples)
-                batch_progress.set_postfix(loss=f"{average_loss:.4f}")
                 metric_targets = rest[0] if rest else None
                 detached_outputs, detached_targets, detached_metric_targets = (
                     _detach_metric_payload(model_key, outputs, targets, metric_targets)
@@ -674,7 +703,8 @@ def train_and_evaluate(
                     _make_quantized_copy(model, bit_width, quantization_mode)
             batch_progress.close()
 
-            train_loss = running_loss / max(1, train_examples)
+            # Single sync per epoch to read the accumulated GPU-side loss.
+            train_loss = (running_loss_t / max(1, train_examples)).item()
             train_metrics = {}
             if train_outputs:
                 train_metrics = _compute_all_metrics(
@@ -688,14 +718,14 @@ def train_and_evaluate(
                 )
 
             model.eval()
-            val_running_loss = 0.0
+            val_running_loss_t = torch.zeros(1, device=device)
             val_examples = 0
             val_outputs: list[Any] = []
             val_targets: list[Any] = []
             val_metric_targets: list[Any] = []
             with torch.no_grad():
                 for batch in bundle.val_loader:
-                    batch = tuple(item.to(device) for item in batch)
+                    batch = tuple(item.to(device, non_blocking=True) for item in batch)
                     outputs, targets, *rest = _forward(model_key, model, batch)
                     metric_targets = rest[0] if rest else None
                     if model_key == "actor_critic":
@@ -703,7 +733,9 @@ def train_and_evaluate(
                     else:
                         loss = criterion(outputs, targets)
                     batch_examples = _batch_size(targets)
-                    val_running_loss += float(loss.detach().item()) * batch_examples
+                    val_running_loss_t = (
+                        val_running_loss_t + loss.detach() * batch_examples
+                    )
                     val_examples += batch_examples
                     detached_outputs, detached_targets, detached_metric_targets = (
                         _detach_metric_payload(
@@ -715,7 +747,7 @@ def train_and_evaluate(
                     if detached_metric_targets is not None:
                         val_metric_targets.append(detached_metric_targets)
 
-            val_loss = val_running_loss / max(1, val_examples)
+            val_loss = (val_running_loss_t / max(1, val_examples)).item()
             val_metrics = {}
             if val_outputs:
                 val_metrics = _compute_all_metrics(
@@ -789,14 +821,14 @@ def train_and_evaluate(
         model = _make_quantized_copy(model, bit_width, quantization_mode)
 
     model.eval()
-    test_running_loss = 0.0
+    test_running_loss_t = torch.zeros(1, device=device)
     test_examples = 0
     test_outputs: list[Any] = []
     test_targets: list[Any] = []
     test_metric_targets: list[Any] = []
     with torch.no_grad():
         for batch in bundle.test_loader:
-            batch = tuple(item.to(device) for item in batch)
+            batch = tuple(item.to(device, non_blocking=True) for item in batch)
             outputs, targets, *rest = _forward(model_key, model, batch)
             metric_targets = rest[0] if rest else None
             if model_key == "actor_critic":
@@ -804,7 +836,7 @@ def train_and_evaluate(
             else:
                 loss = criterion(outputs, targets)
             batch_examples = _batch_size(targets)
-            test_running_loss += float(loss.detach().item()) * batch_examples
+            test_running_loss_t = test_running_loss_t + loss.detach() * batch_examples
             test_examples += batch_examples
             detached_outputs, detached_targets, detached_metric_targets = (
                 _detach_metric_payload(model_key, outputs, targets, metric_targets)
@@ -814,7 +846,7 @@ def train_and_evaluate(
             if detached_metric_targets is not None:
                 test_metric_targets.append(detached_metric_targets)
 
-    test_loss = test_running_loss / max(1, test_examples)
+    test_loss = (test_running_loss_t / max(1, test_examples)).item()
     test_metrics = {}
     if test_outputs:
         test_metrics = _compute_all_metrics(
