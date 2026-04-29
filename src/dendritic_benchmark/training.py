@@ -462,6 +462,18 @@ def _forward(model_key: str, model: Any, batch: tuple[Any, ...]) -> tuple[Any, A
     return model(x), targets
 
 
+def _unwrap_compiled(model: Any) -> Any:
+    """Return the underlying ``nn.Module`` when the model is a ``torch.compile``
+    wrapper (``torch._dynamo.OptimizedModule``).
+
+    ``torch.compile`` stores the original module as ``self._orig_mod`` and
+    prefixes every key in ``state_dict()`` with ``_orig_mod.``.  Always saving
+    and loading checkpoints through the unwrapped module keeps key names clean
+    so downstream conditions can load the file into a fresh, uncompiled model.
+    """
+    return getattr(model, "_orig_mod", model)
+
+
 def _make_quantized_copy(
     model: Any, bit_width: int | None, mode: str | None = None
 ) -> Any:
@@ -784,8 +796,11 @@ def train_and_evaluate(
             ):
                 best_metric = val_metric
                 best_epoch = epoch + 1
+                # Capture state from the unwrapped model so keys are plain
+                # (e.g. "features.0.weight") rather than "_orig_mod.features.0.weight".
                 best_state = {
-                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                    k: v.detach().cpu().clone()
+                    for k, v in _unwrap_compiled(model).state_dict().items()
                 }
             epoch_progress.set_postfix(
                 val_metric=_format_metric_value(val_metric),
@@ -815,7 +830,9 @@ def train_and_evaluate(
         )
 
     if best_state is not None:
-        model.load_state_dict(best_state)
+        # Load into the underlying module; the compiled wrapper's forward graph
+        # reads parameters in-place from the same tensors, so it stays in sync.
+        _unwrap_compiled(model).load_state_dict(best_state)
 
     if bit_width is not None and bit_width < 32:
         model = _make_quantized_copy(model, bit_width, quantization_mode)
@@ -861,10 +878,13 @@ def train_and_evaluate(
         best_metric = final_metric
 
     checkpoint_path = output_dir / "model.pt"
-    torch.save(model.state_dict(), checkpoint_path)
+    # Always save from the unwrapped module so checkpoint keys are portable
+    # (no "_orig_mod." prefix) and can be loaded by any uncompiled model.
+    _plain_model = _unwrap_compiled(model)
+    torch.save(_plain_model.state_dict(), checkpoint_path)
     if use_dendrites:
-        torch.save(model.state_dict(), output_dir / "best_model")
-        torch.save(model.state_dict(), output_dir / "final_clean_pai")
+        torch.save(_plain_model.state_dict(), output_dir / "best_model")
+        torch.save(_plain_model.state_dict(), output_dir / "final_clean_pai")
     artifact_path = _artifact_path(output_dir, use_dendrites)
     file_size_mb = artifact_path.stat().st_size / (1024 * 1024)
 
