@@ -188,7 +188,7 @@ def _build_mnist(batch_size: int) -> TaskBundle:
 
 
 class _SpeechCommands12:
-    def __init__(self, subset: str):
+    def __init__(self, subset: str) -> None:
         torchaudio = _require_dependency("torchaudio")
         root = _data_root() / "speechcommands"
         root.mkdir(parents=True, exist_ok=True)
@@ -206,7 +206,7 @@ class _SpeechCommands12:
     def __len__(self) -> int:
         return len(self.indices)
 
-    def __getitem__(self, index: int):
+    def __getitem__(self, index: int) -> tuple[Any, Any]:
         _torch = (
             require_torch()
         )  # lightweight: just returns the already-imported module
@@ -243,13 +243,13 @@ def _build_speechcommands(batch_size: int) -> TaskBundle:
 
 
 class _TensorRowsDataset:
-    def __init__(self, *tensors: Any):
+    def __init__(self, *tensors: Any) -> None:
         self.tensors = tensors
 
     def __len__(self) -> int:
         return len(self.tensors[0])
 
-    def __getitem__(self, index: int):
+    def __getitem__(self, index: int) -> tuple[Any, ...]:
         return tuple(tensor[index] for tensor in self.tensors)
 
 
@@ -370,7 +370,7 @@ class _CoraEgoDataset:
     def __len__(self) -> int:
         return int(self.y_all.shape[0])
 
-    def __getitem__(self, index: int):
+    def __getitem__(self, index: int) -> tuple[Any, Any, Any]:
         torch = require_torch()
         neighbors = self.adjacency[index].nonzero().flatten()[:50]
         if len(neighbors) < 50:
@@ -446,7 +446,7 @@ def _build_adult(batch_size: int) -> TaskBundle:
     encoders: list[dict[str, int]] = [{} for _ in range(feature_count)]
     numeric_columns = {0, 2, 4, 10, 11, 12}
 
-    def encode(rows: list[list[str]]):
+    def encode(rows: list[list[str]]) -> tuple[list[list[float]], list[int]]:
         values = []
         labels = []
         for row in rows:
@@ -491,7 +491,7 @@ def _build_adult(batch_size: int) -> TaskBundle:
     )
 
 
-def _smiles_to_graph(smiles: str):
+def _smiles_to_graph(smiles: str) -> tuple[Any, Any]:
     torch = require_torch()
     atoms: list[str] = []
     edges: list[tuple[int, int]] = []

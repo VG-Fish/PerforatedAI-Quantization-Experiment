@@ -114,7 +114,7 @@ def perforate_model(
     global _PAI_CONFIG_SAVED_PRINTED
     original_print = builtins.print
 
-    def _filtered_print(*args, **kwargs):
+    def _filtered_print(*args: Any, **kwargs: Any) -> None:
         global _PAI_CONFIG_SAVED_PRINTED
         try:
             text = " ".join(str(a) for a in args)

@@ -47,19 +47,19 @@ def _metric_is_better(new: float, old: float, direction: str) -> bool:
     return new > old if direction == "maximize" else new < old
 
 
-def _accuracy(logits, targets):
+def _accuracy(logits: Any, targets: Any) -> float:
     return (logits.argmax(dim=-1) == targets).float().mean().item()
 
 
-def _mae(preds, targets):
+def _mae(preds: Any, targets: Any) -> float:
     return (preds - targets).abs().mean().item()
 
 
-def _rmse(preds, targets):
+def _rmse(preds: Any, targets: Any) -> float:
     return math.sqrt(((preds - targets) ** 2).mean().item())
 
 
-def _auc(scores, targets):
+def _auc(scores: Any, targets: Any) -> float:
     scores = scores.detach().flatten()
     targets = targets.detach().flatten().long()
     positives = scores[targets == 1]
@@ -71,7 +71,7 @@ def _auc(scores, targets):
     return (comparisons + ties).mean().item()
 
 
-def _reward_proxy(preds, targets):
+def _reward_proxy(preds: Any, targets: Any) -> float:
     return _accuracy(preds, targets)
 
 
@@ -89,7 +89,7 @@ _PRIMARY_METRIC_KEY: dict[str, str] = {
 }
 
 
-def _binary_or_multi_loss(model_key: str):
+def _binary_or_multi_loss(model_key: str) -> Any:
     torch = require_torch()
     if model_key in {"lstm_forecaster", "mpnn"}:
         return torch.nn.MSELoss()
@@ -445,7 +445,7 @@ def _history_fieldnames(history: list[dict[str, Any]]) -> list[str]:
     return fieldnames
 
 
-def _forward(model_key: str, model: Any, batch: tuple[Any, ...]) -> tuple[Any, Any]:
+def _forward(model_key: str, model: Any, batch: tuple[Any, ...]) -> tuple[Any, ...]:
     if model_key in {"gcn"}:
         x, adjacency, targets = batch
         return model(x, adjacency), targets

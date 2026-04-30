@@ -12,8 +12,8 @@ from .results import (
     write_manifest,
     write_model_reports,
 )
-from .specs import CONDITION_SPECS, MODEL_SPECS, condition_by_key, model_by_key
-from .training import train_and_evaluate
+from .specs import CONDITION_SPECS, MODEL_SPECS, ConditionSpec, condition_by_key, model_by_key
+from .training import TrainingRecord, train_and_evaluate
 
 EPOCH_MULTIPLIER = 10
 
@@ -144,7 +144,7 @@ class BenchmarkRunner:
                 linear.set_this_output_dimensions([-1, 0])
         return model
 
-    def _base_epoch_budget(self, condition: Any) -> int:
+    def _base_epoch_budget(self, condition: ConditionSpec) -> int:
         return 4 * EPOCH_MULTIPLIER
 
     def run(
@@ -209,9 +209,9 @@ class BenchmarkRunner:
         metric_name: str,
         metric_direction: str,
         bundle: Any,
-        condition: Any,
+        condition: ConditionSpec,
         saved_dirs: dict[str, Path],
-    ):
+    ) -> TrainingRecord:
         torch = require_torch()
         model = build_model(model_key, **self._model_kwargs(model_key))
         if condition.source_key in saved_dirs:

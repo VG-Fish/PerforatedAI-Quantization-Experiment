@@ -23,6 +23,11 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--manifest", action="store_true", help="Rewrite the manifest CSV before plotting")
 
     generate_graphs_parser = subparsers.add_parser("generate_graphs", help="Generate training curves from saved results")
+    generate_graphs_parser.add_argument(
+        "--regenerate-graphs",
+        action="store_true",
+        help="Recreate graphs even if they already exist",
+    )
 
     return parser
 
@@ -54,7 +59,7 @@ def main() -> None:
         return
 
     if args.command == "generate_graphs":
-        generate_training_graphs(results_root)
+        generate_training_graphs(results_root, regenerate=args.regenerate_graphs)
         return
 
     parser.print_help()

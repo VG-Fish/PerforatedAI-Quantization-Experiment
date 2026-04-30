@@ -32,7 +32,7 @@ if nn is not None:  # pragma: no branch - optional dependency gating
                 nn.Linear(84, num_classes),
             )
 
-        def forward(self, x):
+        def forward(self, x: Any) -> Any:
             return self.classifier(self.features(x))
 
 
@@ -52,7 +52,7 @@ if nn is not None:  # pragma: no branch - optional dependency gating
             )
             self.classifier = nn.Sequential(nn.Flatten(), nn.Linear(128, num_classes))
 
-        def forward(self, x):
+        def forward(self, x: Any) -> Any:
             return self.classifier(self.features(x))
 
 
@@ -62,7 +62,7 @@ if nn is not None:  # pragma: no branch - optional dependency gating
             self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
             self.head = nn.Linear(hidden_size, 1)
 
-        def forward(self, x):
+        def forward(self, x: Any) -> Any:
             _, (hidden, _) = self.lstm(x)
             return self.head(hidden[-1]).squeeze(-1)
 
@@ -76,7 +76,7 @@ if nn is not None:  # pragma: no branch - optional dependency gating
             )
             self.classifier = nn.Sequential(nn.Dropout(0.2), nn.Linear(64 * 3, num_classes))
 
-        def forward(self, x):
+        def forward(self, x: Any) -> Any:
             x = self.embedding(x.long()).transpose(1, 2)
             pooled = [F.relu(conv(x)).max(dim=-1).values for conv in self.convs]
             return self.classifier(torch.cat(pooled, dim=1))
@@ -87,7 +87,7 @@ if nn is not None:  # pragma: no branch - optional dependency gating
             super().__init__()
             self.linear = nn.Linear(in_features, out_features)
 
-        def forward(self, x, adjacency):
+        def forward(self, x: Any, adjacency: Any) -> Any:
             degree = adjacency.sum(dim=-1, keepdim=True).clamp_min(1.0)
             norm_adj = adjacency / degree
             return self.linear(norm_adj @ x)
@@ -99,7 +99,7 @@ if nn is not None:  # pragma: no branch - optional dependency gating
             self.conv1 = GraphConv(in_features, hidden)
             self.conv2 = GraphConv(hidden, num_classes)
 
-        def forward(self, x, adjacency):
+        def forward(self, x: Any, adjacency: Any) -> Any:
             x = F.relu(self.conv1(x, adjacency))
             x = self.conv2(x, adjacency)
             return x.mean(dim=1)
@@ -117,7 +117,7 @@ if nn is not None:  # pragma: no branch - optional dependency gating
             )
             self.head = nn.Linear(hidden, num_classes)
 
-        def forward(self, x):
+        def forward(self, x: Any) -> Any:
             return self.head(self.backbone(x))
 
 
@@ -128,7 +128,7 @@ if nn is not None:  # pragma: no branch - optional dependency gating
             self.update = nn.GRUCell(hidden, hidden)
             self.readout = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, 1))
 
-        def forward(self, node_features, adjacency):
+        def forward(self, node_features: Any, adjacency: Any) -> Any:
             batch_size, num_nodes, _ = node_features.shape
             h = self.message(node_features)
             agg = torch.bmm(adjacency, h)
@@ -145,7 +145,7 @@ if nn is not None:  # pragma: no branch - optional dependency gating
             self.policy = nn.Linear(hidden, action_dim)
             self.value = nn.Linear(hidden, 1)
 
-        def forward(self, x):
+        def forward(self, x: Any) -> tuple[Any, Any]:
             hidden = self.backbone(x)
             return self.policy(hidden), self.value(hidden).squeeze(-1)
 
@@ -157,7 +157,7 @@ if nn is not None:  # pragma: no branch - optional dependency gating
             self.decoder = nn.LSTM(input_size, hidden, batch_first=True)
             self.output = nn.Linear(hidden, input_size)
 
-        def forward(self, x):
+        def forward(self, x: Any) -> Any:
             batch, seq_len, feat = x.shape
             _, (hidden, _) = self.encoder(x)
             decoder_input = x.new_zeros((batch, seq_len, feat))
@@ -172,7 +172,7 @@ if nn is not None:  # pragma: no branch - optional dependency gating
             self.encoder = nn.GRU(embed_dim, 128, batch_first=True, bidirectional=True)
             self.head = nn.Linear(256, num_classes)
 
-        def forward(self, x):
+        def forward(self, x: Any) -> Any:
             embedded = self.embedding(x.long())
             encoded, _ = self.encoder(embedded)
             pooled = encoded.mean(dim=1)

@@ -261,7 +261,7 @@ def _graphs_slugify(name: str) -> str:
     return cleaned.strip("_") or "metric"
 
 
-def _process_condition_graphs(history_file_str: str) -> tuple[list[str], int]:
+def _process_condition_graphs(history_file_str: str, regenerate: bool = False) -> tuple[list[str], int]:
     """Process one condition directory and return (log_lines, graph_count).
     Module-level so it is picklable by ProcessPoolExecutor."""
     import shutil
@@ -274,10 +274,13 @@ def _process_condition_graphs(history_file_str: str) -> tuple[list[str], int]:
     condition_key = condition_dir.name
     plots_dir = condition_dir / "plots"
 
-    if plots_dir.exists():
+    if plots_dir.exists() and any(plots_dir.iterdir()):
+        if not regenerate:
+            logs.append(f"  Skipping — plots already exist (use --regenerate-graphs to overwrite).")
+            return logs, graph_count
         logs.append(f"  Clearing existing plots directory: {plots_dir}")
         shutil.rmtree(plots_dir)
-    plots_dir.mkdir(parents=True)
+    plots_dir.mkdir(parents=True, exist_ok=True)
     logs.append(f"  Plots directory ready: {plots_dir}")
 
     history: list[dict[str, Any]] = []
@@ -453,7 +456,7 @@ def _process_condition_graphs(history_file_str: str) -> tuple[list[str], int]:
     return logs, graph_count
 
 
-def generate_training_graphs(results_root: Path) -> None:
+def generate_training_graphs(results_root: Path, regenerate: bool = False) -> None:
     """Generate training curves from saved history.csv files in all model/condition directories."""
     import os
     from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -477,7 +480,7 @@ def generate_training_graphs(results_root: Path) -> None:
     completed = 0
     with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(_process_condition_graphs, str(f)): f
+            executor.submit(_process_condition_graphs, str(f), regenerate): f
             for f in all_history_files
         }
         for future in as_completed(futures):
