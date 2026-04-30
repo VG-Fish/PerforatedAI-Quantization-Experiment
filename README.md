@@ -26,3 +26,24 @@ Results are written to:
 ```bash
 uv run dqb compare
 ```
+
+## Documentation
+
+The repository includes extended documentation under the `information/` directory. Below are short summaries with links to the full markdown files.
+
+- `information/DOCUMENTATION.md` — Comprehensive project documentation (recommended start):
+	- Experiment plan for 10 models across 13 conditions (per-model and cross-model graphs).
+	- Execution strategy targeting Apple M3 Pro (MPS) and PyTorch integration notes.
+	- Detailed PerforatedAI (PAI) integration steps, quantization (`torchao`) and pruning examples, and training loop hooks.
+	- Round-2 expansion with 15 additional models and research findings from a preliminary run.
+
+- `information/CLI_DIAGRAMS.md` — CLI reference and diagrams:
+	- Command summaries and Mermaid flowcharts for `uv run dqb run`, `uv run dqb download_data`, `uv run dqb compare`, and `uv run dqb generate_graphs`.
+	- Global CLI flags and the recommended output directory layout.
+
+Read the full documents for architecture details, hypotheses, and example commands:
+
+[DOCUMENTATION.md](information/DOCUMENTATION.md)
+
+[CLI_DIAGRAMS.md](information/CLI_DIAGRAMS.md)
+
