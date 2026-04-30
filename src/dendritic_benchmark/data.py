@@ -591,6 +591,25 @@ def _parse_adult_file(path: Path) -> list[list[str]]:
     return rows
 
 
+def _encode_adult_row(
+    row: list[str],
+    encoders: list[dict[str, int]],
+    numeric_columns: set[int],
+    feature_count: int,
+) -> list[float]:
+    encoded: list[float] = []
+    for col in range(feature_count):
+        value: str = row[col]
+        if col in numeric_columns:
+            encoded.append(float(value) if value != "?" else 0.0)
+        else:
+            mapping: dict[str, int] = encoders[col]
+            if value not in mapping:
+                mapping[value] = len(mapping) + 1
+            encoded.append(float(mapping[value]))
+    return encoded
+
+
 def _encode_adult_rows(
     rows: list[list[str]],
     encoders: list[dict[str, int]],
@@ -600,17 +619,7 @@ def _encode_adult_rows(
     values: list[list[float]] = []
     labels: list[int] = []
     for row in rows:
-        encoded: list[float] = []
-        for col in range(feature_count):
-            value: str = row[col]
-            if col in numeric_columns:
-                encoded.append(float(value) if value != "?" else 0.0)
-            else:
-                mapping: dict[str, int] = encoders[col]
-                if value not in mapping:
-                    mapping[value] = len(mapping) + 1
-                encoded.append(float(mapping[value]))
-        values.append(encoded)
+        values.append(_encode_adult_row(row, encoders, numeric_columns, feature_count))
         labels.append(1 if row[-1] == ">50K" else 0)
     return values, labels
 
@@ -665,6 +674,22 @@ def _parse_smiles_token(
     return None, index + 1
 
 
+def _build_graph_tensors(
+    atoms: list[str], edges: list[tuple[int, int]], torch: Any
+) -> tuple[Any, Any]:
+    atom_types: list[str] = ["C", "N", "O", "S", "F", "CL", "BR", "I"]
+    x = torch.zeros((24, 9), dtype=torch.float32)
+    for atom_index, atom in enumerate(atoms[:24]):
+        feature_index: int = atom_types.index(atom) if atom in atom_types else 8
+        x[atom_index, feature_index] = 1.0
+    adjacency = torch.eye(24, dtype=torch.float32)
+    for src, dst in edges:
+        if src < 24 and dst < 24:
+            adjacency[src, dst] = 1.0
+            adjacency[dst, src] = 1.0
+    return x, adjacency
+
+
 def _smiles_to_graph(smiles: str) -> tuple[Any, Any]:
     torch = require_torch()
     atoms: list[str] = []
@@ -691,17 +716,7 @@ def _smiles_to_graph(smiles: str) -> tuple[Any, Any]:
         last_atom = atom_index
     if not atoms:
         atoms = ["C"]
-    atom_types: list[str] = ["C", "N", "O", "S", "F", "CL", "BR", "I"]
-    x = torch.zeros((24, 9), dtype=torch.float32)
-    for atom_index, atom in enumerate(atoms[:24]):
-        feature_index: int = atom_types.index(atom) if atom in atom_types else 8
-        x[atom_index, feature_index] = 1.0
-    adjacency = torch.eye(24, dtype=torch.float32)
-    for src, dst in edges:
-        if src < 24 and dst < 24:
-            adjacency[src, dst] = 1.0
-            adjacency[dst, src] = 1.0
-    return x, adjacency
+    return _build_graph_tensors(atoms, edges, torch)
 
 
 def _build_esol(batch_size: int) -> TaskBundle:

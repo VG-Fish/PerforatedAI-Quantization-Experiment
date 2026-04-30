@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import builtins
 
 # Module-level flag to ensure the PAI config-saved message is emitted only once
-_PAI_CONFIG_SAVED_PRINTED = False
+_PAI_CONFIG_SAVED_PRINTED: bool = False
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -105,7 +105,7 @@ def backend_status() -> BackendStatus:
 
 
 def _configure_pai_trackers(
-    GPA: Any,
+    gpa: Any,
     modules_to_track: list[Any] | None,
     module_names_to_track: list[str] | None,
     confirm_unwrapped_modules: bool,
@@ -118,17 +118,17 @@ def _configure_pai_trackers(
         "set_module_names_to_perforate",
         "set_module_ids_to_perforate",
     ):
-        setter = getattr(GPA.pc, setter_name, None)
+        setter = getattr(gpa.pc, setter_name, None)
         if setter is not None:
             setter([])
     if modules_to_track:
-        GPA.pc.append_modules_to_track(modules_to_track)
+        gpa.pc.append_modules_to_track(modules_to_track)
     if module_names_to_track:
-        GPA.pc.append_module_names_to_track(module_names_to_track)
-    if hasattr(GPA.pc, "set_testing_dendrite_capacity"):
-        GPA.pc.set_testing_dendrite_capacity(False)
+        gpa.pc.append_module_names_to_track(module_names_to_track)
+    if hasattr(gpa.pc, "set_testing_dendrite_capacity"):
+        gpa.pc.set_testing_dendrite_capacity(False)
     if confirm_unwrapped_modules:
-        GPA.pc.set_unwrapped_modules_confirmed(True)
+        gpa.pc.set_unwrapped_modules_confirmed(True)
 
 
 def perforate_model(

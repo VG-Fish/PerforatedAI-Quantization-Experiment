@@ -220,6 +220,59 @@ class BenchmarkRunner:
         saved_dirs[condition.key] = condition_dir
         return newly_trained
 
+    def _process_one_model_spec(
+        self,
+        model_spec: Any,
+        selected_conditions: list[Any],
+        ignore_saved: bool,
+        all_records: list[dict[str, Any]],
+    ) -> bool:
+        pending = [
+            cond for cond in selected_conditions
+            if ignore_saved or not (
+                self.results_root / model_spec.key / cond.key / _RECORD_JSON
+            ).exists()
+        ]
+        already_done = [cond for cond in selected_conditions if cond not in pending]
+
+        if not pending:
+            _log(
+                f"[skip] {model_spec.key} — all conditions already recorded, "
+                "skipping dataset load.",
+                before=True,
+            )
+        else:
+            _log(
+                f"[data] {model_spec.key} — loading dataset "
+                f"({len(pending)} condition(s) to train)…",
+                before=True,
+            )
+
+        model_records: list[dict[str, Any]] = []
+        saved_dirs: dict[str, Path] = {}
+
+        for condition in already_done:
+            self._load_saved_condition(
+                model_spec.key, condition, model_records, all_records, saved_dirs
+            )
+
+        newly_trained = False
+        if pending:
+            bundle = build_task_bundle(model_spec.key)
+            for condition in pending:
+                if self._train_pending_condition(
+                    model_spec, condition, bundle, ignore_saved,
+                    model_records, all_records, saved_dirs,
+                ):
+                    newly_trained = True
+
+        write_model_reports(
+            model_spec.display_name,
+            model_records,
+            self.results_root / model_spec.key,
+        )
+        return newly_trained
+
     def run(
         self,
         model_keys: list[str] | None = None,
@@ -235,51 +288,9 @@ class BenchmarkRunner:
         all_records: list[dict[str, Any]] = []
 
         for model_spec in selected_models:
-            pending = [
-                cond for cond in selected_conditions
-                if ignore_saved or not (
-                    self.results_root / model_spec.key / cond.key / _RECORD_JSON
-                ).exists()
-            ]
-            already_done = [cond for cond in selected_conditions if cond not in pending]
-
-            if not pending:
-                _log(
-                    f"[skip] {model_spec.key} — all conditions already recorded, "
-                    "skipping dataset load.",
-                    before=True,
-                )
-            else:
-                _log(
-                    f"[data] {model_spec.key} — loading dataset "
-                    f"({len(pending)} condition(s) to train)…",
-                    before=True,
-                )
-
-            model_records: list[dict[str, Any]] = []
-            saved_dirs: dict[str, Path] = {}
-
-            for condition in already_done:
-                self._load_saved_condition(
-                    model_spec.key, condition, model_records, all_records, saved_dirs
-                )
-
-            newly_trained = False
-            if pending:
-                bundle = build_task_bundle(model_spec.key)
-                for condition in pending:
-                    if self._train_pending_condition(
-                        model_spec, condition, bundle, ignore_saved,
-                        model_records, all_records, saved_dirs,
-                    ):
-                        newly_trained = True
-
-            write_model_reports(
-                model_spec.display_name,
-                model_records,
-                self.results_root / model_spec.key,
+            newly_trained = self._process_one_model_spec(
+                model_spec, selected_conditions, ignore_saved, all_records
             )
-
             if newly_trained:
                 completed_model_keys = {r["model_key"] for r in all_records}
                 if len(completed_model_keys) >= 2:

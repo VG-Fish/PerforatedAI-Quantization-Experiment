@@ -354,6 +354,103 @@ def _write_arch_evolution(
     return logs, graph_count
 
 
+def _load_condition_metrics(condition_dir: Path) -> tuple[str, str, list[str]]:
+    logs: list[str] = []
+    metric_name = "Validation Metric"
+    primary_metric_key = "metric"
+    metrics_file = condition_dir / "metrics.json"
+    if metrics_file.exists():
+        try:
+            metrics_data = json.loads(metrics_file.read_text())
+            metric_name = metrics_data.get("metric_name", "Validation Metric")
+            primary_metric_key = metrics_data.get("primary_metric_key", primary_metric_key)
+            logs.append(f"  Metric: {metric_name} (key: {primary_metric_key})")
+        except Exception:
+            logs.append("  WARNING: could not parse metrics.json — using defaults.")
+    else:
+        logs.append("  metrics.json not found — using default metric labels.")
+    return metric_name, primary_metric_key, logs
+
+
+def _write_standard_charts(
+    history: list[dict[str, Any]],
+    epochs: list[Any],
+    plots_dir: Path,
+    model_key: str,
+    condition_key: str,
+    metric_name: str,
+    primary_metric_key: str,
+) -> tuple[list[str], int]:
+    logs: list[str] = []
+    graph_count = 0
+    primary_series = _build_metric_series(history, [
+        ("train_primary_metric", f"Train {metric_name}", "#2b6cb0"),
+        ("val_primary_metric", f"Validation {metric_name}", "#2f855a"),
+        ("test_primary_metric", f"Test {metric_name}", "#c05621"),
+    ])
+    if primary_series:
+        out_path = plots_dir / "primary_metric.svg"
+        multi_line_chart(out_path,
+                         f"{model_key.upper()} - {condition_key}: Primary Metric ({primary_metric_key})",
+                         "Epoch", metric_name, epochs, primary_series)
+        logs.append(f"  Wrote: {out_path.name}  ({len(primary_series)} series)")
+        graph_count += 1
+    else:
+        logs.append("  Skipped primary_metric.svg — no valid series found.")
+    loss_series = _build_metric_series(history, [
+        ("train_loss", "Train Loss", "#2b6cb0"),
+        ("val_loss", "Validation Loss", "#2f855a"),
+        ("test_loss", "Test Loss", "#c05621"),
+    ])
+    if loss_series:
+        out_path = plots_dir / "loss_curves.svg"
+        multi_line_chart(out_path, f"{model_key.upper()} - {condition_key}: Loss Curves",
+                         "Epoch", "Loss", epochs, loss_series)
+        logs.append(f"  Wrote: {out_path.name}  ({len(loss_series)} series)")
+        graph_count += 1
+    else:
+        logs.append("  Skipped loss_curves.svg — no valid series found.")
+    return logs, graph_count
+
+
+def _write_grouped_metric_charts(
+    history: list[dict[str, Any]],
+    epochs: list[Any],
+    plots_dir: Path,
+    model_key: str,
+    condition_key: str,
+) -> tuple[list[str], int]:
+    logs: list[str] = []
+    graph_count = 0
+    grouped_suffixes: dict[str, list[tuple[str, list[float], str | None]]] = {}
+    for key in sorted({column for row in history for column in row.keys()}):
+        for prefix, color, label_prefix in (
+            ("train_", "#2b6cb0", "Train"),
+            ("val_", "#2f855a", "Validation"),
+            ("test_", "#c05621", "Test"),
+        ):
+            if not key.startswith(prefix):
+                continue
+            suffix = key[len(prefix):]
+            if suffix in {"loss", "primary_metric", "metric"}:
+                continue
+            values = _graphs_numeric_series(history, key)
+            if not _graphs_has_real_values(values):
+                continue
+            grouped_suffixes.setdefault(suffix, []).append(
+                (f"{label_prefix} {suffix.replace('_', ' ').title()}", values, color)
+            )
+            break
+    for suffix, series in sorted(grouped_suffixes.items()):
+        out_path = plots_dir / f"metric_{_graphs_slugify(suffix)}.svg"
+        multi_line_chart(out_path,
+                         f"{model_key.upper()} - {condition_key}: {suffix.replace('_', ' ').title()}",
+                         "Epoch", suffix.replace("_", " ").title(), epochs, series)
+        logs.append(f"  Wrote: {out_path.name}  ({len(series)} series)")
+        graph_count += 1
+    return logs, graph_count
+
+
 def _process_condition_graphs(history_file_str: str, regenerate: bool = False) -> tuple[list[str], int]:
     """Process one condition directory and return (log_lines, graph_count).
     Module-level so it is picklable by ProcessPoolExecutor."""
@@ -382,19 +479,8 @@ def _process_condition_graphs(history_file_str: str, regenerate: bool = False) -
         return logs, graph_count
 
     epochs = [row["epoch"] for row in history]
-    metric_name = "Validation Metric"
-    primary_metric_key = "metric"
-    metrics_file = condition_dir / "metrics.json"
-    if metrics_file.exists():
-        try:
-            metrics_data = json.loads(metrics_file.read_text())
-            metric_name = metrics_data.get("metric_name", "Validation Metric")
-            primary_metric_key = metrics_data.get("primary_metric_key", primary_metric_key)
-            logs.append(f"  Metric: {metric_name} (key: {primary_metric_key})")
-        except Exception:
-            logs.append("  WARNING: could not parse metrics.json — using defaults.")
-    else:
-        logs.append("  metrics.json not found — using default metric labels.")
+    metric_name, primary_metric_key, metric_logs = _load_condition_metrics(condition_dir)
+    logs.extend(metric_logs)
 
     if "val_metric" in history[0] and "val_primary_metric" not in history[0]:
         val_metrics = _graphs_numeric_series(history, "val_metric")
@@ -406,62 +492,17 @@ def _process_condition_graphs(history_file_str: str, regenerate: bool = False) -
         logs.append(f"  Done — {graph_count} graph(s) written.")
         return logs, graph_count
 
-    primary_series = _build_metric_series(history, [
-        ("train_primary_metric", f"Train {metric_name}", "#2b6cb0"),
-        ("val_primary_metric", f"Validation {metric_name}", "#2f855a"),
-        ("test_primary_metric", f"Test {metric_name}", "#c05621"),
-    ])
-    if primary_series:
-        out_path = plots_dir / "primary_metric.svg"
-        multi_line_chart(out_path,
-                         f"{model_key.upper()} - {condition_key}: Primary Metric ({primary_metric_key})",
-                         "Epoch", metric_name, epochs, primary_series)
-        logs.append(f"  Wrote: {out_path.name}  ({len(primary_series)} series)")
-        graph_count += 1
-    else:
-        logs.append("  Skipped primary_metric.svg — no valid series found.")
+    std_logs, std_count = _write_standard_charts(
+        history, epochs, plots_dir, model_key, condition_key, metric_name, primary_metric_key
+    )
+    logs.extend(std_logs)
+    graph_count += std_count
 
-    loss_series = _build_metric_series(history, [
-        ("train_loss", "Train Loss", "#2b6cb0"),
-        ("val_loss", "Validation Loss", "#2f855a"),
-        ("test_loss", "Test Loss", "#c05621"),
-    ])
-    if loss_series:
-        out_path = plots_dir / "loss_curves.svg"
-        multi_line_chart(out_path, f"{model_key.upper()} - {condition_key}: Loss Curves",
-                         "Epoch", "Loss", epochs, loss_series)
-        logs.append(f"  Wrote: {out_path.name}  ({len(loss_series)} series)")
-        graph_count += 1
-    else:
-        logs.append("  Skipped loss_curves.svg — no valid series found.")
-
-    grouped_suffixes: dict[str, list[tuple[str, list[float], str | None]]] = {}
-    for key in sorted({column for row in history for column in row.keys()}):
-        for prefix, color, label_prefix in (
-            ("train_", "#2b6cb0", "Train"),
-            ("val_", "#2f855a", "Validation"),
-            ("test_", "#c05621", "Test"),
-        ):
-            if not key.startswith(prefix):
-                continue
-            suffix = key[len(prefix):]
-            if suffix in {"loss", "primary_metric", "metric"}:
-                continue
-            values = _graphs_numeric_series(history, key)
-            if not _graphs_has_real_values(values):
-                continue
-            grouped_suffixes.setdefault(suffix, []).append(
-                (f"{label_prefix} {suffix.replace('_', ' ').title()}", values, color)
-            )
-            break
-
-    for suffix, series in sorted(grouped_suffixes.items()):
-        out_path = plots_dir / f"metric_{_graphs_slugify(suffix)}.svg"
-        multi_line_chart(out_path,
-                         f"{model_key.upper()} - {condition_key}: {suffix.replace('_', ' ').title()}",
-                         "Epoch", suffix.replace("_", " ").title(), epochs, series)
-        logs.append(f"  Wrote: {out_path.name}  ({len(series)} series)")
-        graph_count += 1
+    grp_logs, grp_count = _write_grouped_metric_charts(
+        history, epochs, plots_dir, model_key, condition_key
+    )
+    logs.extend(grp_logs)
+    graph_count += grp_count
 
     best_arch_file = condition_dir / "best_arch_scores.csv"
     if best_arch_file.exists():

@@ -18,7 +18,7 @@ from .compat import (
     ternary_quantize_tensor,
 )
 
-_MODEL_PT = "model.pt"
+_MODEL_PT: str = "model.pt"
 
 
 @dataclass
@@ -705,7 +705,6 @@ def _eval_on_loader(
     device: Any,
     criterion: Any,
     metric_name: str,
-    primary_metric_key: str,
     torch: Any,
 ) -> tuple[float, dict[str, Any]]:
     """Run evaluation on a dataloader, return (loss, metrics)."""
@@ -742,6 +741,197 @@ def _eval_on_loader(
     return loss_val, metrics
 
 
+def _configure_gcn_dendrites(
+    model: Any, model_key: str, use_dendrites: bool, device: Any, torch: Any
+) -> None:
+    if (
+        use_dendrites
+        and model_key == "gcn"
+        and hasattr(model, "conv2")
+        and hasattr(model.conv2, "linear")
+    ):
+        linear = model.conv2.linear
+        if hasattr(linear, "set_this_output_dimensions"):
+            linear.set_this_output_dimensions(torch.tensor([-1, 0], device=device))
+
+
+def _determine_skip_info(
+    max_epochs: int,
+    bit_width: int | None,
+    use_qat: bool,
+    quantization_mode: str | None,
+) -> tuple[bool, str]:
+    training_skipped = max_epochs == 0
+    if not training_skipped:
+        return False, ""
+    if bit_width is not None and bit_width < 32 and not use_qat:
+        _quant_desc = f"{bit_width}-bit {quantization_mode or 'int'}"
+        skip_reason = (
+            f"post-training quantization ({_quant_desc})"
+            " — weights are quantized without any gradient updates"
+        )
+    else:
+        skip_reason = "no training epochs configured"
+    return True, skip_reason
+
+
+def _print_skip_banner(
+    run_label: str,
+    skip_reason: str,
+    source_condition_key: str | None,
+    condition_key: str,
+    bit_width: int | None,
+    quantization_mode: str | None,
+) -> None:
+    _source_info = (
+        f"condition '{source_condition_key}'"
+        if source_condition_key and source_condition_key != condition_key
+        else "the current model state"
+    )
+    _quant_info = (
+        f"{bit_width}-bit {quantization_mode or 'int'} quantization"
+        if bit_width is not None and bit_width < 32
+        else "no quantization"
+    )
+    print(
+        f"\n{'─' * 64}\n"
+        f"[SKIP TRAINING]  {run_label}\n"
+        f"  Reason  : {skip_reason.capitalize()}\n"
+        f"  Source  : checkpoint loaded from {_source_info}\n"
+        f"  Quant.  : {_quant_info} will be applied to the loaded weights\n"
+        f"  Next    : proceeding directly to test-set evaluation\n"
+        f"{'─' * 64}\n"
+    )
+
+
+def _run_epoch_batches(
+    model: Any,
+    model_key: str,
+    bundle: Any,
+    device: Any,
+    criterion: Any,
+    optimizer: Any,
+    torch: Any,
+    epoch: int,
+    max_epochs: int,
+    run_label: str,
+    config: "TrainingConfig",
+    metric_name: str,
+) -> tuple[float, dict[str, Any]]:
+    model.train()
+    running_loss_t = torch.zeros(1, device=device)
+    train_examples = 0
+    train_outputs: list[Any] = []
+    train_targets: list[Any] = []
+    train_metric_targets: list[Any] = []
+    batch_progress = tqdm(
+        bundle.train_loader,
+        desc=f"{run_label} | epoch {epoch + 1}/{max_epochs}",
+        unit="batch",
+        leave=False,
+        dynamic_ncols=True,
+        miniters=max(1, len(bundle.train_loader) // 10),
+    )
+    for batch in batch_progress:
+        batch = tuple(item.to(device, non_blocking=True) for item in batch)
+        optimizer.zero_grad(set_to_none=True)
+        outputs, targets, metric_targets = _forward(model_key, model, batch)
+        loss = _compute_loss(model_key, criterion, outputs, targets)
+        loss.backward()
+        optimizer.step()
+        batch_examples = _batch_size(targets)
+        running_loss_t = running_loss_t + loss.detach() * batch_examples
+        train_examples += batch_examples
+        det_out, det_tgt, det_mt = _detach_metric_payload(model_key, outputs, targets, metric_targets)
+        train_outputs.append(det_out)
+        train_targets.append(det_tgt)
+        if det_mt is not None:
+            train_metric_targets.append(det_mt)
+        if config.bit_width is not None and config.bit_width < 32 and config.use_qat:
+            _make_quantized_copy(model, config.bit_width, config.quantization_mode)
+    batch_progress.close()
+    train_loss = (running_loss_t / max(1, train_examples)).item()
+    train_metrics: dict[str, Any] = {}
+    if train_outputs:
+        train_metrics = _compute_all_metrics(
+            model_key,
+            _cat_payload(train_outputs),
+            torch.cat(train_targets, dim=0),
+            torch.cat(train_metric_targets, dim=0) if train_metric_targets else None,
+            metric_name=metric_name,
+        )
+    return train_loss, train_metrics
+
+
+def _run_training_epochs(
+    model: Any,
+    model_key: str,
+    bundle: Any,
+    device: Any,
+    criterion: Any,
+    optimizer: Any,
+    torch: Any,
+    max_epochs: int,
+    run_label: str,
+    config: "TrainingConfig",
+    metric_name: str,
+    primary_metric_key: str,
+    metric_direction: str,
+) -> tuple[list[dict[str, Any]], float, int, dict[str, Any] | None]:
+    history: list[dict[str, Any]] = []
+    best_metric = -math.inf if metric_direction == "maximize" else math.inf
+    best_epoch = 0
+    best_state: dict[str, Any] | None = None
+    epoch_progress = tqdm(
+        range(max_epochs),
+        desc=run_label,
+        unit="epoch",
+        leave=True,
+        dynamic_ncols=True,
+    )
+    for epoch in epoch_progress:
+        epoch_start = time.perf_counter()
+        train_loss, train_metrics = _run_epoch_batches(
+            model, model_key, bundle, device, criterion, optimizer, torch,
+            epoch, max_epochs, run_label, config, metric_name,
+        )
+        model.eval()
+        val_loss, val_metrics = _eval_on_loader(
+            model, model_key, bundle.val_loader, device, criterion, metric_name, torch
+        )
+        val_metric = float(val_metrics.get(primary_metric_key, 0.0))
+        history_row: dict[str, Any] = {
+            "epoch": epoch + 1,
+            "primary_metric_name": metric_name,
+            "primary_metric_key": primary_metric_key,
+            "metric_direction": metric_direction,
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            "epoch_seconds": time.perf_counter() - epoch_start,
+            "train_loss": train_loss,
+            "train_primary_metric": float(train_metrics.get(primary_metric_key, 0.0)),
+            "val_loss": val_loss,
+            "val_primary_metric": val_metric,
+            "val_metric": val_metric,
+        }
+        history_row.update(_prefix_metrics("train", train_metrics))
+        history_row.update(_prefix_metrics("val", val_metrics))
+        history.append(history_row)
+        if best_state is None or _metric_is_better(val_metric, best_metric, metric_direction):
+            best_metric = val_metric
+            best_epoch = epoch + 1
+            best_state = {
+                k: v.detach().cpu().clone()
+                for k, v in _unwrap_compiled(model).state_dict().items()
+            }
+        epoch_progress.set_postfix(
+            val_metric=_format_metric_value(val_metric),
+            best_metric=_format_metric_value(best_metric),
+            best_epoch=best_epoch,
+        )
+    epoch_progress.close()
+    return history, best_metric, best_epoch, best_state
+
+
 def train_and_evaluate(
     *,
     model_key: str,
@@ -762,6 +952,7 @@ def train_and_evaluate(
     use_pruning = config.use_pruning
     prune_amount = config.prune_amount
     use_qat = config.use_qat
+    fine_tune_epochs = config.fine_tune_epochs
     max_epochs = config.max_epochs
     source_condition_key = config.source_condition_key
 
@@ -771,15 +962,7 @@ def train_and_evaluate(
     model = model.to(device)
     primary_metric_key = _PRIMARY_METRIC_KEY.get(model_key, "accuracy")
 
-    if (
-        use_dendrites
-        and model_key == "gcn"
-        and hasattr(model, "conv2")
-        and hasattr(model.conv2, "linear")
-    ):
-        linear = model.conv2.linear
-        if hasattr(linear, "set_this_output_dimensions"):
-            linear.set_this_output_dimensions(torch.tensor([-1, 0], device=device))
+    _configure_gcn_dendrites(model, model_key, use_dendrites, device, torch)
 
     if use_pruning:
         _apply_pruning(model, torch, prune_amount)
@@ -791,157 +974,27 @@ def train_and_evaluate(
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = _binary_or_multi_loss(model_key)
-    history: list[dict[str, Any]] = []
-    best_metric = -math.inf if metric_direction == "maximize" else math.inf
-    best_epoch = 0
-    best_state = None
     start_time = time.perf_counter()
     run_label = f"{model_key} | {condition_key}"
 
-    # Determine whether the training loop will be skipped entirely (PTQ conditions).
-    training_skipped = max_epochs == 0
-    if training_skipped:
-        if bit_width is not None and bit_width < 32 and not use_qat:
-            _quant_desc = f"{bit_width}-bit {quantization_mode or 'int'}"
-            skip_reason = (
-                f"post-training quantization ({_quant_desc})"
-                " — weights are quantized without any gradient updates"
-            )
-        else:
-            skip_reason = "no training epochs configured"
-    else:
-        skip_reason = ""
+    training_skipped, skip_reason = _determine_skip_info(
+        max_epochs, bit_width, use_qat, quantization_mode
+    )
 
     if max_epochs > 0:
-        epoch_progress = tqdm(
-            range(max_epochs),
-            desc=run_label,
-            unit="epoch",
-            leave=True,
-            dynamic_ncols=True,
+        history, best_metric, best_epoch, best_state = _run_training_epochs(
+            model, model_key, bundle, device, criterion, optimizer, torch,
+            max_epochs, run_label, config,
+            metric_name, primary_metric_key, metric_direction,
         )
-
-        for epoch in epoch_progress:
-            epoch_start = time.perf_counter()
-            model.train()
-            # Keep the loss sum on-device to eliminate one CPU–GPU sync per batch.
-            # A single .item() call at epoch-end materialises the value.
-            running_loss_t = torch.zeros(1, device=device)
-            train_examples = 0
-            train_outputs: list[Any] = []
-            train_targets: list[Any] = []
-            train_metric_targets: list[Any] = []
-            batch_progress = tqdm(
-                bundle.train_loader,
-                desc=f"{run_label} | epoch {epoch + 1}/{max_epochs}",
-                unit="batch",
-                leave=False,
-                dynamic_ncols=True,
-                # Refresh at most ~10 times per epoch to reduce tqdm Python overhead.
-                miniters=max(1, len(bundle.train_loader) // 10),
-            )
-            for batch in batch_progress:
-                # non_blocking=True lets the CPU queue the next transfer while the
-                # GPU is still computing the current batch (no-op for MPS unified
-                # memory, but harmless and future-proof for CUDA).
-                batch = tuple(item.to(device, non_blocking=True) for item in batch)
-                # set_to_none=True skips the memset and lets the allocator reuse
-                # gradient buffers, saving a small but consistent amount of work.
-                optimizer.zero_grad(set_to_none=True)
-                outputs, targets, metric_targets = _forward(model_key, model, batch)
-                loss = _compute_loss(model_key, criterion, outputs, targets)
-                loss.backward()
-                optimizer.step()
-                batch_examples = _batch_size(targets)
-                # Accumulate on-device — no CPU–GPU sync in the hot path.
-                running_loss_t = running_loss_t + loss.detach() * batch_examples
-                train_examples += batch_examples
-                detached_outputs, detached_targets, detached_metric_targets = (
-                    _detach_metric_payload(model_key, outputs, targets, metric_targets)
-                )
-                train_outputs.append(detached_outputs)
-                train_targets.append(detached_targets)
-                if detached_metric_targets is not None:
-                    train_metric_targets.append(detached_metric_targets)
-                if bit_width is not None and bit_width < 32 and use_qat:
-                    _make_quantized_copy(model, bit_width, quantization_mode)
-            batch_progress.close()
-
-            # Single sync per epoch to read the accumulated GPU-side loss.
-            train_loss = (running_loss_t / max(1, train_examples)).item()
-            train_metrics = {}
-            if train_outputs:
-                train_metrics = _compute_all_metrics(
-                    model_key,
-                    _cat_payload(train_outputs),
-                    torch.cat(train_targets, dim=0),
-                    torch.cat(train_metric_targets, dim=0)
-                    if train_metric_targets
-                    else None,
-                    metric_name=metric_name,
-                )
-
-            model.eval()
-            val_loss, val_metrics = _eval_on_loader(
-                model, model_key, bundle.val_loader, device, criterion,
-                metric_name, primary_metric_key, torch
-            )
-            val_metric = float(val_metrics.get(primary_metric_key, 0.0))
-
-            history_row: dict[str, Any] = {
-                "epoch": epoch + 1,
-                "primary_metric_name": metric_name,
-                "primary_metric_key": primary_metric_key,
-                "metric_direction": metric_direction,
-                "learning_rate": float(optimizer.param_groups[0]["lr"]),
-                "epoch_seconds": time.perf_counter() - epoch_start,
-                "train_loss": train_loss,
-                "train_primary_metric": float(
-                    train_metrics.get(primary_metric_key, 0.0)
-                ),
-                "val_loss": val_loss,
-                "val_primary_metric": val_metric,
-                "val_metric": val_metric,
-            }
-            history_row.update(_prefix_metrics("train", train_metrics))
-            history_row.update(_prefix_metrics("val", val_metrics))
-            history.append(history_row)
-            if best_state is None or _metric_is_better(
-                val_metric, best_metric, metric_direction
-            ):
-                best_metric = val_metric
-                best_epoch = epoch + 1
-                # Capture state from the unwrapped model so keys are plain
-                # (e.g. "features.0.weight") rather than "_orig_mod.features.0.weight".
-                best_state = {
-                    k: v.detach().cpu().clone()
-                    for k, v in _unwrap_compiled(model).state_dict().items()
-                }
-            epoch_progress.set_postfix(
-                val_metric=_format_metric_value(val_metric),
-                best_metric=_format_metric_value(best_metric),
-                best_epoch=best_epoch,
-            )
-        epoch_progress.close()
     else:
-        _source_info = (
-            f"condition '{source_condition_key}'"
-            if source_condition_key and source_condition_key != condition_key
-            else "the current model state"
-        )
-        _quant_info = (
-            f"{bit_width}-bit {quantization_mode or 'int'} quantization"
-            if bit_width is not None and bit_width < 32
-            else "no quantization"
-        )
-        print(
-            f"\n{'─' * 64}\n"
-            f"[SKIP TRAINING]  {run_label}\n"
-            f"  Reason  : {skip_reason.capitalize()}\n"
-            f"  Source  : checkpoint loaded from {_source_info}\n"
-            f"  Quant.  : {_quant_info} will be applied to the loaded weights\n"
-            f"  Next    : proceeding directly to test-set evaluation\n"
-            f"{'─' * 64}\n"
+        history = []
+        best_metric = -math.inf if metric_direction == "maximize" else math.inf
+        best_epoch = 0
+        best_state = None
+        _print_skip_banner(
+            run_label, skip_reason, source_condition_key, condition_key,
+            bit_width, quantization_mode
         )
 
     if best_state is not None:
@@ -955,7 +1008,7 @@ def train_and_evaluate(
     model.eval()
     test_loss, test_metrics = _eval_on_loader(
         model, model_key, bundle.test_loader, device, criterion,
-        metric_name, primary_metric_key, torch
+        metric_name, torch
     )
     final_metric = float(test_metrics.get(primary_metric_key, 0.0))
     if best_epoch == 0:

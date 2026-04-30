@@ -20,7 +20,7 @@ def _log(msg: str) -> None:
     print(f"[{ts}] {msg}")
 
 
-_MODEL_KEYS = (
+_MODEL_KEYS: str = (
     "lenet5, m5, lstm_forecaster, textcnn, gcn, tabnet, mpnn, actor_critic, "
     "lstm_autoencoder, distilbert, dqn_lunarlander, ppo_bipedalwalker, "
     "attentivefp_freesolv, gin_imdbb, tcn_forecaster, gru_forecaster, "
@@ -28,7 +28,7 @@ _MODEL_KEYS = (
     "mobilenetv2_cifar10, saint_adult, capsnet_mnist, convlstm_movingmnist"
 )
 
-_CONDITION_KEYS = (
+_CONDITION_KEYS: str = (
     "base_fp32, base_q8, base_q4, base_q2, base_q1_58, base_q1, "
     "dendrites_fp32, dendrites_pruned, dendrites_pruned_q8, dendrites_pruned_q4, "
     "dendrites_pruned_q2, dendrites_pruned_q1_58, dendrites_pruned_q1"
@@ -36,7 +36,7 @@ _CONDITION_KEYS = (
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
         description=(
             "Dendritic quantization benchmark runner.\n\n"
             "Trains 25 models across 13 conditions that combine baseline FP32 training, "
@@ -75,9 +75,9 @@ def build_parser() -> argparse.ArgumentParser:
             "All stdout and stderr are teed to this file. (default: logs)"
         ),
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers: argparse._SubParsersAction = parser.add_subparsers(dest="command", required=True)
 
-    run_parser = subparsers.add_parser(
+    run_parser: argparse.ArgumentParser = subparsers.add_parser(
         "run",
         help="Train models across all (or a subset of) conditions and save results.",
         description=(
@@ -122,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    download_parser = subparsers.add_parser(
+    download_parser: argparse.ArgumentParser = subparsers.add_parser(
         "download_data",
         help="Pre-download and cache datasets so that 'run' works offline.",
         description=(
@@ -155,7 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    compare_parser = subparsers.add_parser(  # noqa: F841
+    compare_parser: argparse.ArgumentParser = subparsers.add_parser(
         "compare",
         help="Generate cross-model comparison reports and plots from saved training records.",
         description=(
@@ -177,7 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    generate_graphs_parser = subparsers.add_parser(
+    generate_graphs_parser: argparse.ArgumentParser = subparsers.add_parser(
         "generate_graphs",
         help="Render per-epoch training-curve plots from saved results.",
         description=(
