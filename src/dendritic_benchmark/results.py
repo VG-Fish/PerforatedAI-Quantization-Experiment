@@ -99,11 +99,6 @@ def write_model_reports(
     colors = [
         "#2b6cb0" if index < 6 else "#2f855a" for index in range(len(condition_order))
     ]
-    # Hatch bars for conditions where training was skipped (PTQ — no gradient updates).
-    hatches = [
-        "////" if by_condition.get(key, {}).get("training_skipped", False) else None
-        for key in condition_order
-    ]
     metric_name = records[0]["metric_name"] if records else "Metric"
     bar_chart(
         output_dir / "metric_comparison.svg",
@@ -112,7 +107,6 @@ def write_model_reports(
         metric_values,
         metric_name,
         colors=colors,
-        hatches=hatches,
     )
     bar_chart(
         output_dir / "parameter_count.svg",
@@ -121,7 +115,6 @@ def write_model_reports(
         param_values,
         "Parameters",
         colors=colors,
-        hatches=hatches,
     )
     bar_chart(
         output_dir / "model_size.svg",
@@ -130,7 +123,6 @@ def write_model_reports(
         size_values,
         "MB",
         colors=colors,
-        hatches=hatches,
     )
 
 
@@ -196,9 +188,6 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
                     "nonzero_params": record["nonzero_params"],
                 }
             )
-            # PTQ conditions (training_skipped=True) get their own marker shape so
-            # they are visually distinct from normally-trained conditions in the scatter.
-            _is_ptq = record.get("training_skipped", False)
             tradeoff_points.append(
                 {
                     "x": size_reduction,
@@ -207,11 +196,7 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
                     "color": "#2b6cb0"
                     if "dendrites" not in condition_key
                     else "#2f855a",
-                    "shape": (
-                        "ptq"
-                        if _is_ptq
-                        else ("square" if "dendrites" in condition_key else "circle")
-                    ),
+                    "shape": "square" if "dendrites" in condition_key else "circle",
                 }
             )
 
@@ -255,202 +240,260 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
             writer.writerows(summary_rows)
 
 
+def _graphs_numeric_series(
+    history: list[dict[str, Any]], column: str
+) -> list[float]:
+    values: list[float] = []
+    for row in history:
+        value = row.get(column)
+        values.append(float(value) if isinstance(value, (int, float)) else float("nan"))
+    return values
+
+
+def _graphs_has_real_values(values: list[float]) -> bool:
+    return any(v == v for v in values)
+
+
+def _graphs_slugify(name: str) -> str:
+    cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in name)
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned.strip("_") or "metric"
+
+
+def _process_condition_graphs(history_file_str: str) -> tuple[list[str], int]:
+    """Process one condition directory and return (log_lines, graph_count).
+    Module-level so it is picklable by ProcessPoolExecutor."""
+    import shutil
+
+    logs: list[str] = []
+    graph_count = 0
+    history_file = Path(history_file_str)
+    condition_dir = history_file.parent
+    model_key = condition_dir.parent.name
+    condition_key = condition_dir.name
+    plots_dir = condition_dir / "plots"
+
+    if plots_dir.exists():
+        logs.append(f"  Clearing existing plots directory: {plots_dir}")
+        shutil.rmtree(plots_dir)
+    plots_dir.mkdir(parents=True)
+    logs.append(f"  Plots directory ready: {plots_dir}")
+
+    history: list[dict[str, Any]] = []
+    try:
+        with history_file.open("r", newline="") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                parsed_row: dict[str, Any] = {}
+                for key, value in row.items():
+                    if value is None or value == "":
+                        parsed_row[key] = None
+                        continue
+                    if key == "epoch":
+                        parsed_row[key] = int(float(value))
+                        continue
+                    try:
+                        parsed_row[key] = float(value)
+                    except ValueError:
+                        parsed_row[key] = value
+                history.append(parsed_row)
+        logs.append(f"  Loaded {len(history)} epoch(s) from history.csv")
+    except Exception as e:
+        logs.append(f"  ERROR reading {history_file}: {e} — skipping.")
+        return logs, graph_count
+
+    if not history:
+        logs.append(f"  history.csv is empty — skipping.")
+        return logs, graph_count
+
+    epochs = [row["epoch"] for row in history]
+
+    metrics_file = condition_dir / "metrics.json"
+    metric_name = "Validation Metric"
+    primary_metric_key = "metric"
+    if metrics_file.exists():
+        try:
+            metrics_data = json.loads(metrics_file.read_text())
+            metric_name = metrics_data.get("metric_name", "Validation Metric")
+            primary_metric_key = metrics_data.get("primary_metric_key", primary_metric_key)
+            logs.append(f"  Metric: {metric_name} (key: {primary_metric_key})")
+        except Exception:
+            logs.append(f"  WARNING: could not parse metrics.json — using defaults.")
+    else:
+        logs.append(f"  metrics.json not found — using default metric labels.")
+
+    if "val_metric" in history[0] and "val_primary_metric" not in history[0]:
+        val_metrics = _graphs_numeric_series(history, "val_metric")
+        title = f"{model_key.upper()} - {condition_key}: Training {metric_name}"
+        out_path = plots_dir / "training_curve.svg"
+        line_chart(out_path, title, "Epoch", metric_name, epochs, val_metrics)
+        logs.append(f"  Wrote: {out_path.name}")
+        graph_count += 1
+        logs.append(f"  Done — {graph_count} graph(s) written.")
+        return logs, graph_count
+
+    primary_series: list[tuple[str, list[float], str | None]] = []
+    for column, label, color in (
+        ("train_primary_metric", f"Train {metric_name}", "#2b6cb0"),
+        ("val_primary_metric", f"Validation {metric_name}", "#2f855a"),
+        ("test_primary_metric", f"Test {metric_name}", "#c05621"),
+    ):
+        if any(column in row for row in history):
+            values = _graphs_numeric_series(history, column)
+            if _graphs_has_real_values(values):
+                primary_series.append((label, values, color))
+    if primary_series:
+        out_path = plots_dir / "primary_metric.svg"
+        multi_line_chart(
+            out_path,
+            f"{model_key.upper()} - {condition_key}: Primary Metric ({primary_metric_key})",
+            "Epoch",
+            metric_name,
+            epochs,
+            primary_series,
+        )
+        logs.append(f"  Wrote: {out_path.name}  ({len(primary_series)} series)")
+        graph_count += 1
+    else:
+        logs.append(f"  Skipped primary_metric.svg — no valid series found.")
+
+    loss_series: list[tuple[str, list[float], str | None]] = []
+    for column, label, color in (
+        ("train_loss", "Train Loss", "#2b6cb0"),
+        ("val_loss", "Validation Loss", "#2f855a"),
+        ("test_loss", "Test Loss", "#c05621"),
+    ):
+        if any(column in row for row in history):
+            values = _graphs_numeric_series(history, column)
+            if _graphs_has_real_values(values):
+                loss_series.append((label, values, color))
+    if loss_series:
+        out_path = plots_dir / "loss_curves.svg"
+        multi_line_chart(
+            out_path,
+            f"{model_key.upper()} - {condition_key}: Loss Curves",
+            "Epoch",
+            "Loss",
+            epochs,
+            loss_series,
+        )
+        logs.append(f"  Wrote: {out_path.name}  ({len(loss_series)} series)")
+        graph_count += 1
+    else:
+        logs.append(f"  Skipped loss_curves.svg — no valid series found.")
+
+    grouped_suffixes: dict[str, list[tuple[str, list[float], str | None]]] = {}
+    for key in sorted({column for row in history for column in row.keys()}):
+        for prefix, color, label_prefix in (
+            ("train_", "#2b6cb0", "Train"),
+            ("val_", "#2f855a", "Validation"),
+            ("test_", "#c05621", "Test"),
+        ):
+            if not key.startswith(prefix):
+                continue
+            suffix = key[len(prefix):]
+            if suffix in {"loss", "primary_metric", "metric"}:
+                continue
+            values = _graphs_numeric_series(history, key)
+            if not _graphs_has_real_values(values):
+                continue
+            grouped_suffixes.setdefault(suffix, []).append(
+                (f"{label_prefix} {suffix.replace('_', ' ').title()}", values, color)
+            )
+            break
+
+    for suffix, series in sorted(grouped_suffixes.items()):
+        out_path = plots_dir / f"metric_{_graphs_slugify(suffix)}.svg"
+        multi_line_chart(
+            out_path,
+            f"{model_key.upper()} - {condition_key}: {suffix.replace('_', ' ').title()}",
+            "Epoch",
+            suffix.replace("_", " ").title(),
+            epochs,
+            series,
+        )
+        logs.append(f"  Wrote: {out_path.name}  ({len(series)} series)")
+        graph_count += 1
+
+    best_arch_file = condition_dir / "best_arch_scores.csv"
+    if best_arch_file.exists():
+        logs.append(f"  Found best_arch_scores.csv — generating architecture evolution plot.")
+        try:
+            arch_history = []
+            with best_arch_file.open("r", newline="") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    arch_history.append(
+                        {
+                            "cycle": int(row["cycle"]),
+                            "best_metric_value": float(row["best_metric_value"]),
+                        }
+                    )
+            if arch_history:
+                cycles = [row["cycle"] for row in arch_history]
+                best_metrics = [row["best_metric_value"] for row in arch_history]
+                out_path = plots_dir / "architecture_evolution.svg"
+                line_chart(
+                    out_path,
+                    f"{model_key.upper()} - {condition_key}: Architecture Evolution",
+                    "Cycle",
+                    f"Best {metric_name}",
+                    cycles,
+                    best_metrics,
+                )
+                logs.append(f"  Wrote: {out_path.name}  ({len(arch_history)} cycle(s))")
+                graph_count += 1
+            else:
+                logs.append(f"  best_arch_scores.csv is empty — skipping architecture evolution plot.")
+        except Exception as e:
+            logs.append(f"  ERROR reading {best_arch_file}: {e}")
+
+    logs.append(f"  Done — {graph_count} graph(s) written.")
+    return logs, graph_count
+
+
 def generate_training_graphs(results_root: Path) -> None:
     """Generate training curves from saved history.csv files in all model/condition directories."""
-    import shutil
+    import os
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     results_root = Path(results_root)
     if not results_root.exists():
-        print(f"Results root {results_root} does not exist")
+        print(f"[generate_graphs] Results root '{results_root}' does not exist — nothing to do.")
         return
 
+    all_history_files = sorted(results_root.glob("*/*/history.csv"))
+    total_conditions = len(all_history_files)
+    if total_conditions == 0:
+        print(f"[generate_graphs] No history.csv files found under '{results_root}'.")
+        return
+
+    workers = os.cpu_count() or 4
+    print(f"[generate_graphs] Found {total_conditions} condition(s) — using {workers} parallel workers.")
+    print(f"{'─' * 64}")
+
     graph_count = 0
-    for history_file in sorted(results_root.glob("*/*/history.csv")):
-        condition_dir = history_file.parent
-        model_key = condition_dir.parent.name
-        condition_key = condition_dir.name
-        plots_dir = condition_dir / "plots"
-
-        # Clean and recreate the plots directory
-        if plots_dir.exists():
-            shutil.rmtree(plots_dir)
-        plots_dir.mkdir(parents=True)
-
-        history: list[dict[str, Any]] = []
-        try:
-            with history_file.open("r", newline="") as fh:
-                reader = csv.DictReader(fh)
-                for row in reader:
-                    parsed_row: dict[str, Any] = {}
-                    for key, value in row.items():
-                        if value is None or value == "":
-                            parsed_row[key] = None
-                            continue
-                        if key == "epoch":
-                            parsed_row[key] = int(float(value))
-                            continue
-                        try:
-                            parsed_row[key] = float(value)
-                        except ValueError:
-                            parsed_row[key] = value
-                    history.append(parsed_row)
-        except Exception as e:
-            print(f"Error reading {history_file}: {e}")
-            continue
-
-        if not history:
-            continue
-
-        epochs = [row["epoch"] for row in history]
-
-        metrics_file = condition_dir / "metrics.json"
-        metric_name = "Validation Metric"
-        primary_metric_key = "metric"
-        if metrics_file.exists():
+    completed = 0
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_process_condition_graphs, str(f)): f
+            for f in all_history_files
+        }
+        for future in as_completed(futures):
+            history_file = futures[future]
+            condition_dir = history_file.parent
+            model_key = condition_dir.parent.name
+            condition_key = condition_dir.name
+            completed += 1
             try:
-                metrics_data = json.loads(metrics_file.read_text())
-                metric_name = metrics_data.get("metric_name", "Validation Metric")
-                primary_metric_key = metrics_data.get(
-                    "primary_metric_key", primary_metric_key
-                )
-            except Exception:
-                pass
-
-        def numeric_series(column: str) -> list[float]:
-            values: list[float] = []
-            for row in history:
-                value = row.get(column)
-                values.append(
-                    float(value) if isinstance(value, (int, float)) else float("nan")
-                )
-            return values
-
-        def has_real_values(values: list[float]) -> bool:
-            return any(value == value for value in values)
-
-        def slugify(name: str) -> str:
-            cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in name)
-            while "__" in cleaned:
-                cleaned = cleaned.replace("__", "_")
-            return cleaned.strip("_") or "metric"
-
-        if "val_metric" in history[0] and "val_primary_metric" not in history[0]:
-            val_metrics = numeric_series("val_metric")
-            title = f"{model_key.upper()} - {condition_key}: Training {metric_name}"
-            line_chart(
-                plots_dir / "training_curve.svg",
-                title,
-                "Epoch",
-                metric_name,
-                epochs,
-                val_metrics,
-            )
-            graph_count += 1
-            continue
-
-        primary_series: list[tuple[str, list[float], str | None]] = []
-        for column, label, color in (
-            ("train_primary_metric", f"Train {metric_name}", "#2b6cb0"),
-            ("val_primary_metric", f"Validation {metric_name}", "#2f855a"),
-            ("test_primary_metric", f"Test {metric_name}", "#c05621"),
-        ):
-            if any(column in row for row in history):
-                values = numeric_series(column)
-                if has_real_values(values):
-                    primary_series.append((label, values, color))
-        if primary_series:
-            multi_line_chart(
-                plots_dir / "primary_metric.svg",
-                f"{model_key.upper()} - {condition_key}: Primary Metric ({primary_metric_key})",
-                "Epoch",
-                metric_name,
-                epochs,
-                primary_series,
-            )
-            graph_count += 1
-
-        loss_series: list[tuple[str, list[float], str | None]] = []
-        for column, label, color in (
-            ("train_loss", "Train Loss", "#2b6cb0"),
-            ("val_loss", "Validation Loss", "#2f855a"),
-            ("test_loss", "Test Loss", "#c05621"),
-        ):
-            if any(column in row for row in history):
-                values = numeric_series(column)
-                if has_real_values(values):
-                    loss_series.append((label, values, color))
-        if loss_series:
-            multi_line_chart(
-                plots_dir / "loss_curves.svg",
-                f"{model_key.upper()} - {condition_key}: Loss Curves",
-                "Epoch",
-                "Loss",
-                epochs,
-                loss_series,
-            )
-            graph_count += 1
-
-        grouped_suffixes: dict[str, list[tuple[str, list[float], str | None]]] = {}
-        for key in sorted({column for row in history for column in row.keys()}):
-            for prefix, color, label_prefix in (
-                ("train_", "#2b6cb0", "Train"),
-                ("val_", "#2f855a", "Validation"),
-                ("test_", "#c05621", "Test"),
-            ):
-                if not key.startswith(prefix):
-                    continue
-                suffix = key[len(prefix) :]
-                if suffix in {"loss", "primary_metric", "metric"}:
-                    continue
-                values = numeric_series(key)
-                if not has_real_values(values):
-                    continue
-                grouped_suffixes.setdefault(suffix, []).append(
-                    (
-                        f"{label_prefix} {suffix.replace('_', ' ').title()}",
-                        values,
-                        color,
-                    )
-                )
-                break
-
-        for suffix, series in sorted(grouped_suffixes.items()):
-            multi_line_chart(
-                plots_dir / f"metric_{slugify(suffix)}.svg",
-                f"{model_key.upper()} - {condition_key}: {suffix.replace('_', ' ').title()}",
-                "Epoch",
-                suffix.replace("_", " ").title(),
-                epochs,
-                series,
-            )
-            graph_count += 1
-
-        best_arch_file = condition_dir / "best_arch_scores.csv"
-        if best_arch_file.exists():
-            try:
-                arch_history = []
-                with best_arch_file.open("r", newline="") as fh:
-                    reader = csv.DictReader(fh)
-                    for row in reader:
-                        arch_history.append(
-                            {
-                                "cycle": int(row["cycle"]),
-                                "best_metric_value": float(row["best_metric_value"]),
-                            }
-                        )
-                if arch_history:
-                    cycles = [row["cycle"] for row in arch_history]
-                    best_metrics = [row["best_metric_value"] for row in arch_history]
-                    line_chart(
-                        plots_dir / "architecture_evolution.svg",
-                        f"{model_key.upper()} - {condition_key}: Architecture Evolution",
-                        "Cycle",
-                        f"Best {metric_name}",
-                        cycles,
-                        best_metrics,
-                    )
-                    graph_count += 1
+                logs, count = future.result()
+                print(f"[{completed}/{total_conditions}] {model_key} / {condition_key}")
+                for line in logs:
+                    print(line)
+                graph_count += count
             except Exception as e:
-                print(f"Error reading {best_arch_file}: {e}")
+                print(f"[{completed}/{total_conditions}] {model_key} / {condition_key}  ERROR: {e}")
 
-    print(f"Generated {graph_count} training graphs in {results_root}")
+    print(f"{'─' * 64}")
+    print(f"[generate_graphs] Finished. {graph_count} graph(s) written across {total_conditions} condition(s).")

@@ -145,12 +145,7 @@ class BenchmarkRunner:
         return model
 
     def _base_epoch_budget(self, condition: Any) -> int:
-        max_epochs = 4 if condition.key in {"base_fp32", "dendrites_fp32"} else 0
-        if condition.key == "dendrites_pruned":
-            max_epochs = condition.fine_tune_epochs or 5
-        if condition.use_qat and condition.quantized:
-            max_epochs = condition.fine_tune_epochs or 2
-        return max_epochs * EPOCH_MULTIPLIER
+        return 4 * EPOCH_MULTIPLIER
 
     def run(
         self,
