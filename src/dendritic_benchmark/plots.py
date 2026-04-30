@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import textwrap
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import matplotlib
 
@@ -63,7 +63,7 @@ def _draw(fig: Figure) -> None:
 
 def _text_bboxes(fig: Figure, artists: list[Any]) -> list[Bbox]:
     _draw(fig)
-    renderer = fig.canvas.get_renderer()
+    renderer = getattr(fig.canvas, "get_renderer")()
     return [
         artist.get_window_extent(renderer=renderer).expanded(1.04, 1.12)
         for artist in artists
@@ -85,7 +85,7 @@ def _autosize_axis_labels(fig: Figure, ax: Axes, *, min_font: int = 7) -> None:
     if not tick_labels:
         return
 
-    candidates = [
+    candidates: list[tuple[int, int, Literal["left", "center", "right"]]] = [
         (0, 10, "center"),
         (25, 9, "right"),
         (45, 8, "right"),
@@ -95,7 +95,7 @@ def _autosize_axis_labels(fig: Figure, ax: Axes, *, min_font: int = 7) -> None:
         for label in tick_labels:
             label.set_rotation(rotation)
             label.set_fontsize(max(min_font, font_size))
-            label.set_ha(horizontal_alignment)
+            label.set_horizontalalignment(horizontal_alignment)
             label.set_rotation_mode("anchor")
         _draw(fig)
         if not _has_overlaps(fig, tick_labels):
@@ -106,7 +106,7 @@ def _annotate_bars_without_overlap(
     fig: Figure, ax: Axes, bars: Any, values: list[float]
 ) -> None:
     _draw(fig)
-    renderer = fig.canvas.get_renderer()
+    renderer = getattr(fig.canvas, "get_renderer")()
     accepted: list[Bbox] = []
     skipped = 0
     y_min, y_max = ax.get_ylim()
@@ -329,7 +329,7 @@ def _place_scatter_labels(
     fig: Figure, ax: Axes, annotations: list[tuple[float, float, str]]
 ) -> int:
     _draw(fig)
-    renderer = fig.canvas.get_renderer()
+    renderer = getattr(fig.canvas, "get_renderer")()
     accepted = [
         tick.get_window_extent(renderer=renderer)
         for tick in ax.get_xticklabels() + ax.get_yticklabels()

@@ -8,26 +8,34 @@ import builtins
 # Module-level flag to ensure the PAI config-saved message is emitted only once
 _PAI_CONFIG_SAVED_PRINTED = False
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-try:  # pragma: no cover - optional dependency
+if TYPE_CHECKING:  # pragma: no cover
     from dotenv import load_dotenv
-except Exception:  # pragma: no cover - allow import before deps are installed
-    load_dotenv = None
+else:
+    try:  # pragma: no cover - optional dependency
+        from dotenv import load_dotenv
+    except Exception:  # pragma: no cover - allow import before deps are installed
+        load_dotenv = None
 
 
 def module_available(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
-try:  # pragma: no cover - optional dependency
+if TYPE_CHECKING:  # pragma: no cover
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
-except Exception:  # pragma: no cover - allow import on machines without torch
-    torch = None
-    nn = None
-    F = None
+else:
+    try:  # pragma: no cover - optional dependency
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+    except Exception:  # pragma: no cover - allow import on machines without torch
+        torch = None
+        nn = None
+        F = None
 
 
 def require_torch() -> Any:
@@ -127,10 +135,10 @@ def perforate_model(
         return original_print(*args, **kwargs)
 
     try:  # pragma: no cover - optional dependency
-        builtins.print = _filtered_print
+        setattr(builtins, "print", _filtered_print)
         _mirror_env_aliases()
-        from perforatedai import globals_perforatedai as GPA
-        from perforatedai import utils_perforatedai as UPA
+        GPA = importlib.import_module("perforatedai.globals_perforatedai")
+        UPA = importlib.import_module("perforatedai.utils_perforatedai")
 
         for setter_name in (
             "set_modules_to_track",
