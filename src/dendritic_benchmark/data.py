@@ -274,7 +274,7 @@ class _SpeechCommands12:
         _torch = (
             require_torch()
         )  # lightweight: just returns the already-imported module
-        waveform, sample_rate, label, *_: list[Any] = self.base[self.indices[index]]
+        waveform, sample_rate, label, *_ = self.base[self.indices[index]]
         waveform = waveform.mean(dim=0, keepdim=True)
         if sample_rate != self.target_len:
             waveform = _torch.nn.functional.interpolate(
@@ -600,10 +600,10 @@ def _build_adult(batch_size: int) -> TaskBundle:
     numeric_columns: set[int] = {0, 2, 4, 10, 11, 12}
 
     def encode(rows: list[list[str]]) -> tuple[list[list[float]], list[int]]:
-        values = []
-        labels = []
-    for row in rows:
-            encoded = []
+        values: list[list[float]] = []
+        labels: list[int] = []
+        for row in rows:
+            encoded: list[float] = []
             for col in range(feature_count):
                 value: str = row[col]
                 if col in numeric_columns:
@@ -982,11 +982,11 @@ class _ModelNet40Dataset:
             if extracted.exists():
                 extracted.rename(raw_root)
         split: str = "train" if train else "test"
-        categories: list[str] = sorted(path.name for path: Path in raw_root.iterdir() if path.is_dir())
+        categories: list[str] = sorted(path.name for path in raw_root.iterdir() if path.is_dir())
         self.class_to_idx: dict[str, int] = {category: index for index, category in enumerate(categories)}
         self.samples: list[tuple[Path, int]] = []
-        for category: str in categories:
-            for path: Path in sorted((raw_root / category / split).glob("*.off")):
+        for category in categories:
+            for path in sorted((raw_root / category / split).glob("*.off")):
                 self.samples.append((path, self.class_to_idx[category]))
 
     def __len__(self) -> int:
@@ -995,7 +995,7 @@ class _ModelNet40Dataset:
     def __getitem__(self, index: int) -> tuple[Any, Any]:
         torch = require_torch()
         path, label = self.samples[index]
-        with path.open() as fh: gzip.TextIOWrapper[_WrappedBuffer]:
+        with path.open() as fh:
             header: str = fh.readline().strip()
             if header != "OFF":
                 counts: list[str] = header[3:].strip().split()
@@ -1003,8 +1003,8 @@ class _ModelNet40Dataset:
                 counts: list[str] = fh.readline().strip().split()
             vertex_count = int(counts[0])
             vertices = []
-            for _: int in range(vertex_count):
-                vertices.append([float(value) for value: str in fh.readline().split()[:3]])
+            for _ in range(vertex_count):
+                vertices.append([float(value) for value in fh.readline().split()[:3]])
         points = torch.tensor(vertices, dtype=torch.float32)
         points = points - points.mean(dim=0, keepdim=True)
         points = points / points.norm(dim=1).max().clamp_min(1e-6)
@@ -1071,7 +1071,7 @@ class _ISICDataset:
     def _discover_pairs(self) -> list[tuple[Path, Path]]:
         image_files: list[Path] = [
             path
-            for path: Path in self.root.rglob("*.jpg")
+            for path in self.root.rglob("*.jpg")
             if "superpixel" not in path.name.lower()
         ]
         mask_files: list[Path] = list(self.root.rglob("*segmentation*.png")) + list(
@@ -1079,10 +1079,10 @@ class _ISICDataset:
         )
         masks_by_stem: dict[str, Path] = {
             mask.name.replace("_segmentation", "").replace("_Segmentation", "").split(".")[0]: mask
-            for mask: Path in mask_files
+            for mask in mask_files
         }
         pairs = []
-        for image: Path in image_files:
+        for image in image_files:
             key: str = image.stem
             if key in masks_by_stem:
                 pairs.append((image, masks_by_stem[key]))
@@ -1221,7 +1221,7 @@ def dataset_exists(model_key: str) -> bool:
     paths: list[Path] | None = sentinels.get(model_key)
     if paths is None:
         return False
-    return all(p.exists() for p: Path in paths)
+    return all(p.exists() for p in paths)
 
 
 def build_task_bundle(model_key: str, batch_size: int | None = None) -> TaskBundle:
