@@ -14,3 +14,4 @@ PAI/
 .claude
 uv.lock
 logs/
+sonar-project.properties
