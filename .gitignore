@@ -15,3 +15,4 @@ PAI/
 uv.lock
 logs/
 sonar-project.properties
+.scannerwork/

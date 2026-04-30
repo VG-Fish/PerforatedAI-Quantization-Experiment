@@ -9,40 +9,40 @@ import zipfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Callable
 
 from .compat import require_torch
 
-DATA_ROOT_ENV = "DQB_DATA_ROOT"
-DEFAULT_DATA_ROOT = "data"
-ETTH1_URL = (
+DATA_ROOT_ENV: str = "DQB_DATA_ROOT"
+DEFAULT_DATA_ROOT: str = "data"
+ETTH1_URL: str = (
     "https://raw.githubusercontent.com/zhouhaoyi/ETDataset/main/ETT-small/ETTh1.csv"
 )
-ETTM1_URL = (
+ETTM1_URL: str = (
     "https://raw.githubusercontent.com/zhouhaoyi/ETDataset/main/ETT-small/ETTm1.csv"
 )
-WEATHER_URL = (
+WEATHER_URL: str = (
     "https://huggingface.co/datasets/dunzane/time-series-dataset/raw/main/weather/weather.csv"
 )
-ADULT_URLS = {
+ADULT_URLS: dict[str, str] = {
     "adult.data": "https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.data",
     "adult.test": "https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.test",
 }
-CORA_URL = "https://linqs-data.soe.ucsc.edu/public/lbc/cora.tgz"
-ESOL_URL = (
+CORA_URL: str = "https://linqs-data.soe.ucsc.edu/public/lbc/cora.tgz"
+ESOL_URL: str = (
     "https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/delaney-processed.csv"
 )
-FREESOLV_URL = "https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/SAMPL.csv"
-IMDBB_URL = "https://www.chrsmrrs.com/graphkerneldatasets/IMDB-BINARY.zip"
-MOVING_MNIST_URL = "https://github.com/tychovdo/MovingMNIST/raw/master/mnist_test_seq.npy.gz"
-ISIC_SAMPLE_URL = (
+FREESOLV_URL: str = "https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/SAMPL.csv"
+IMDBB_URL: str = "https://www.chrsmrrs.com/graphkerneldatasets/IMDB-BINARY.zip"
+MOVING_MNIST_URL: str = "https://github.com/tychovdo/MovingMNIST/raw/master/mnist_test_seq.npy.gz"
+ISIC_SAMPLE_URL: str = (
     "https://isic-archive.s3.amazonaws.com/challenges/2018/ISIC2018_Task1-2_Training_Input.zip"
 )
-ISIC_MASK_SAMPLE_URL = (
+ISIC_MASK_SAMPLE_URL: str = (
     "https://isic-archive.s3.amazonaws.com/challenges/2018/ISIC2018_Task1_Training_GroundTruth.zip"
 )
-MITBIH_RECORDS = ["100", "101", "103", "105", "106", "108", "109", "111"]
-SPEECH_COMMAND_LABELS = (
+MITBIH_RECORDS: list[str] = ["100", "101", "103", "105", "106", "108", "109", "111"]
+SPEECH_COMMAND_LABELS: tuple[str, ...] = (
     "yes",
     "no",
     "up",
@@ -81,7 +81,7 @@ def _download(url: str, destination: Path) -> Path:
 
 
 def _extract_zip(archive: Path, destination: Path) -> None:
-    marker = destination / ".extracted"
+    marker: Path = destination / ".extracted"
     if marker.exists():
         return
     destination.mkdir(parents=True, exist_ok=True)
@@ -94,7 +94,7 @@ def _require_dependency(import_name: str, package_name: str | None = None) -> An
     try:
         return __import__(import_name)
     except ImportError as exc:
-        package = package_name or import_name
+        package: str = package_name or import_name
         raise RuntimeError(
             f"Real dataset loading for this benchmark requires `{package}`. "
             f"Install project dependencies with `uv sync` or add `{package}` to the environment."
@@ -128,17 +128,17 @@ def _split_dataset(
     dataset: Any, train_ratio: float = 0.7, val_ratio: float = 0.15
 ) -> tuple[Any, Any, Any]:
     torch = require_torch()
-    total = len(dataset)
+    total: int = len(dataset)
     if total < 3:
         raise ValueError(
             "Need at least three samples to build train/validation/test splits."
         )
-    train_size = max(1, int(total * train_ratio))
-    val_size = max(1, int(total * val_ratio))
-    test_size = max(1, total - train_size - val_size)
-    overflow = train_size + val_size + test_size - total
+    train_size: int = max(1, int(total * train_ratio))
+    val_size: int = max(1, int(total * val_ratio))
+    test_size: int = max(1, total - train_size - val_size)
+    overflow: int = train_size + val_size + test_size - total
     if overflow > 0:
-        train_size = max(1, train_size - overflow)
+        train_size: int = max(1, train_size - overflow)
     return torch.utils.data.random_split(
         dataset,
         [train_size, val_size, test_size],
@@ -189,7 +189,7 @@ def _bundle_from_dataset(
 def _build_mnist(batch_size: int) -> TaskBundle:
     torchvision = _require_dependency("torchvision")
     transforms = __import__("torchvision.transforms", fromlist=["transforms"])
-    root = _data_root() / "mnist"
+    root: Path = _data_root() / "mnist"
     root.mkdir(parents=True, exist_ok=True)
     transform = transforms.Compose([transforms.ToTensor()])
     train_full = torchvision.datasets.MNIST(
@@ -217,7 +217,7 @@ def _build_mnist(batch_size: int) -> TaskBundle:
 def _build_cifar10(batch_size: int) -> TaskBundle:
     torchvision = _require_dependency("torchvision")
     transforms = __import__("torchvision.transforms", fromlist=["transforms"])
-    root = _data_root() / "cifar10"
+    root: Path = _data_root() / "cifar10"
     root.mkdir(parents=True, exist_ok=True)
     transform = transforms.Compose(
         [
@@ -254,15 +254,15 @@ def _build_cifar10(batch_size: int) -> TaskBundle:
 class _SpeechCommands12:
     def __init__(self, subset: str) -> None:
         torchaudio = _require_dependency("torchaudio")
-        root = _data_root() / "speechcommands"
+        root: Path = _data_root() / "speechcommands"
         root.mkdir(parents=True, exist_ok=True)
         base = torchaudio.datasets.SPEECHCOMMANDS(
             str(root), download=True, subset=subset
         )
-        labels = {label: index for index, label in enumerate(SPEECH_COMMAND_LABELS)}
+        labels: dict[str, int] = {label: index for index, label in enumerate(SPEECH_COMMAND_LABELS)}
         self.base = base
-        self.labels = labels
-        self.indices = [index for index, item in enumerate(base) if item[2] in labels]
+        self.labels: dict[str, int] = labels
+        self.indices: list[int] = [index for index, item in enumerate(base) if item[2] in labels]
         self.target_len = 16_000
         # Do NOT store self.torch — the torch module object is not picklable, which
         # would prevent DataLoader from serialising this dataset for worker processes.
@@ -274,7 +274,7 @@ class _SpeechCommands12:
         _torch = (
             require_torch()
         )  # lightweight: just returns the already-imported module
-        waveform, sample_rate, label, *_ = self.base[self.indices[index]]
+        waveform, sample_rate, label, *_: list[Any] = self.base[self.indices[index]]
         waveform = waveform.mean(dim=0, keepdim=True)
         if sample_rate != self.target_len:
             waveform = _torch.nn.functional.interpolate(
@@ -308,7 +308,7 @@ def _build_speechcommands(batch_size: int) -> TaskBundle:
 
 class _TensorRowsDataset:
     def __init__(self, *tensors: Any) -> None:
-        self.tensors = tensors
+        self.tensors: tuple[Any, ...] = tensors
 
     def __len__(self) -> int:
         return len(self.tensors[0])
@@ -319,10 +319,10 @@ class _TensorRowsDataset:
 
 def _build_etth1(batch_size: int) -> TaskBundle:
     torch = require_torch()
-    path = _download(ETTH1_URL, _data_root() / "etth1" / "ETTh1.csv")
+    path: Path = _download(ETTH1_URL, _data_root() / "etth1" / "ETTh1.csv")
     rows: list[float] = []
     with path.open(newline="") as fh:
-        reader = csv.DictReader(fh)
+        reader: csv.DictReader[str] = csv.DictReader(fh)
         for row in reader:
             rows.append(float(row["OT"]))
     values = torch.tensor(rows, dtype=torch.float32)
@@ -354,18 +354,19 @@ def _build_multivariate_forecast(
     input_description: str,
 ) -> TaskBundle:
     torch = require_torch()
-    path = _download(url, _data_root() / subdir / filename)
+    path: Path = _download(url, _data_root() / subdir / filename)
     rows: list[list[float]] = []
     with path.open(newline="") as fh:
-        reader = csv.DictReader(fh)
+        reader: csv.DictReader[str] = csv.DictReader(fh)
         for row in reader:
-            values = []
+            values: list[float] = []
             for key, value in row.items():
                 if key.lower() == "date":
                     continue
                 try:
                     values.append(float(value))
                 except ValueError:
+                    # skip non-numeric columns
                     pass
             if values:
                 rows.append(values)
@@ -375,7 +376,7 @@ def _build_multivariate_forecast(
     values_t = (values_t - mean) / std
     xs = []
     ys = []
-    limit = len(values_t) - seq_len - horizon + 1
+    limit: int = len(values_t) - seq_len - horizon + 1
     for index in range(limit):
         xs.append(values_t[index : index + seq_len])
         ys.append(values_t[index + seq_len : index + seq_len + horizon])
@@ -407,12 +408,12 @@ def _build_weather(batch_size: int) -> TaskBundle:
         "dunzane/time-series-dataset", "Weather", cache_dir=_hf_dataset_cache()
     )
     split = loaded["train"]
-    columns = [
+    columns: list[Any] = [
         name
         for name in split.column_names
         if name.lower() != "date" and split.features[name].dtype in {"float32", "float64", "int32", "int64"}
     ]
-    rows = [[float(row[name]) for name in columns] for row in split]
+    rows: list[list[float]] = [[float(row[name]) for name in columns] for row in split]
     values_t = torch.tensor(rows, dtype=torch.float32)
     mean = values_t.mean(dim=0, keepdim=True)
     std = values_t.std(dim=0, keepdim=True).clamp_min(1e-6)
@@ -449,16 +450,16 @@ def _build_vocab(texts: Iterable[str], vocab_size: int) -> dict[str, int]:
 
 def _encode_texts(texts: Iterable[str], vocab: dict[str, int], seq_len: int) -> Any:
     torch = require_torch()
-    encoded = []
+    encoded: list[list[int]] = []
     for text in texts:
-        ids = [vocab.get(token, 0) for token in _tokenize(text)[:seq_len]]
+        ids: list[int] = [vocab.get(token, 0) for token in _tokenize(text)[:seq_len]]
         ids.extend([0] * (seq_len - len(ids)))
         encoded.append(ids)
     return torch.tensor(encoded, dtype=torch.long)
 
 
 def _hf_dataset_cache() -> str:
-    cache = _data_root() / "huggingface"
+    cache: Path = _data_root() / "huggingface"
     cache.mkdir(parents=True, exist_ok=True)
     return str(cache)
 
@@ -467,7 +468,7 @@ def _build_ag_news(batch_size: int) -> TaskBundle:
     torch = require_torch()
     datasets = _require_dependency("datasets")
     loaded = datasets.load_dataset("ag_news", cache_dir=_hf_dataset_cache())
-    vocab = _build_vocab(loaded["train"]["text"], 5_000)
+    vocab: dict[str, int] = _build_vocab(loaded["train"]["text"], 5_000)
     train_texts = loaded["train"]["text"]
     train_labels = torch.tensor(loaded["train"]["label"], dtype=torch.long)
     x_train = _encode_texts(train_texts, vocab, 64)
@@ -490,7 +491,7 @@ def _build_sst2(batch_size: int) -> TaskBundle:
     torch = require_torch()
     datasets = _require_dependency("datasets")
     loaded = datasets.load_dataset("glue", "sst2", cache_dir=_hf_dataset_cache())
-    vocab = _build_vocab(loaded["train"]["sentence"], 5_000)
+    vocab: dict[str, int] = _build_vocab(loaded["train"]["sentence"], 5_000)
     x_train = _encode_texts(loaded["train"]["sentence"], vocab, 96)
     y_train = torch.tensor(loaded["train"]["label"], dtype=torch.long)
     train_full = _TensorRowsDataset(x_train, y_train)
@@ -537,10 +538,10 @@ class _CoraEgoDataset:
 
 def _build_cora(batch_size: int) -> TaskBundle:
     torch = require_torch()
-    root = _data_root() / "cora"
-    archive = _download(CORA_URL, root / "cora.tgz")
-    content = root / "cora" / "cora.content"
-    cites = root / "cora" / "cora.cites"
+    root: Path = _data_root() / "cora"
+    archive: Path = _download(CORA_URL, root / "cora.tgz")
+    content: Path = root / "cora" / "cora.content"
+    cites: Path = root / "cora" / "cora.cites"
     if not content.exists() or not cites.exists():
         with tarfile.open(archive) as tar:
             tar.extractall(root)
@@ -550,16 +551,14 @@ def _build_cora(batch_size: int) -> TaskBundle:
     labels_raw: list[str] = []
     with content.open() as fh:
         for line in fh:
-            parts = line.strip().split()
+            parts: list[str] = line.strip().split()
             paper_ids.append(parts[0])
             features.append([float(value) for value in parts[1:-1]])
             labels_raw.append(parts[-1])
-    id_to_idx = {paper_id: index for index, paper_id in enumerate(paper_ids)}
-    label_to_idx = {label: index for index, label in enumerate(sorted(set(labels_raw)))}
+    id_to_idx: dict[str, int] = {paper_id: index for index, paper_id in enumerate(paper_ids)}
+    label_to_idx: dict[str, int] = {label: index for index, label in enumerate(sorted(set(labels_raw)))}
     x_all = torch.tensor(features, dtype=torch.float32)
-    y_all = torch.tensor(
-        [label_to_idx[label] for label in labels_raw], dtype=torch.long
-    )
+    y_all = torch.tensor([label_to_idx[label] for label in labels_raw], dtype=torch.long)
     adjacency = torch.eye(len(paper_ids), dtype=torch.float32)
     with cites.open() as fh:
         for line in fh:
@@ -591,26 +590,26 @@ def _parse_adult_file(path: Path) -> list[list[str]]:
 
 def _build_adult(batch_size: int) -> TaskBundle:
     torch = require_torch()
-    root = _data_root() / "adult"
+    root: Path = _data_root() / "adult"
     for filename, url in ADULT_URLS.items():
         _download(url, root / filename)
-    train_rows = _parse_adult_file(root / "adult.data")
-    test_rows = _parse_adult_file(root / "adult.test")
+    train_rows: list[list[str]] = _parse_adult_file(root / "adult.data")
+    test_rows: list[list[str]] = _parse_adult_file(root / "adult.test")
     feature_count = 14
     encoders: list[dict[str, int]] = [{} for _ in range(feature_count)]
-    numeric_columns = {0, 2, 4, 10, 11, 12}
+    numeric_columns: set[int] = {0, 2, 4, 10, 11, 12}
 
     def encode(rows: list[list[str]]) -> tuple[list[list[float]], list[int]]:
         values = []
         labels = []
-        for row in rows:
+    for row in rows:
             encoded = []
             for col in range(feature_count):
-                value = row[col]
+                value: str = row[col]
                 if col in numeric_columns:
                     encoded.append(float(value) if value != "?" else 0.0)
                 else:
-                    mapping = encoders[col]
+                    mapping: dict[str, int] = encoders[col]
                     if value not in mapping:
                         mapping[value] = len(mapping) + 1
                     encoded.append(float(mapping[value]))
@@ -653,13 +652,13 @@ def _smiles_to_graph(smiles: str) -> tuple[Any, Any]:
     ring_open: dict[str, int] = {}
     index = 0
     while index < len(smiles):
-        char = smiles[index]
+        char: str = smiles[index]
         token = None
         if index + 1 < len(smiles) and smiles[index : index + 2] in {"Cl", "Br"}:
-            token = smiles[index : index + 2]
+            token: str = smiles[index : index + 2]
             index += 2
         elif char.isalpha():
-            token = char.upper()
+            token: str = char.upper()
             index += 1
         elif char.isdigit() and last_atom is not None:
             if char in ring_open:
@@ -671,17 +670,17 @@ def _smiles_to_graph(smiles: str) -> tuple[Any, Any]:
         else:
             index += 1
             continue
-        atom_index = len(atoms)
+        atom_index: int = len(atoms)
         atoms.append(token)
         if last_atom is not None:
             edges.append((last_atom, atom_index))
         last_atom = atom_index
     if not atoms:
         atoms = ["C"]
-    atom_types = ["C", "N", "O", "S", "F", "CL", "BR", "I"]
+    atom_types: list[str] = ["C", "N", "O", "S", "F", "CL", "BR", "I"]
     x = torch.zeros((24, 9), dtype=torch.float32)
     for atom_index, atom in enumerate(atoms[:24]):
-        feature_index = atom_types.index(atom) if atom in atom_types else 8
+        feature_index: int = atom_types.index(atom) if atom in atom_types else 8
         x[atom_index, feature_index] = 1.0
     adjacency = torch.eye(24, dtype=torch.float32)
     for src, dst in edges:
@@ -693,15 +692,15 @@ def _smiles_to_graph(smiles: str) -> tuple[Any, Any]:
 
 def _build_esol(batch_size: int) -> TaskBundle:
     torch = require_torch()
-    path = _download(ESOL_URL, _data_root() / "esol" / "delaney-processed.csv")
+    path: Path = _download(ESOL_URL, _data_root() / "esol" / "delaney-processed.csv")
     node_features = []
     adjacencies = []
     labels = []
     with path.open(newline="") as fh:
-        reader = csv.DictReader(fh)
+        reader: csv.DictReader[str] = csv.DictReader(fh)
         for row in reader:
-            smiles = row.get("smiles") or row.get("smile") or row.get("SMILES")
-            target = row.get("measured log solubility in mols per litre") or row.get(
+            smiles: str | Any | None = row.get("smiles") or row.get("smile") or row.get("SMILES")
+            target: str | Any | None = row.get("measured log solubility in mols per litre") or row.get(
                 "ESOL predicted log solubility in mols per litre"
             )
             if smiles is None or target is None:
@@ -725,15 +724,15 @@ def _build_esol(batch_size: int) -> TaskBundle:
 
 def _build_freesolv(batch_size: int) -> TaskBundle:
     torch = require_torch()
-    path = _download(FREESOLV_URL, _data_root() / "freesolv" / "SAMPL.csv")
+    path: Path = _download(FREESOLV_URL, _data_root() / "freesolv" / "SAMPL.csv")
     node_features = []
     adjacencies = []
     labels = []
     with path.open(newline="") as fh:
-        reader = csv.DictReader(fh)
+        reader: csv.DictReader[str] = csv.DictReader(fh)
         for row in reader:
-            smiles = row.get("smiles") or row.get("SMILES")
-            target = (
+            smiles: str | Any | None = row.get("smiles") or row.get("SMILES")
+            target: str | Any | None = (
                 row.get("expt")
                 or row.get("measured log solubility in mols per litre")
                 or row.get("y")
@@ -763,12 +762,12 @@ def _read_tu_indicator(path: Path) -> list[int]:
 
 def _build_imdbb(batch_size: int) -> TaskBundle:
     torch = require_torch()
-    root = _data_root() / "imdb_binary"
-    archive = _download(IMDBB_URL, root / "IMDB-BINARY.zip")
+    root: Path = _data_root() / "imdb_binary"
+    archive: Path = _download(IMDBB_URL, root / "IMDB-BINARY.zip")
     _extract_zip(archive, root)
-    dataset_dir = root / "IMDB-BINARY"
-    graph_indicator = _read_tu_indicator(dataset_dir / "IMDB-BINARY_graph_indicator.txt")
-    labels_raw = _read_tu_indicator(dataset_dir / "IMDB-BINARY_graph_labels.txt")
+    dataset_dir: Path = root / "IMDB-BINARY"
+    graph_indicator: list[int] = _read_tu_indicator(dataset_dir / "IMDB-BINARY_graph_indicator.txt")
+    labels_raw: list[int] = _read_tu_indicator(dataset_dir / "IMDB-BINARY_graph_labels.txt")
     edges: list[tuple[int, int]] = []
     with (dataset_dir / "IMDB-BINARY_A.txt").open() as fh:
         for line in fh:
@@ -781,10 +780,10 @@ def _build_imdbb(batch_size: int) -> TaskBundle:
     features = []
     adjacencies = []
     labels = []
-    edge_set = set(edges) | {(b, a) for a, b in edges}
+    edge_set: set[tuple[int, int]] = set(edges) | {(b, a) for a, b in edges}
     for graph_id, nodes in sorted(graph_nodes.items()):
         nodes = nodes[:max_nodes]
-        node_map = {node: i for i, node in enumerate(nodes)}
+        node_map: dict[int, int] = {node: i for i, node in enumerate(nodes)}
         adjacency = torch.eye(max_nodes, dtype=torch.float32)
         degree = torch.zeros(max_nodes, dtype=torch.float32)
         for src, dst in edge_set:
@@ -815,7 +814,7 @@ def _build_cartpole(batch_size: int) -> TaskBundle:
     torch = require_torch()
     gymnasium = _require_dependency("gymnasium", "gymnasium[classic-control]")
     numpy = _require_dependency("numpy")
-    cache = _data_root() / "cartpole" / "heuristic_rollouts.pt"
+    cache: Path = _data_root() / "cartpole" / "heuristic_rollouts.pt"
     if cache.exists():
         payload = torch.load(cache, map_location="cpu")
         x, y = payload["x"], payload["y"]
@@ -826,7 +825,7 @@ def _build_cartpole(batch_size: int) -> TaskBundle:
         actions = []
         obs, _ = env.reset(seed=42)
         while len(observations) < 10_000:
-            action = 1 if (obs[2] + 0.25 * obs[3]) > 0 else 0
+            action: int = 1 if (obs[2] + 0.25 * obs[3]) > 0 else 0
             observations.append(obs)
             actions.append(action)
             obs, _, terminated, truncated, _ = env.step(action)
@@ -849,7 +848,7 @@ def _build_lunarlander(batch_size: int) -> TaskBundle:
     torch = require_torch()
     gymnasium = _require_dependency("gymnasium", "gymnasium[box2d]")
     numpy = _require_dependency("numpy")
-    cache = _data_root() / "lunarlander" / "heuristic_rollouts.pt"
+    cache: Path = _data_root() / "lunarlander" / "heuristic_rollouts.pt"
     if cache.exists():
         payload = torch.load(cache, map_location="cpu")
         x, y = payload["x"], payload["y"]
@@ -865,13 +864,13 @@ def _build_lunarlander(batch_size: int) -> TaskBundle:
         while len(observations) < 40_000:
             x_pos, y_pos, x_vel, y_vel, angle, angular_vel, left_contact, right_contact = obs
             if left_contact or right_contact:
-                action = 0 if abs(x_vel) < 0.2 else (3 if x_vel < 0 else 1)
+                action: int = 0 if abs(x_vel) < 0.2 else (3 if x_vel < 0 else 1)
             elif abs(angle) > 0.12:
-                action = 1 if angle > 0 else 3
+                action: int = 1 if angle > 0 else 3
             elif y_vel < -0.25 or y_pos < 0.6:
                 action = 2
             elif abs(x_pos) > 0.15:
-                action = 3 if x_pos < 0 else 1
+                action: int = 3 if x_pos < 0 else 1
             else:
                 action = 0
             observations.append(obs)
@@ -896,7 +895,7 @@ def _build_bipedalwalker(batch_size: int) -> TaskBundle:
     torch = require_torch()
     gymnasium = _require_dependency("gymnasium", "gymnasium[box2d]")
     numpy = _require_dependency("numpy")
-    cache = _data_root() / "bipedalwalker" / "heuristic_rollouts.pt"
+    cache: Path = _data_root() / "bipedalwalker" / "heuristic_rollouts.pt"
     if cache.exists():
         payload = torch.load(cache, map_location="cpu")
         x, y = payload["x"], payload["y"]
@@ -940,7 +939,7 @@ def _build_bipedalwalker(batch_size: int) -> TaskBundle:
 def _build_mitbih(batch_size: int) -> TaskBundle:
     torch = require_torch()
     wfdb = _require_dependency("wfdb")
-    root = _data_root() / "mit-bih"
+    root: Path = _data_root() / "mit-bih"
     if not all((root / f"{record}.dat").exists() for record in MITBIH_RECORDS):
         root.mkdir(parents=True, exist_ok=True)
         wfdb.dl_database("mitdb", dl_dir=str(root), records=MITBIH_RECORDS)
@@ -974,20 +973,20 @@ def _build_mitbih(batch_size: int) -> TaskBundle:
 
 class _ModelNet40Dataset:
     def __init__(self, train: bool) -> None:
-        self.root = _data_root() / "modelnet40"
-        archive = _download("http://modelnet.cs.princeton.edu/ModelNet40.zip", self.root / "ModelNet40.zip")
-        raw_root = self.root / "raw"
+        self.root: Path = _data_root() / "modelnet40"
+        archive: Path = _download("http://modelnet.cs.princeton.edu/ModelNet40.zip", self.root / "ModelNet40.zip")
+        raw_root: Path = self.root / "raw"
         if not raw_root.exists() or not any(raw_root.iterdir()):
             _extract_zip(archive, self.root / "_extracted")
-            extracted = self.root / "_extracted" / "ModelNet40"
+            extracted: Path = self.root / "_extracted" / "ModelNet40"
             if extracted.exists():
                 extracted.rename(raw_root)
-        split = "train" if train else "test"
-        categories = sorted(path.name for path in raw_root.iterdir() if path.is_dir())
-        self.class_to_idx = {category: index for index, category in enumerate(categories)}
+        split: str = "train" if train else "test"
+        categories: list[str] = sorted(path.name for path: Path in raw_root.iterdir() if path.is_dir())
+        self.class_to_idx: dict[str, int] = {category: index for index, category in enumerate(categories)}
         self.samples: list[tuple[Path, int]] = []
-        for category in categories:
-            for path in sorted((raw_root / category / split).glob("*.off")):
+        for category: str in categories:
+            for path: Path in sorted((raw_root / category / split).glob("*.off")):
                 self.samples.append((path, self.class_to_idx[category]))
 
     def __len__(self) -> int:
@@ -996,16 +995,16 @@ class _ModelNet40Dataset:
     def __getitem__(self, index: int) -> tuple[Any, Any]:
         torch = require_torch()
         path, label = self.samples[index]
-        with path.open() as fh:
-            header = fh.readline().strip()
+        with path.open() as fh: gzip.TextIOWrapper[_WrappedBuffer]:
+            header: str = fh.readline().strip()
             if header != "OFF":
-                counts = header[3:].strip().split()
+                counts: list[str] = header[3:].strip().split()
             else:
-                counts = fh.readline().strip().split()
+                counts: list[str] = fh.readline().strip().split()
             vertex_count = int(counts[0])
             vertices = []
-            for _ in range(vertex_count):
-                vertices.append([float(value) for value in fh.readline().split()[:3]])
+            for _: int in range(vertex_count):
+                vertices.append([float(value) for value: str in fh.readline().split()[:3]])
         points = torch.tensor(vertices, dtype=torch.float32)
         points = points - points.mean(dim=0, keepdim=True)
         points = points / points.norm(dim=1).max().clamp_min(1e-6)
@@ -1047,7 +1046,7 @@ def _build_nmnist(batch_size: int) -> TaskBundle:
             lambda frames: torch.tensor(frames, dtype=torch.float32).sum(dim=0),
         ]
     )
-    root = _data_root() / "nmnist"
+    root: Path = _data_root() / "nmnist"
     train_full = tonic.datasets.NMNIST(save_to=str(root), train=True, transform=transform)
     test_ds = tonic.datasets.NMNIST(save_to=str(root), train=False, transform=transform)
     train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
@@ -1065,26 +1064,26 @@ def _build_nmnist(batch_size: int) -> TaskBundle:
 
 class _ISICDataset:
     def __init__(self, root: Path, image_size: int = 128) -> None:
-        self.root = root
-        self.image_size = image_size
-        self.samples = self._discover_pairs()
+        self.root: Path = root
+        self.image_size: int = image_size
+        self.samples: list[tuple[Path, Path]] = self._discover_pairs()
 
     def _discover_pairs(self) -> list[tuple[Path, Path]]:
-        image_files = [
+        image_files: list[Path] = [
             path
-            for path in self.root.rglob("*.jpg")
+            for path: Path in self.root.rglob("*.jpg")
             if "superpixel" not in path.name.lower()
         ]
-        mask_files = list(self.root.rglob("*segmentation*.png")) + list(
+        mask_files: list[Path] = list(self.root.rglob("*segmentation*.png")) + list(
             self.root.rglob("*Segmentation*.png")
         )
-        masks_by_stem = {
+        masks_by_stem: dict[str, Path] = {
             mask.name.replace("_segmentation", "").replace("_Segmentation", "").split(".")[0]: mask
-            for mask in mask_files
+            for mask: Path in mask_files
         }
         pairs = []
-        for image in image_files:
-            key = image.stem
+        for image: Path in image_files:
+            key: str = image.stem
             if key in masks_by_stem:
                 pairs.append((image, masks_by_stem[key]))
         if not pairs:
@@ -1112,9 +1111,9 @@ class _ISICDataset:
 
 
 def _build_isic(batch_size: int) -> TaskBundle:
-    root = _data_root() / "isic2018"
-    image_archive = _download(ISIC_SAMPLE_URL, root / "images.zip")
-    mask_archive = _download(ISIC_MASK_SAMPLE_URL, root / "masks.zip")
+    root: Path = _data_root() / "isic2018"
+    image_archive: Path = _download(ISIC_SAMPLE_URL, root / "images.zip")
+    mask_archive: Path = _download(ISIC_MASK_SAMPLE_URL, root / "masks.zip")
     _extract_zip(image_archive, root / "images")
     _extract_zip(mask_archive, root / "masks")
     return _bundle_from_dataset(
@@ -1130,9 +1129,9 @@ def _build_isic(batch_size: int) -> TaskBundle:
 def _build_moving_mnist(batch_size: int) -> TaskBundle:
     torch = require_torch()
     numpy = _require_dependency("numpy")
-    root = _data_root() / "moving_mnist"
-    gz_path = _download(MOVING_MNIST_URL, root / "mnist_test_seq.npy.gz")
-    npy_path = root / "mnist_test_seq.npy"
+    root: Path = _data_root() / "moving_mnist"
+    gz_path: Path = _download(MOVING_MNIST_URL, root / "mnist_test_seq.npy.gz")
+    npy_path: Path = root / "mnist_test_seq.npy"
     if not npy_path.exists():
         with gzip.open(gz_path, "rb") as src, npy_path.open("wb") as dst:
             dst.write(src.read())
@@ -1191,7 +1190,7 @@ def dataset_exists(model_key: str) -> bool:
     that the download and extraction steps have already completed.  A False result
     is always safe: ``build_task_bundle`` will then run and fill any gaps.
     """
-    root = _data_root()
+    root: Path = _data_root()
     sentinels: dict[str, list[Path]] = {
         "lenet5":               [root / "mnist"],
         "vae_mnist":            [root / "mnist"],
@@ -1219,10 +1218,10 @@ def dataset_exists(model_key: str) -> bool:
         "unet_isic":            [root / "isic2018" / "images" / ".extracted"],
         "convlstm_movingmnist": [root / "moving_mnist" / "mnist_test_seq.npy"],
     }
-    paths = sentinels.get(model_key)
+    paths: list[Path] | None = sentinels.get(model_key)
     if paths is None:
         return False
-    return all(p.exists() for p in paths)
+    return all(p.exists() for p: Path in paths)
 
 
 def build_task_bundle(model_key: str, batch_size: int | None = None) -> TaskBundle:
@@ -1232,7 +1231,7 @@ def build_task_bundle(model_key: str, batch_size: int | None = None) -> TaskBund
     ``_BATCH_SIZES`` (useful for smoke tests or ablation studies).
     """
     require_torch()
-    builders = {
+    builders: dict[str, Callable[..., TaskBundle]] = {
         "lenet5": _build_mnist,
         "m5": _build_speechcommands,
         "lstm_forecaster": _build_etth1,
@@ -1261,7 +1260,7 @@ def build_task_bundle(model_key: str, batch_size: int | None = None) -> TaskBund
     }
     if model_key not in builders:
         raise KeyError(f"Unknown model key: {model_key}")
-    effective_batch_size = (
+    effective_batch_size: int = (
         batch_size if batch_size is not None else _BATCH_SIZES.get(model_key, 64)
     )
     return builders[model_key](effective_batch_size)
