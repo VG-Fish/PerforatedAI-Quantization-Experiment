@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from .compat import load_project_environment, perforatedai_credentials_present
+from .data import build_task_bundle
 from .pipeline import BenchmarkRunner
 from .results import load_training_records, write_comparison_reports, write_manifest, write_model_reports, generate_training_graphs
 from .specs import MODEL_SPECS
@@ -18,6 +19,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Run the benchmark")
     run_parser.add_argument("--models", nargs="*", help="Optional subset of model keys")
     run_parser.add_argument("--conditions", nargs="*", help="Optional subset of condition keys")
+
+    download_parser = subparsers.add_parser("download_data", help="Download/cache datasets for selected models")
+    download_parser.add_argument("--models", nargs="*", help="Optional subset of model keys")
+    download_parser.add_argument("--strict", action="store_true", help="Stop on the first dataset download error")
 
     compare_parser = subparsers.add_parser("compare", help="Build comparison outputs from saved records")
     compare_parser.add_argument("--manifest", action="store_true", help="Rewrite the manifest CSV before plotting")
@@ -45,6 +50,24 @@ def main() -> None:
     if args.command == "run":
         runner = BenchmarkRunner(results_root=results_root, comparison_root=comparison_root)
         runner.run(model_keys=args.models, condition_keys=args.conditions)
+        return
+
+    if args.command == "download_data":
+        selected = args.models or [spec.key for spec in MODEL_SPECS]
+        failures = []
+        for model_key in selected:
+            print(f"[data] preparing {model_key}")
+            try:
+                build_task_bundle(model_key)
+            except Exception as exc:
+                if args.strict:
+                    raise
+                failures.append((model_key, str(exc)))
+                print(f"[data] FAILED {model_key}: {exc}")
+        if failures:
+            print("[data] completed with failures:")
+            for model_key, message in failures:
+                print(f"  - {model_key}: {message}")
         return
 
     if args.command == "compare":

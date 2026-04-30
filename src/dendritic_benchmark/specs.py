@@ -47,6 +47,21 @@ MODEL_SPECS: list[ModelSpec] = [
     ModelSpec("actor_critic", "Actor-Critic", "Reinforcement Learning", "CartPole-v1", "Reward", "maximize", "actor_critic"),
     ModelSpec("lstm_autoencoder", "LSTM Autoencoder", "Anomaly Detection", "MIT-BIH", "AUC", "maximize", "lstm_autoencoder"),
     ModelSpec("distilbert", "DistilBERT", "NLP / Seq Classification", "SST-2", "Accuracy", "maximize", "distilbert"),
+    ModelSpec("dqn_lunarlander", "DQN (LunarLander)", "Reinforcement Learning", "LunarLander-v2", "Reward", "maximize", "dqn_lunarlander"),
+    ModelSpec("ppo_bipedalwalker", "PPO Policy Network", "Reinforcement Learning", "BipedalWalker-v3", "Reward", "maximize", "ppo_bipedalwalker"),
+    ModelSpec("attentivefp_freesolv", "AttentiveFP", "Drug Discovery / Molecular", "FreeSolv", "RMSE", "minimize", "attentivefp_freesolv"),
+    ModelSpec("gin_imdbb", "GIN", "Graph Classification", "IMDB-Binary", "Accuracy", "maximize", "gin_imdbb"),
+    ModelSpec("tcn_forecaster", "TCN Forecaster", "Time-Series Forecasting", "ETTm1", "MAE", "minimize", "tcn_forecaster"),
+    ModelSpec("gru_forecaster", "GRU Forecaster", "Time-Series Forecasting", "Weather", "MAE", "minimize", "gru_forecaster"),
+    ModelSpec("pointnet_modelnet40", "PointNet", "3D Point Cloud Classification", "ModelNet40", "Accuracy", "maximize", "pointnet_modelnet40"),
+    ModelSpec("vae_mnist", "VAE", "Generative Modeling", "MNIST", "ELBO", "maximize", "vae_mnist"),
+    ModelSpec("snn_nmnist", "Spiking Neural Network", "Neuromorphic Computing", "N-MNIST", "Accuracy", "maximize", "snn_nmnist"),
+    ModelSpec("unet_isic", "Tiny U-Net", "Medical Image Segmentation", "ISIC 2018 Task 1", "Dice", "maximize", "unet_isic"),
+    ModelSpec("resnet18_cifar10", "ResNet-18", "Image Classification", "CIFAR-10", "Accuracy", "maximize", "resnet18_cifar10"),
+    ModelSpec("mobilenetv2_cifar10", "MobileNetV2", "Image Classification", "CIFAR-10", "Accuracy", "maximize", "mobilenetv2_cifar10"),
+    ModelSpec("saint_adult", "SAINT", "Tabular Classification", "Adult Income", "Accuracy", "maximize", "saint_adult"),
+    ModelSpec("capsnet_mnist", "CapsNet", "Image Classification", "MNIST", "Accuracy", "maximize", "capsnet_mnist"),
+    ModelSpec("convlstm_movingmnist", "ConvLSTM", "Spatiotemporal Prediction", "Moving MNIST", "SSIM", "maximize", "convlstm_movingmnist"),
 ]
 
 

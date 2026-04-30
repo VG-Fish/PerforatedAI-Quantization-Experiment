@@ -71,7 +71,45 @@ def _auc(scores: Any, targets: Any) -> float:
     return (comparisons + ties).mean().item()
 
 
+def _dice_from_logits(logits: Any, targets: Any) -> float:
+    probs = logits.sigmoid()
+    preds = (probs >= 0.5).float()
+    intersection = (preds * targets).sum(dim=tuple(range(1, preds.dim())))
+    union = preds.sum(dim=tuple(range(1, preds.dim()))) + targets.sum(
+        dim=tuple(range(1, targets.dim()))
+    )
+    return float(((2.0 * intersection + 1e-6) / (union + 1e-6)).mean().item())
+
+
+def _ssim_proxy(preds: Any, targets: Any) -> float:
+    mse = ((preds - targets) ** 2).mean()
+    return float((1.0 / (1.0 + mse)).item())
+
+
+def _vae_loss(outputs: Any, targets: Any) -> Any:
+    torch = require_torch()
+    recon, mu, logvar = outputs
+    bce = torch.nn.functional.binary_cross_entropy(recon, targets, reduction="sum")
+    kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    return (bce + kld) / max(1, targets.shape[0])
+
+
+def _vae_metrics(outputs: Any, targets: Any) -> dict[str, float]:
+    torch = require_torch()
+    recon, mu, logvar = outputs
+    bce = torch.nn.functional.binary_cross_entropy(recon, targets, reduction="sum")
+    kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    elbo = -float(((bce + kld) / max(1, targets.shape[0])).item())
+    return {
+        "elbo": elbo,
+        "reconstruction_bce": float((bce / max(1, targets.shape[0])).item()),
+        "kl_divergence": float((kld / max(1, targets.shape[0])).item()),
+    }
+
+
 def _reward_proxy(preds: Any, targets: Any) -> float:
+    if preds.shape == targets.shape and preds.dtype.is_floating_point:
+        return -_mae(preds, targets)
     return _accuracy(preds, targets)
 
 
@@ -86,15 +124,34 @@ _PRIMARY_METRIC_KEY: dict[str, str] = {
     "actor_critic": "reward_proxy",
     "lstm_autoencoder": "auc",
     "distilbert": "accuracy",
+    "dqn_lunarlander": "reward_proxy",
+    "ppo_bipedalwalker": "reward_proxy",
+    "attentivefp_freesolv": "rmse",
+    "gin_imdbb": "accuracy",
+    "tcn_forecaster": "mae",
+    "gru_forecaster": "mae",
+    "pointnet_modelnet40": "accuracy",
+    "vae_mnist": "elbo",
+    "snn_nmnist": "accuracy",
+    "unet_isic": "dice",
+    "resnet18_cifar10": "accuracy",
+    "mobilenetv2_cifar10": "accuracy",
+    "saint_adult": "accuracy",
+    "capsnet_mnist": "accuracy",
+    "convlstm_movingmnist": "ssim",
 }
 
 
 def _binary_or_multi_loss(model_key: str) -> Any:
     torch = require_torch()
-    if model_key in {"lstm_forecaster", "mpnn"}:
+    if model_key in {"lstm_forecaster", "mpnn", "attentivefp_freesolv", "tcn_forecaster", "gru_forecaster", "ppo_bipedalwalker", "convlstm_movingmnist"}:
         return torch.nn.MSELoss()
     if model_key in {"lstm_autoencoder"}:
         return torch.nn.MSELoss()
+    if model_key == "unet_isic":
+        return torch.nn.BCEWithLogitsLoss()
+    if model_key == "vae_mnist":
+        return None
     if model_key == "actor_critic":
         return torch.nn.CrossEntropyLoss()
     return torch.nn.CrossEntropyLoss()
@@ -103,12 +160,20 @@ def _binary_or_multi_loss(model_key: str) -> Any:
 def _collapse_metric(
     model_key: str, outputs: Any, targets: Any, metric_targets: Any | None = None
 ) -> float:
-    if model_key == "actor_critic":
+    if model_key in {"actor_critic"}:
         outputs = outputs[0]
-    if model_key == "lstm_forecaster":
+    if model_key in {"lstm_forecaster", "tcn_forecaster", "gru_forecaster"}:
         return _mae(outputs, targets)
-    if model_key == "mpnn":
+    if model_key in {"mpnn", "attentivefp_freesolv"}:
         return _rmse(outputs, targets)
+    if model_key == "ppo_bipedalwalker":
+        return _reward_proxy(outputs, targets)
+    if model_key == "unet_isic":
+        return _dice_from_logits(outputs, targets)
+    if model_key == "convlstm_movingmnist":
+        return _ssim_proxy(outputs, targets)
+    if model_key == "vae_mnist":
+        return _vae_metrics(outputs, targets)["elbo"]
     if model_key == "lstm_autoencoder":
         torch = require_torch()
         if metric_targets is None:
@@ -135,7 +200,10 @@ def _detach_metric_payload(
 ) -> tuple[Any, Any, Any | None]:
     if model_key == "actor_critic":
         outputs = outputs[0]
-    outputs = outputs.detach().cpu()
+    if model_key == "vae_mnist" and isinstance(outputs, tuple):
+        outputs = tuple(item.detach().cpu() for item in outputs)
+    else:
+        outputs = outputs.detach().cpu()
     targets = targets.detach().cpu()
     if metric_targets is not None:
         metric_targets = metric_targets.detach().cpu()
@@ -403,8 +471,20 @@ def _compute_all_metrics(
 ) -> dict[str, float]:
     if model_key == "actor_critic" and isinstance(outputs, tuple):
         outputs = outputs[0]
-    if model_key in {"lstm_forecaster", "mpnn"}:
+    if model_key in {"lstm_forecaster", "mpnn", "attentivefp_freesolv", "tcn_forecaster", "gru_forecaster"}:
         return _regression_metrics(outputs, targets)
+    if model_key == "ppo_bipedalwalker":
+        metrics = _regression_metrics(outputs, targets)
+        metrics["reward_proxy"] = -metrics["mae"]
+        return metrics
+    if model_key == "vae_mnist":
+        return _vae_metrics(outputs, targets)
+    if model_key == "unet_isic":
+        return {"dice": _dice_from_logits(outputs, targets)}
+    if model_key == "convlstm_movingmnist":
+        metrics = _regression_metrics(outputs, targets)
+        metrics["ssim"] = _ssim_proxy(outputs, targets)
+        return metrics
     if model_key == "lstm_autoencoder":
         return _anomaly_metrics(outputs, targets, metric_targets)
     metrics = _classification_metrics(outputs, targets)
@@ -417,6 +497,16 @@ def _compute_all_metrics(
 
 def _prefix_metrics(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
     return {f"{prefix}_{key}": value for key, value in metrics.items()}
+
+
+def _cat_payload(items: list[Any]) -> Any:
+    torch = require_torch()
+    if not items:
+        return items
+    first = items[0]
+    if isinstance(first, tuple):
+        return tuple(torch.cat([item[index] for item in items], dim=0) for index in range(len(first)))
+    return torch.cat(items, dim=0)
 
 
 def _history_fieldnames(history: list[dict[str, Any]]) -> list[str]:
@@ -446,10 +536,10 @@ def _history_fieldnames(history: list[dict[str, Any]]) -> list[str]:
 
 
 def _forward(model_key: str, model: Any, batch: tuple[Any, ...]) -> tuple[Any, ...]:
-    if model_key in {"gcn"}:
+    if model_key in {"gcn", "gin_imdbb"}:
         x, adjacency, targets = batch
         return model(x, adjacency), targets
-    if model_key in {"mpnn"}:
+    if model_key in {"mpnn", "attentivefp_freesolv"}:
         node_features, adjacency, targets = batch
         return model(node_features, adjacency), targets
     if model_key == "lstm_autoencoder":
@@ -460,6 +550,14 @@ def _forward(model_key: str, model: Any, batch: tuple[Any, ...]) -> tuple[Any, .
         return model(x), targets
     x, targets = batch
     return model(x), targets
+
+
+def _compute_loss(model_key: str, criterion: Any, outputs: Any, targets: Any) -> Any:
+    if model_key == "actor_critic":
+        return criterion(outputs[0], targets)
+    if model_key == "vae_mnist":
+        return _vae_loss(outputs, targets)
+    return criterion(outputs, targets)
 
 
 def _unwrap_compiled(model: Any) -> Any:
@@ -693,10 +791,7 @@ def train_and_evaluate(
                 # gradient buffers, saving a small but consistent amount of work.
                 optimizer.zero_grad(set_to_none=True)
                 outputs, targets, *rest = _forward(model_key, model, batch)
-                if model_key == "actor_critic":
-                    loss = criterion(outputs[0], targets)
-                else:
-                    loss = criterion(outputs, targets)
+                loss = _compute_loss(model_key, criterion, outputs, targets)
                 loss.backward()
                 optimizer.step()
                 batch_examples = _batch_size(targets)
@@ -721,7 +816,7 @@ def train_and_evaluate(
             if train_outputs:
                 train_metrics = _compute_all_metrics(
                     model_key,
-                    torch.cat(train_outputs, dim=0),
+                    _cat_payload(train_outputs),
                     torch.cat(train_targets, dim=0),
                     torch.cat(train_metric_targets, dim=0)
                     if train_metric_targets
@@ -740,10 +835,7 @@ def train_and_evaluate(
                     batch = tuple(item.to(device, non_blocking=True) for item in batch)
                     outputs, targets, *rest = _forward(model_key, model, batch)
                     metric_targets = rest[0] if rest else None
-                    if model_key == "actor_critic":
-                        loss = criterion(outputs[0], targets)
-                    else:
-                        loss = criterion(outputs, targets)
+                    loss = _compute_loss(model_key, criterion, outputs, targets)
                     batch_examples = _batch_size(targets)
                     val_running_loss_t = (
                         val_running_loss_t + loss.detach() * batch_examples
@@ -764,7 +856,7 @@ def train_and_evaluate(
             if val_outputs:
                 val_metrics = _compute_all_metrics(
                     model_key,
-                    torch.cat(val_outputs, dim=0),
+                    _cat_payload(val_outputs),
                     torch.cat(val_targets, dim=0),
                     torch.cat(val_metric_targets, dim=0)
                     if val_metric_targets
@@ -848,10 +940,7 @@ def train_and_evaluate(
             batch = tuple(item.to(device, non_blocking=True) for item in batch)
             outputs, targets, *rest = _forward(model_key, model, batch)
             metric_targets = rest[0] if rest else None
-            if model_key == "actor_critic":
-                loss = criterion(outputs[0], targets)
-            else:
-                loss = criterion(outputs, targets)
+            loss = _compute_loss(model_key, criterion, outputs, targets)
             batch_examples = _batch_size(targets)
             test_running_loss_t = test_running_loss_t + loss.detach() * batch_examples
             test_examples += batch_examples
@@ -868,7 +957,7 @@ def train_and_evaluate(
     if test_outputs:
         test_metrics = _compute_all_metrics(
             model_key,
-            torch.cat(test_outputs, dim=0),
+            _cat_payload(test_outputs),
             torch.cat(test_targets, dim=0),
             torch.cat(test_metric_targets, dim=0) if test_metric_targets else None,
             metric_name=metric_name,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -110,7 +111,7 @@ class BenchmarkRunner:
         return [key for key in [spec.key for spec in CONDITION_SPECS] if key in ordered]
 
     def _model_kwargs(self, model_key: str) -> dict[str, Any]:
-        if model_key in {"lenet5"}:
+        if model_key in {"lenet5", "vae_mnist", "snn_nmnist", "capsnet_mnist"}:
             return {"num_classes": 10}
         if model_key == "m5":
             return {"num_classes": 12}
@@ -118,8 +119,10 @@ class BenchmarkRunner:
             return {"num_classes": 4}
         if model_key == "gcn":
             return {"num_classes": 7}
-        if model_key == "tabnet":
+        if model_key in {"tabnet", "gin_imdbb", "saint_adult"}:
             return {"num_classes": 2}
+        if model_key == "pointnet_modelnet40":
+            return {"num_classes": 40}
         if model_key == "distilbert":
             return {"num_classes": 2}
         return {}
@@ -129,8 +132,12 @@ class BenchmarkRunner:
             return []
         if model_key in {"lstm_forecaster", "lstm_autoencoder"}:
             return [nn.LSTM]
-        if model_key == "distilbert":
+        if model_key in {"distilbert", "gru_forecaster"}:
             return [nn.GRU]
+        if model_key == "attentivefp_freesolv":
+            return [nn.GRUCell]
+        if model_key == "saint_adult":
+            return [nn.MultiheadAttention]
         return []
 
     def _configure_perforated_model(self, model: Any, model_key: str) -> Any:
@@ -165,19 +172,27 @@ class BenchmarkRunner:
             model_records: list[dict[str, Any]] = []
             saved_dirs: dict[str, Path] = {}
             for condition in selected_conditions:
-                record = self._run_condition(
-                    model_spec.key,
-                    model_spec.display_name,
-                    model_spec.metric_name,
-                    model_spec.metric_direction,
-                    bundle,
-                    condition,
-                    saved_dirs,
-                )
+                condition_dir = self.results_root / model_spec.key / condition.key
+                record_path = condition_dir / "record.json"
+                if record_path.exists():
+                    print(
+                        f"[skip] {model_spec.key} / {condition.key} "
+                        "— record.json found, skipping training."
+                    )
+                    record = TrainingRecord(**json.loads(record_path.read_text()))
+                else:
+                    record = self._run_condition(
+                        model_spec.key,
+                        model_spec.display_name,
+                        model_spec.metric_name,
+                        model_spec.metric_direction,
+                        bundle,
+                        condition,
+                        saved_dirs,
+                    )
+                    save_training_record(record, condition_dir)
                 model_records.append(record.to_dict())
                 all_records.append(record.to_dict())
-                condition_dir = self.results_root / model_spec.key / condition.key
-                save_training_record(record, condition_dir)
                 saved_dirs[condition.key] = condition_dir
             write_model_reports(
                 model_spec.display_name,

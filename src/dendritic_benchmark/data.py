@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import os
 import tarfile
 import urllib.request
+import zipfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +18,12 @@ DEFAULT_DATA_ROOT = "data"
 ETTH1_URL = (
     "https://raw.githubusercontent.com/zhouhaoyi/ETDataset/main/ETT-small/ETTh1.csv"
 )
+ETTM1_URL = (
+    "https://raw.githubusercontent.com/zhouhaoyi/ETDataset/main/ETT-small/ETTm1.csv"
+)
+WEATHER_URL = (
+    "https://huggingface.co/datasets/dunzane/time-series-dataset/raw/main/weather/weather.csv"
+)
 ADULT_URLS = {
     "adult.data": "https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.data",
     "adult.test": "https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.test",
@@ -23,6 +31,15 @@ ADULT_URLS = {
 CORA_URL = "https://linqs-data.soe.ucsc.edu/public/lbc/cora.tgz"
 ESOL_URL = (
     "https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/delaney-processed.csv"
+)
+FREESOLV_URL = "https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/SAMPL.csv"
+IMDBB_URL = "https://www.chrsmrrs.com/graphkerneldatasets/IMDB-BINARY.zip"
+MOVING_MNIST_URL = "https://github.com/tychovdo/MovingMNIST/raw/master/mnist_test_seq.npy.gz"
+ISIC_SAMPLE_URL = (
+    "https://isic-archive.s3.amazonaws.com/challenges/2018/ISIC2018_Task1-2_Training_Input.zip"
+)
+ISIC_MASK_SAMPLE_URL = (
+    "https://isic-archive.s3.amazonaws.com/challenges/2018/ISIC2018_Task1_Training_GroundTruth.zip"
 )
 MITBIH_RECORDS = ["100", "101", "103", "105", "106", "108", "109", "111"]
 SPEECH_COMMAND_LABELS = (
@@ -61,6 +78,16 @@ def _download(url: str, destination: Path) -> Path:
         print(f"Downloading {url} -> {destination}")
         urllib.request.urlretrieve(url, destination)
     return destination
+
+
+def _extract_zip(archive: Path, destination: Path) -> None:
+    marker = destination / ".extracted"
+    if marker.exists():
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive) as zf:
+        zf.extractall(destination)
+    marker.write_text("ok\n")
 
 
 def _require_dependency(import_name: str, package_name: str | None = None) -> Any:
@@ -187,6 +214,43 @@ def _build_mnist(batch_size: int) -> TaskBundle:
     )
 
 
+def _build_cifar10(batch_size: int) -> TaskBundle:
+    torchvision = _require_dependency("torchvision")
+    transforms = __import__("torchvision.transforms", fromlist=["transforms"])
+    root = _data_root() / "cifar10"
+    root.mkdir(parents=True, exist_ok=True)
+    transform = transforms.Compose(
+        [
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+        ]
+    )
+    test_transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+        ]
+    )
+    train_full = torchvision.datasets.CIFAR10(
+        root=str(root), train=True, download=True, transform=transform
+    )
+    test_ds = torchvision.datasets.CIFAR10(
+        root=str(root), train=False, download=True, transform=test_transform
+    )
+    train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
+    return _bundle_from_splits(
+        train_ds,
+        val_ds,
+        test_ds,
+        batch_size,
+        "Accuracy",
+        "maximize",
+        "CIFAR-10 32x32 natural images",
+    )
+
+
 class _SpeechCommands12:
     def __init__(self, subset: str) -> None:
         torchaudio = _require_dependency("torchaudio")
@@ -276,6 +340,96 @@ def _build_etth1(batch_size: int) -> TaskBundle:
         "MAE",
         "minimize",
         "ETTh1 hourly oil temperature forecasting windows",
+    )
+
+
+def _build_multivariate_forecast(
+    batch_size: int,
+    *,
+    url: str,
+    subdir: str,
+    filename: str,
+    seq_len: int,
+    horizon: int,
+    input_description: str,
+) -> TaskBundle:
+    torch = require_torch()
+    path = _download(url, _data_root() / subdir / filename)
+    rows: list[list[float]] = []
+    with path.open(newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            values = []
+            for key, value in row.items():
+                if key.lower() == "date":
+                    continue
+                try:
+                    values.append(float(value))
+                except ValueError:
+                    pass
+            if values:
+                rows.append(values)
+    values_t = torch.tensor(rows, dtype=torch.float32)
+    mean = values_t.mean(dim=0, keepdim=True)
+    std = values_t.std(dim=0, keepdim=True).clamp_min(1e-6)
+    values_t = (values_t - mean) / std
+    xs = []
+    ys = []
+    limit = len(values_t) - seq_len - horizon + 1
+    for index in range(limit):
+        xs.append(values_t[index : index + seq_len])
+        ys.append(values_t[index + seq_len : index + seq_len + horizon])
+    return _bundle_from_dataset(
+        _TensorRowsDataset(torch.stack(xs), torch.stack(ys)),
+        batch_size,
+        "MAE",
+        "minimize",
+        input_description,
+    )
+
+
+def _build_ettm1(batch_size: int) -> TaskBundle:
+    return _build_multivariate_forecast(
+        batch_size,
+        url=ETTM1_URL,
+        subdir="ettm1",
+        filename="ETTm1.csv",
+        seq_len=96,
+        horizon=24,
+        input_description="ETTm1 15-minute multivariate transformer-temperature windows",
+    )
+
+
+def _build_weather(batch_size: int) -> TaskBundle:
+    torch = require_torch()
+    datasets = _require_dependency("datasets")
+    loaded = datasets.load_dataset(
+        "dunzane/time-series-dataset", "Weather", cache_dir=_hf_dataset_cache()
+    )
+    split = loaded["train"]
+    columns = [
+        name
+        for name in split.column_names
+        if name.lower() != "date" and split.features[name].dtype in {"float32", "float64", "int32", "int64"}
+    ]
+    rows = [[float(row[name]) for name in columns] for row in split]
+    values_t = torch.tensor(rows, dtype=torch.float32)
+    mean = values_t.mean(dim=0, keepdim=True)
+    std = values_t.std(dim=0, keepdim=True).clamp_min(1e-6)
+    values_t = (values_t - mean) / std
+    seq_len = 96
+    horizon = 24
+    xs = []
+    ys = []
+    for index in range(len(values_t) - seq_len - horizon + 1):
+        xs.append(values_t[index : index + seq_len])
+        ys.append(values_t[index + seq_len : index + seq_len + horizon])
+    return _bundle_from_dataset(
+        _TensorRowsDataset(torch.stack(xs), torch.stack(ys)),
+        batch_size,
+        "MAE",
+        "minimize",
+        "Weather multivariate meteorological forecasting windows",
     )
 
 
@@ -569,6 +723,94 @@ def _build_esol(batch_size: int) -> TaskBundle:
     )
 
 
+def _build_freesolv(batch_size: int) -> TaskBundle:
+    torch = require_torch()
+    path = _download(FREESOLV_URL, _data_root() / "freesolv" / "SAMPL.csv")
+    node_features = []
+    adjacencies = []
+    labels = []
+    with path.open(newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            smiles = row.get("smiles") or row.get("SMILES")
+            target = (
+                row.get("expt")
+                or row.get("measured log solubility in mols per litre")
+                or row.get("y")
+            )
+            if smiles is None or target is None:
+                continue
+            x, adjacency = _smiles_to_graph(smiles)
+            node_features.append(x)
+            adjacencies.append(adjacency)
+            labels.append(float(target))
+    return _bundle_from_dataset(
+        _TensorRowsDataset(
+            torch.stack(node_features),
+            torch.stack(adjacencies),
+            torch.tensor(labels, dtype=torch.float32),
+        ),
+        batch_size,
+        "RMSE",
+        "minimize",
+        "FreeSolv molecular hydration free-energy graphs from SMILES",
+    )
+
+
+def _read_tu_indicator(path: Path) -> list[int]:
+    return [int(line.strip()) for line in path.read_text().splitlines() if line.strip()]
+
+
+def _build_imdbb(batch_size: int) -> TaskBundle:
+    torch = require_torch()
+    root = _data_root() / "imdb_binary"
+    archive = _download(IMDBB_URL, root / "IMDB-BINARY.zip")
+    _extract_zip(archive, root)
+    dataset_dir = root / "IMDB-BINARY"
+    graph_indicator = _read_tu_indicator(dataset_dir / "IMDB-BINARY_graph_indicator.txt")
+    labels_raw = _read_tu_indicator(dataset_dir / "IMDB-BINARY_graph_labels.txt")
+    edges: list[tuple[int, int]] = []
+    with (dataset_dir / "IMDB-BINARY_A.txt").open() as fh:
+        for line in fh:
+            left, right = line.replace(" ", "").strip().split(",")
+            edges.append((int(left) - 1, int(right) - 1))
+    graph_nodes: dict[int, list[int]] = {}
+    for node_index, graph_id in enumerate(graph_indicator):
+        graph_nodes.setdefault(graph_id, []).append(node_index)
+    max_nodes = 96
+    features = []
+    adjacencies = []
+    labels = []
+    edge_set = set(edges) | {(b, a) for a, b in edges}
+    for graph_id, nodes in sorted(graph_nodes.items()):
+        nodes = nodes[:max_nodes]
+        node_map = {node: i for i, node in enumerate(nodes)}
+        adjacency = torch.eye(max_nodes, dtype=torch.float32)
+        degree = torch.zeros(max_nodes, dtype=torch.float32)
+        for src, dst in edge_set:
+            if src in node_map and dst in node_map:
+                i, j = node_map[src], node_map[dst]
+                adjacency[i, j] = 1.0
+                degree[i] += 1.0
+        x = torch.zeros((max_nodes, 8), dtype=torch.float32)
+        x[: len(nodes), 0] = 1.0
+        x[:, 1] = degree / degree.clamp_min(1.0).max().clamp_min(1.0)
+        features.append(x)
+        adjacencies.append(adjacency)
+        labels.append(1 if labels_raw[graph_id - 1] > 0 else 0)
+    return _bundle_from_dataset(
+        _TensorRowsDataset(
+            torch.stack(features),
+            torch.stack(adjacencies),
+            torch.tensor(labels, dtype=torch.long),
+        ),
+        batch_size,
+        "Accuracy",
+        "maximize",
+        "IMDB-Binary social-network graph classification",
+    )
+
+
 def _build_cartpole(batch_size: int) -> TaskBundle:
     torch = require_torch()
     gymnasium = _require_dependency("gymnasium", "gymnasium[classic-control]")
@@ -600,6 +842,98 @@ def _build_cartpole(batch_size: int) -> TaskBundle:
         "Reward",
         "maximize",
         "CartPole-v1 observations labeled by a stabilizing policy",
+    )
+
+
+def _build_lunarlander(batch_size: int) -> TaskBundle:
+    torch = require_torch()
+    gymnasium = _require_dependency("gymnasium", "gymnasium[box2d]")
+    numpy = _require_dependency("numpy")
+    cache = _data_root() / "lunarlander" / "heuristic_rollouts.pt"
+    if cache.exists():
+        payload = torch.load(cache, map_location="cpu")
+        x, y = payload["x"], payload["y"]
+    else:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            env = gymnasium.make("LunarLander-v3")
+        except Exception:
+            env = gymnasium.make("LunarLander-v2")
+        observations = []
+        actions = []
+        obs, _ = env.reset(seed=42)
+        while len(observations) < 40_000:
+            x_pos, y_pos, x_vel, y_vel, angle, angular_vel, left_contact, right_contact = obs
+            if left_contact or right_contact:
+                action = 0 if abs(x_vel) < 0.2 else (3 if x_vel < 0 else 1)
+            elif abs(angle) > 0.12:
+                action = 1 if angle > 0 else 3
+            elif y_vel < -0.25 or y_pos < 0.6:
+                action = 2
+            elif abs(x_pos) > 0.15:
+                action = 3 if x_pos < 0 else 1
+            else:
+                action = 0
+            observations.append(obs)
+            actions.append(action)
+            obs, _, terminated, truncated, _ = env.step(action)
+            if terminated or truncated:
+                obs, _ = env.reset()
+        env.close()
+        x = torch.tensor(numpy.array(observations), dtype=torch.float32)
+        y = torch.tensor(actions, dtype=torch.long)
+        torch.save({"x": x, "y": y}, cache)
+    return _bundle_from_dataset(
+        _TensorRowsDataset(x, y),
+        batch_size,
+        "Reward",
+        "maximize",
+        "LunarLander-v3 observations labeled by a stabilizing heuristic policy",
+    )
+
+
+def _build_bipedalwalker(batch_size: int) -> TaskBundle:
+    torch = require_torch()
+    gymnasium = _require_dependency("gymnasium", "gymnasium[box2d]")
+    numpy = _require_dependency("numpy")
+    cache = _data_root() / "bipedalwalker" / "heuristic_rollouts.pt"
+    if cache.exists():
+        payload = torch.load(cache, map_location="cpu")
+        x, y = payload["x"], payload["y"]
+    else:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        env = gymnasium.make("BipedalWalker-v3")
+        observations = []
+        actions = []
+        obs, _ = env.reset(seed=42)
+        while len(observations) < 50_000:
+            hull_angle = obs[0]
+            hull_angular_velocity = obs[1]
+            hip_drive = -0.6 * hull_angle - 0.2 * hull_angular_velocity
+            action = numpy.array(
+                [
+                    numpy.clip(hip_drive + 0.35, -1.0, 1.0),
+                    0.45,
+                    numpy.clip(-hip_drive + 0.35, -1.0, 1.0),
+                    0.45,
+                ],
+                dtype=numpy.float32,
+            )
+            observations.append(obs)
+            actions.append(action)
+            obs, _, terminated, truncated, _ = env.step(action)
+            if terminated or truncated:
+                obs, _ = env.reset()
+        env.close()
+        x = torch.tensor(numpy.array(observations), dtype=torch.float32)
+        y = torch.tensor(numpy.array(actions), dtype=torch.float32)
+        torch.save({"x": x, "y": y}, cache)
+    return _bundle_from_dataset(
+        _TensorRowsDataset(x, y),
+        batch_size,
+        "Reward",
+        "maximize",
+        "BipedalWalker-v3 observations labeled by a continuous-action heuristic policy",
     )
 
 
@@ -638,6 +972,184 @@ def _build_mitbih(batch_size: int) -> TaskBundle:
     )
 
 
+class _ModelNet40Dataset:
+    def __init__(self, train: bool) -> None:
+        self.root = _data_root() / "modelnet40"
+        archive = _download("http://modelnet.cs.princeton.edu/ModelNet40.zip", self.root / "ModelNet40.zip")
+        raw_root = self.root / "raw"
+        if not raw_root.exists() or not any(raw_root.iterdir()):
+            _extract_zip(archive, self.root / "_extracted")
+            extracted = self.root / "_extracted" / "ModelNet40"
+            if extracted.exists():
+                extracted.rename(raw_root)
+        split = "train" if train else "test"
+        categories = sorted(path.name for path in raw_root.iterdir() if path.is_dir())
+        self.class_to_idx = {category: index for index, category in enumerate(categories)}
+        self.samples: list[tuple[Path, int]] = []
+        for category in categories:
+            for path in sorted((raw_root / category / split).glob("*.off")):
+                self.samples.append((path, self.class_to_idx[category]))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> tuple[Any, Any]:
+        torch = require_torch()
+        path, label = self.samples[index]
+        with path.open() as fh:
+            header = fh.readline().strip()
+            if header != "OFF":
+                counts = header[3:].strip().split()
+            else:
+                counts = fh.readline().strip().split()
+            vertex_count = int(counts[0])
+            vertices = []
+            for _ in range(vertex_count):
+                vertices.append([float(value) for value in fh.readline().split()[:3]])
+        points = torch.tensor(vertices, dtype=torch.float32)
+        points = points - points.mean(dim=0, keepdim=True)
+        points = points / points.norm(dim=1).max().clamp_min(1e-6)
+        if len(points) >= 1024:
+            choice = torch.linspace(0, len(points) - 1, steps=1024).long()
+            points = points[choice]
+        else:
+            pad = points[torch.arange(1024 - len(points)) % len(points)]
+            points = torch.cat([points, pad], dim=0)
+        return points, torch.tensor(label, dtype=torch.long)
+
+
+def _build_modelnet40(batch_size: int) -> TaskBundle:
+    train_full = _ModelNet40Dataset(train=True)
+    train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
+    test_ds = _ModelNet40Dataset(train=False)
+    return _bundle_from_splits(
+        train_ds,
+        val_ds,
+        test_ds,
+        batch_size,
+        "Accuracy",
+        "maximize",
+        "ModelNet40 1024-point CAD object clouds",
+        num_workers=0,
+    )
+
+
+def _build_nmnist(batch_size: int) -> TaskBundle:
+    torch = require_torch()
+    tonic = _require_dependency("tonic")
+    transforms = __import__("tonic.transforms", fromlist=["transforms"])
+    transform = transforms.Compose(
+        [
+            transforms.ToFrame(
+                sensor_size=tonic.datasets.NMNIST.sensor_size,
+                n_time_bins=10,
+            ),
+            lambda frames: torch.tensor(frames, dtype=torch.float32).sum(dim=0),
+        ]
+    )
+    root = _data_root() / "nmnist"
+    train_full = tonic.datasets.NMNIST(save_to=str(root), train=True, transform=transform)
+    test_ds = tonic.datasets.NMNIST(save_to=str(root), train=False, transform=transform)
+    train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
+    return _bundle_from_splits(
+        train_ds,
+        val_ds,
+        test_ds,
+        batch_size,
+        "Accuracy",
+        "maximize",
+        "N-MNIST event-camera spike frames",
+        num_workers=0,
+    )
+
+
+class _ISICDataset:
+    def __init__(self, root: Path, image_size: int = 128) -> None:
+        self.root = root
+        self.image_size = image_size
+        self.samples = self._discover_pairs()
+
+    def _discover_pairs(self) -> list[tuple[Path, Path]]:
+        image_files = [
+            path
+            for path in self.root.rglob("*.jpg")
+            if "superpixel" not in path.name.lower()
+        ]
+        mask_files = list(self.root.rglob("*segmentation*.png")) + list(
+            self.root.rglob("*Segmentation*.png")
+        )
+        masks_by_stem = {
+            mask.name.replace("_segmentation", "").replace("_Segmentation", "").split(".")[0]: mask
+            for mask in mask_files
+        }
+        pairs = []
+        for image in image_files:
+            key = image.stem
+            if key in masks_by_stem:
+                pairs.append((image, masks_by_stem[key]))
+        if not pairs:
+            raise RuntimeError(
+                "ISIC files were downloaded, but image/mask pairs could not be matched."
+            )
+        return pairs
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> tuple[Any, Any]:
+        torch = require_torch()
+        Image = __import__("PIL.Image", fromlist=["Image"])
+        image_path, mask_path = self.samples[index]
+        image = Image.open(image_path).convert("RGB").resize((self.image_size, self.image_size))
+        mask = Image.open(mask_path).convert("L").resize((self.image_size, self.image_size))
+        image_t = torch.tensor(list(image.getdata()), dtype=torch.float32).view(
+            self.image_size, self.image_size, 3
+        ).permute(2, 0, 1) / 255.0
+        mask_t = torch.tensor(list(mask.getdata()), dtype=torch.float32).view(
+            1, self.image_size, self.image_size
+        ) / 255.0
+        return image_t, (mask_t > 0.5).float()
+
+
+def _build_isic(batch_size: int) -> TaskBundle:
+    root = _data_root() / "isic2018"
+    image_archive = _download(ISIC_SAMPLE_URL, root / "images.zip")
+    mask_archive = _download(ISIC_MASK_SAMPLE_URL, root / "masks.zip")
+    _extract_zip(image_archive, root / "images")
+    _extract_zip(mask_archive, root / "masks")
+    return _bundle_from_dataset(
+        _ISICDataset(root),
+        batch_size,
+        "Dice",
+        "maximize",
+        "ISIC 2018 Task 1 dermoscopy images and lesion masks",
+        num_workers=0,
+    )
+
+
+def _build_moving_mnist(batch_size: int) -> TaskBundle:
+    torch = require_torch()
+    numpy = _require_dependency("numpy")
+    root = _data_root() / "moving_mnist"
+    gz_path = _download(MOVING_MNIST_URL, root / "mnist_test_seq.npy.gz")
+    npy_path = root / "mnist_test_seq.npy"
+    if not npy_path.exists():
+        with gzip.open(gz_path, "rb") as src, npy_path.open("wb") as dst:
+            dst.write(src.read())
+    arr = numpy.load(npy_path)  # (20, 10000, 64, 64)
+    arr = torch.tensor(arr, dtype=torch.float32).permute(1, 0, 2, 3).unsqueeze(2) / 255.0
+    x = arr[:, :10]
+    y = arr[:, 10:20]
+    return _bundle_from_dataset(
+        _TensorRowsDataset(x, y),
+        batch_size,
+        "SSIM",
+        "maximize",
+        "Moving MNIST two-digit video prediction sequences",
+        num_workers=0,
+    )
+
+
 # Per-model batch sizes tuned for Apple Silicon MPS throughput.
 # Larger batches amortise Python-loop and host-to-device transfer overhead,
 # keeping the GPU busy for longer between CPU round-trips.  Each value was
@@ -654,6 +1166,21 @@ _BATCH_SIZES: dict[str, int] = {
     "actor_critic": 1024,  # CartPole 4-D observations — negligible per-sample cost
     "lstm_autoencoder": 256,  # MIT-BIH 128-sample ECG windows
     "distilbert": 128,  # SST-2 token sequences
+    "dqn_lunarlander": 1024,
+    "ppo_bipedalwalker": 1024,
+    "attentivefp_freesolv": 32,
+    "gin_imdbb": 32,
+    "tcn_forecaster": 128,
+    "gru_forecaster": 128,
+    "pointnet_modelnet40": 32,
+    "vae_mnist": 512,
+    "snn_nmnist": 128,
+    "unet_isic": 16,
+    "resnet18_cifar10": 256,
+    "mobilenetv2_cifar10": 256,
+    "saint_adult": 512,
+    "capsnet_mnist": 128,
+    "convlstm_movingmnist": 16,
 }
 
 
@@ -675,6 +1202,21 @@ def build_task_bundle(model_key: str, batch_size: int | None = None) -> TaskBund
         "actor_critic": _build_cartpole,
         "lstm_autoencoder": _build_mitbih,
         "distilbert": _build_sst2,
+        "dqn_lunarlander": _build_lunarlander,
+        "ppo_bipedalwalker": _build_bipedalwalker,
+        "attentivefp_freesolv": _build_freesolv,
+        "gin_imdbb": _build_imdbb,
+        "tcn_forecaster": _build_ettm1,
+        "gru_forecaster": _build_weather,
+        "pointnet_modelnet40": _build_modelnet40,
+        "vae_mnist": _build_mnist,
+        "snn_nmnist": _build_nmnist,
+        "unet_isic": _build_isic,
+        "resnet18_cifar10": _build_cifar10,
+        "mobilenetv2_cifar10": _build_cifar10,
+        "saint_adult": _build_adult,
+        "capsnet_mnist": _build_mnist,
+        "convlstm_movingmnist": _build_moving_mnist,
     }
     if model_key not in builders:
         raise KeyError(f"Unknown model key: {model_key}")

@@ -151,6 +151,21 @@ Available model keys:
 - `actor_critic`
 - `lstm_autoencoder`
 - `distilbert`
+- `dqn_lunarlander`
+- `ppo_bipedalwalker`
+- `attentivefp_freesolv`
+- `gin_imdbb`
+- `tcn_forecaster`
+- `gru_forecaster`
+- `pointnet_modelnet40`
+- `vae_mnist`
+- `snn_nmnist`
+- `unet_isic`
+- `resnet18_cifar10`
+- `mobilenetv2_cifar10`
+- `saint_adult`
+- `capsnet_mnist`
+- `convlstm_movingmnist`
 
 Available condition keys:
 
