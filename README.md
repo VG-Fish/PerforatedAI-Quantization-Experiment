@@ -2,10 +2,25 @@
 
 This repo now contains a `uv`-managed benchmark scaffold for the 10-model / 13-condition experiment described in `Dendritic Quantization Benchmark Plan.md`.
 
+## How It Works
+
+The benchmark automates training neural networks under different quantization and pruning conditions to measure the impact of [PerforatedAI](https://github.com/PerforatedAI/PerforatedAI) techniques. Here's the workflow:
+
+1. **Setup**: Initialize a Python environment with all dependencies (`uv sync`)
+2. **Download Data** (optional): Pre-download datasets for specific models with `uv run dqb download_data`
+3. **Train**: Run `uv run dqb run` to train models across 13 conditions (baseline, quantized, pruned, combined)
+4. **Results**: Training metrics are saved to `results/<model>/<condition>/` with per-epoch histories and final performance records
+5. **Compare**: Generate comparison charts and summary reports using `uv run dqb compare`
+6. **Visualize**: Render training curves and analysis plots with `uv run dqb generate_graphs`
+
+Each condition applies different quantization and pruning strategies to the same models, allowing side-by-side comparison of model efficiency vs. accuracy tradeoffs.
+
 ## Setup
 
 ```bash
+git clone https://github.com/VG-Fish/PerforatedAI-Quantization-Experiment.git
 uv venv .venv
+uv sync
 ```
 
 The benchmark downloads public datasets on first use and caches them under `data/` by default. Set `DQB_DATA_ROOT=/path/to/cache` if you want the datasets stored somewhere else.
@@ -46,4 +61,54 @@ Read the full documents for architecture details, hypotheses, and example comman
 [DOCUMENTATION.md](information/DOCUMENTATION.md)
 
 [CLI_DIAGRAMS.md](information/CLI_DIAGRAMS.md)
+
+
+## Available commands (uv run dqb)
+
+The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` for flowcharts and full details.
+
+- `uv run dqb run`
+	- Train models across one or more conditions. By default runs all models & conditions defined in the project.
+	- Useful flags: `--models`, `--conditions`, `--results-root`, `--comparison-root`, `--ignore-saved-models`.
+	- Examples:
+        ```bash
+        uv run dqb run
+        uv run dqb run --models lenet5 textcnn
+        uv run dqb run --conditions base_fp32 dendrites_fp32
+        uv run dqb run --ignore-saved-models
+        ```
+
+- `uv run dqb download_data`
+	- Pre-downloads and prepares datasets required by the selected models.
+	- Useful flags: `--models` (subset), `--strict` (fail on any download error), `--results-root`.
+	- Examples:
+        ```bash
+        uv run dqb download_data
+        uv run dqb download_data --models lenet5 mpnn
+        uv run dqb download_data --strict
+        ```
+
+- `uv run dqb compare`
+	- Rebuilds comparison charts and summary reports from saved `record.json` files in `results/` without retraining.
+	- Useful flags: `--manifest` (write a manifest CSV), `--results-root`, `--comparison-root`.
+	- Examples:
+        ```bash
+        uv run dqb compare
+        uv run dqb compare --manifest
+        uv run dqb compare --results-root results --comparison-root comparison
+        ```
+
+- `uv run dqb generate_graphs`
+	- Renders per-epoch training curves and other plots from saved `history.csv` files.
+	- Useful flags: `--results-root`, `--regenerate-graphs` (force re-render even if plots exist).
+	- Examples:
+        ```bash
+        uv run dqb generate_graphs
+        uv run dqb generate_graphs --regenerate-graphs
+        ```
+
+- `uv run dqb --help`
+	- Show help for the `dqb` command and available subcommands/flags.
+
+For full command flow diagrams and more flags, open `information/CLI_DIAGRAMS.md`.
 
