@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .compat import load_project_environment, perforatedai_credentials_present
 from .data import DATA_ROOT_ENV, DEFAULT_DATA_ROOT, build_task_bundle, dataset_exists
+from .log_utils import setup_logging
 from .pipeline import BenchmarkRunner
 from .results import load_training_records, write_comparison_reports, write_manifest, write_model_reports, generate_training_graphs
 from .specs import MODEL_SPECS
@@ -61,6 +62,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Root directory for cross-model comparison outputs such as summary "
             "CSVs and aggregate plots. (default: comparison)"
+        ),
+    )
+    parser.add_argument(
+        "--logging-dir",
+        default="logs",
+        metavar="DIR",
+        help=(
+            "Directory where timestamped log files are written. Each invocation "
+            "creates a new file named <command>_YYYYMMDD_HHMMSS.txt. "
+            "All stdout and stderr are teed to this file. (default: logs)"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -194,6 +205,8 @@ def main() -> None:
     args = parser.parse_args()
     results_root = Path(args.results_root)
     comparison_root = Path(args.comparison_root)
+
+    setup_logging(output_dir=args.logging_dir, script_name=args.command)
 
     if perforatedai_credentials_present():
         _log("PerforatedAI credentials detected in environment; beta-capable features can be used if installed.")

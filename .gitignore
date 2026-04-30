@@ -13,3 +13,4 @@ build/
 PAI/
 .claude
 uv.lock
+logs/

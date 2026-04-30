@@ -20,9 +20,13 @@ from .training import TrainingRecord, train_and_evaluate
 EPOCH_MULTIPLIER = 10
 
 
-def _log(msg: str) -> None:
+def _log(msg: str, *, before: bool = False, after: bool = False) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
+    if before:
+        print()
     print(f"[{ts}] {msg}")
+    if after:
+        print()
 
 
 class BenchmarkRunner:
@@ -189,12 +193,14 @@ class BenchmarkRunner:
             if not pending:
                 _log(
                     f"[skip] {model_spec.key} — all conditions already recorded, "
-                    "skipping dataset load."
+                    "skipping dataset load.",
+                    before=True,
                 )
             else:
                 _log(
                     f"[data] {model_spec.key} — loading dataset "
-                    f"({len(pending)} condition(s) to train)…"
+                    f"({len(pending)} condition(s) to train)…",
+                    before=True,
                 )
 
             model_records: list[dict[str, Any]] = []
@@ -214,6 +220,7 @@ class BenchmarkRunner:
                 saved_dirs[condition.key] = condition_dir
 
             # Load dataset only when at least one condition needs training.
+            newly_trained = False
             if pending:
                 bundle = build_task_bundle(model_spec.key)
                 for condition in pending:
@@ -226,6 +233,10 @@ class BenchmarkRunner:
                         )
                         record = TrainingRecord(**json.loads(record_path.read_text()))
                     else:
+                        _log(
+                            f"[train] {model_spec.key} / {condition.key} — starting…",
+                            before=True,
+                        )
                         record = self._run_condition(
                             model_spec.key,
                             model_spec.display_name,
@@ -236,6 +247,13 @@ class BenchmarkRunner:
                             saved_dirs,
                         )
                         save_training_record(record, condition_dir)
+                        _log(
+                            f"[done] {model_spec.key} / {condition.key} — "
+                            f"{model_spec.metric_name}: "
+                            f"{record.metric_value:.4f}",
+                            after=True,
+                        )
+                        newly_trained = True
                     model_records.append(record.to_dict())
                     all_records.append(record.to_dict())
                     saved_dirs[condition.key] = condition_dir
@@ -248,14 +266,17 @@ class BenchmarkRunner:
 
             # Eagerly regenerate comparison outputs as soon as at least 2 models have
             # finished training, so results are visible without waiting for all models.
-            completed_model_keys = {r["model_key"] for r in all_records}
-            if len(completed_model_keys) >= 2:
-                _log(
-                    f"[compare] {len(completed_model_keys)} models complete — "
-                    "regenerating comparison reports…"
-                )
-                write_manifest(all_records, self.results_root / "manifest.csv")
-                write_comparison_reports(all_records, self.comparison_root)
+            # Only regenerate when new training actually occurred (not when skipping).
+            if newly_trained:
+                completed_model_keys = {r["model_key"] for r in all_records}
+                if len(completed_model_keys) >= 2:
+                    _log(
+                        f"[compare] {len(completed_model_keys)} models complete — "
+                        "regenerating comparison reports…",
+                        after=True,
+                    )
+                    write_manifest(all_records, self.results_root / "manifest.csv")
+                    write_comparison_reports(all_records, self.comparison_root)
 
         # Final write covers the single-model case and ensures the manifest and
         # comparison outputs always reflect every completed model.
