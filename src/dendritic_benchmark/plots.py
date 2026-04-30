@@ -325,6 +325,74 @@ def heatmap(
     _save(fig, path)
 
 
+def winner_heatmap(
+    path: Path,
+    title: str,
+    row_labels: list[str],
+    col_labels: list[str],
+    winner_matrix: list[list[int]],
+    score_matrix: list[list[float]],
+    subtitle: str | None = None,
+) -> None:
+    """Categorical heatmap: 0 = base wins (blue), 1 = dendrites wins (green)."""
+    rows = len(row_labels)
+    cols = len(col_labels)
+    fig_width = max(12.0, 1.02 * cols + 4.0)
+    fig_height = max(6.6, 0.52 * rows + 3.2)
+    fig, ax = _setup_figure(fig_width, fig_height)
+
+    import numpy as np
+    from matplotlib.colors import ListedColormap
+
+    data = np.array(winner_matrix, dtype=float)
+    cmap = ListedColormap([BASE_BLUE, DENDRITE_GREEN])
+    ax.imshow(data, aspect="auto", cmap=cmap, vmin=-0.5, vmax=1.5)
+
+    ax.set_title(
+        title if subtitle is None else f"{title}\n{subtitle}",
+        fontsize=18,
+        color=TEXT,
+        pad=18,
+    )
+    ax.set_xticks(range(cols), [_wrap_label(label, width=10) for label in col_labels])
+    ax.set_yticks(range(rows), row_labels)
+    ax.tick_params(axis="x", labeltop=True, labelbottom=False, colors=TEXT, pad=4)
+    ax.tick_params(axis="y", colors=TEXT)
+    ax.set_xticks([index - 0.5 for index in range(1, cols)], minor=True)
+    ax.set_yticks([index - 0.5 for index in range(1, rows)], minor=True)
+    ax.grid(which="minor", color=BACKGROUND, linestyle="-", linewidth=2)
+    ax.tick_params(which="minor", bottom=False, left=False)
+
+    for row_index, (winner_row, score_row) in enumerate(zip(winner_matrix, score_matrix)):
+        for col_index, (winner, score) in enumerate(zip(winner_row, score_row)):
+            label = "Base" if winner == 0 else "Dendrites"
+            ax.text(
+                col_index,
+                row_index,
+                f"{label}\n{score:.1f}%",
+                ha="center",
+                va="center",
+                fontsize=7.5,
+                color="white",
+                fontweight="bold",
+            )
+
+    legend_patches = [
+        Patch(facecolor=BASE_BLUE, label="Base"),
+        Patch(facecolor=DENDRITE_GREEN, label="Dendrites"),
+    ]
+    ax.legend(
+        handles=legend_patches,
+        loc="lower right",
+        framealpha=0.85,
+        fontsize=9,
+        title="Best variant",
+        title_fontsize=9,
+    )
+    _autosize_axis_labels(fig, ax)
+    _save(fig, path)
+
+
 def _place_scatter_labels(
     fig: Figure, ax: Axes, annotations: list[tuple[float, float, str]]
 ) -> int:

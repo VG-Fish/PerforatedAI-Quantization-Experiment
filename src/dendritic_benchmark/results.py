@@ -12,6 +12,7 @@ from .plots import (
     line_chart,
     multi_line_chart,
     scatter,
+    winner_heatmap,
 )
 from .specs import CONDITION_SPECS, MODEL_SPECS, condition_by_key
 from .training import TrainingRecord
@@ -141,6 +142,7 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
     ]
     retention_rows: list[list[float]] = []
     best_quant_rows: list[list[float]] = []
+    best_quant_winners: list[list[int]] = []
     tradeoff_points: list[dict[str, Any]] = []
     summary_rows: list[dict[str, Any]] = []
     for model_key in model_order:
@@ -157,19 +159,24 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
                 for key in condition_order
             ]
         )
-        best_quant_rows.append(
-            [
-                max(
-                    [
-                        _normalization_score(by_condition[key], baseline)
-                        for key in group
-                        if key in by_condition
-                    ]
-                    or [0.0]
-                )
-                for group in quantization_groups
+        quant_row: list[float] = []
+        winner_row: list[int] = []
+        for group in quantization_groups:
+            scores = [
+                (i, _normalization_score(by_condition[key], baseline))
+                for i, key in enumerate(group)
+                if key in by_condition
             ]
-        )
+            if scores:
+                best_i, best_score = max(scores, key=lambda t: t[1])
+                quant_row.append(best_score)
+                # 0 = base (first key in group), 1 = dendrites (second key)
+                winner_row.append(0 if best_i == 0 else 1)
+            else:
+                quant_row.append(0.0)
+                winner_row.append(0)
+        best_quant_rows.append(quant_row)
+        best_quant_winners.append(winner_row)
         for condition_key, record in by_condition.items():
             if not baseline:
                 continue
@@ -225,13 +232,14 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
         ],
         "Retention %",
     )
-    heatmap(
+    winner_heatmap(
         output_dir / "best_quantization_heatmap.svg",
         "Best Quantization Level per Domain",
         [spec.display_name for spec in MODEL_SPECS],
         ["FP32", "Q8", "Q4", "Q2", "Q1.58", "Q1"],
+        best_quant_winners,
         best_quant_rows,
-        subtitle="Best retention among baseline and dendritic pruned variants (%)",
+        subtitle="Which variant achieves the best retention per quantization level (%)",
     )
     with (output_dir / "summary.csv").open("w", newline="") as fh:
         if summary_rows:
