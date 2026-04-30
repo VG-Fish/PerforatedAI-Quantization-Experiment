@@ -12,28 +12,162 @@ from .results import load_training_records, write_comparison_reports, write_mani
 from .specs import MODEL_SPECS
 
 
+_MODEL_KEYS = (
+    "lenet5, m5, lstm_forecaster, textcnn, gcn, tabnet, mpnn, actor_critic, "
+    "lstm_autoencoder, distilbert, dqn_lunarlander, ppo_bipedalwalker, "
+    "attentivefp_freesolv, gin_imdbb, tcn_forecaster, gru_forecaster, "
+    "pointnet_modelnet40, vae_mnist, snn_nmnist, unet_isic, resnet18_cifar10, "
+    "mobilenetv2_cifar10, saint_adult, capsnet_mnist, convlstm_movingmnist"
+)
+
+_CONDITION_KEYS = (
+    "base_fp32, base_q8, base_q4, base_q2, base_q1_58, base_q1, "
+    "dendrites_fp32, dendrites_pruned, dendrites_pruned_q8, dendrites_pruned_q4, "
+    "dendrites_pruned_q2, dendrites_pruned_q1_58, dendrites_pruned_q1"
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Dendritic quantization benchmark runner")
-    parser.add_argument("--results-root", default="results", help="Directory for per-model result folders")
-    parser.add_argument("--comparison-root", default="comparison", help="Directory for cross-model comparison outputs")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Dendritic quantization benchmark runner.\n\n"
+            "Trains 25 models across 13 conditions that combine baseline FP32 training, "
+            "PerforatedAI dendritic augmentation, magnitude pruning, and post-training "
+            "quantization (INT8 down to binary). Results are saved under --results-root "
+            "and cross-model comparisons under --comparison-root."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--results-root",
+        default="results",
+        metavar="DIR",
+        help=(
+            "Root directory where per-model result folders are written. "
+            "Each model gets a subdirectory named by its key containing JSON "
+            "training records and PNG plots. (default: results)"
+        ),
+    )
+    parser.add_argument(
+        "--comparison-root",
+        default="comparison",
+        metavar="DIR",
+        help=(
+            "Root directory for cross-model comparison outputs such as summary "
+            "CSVs and aggregate plots. (default: comparison)"
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    run_parser = subparsers.add_parser("run", help="Run the benchmark")
-    run_parser.add_argument("--models", nargs="*", help="Optional subset of model keys")
-    run_parser.add_argument("--conditions", nargs="*", help="Optional subset of condition keys")
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Train models across all (or a subset of) conditions and save results.",
+        description=(
+            "Runs the full benchmark pipeline: trains each selected model under each "
+            "selected condition, evaluates it, and writes JSON records plus plots to "
+            "--results-root.\n\n"
+            "Conditions are executed in dependency order — e.g. dendrites_pruned_q8 "
+            "requires dendrites_pruned, which in turn requires dendrites_fp32 — so "
+            "omitting an upstream condition will cause its dependents to be skipped.\n\n"
+            f"Available model keys:\n  {_MODEL_KEYS}\n\n"
+            f"Available condition keys:\n  {_CONDITION_KEYS}"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    run_parser.add_argument(
+        "--models",
+        nargs="*",
+        metavar="KEY",
+        help=(
+            "Space-separated list of model keys to include. "
+            "Omit to run all 25 models. "
+            f"Valid keys: {_MODEL_KEYS}"
+        ),
+    )
+    run_parser.add_argument(
+        "--conditions",
+        nargs="*",
+        metavar="KEY",
+        help=(
+            "Space-separated list of condition keys to include. "
+            "Omit to run all 13 conditions. "
+            f"Valid keys: {_CONDITION_KEYS}"
+        ),
+    )
 
-    download_parser = subparsers.add_parser("download_data", help="Download/cache datasets for selected models")
-    download_parser.add_argument("--models", nargs="*", help="Optional subset of model keys")
-    download_parser.add_argument("--strict", action="store_true", help="Stop on the first dataset download error")
+    download_parser = subparsers.add_parser(
+        "download_data",
+        help="Pre-download and cache datasets so that 'run' works offline.",
+        description=(
+            "Downloads and caches all datasets required by the selected models. "
+            "Datasets are stored under the directory given by the DQB_DATA_ROOT "
+            "environment variable (default: ./data). Already-cached datasets are "
+            "skipped automatically.\n\n"
+            "Run this before 'run' if you want to separate the download step, work "
+            "offline, or verify that all data sources are reachable.\n\n"
+            f"Available model keys:\n  {_MODEL_KEYS}"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    download_parser.add_argument(
+        "--models",
+        nargs="*",
+        metavar="KEY",
+        help=(
+            "Space-separated list of model keys whose datasets should be downloaded. "
+            "Omit to download datasets for all 25 models. "
+            f"Valid keys: {_MODEL_KEYS}"
+        ),
+    )
+    download_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Abort immediately on the first download failure instead of continuing "
+            "and reporting all failures at the end."
+        ),
+    )
 
-    compare_parser = subparsers.add_parser("compare", help="Build comparison outputs from saved records")
-    compare_parser.add_argument("--manifest", action="store_true", help="Rewrite the manifest CSV before plotting")
+    compare_parser = subparsers.add_parser(  # noqa: F841
+        "compare",
+        help="Generate cross-model comparison reports and plots from saved training records.",
+        description=(
+            "Reads all JSON training records from --results-root and produces:\n"
+            "  • Per-model summary CSVs and bar charts (written to each model's subfolder)\n"
+            "  • Aggregate cross-model comparison plots and CSVs (written to --comparison-root)\n\n"
+            "Run this after 'run' completes (or partially completes) to visualise results "
+            "without re-training. Safe to re-run multiple times."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    compare_parser.add_argument(
+        "--manifest",
+        action="store_true",
+        help=(
+            "Rewrite the manifest CSV (results/manifest.csv) from the current training "
+            "records before generating plots. Useful after adding new results or manually "
+            "editing record files."
+        ),
+    )
 
-    generate_graphs_parser = subparsers.add_parser("generate_graphs", help="Generate training curves from saved results")
+    generate_graphs_parser = subparsers.add_parser(
+        "generate_graphs",
+        help="Render per-epoch training-curve plots from saved results.",
+        description=(
+            "Walks --results-root and renders a training-curve PNG for every saved "
+            "training record that does not yet have one. Useful for regenerating plots "
+            "after a style change or if graphs were accidentally deleted.\n\n"
+            "By default, existing graph files are left untouched."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     generate_graphs_parser.add_argument(
         "--regenerate-graphs",
         action="store_true",
-        help="Recreate graphs even if they already exist",
+        help=(
+            "Overwrite graph files that already exist on disk. "
+            "Without this flag only missing graphs are created."
+        ),
     )
 
     return parser
