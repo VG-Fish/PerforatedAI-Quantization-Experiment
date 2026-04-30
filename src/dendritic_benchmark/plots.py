@@ -393,6 +393,39 @@ def winner_heatmap(
     _save(fig, path)
 
 
+def _try_place_label(
+    ax: Axes,
+    fig: Figure,
+    renderer: Any,
+    accepted: list[Any],
+    x_value: float,
+    y_value: float,
+    label: str,
+    offsets: list[tuple[int, int]],
+) -> bool:
+    """Try to place a label annotation without overlapping existing bounding boxes.
+    Returns True if placed, False if all offsets were blocked."""
+    for x_offset, y_offset in offsets:
+        text = ax.annotate(
+            label,
+            (x_value, y_value),
+            xytext=(x_offset, y_offset),
+            textcoords="offset points",
+            ha="left" if x_offset >= 0 else "right",
+            va="bottom" if y_offset >= 0 else "top",
+            fontsize=6.5,
+            color=TEXT,
+        )
+        _draw(fig)
+        bbox = text.get_window_extent(renderer=renderer).expanded(1.08, 1.18)
+        if any(bbox.overlaps(existing) for existing in accepted):
+            text.remove()
+            continue
+        accepted.append(bbox)
+        return True
+    return False
+
+
 def _place_scatter_labels(
     fig: Figure, ax: Axes, annotations: list[tuple[float, float, str]]
 ) -> int:
@@ -414,27 +447,7 @@ def _place_scatter_labels(
     hidden = 0
 
     for x_value, y_value, label in annotations:
-        placed = False
-        for x_offset, y_offset in offsets:
-            text = ax.annotate(
-                label,
-                (x_value, y_value),
-                xytext=(x_offset, y_offset),
-                textcoords="offset points",
-                ha="left" if x_offset >= 0 else "right",
-                va="bottom" if y_offset >= 0 else "top",
-                fontsize=6.5,
-                color=TEXT,
-            )
-            _draw(fig)
-            bbox = text.get_window_extent(renderer=renderer).expanded(1.08, 1.18)
-            if any(bbox.overlaps(existing) for existing in accepted):
-                text.remove()
-                continue
-            accepted.append(bbox)
-            placed = True
-            break
-        if not placed:
+        if not _try_place_label(ax, fig, renderer, accepted, x_value, y_value, label, offsets):
             hidden += 1
 
     return hidden
@@ -565,12 +578,12 @@ def scatter(
     ):
         if not group:
             continue
-        scatter_kwargs: dict[str, Any] = dict(
-            c=[point.get("color", BASE_BLUE) for point in group],
-            marker=marker,
-            alpha=0.88,
-            label=label,
-        )
+        scatter_kwargs: dict[str, Any] = {
+            "c": [point.get("color", BASE_BLUE) for point in group],
+            "marker": marker,
+            "alpha": 0.88,
+            "label": label,
+        }
         if marker == "x":
             scatter_kwargs["s"] = 70
             scatter_kwargs["linewidths"] = 1.8

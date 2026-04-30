@@ -15,6 +15,9 @@ from .compat import require_torch
 
 DATA_ROOT_ENV: str = "DQB_DATA_ROOT"
 DEFAULT_DATA_ROOT: str = "data"
+EXTRACTED_MARKER: str = ".extracted"
+HEURISTIC_ROLLOUTS_FILENAME: str = "heuristic_rollouts.pt"
+ADULT_DATA_FILENAME: str = "adult.data"
 ETTH1_URL: str = (
     "https://raw.githubusercontent.com/zhouhaoyi/ETDataset/main/ETT-small/ETTh1.csv"
 )
@@ -25,7 +28,7 @@ WEATHER_URL: str = (
     "https://huggingface.co/datasets/dunzane/time-series-dataset/raw/main/weather/weather.csv"
 )
 ADULT_URLS: dict[str, str] = {
-    "adult.data": "https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.data",
+    ADULT_DATA_FILENAME: "https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.data",
     "adult.test": "https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.test",
 }
 CORA_URL: str = "https://linqs-data.soe.ucsc.edu/public/lbc/cora.tgz"
@@ -81,7 +84,7 @@ def _download(url: str, destination: Path) -> Path:
 
 
 def _extract_zip(archive: Path, destination: Path) -> None:
-    marker: Path = destination / ".extracted"
+    marker: Path = destination / EXTRACTED_MARKER
     if marker.exists():
         return
     destination.mkdir(parents=True, exist_ok=True)
@@ -588,37 +591,43 @@ def _parse_adult_file(path: Path) -> list[list[str]]:
     return rows
 
 
+def _encode_adult_rows(
+    rows: list[list[str]],
+    encoders: list[dict[str, int]],
+    numeric_columns: set[int],
+    feature_count: int,
+) -> tuple[list[list[float]], list[int]]:
+    values: list[list[float]] = []
+    labels: list[int] = []
+    for row in rows:
+        encoded: list[float] = []
+        for col in range(feature_count):
+            value: str = row[col]
+            if col in numeric_columns:
+                encoded.append(float(value) if value != "?" else 0.0)
+            else:
+                mapping: dict[str, int] = encoders[col]
+                if value not in mapping:
+                    mapping[value] = len(mapping) + 1
+                encoded.append(float(mapping[value]))
+        values.append(encoded)
+        labels.append(1 if row[-1] == ">50K" else 0)
+    return values, labels
+
+
 def _build_adult(batch_size: int) -> TaskBundle:
     torch = require_torch()
     root: Path = _data_root() / "adult"
     for filename, url in ADULT_URLS.items():
         _download(url, root / filename)
-    train_rows: list[list[str]] = _parse_adult_file(root / "adult.data")
+    train_rows: list[list[str]] = _parse_adult_file(root / ADULT_DATA_FILENAME)
     test_rows: list[list[str]] = _parse_adult_file(root / "adult.test")
     feature_count = 14
     encoders: list[dict[str, int]] = [{} for _ in range(feature_count)]
     numeric_columns: set[int] = {0, 2, 4, 10, 11, 12}
 
-    def encode(rows: list[list[str]]) -> tuple[list[list[float]], list[int]]:
-        values: list[list[float]] = []
-        labels: list[int] = []
-        for row in rows:
-            encoded: list[float] = []
-            for col in range(feature_count):
-                value: str = row[col]
-                if col in numeric_columns:
-                    encoded.append(float(value) if value != "?" else 0.0)
-                else:
-                    mapping: dict[str, int] = encoders[col]
-                    if value not in mapping:
-                        mapping[value] = len(mapping) + 1
-                    encoded.append(float(mapping[value]))
-            values.append(encoded)
-            labels.append(1 if row[-1] == ">50K" else 0)
-        return values, labels
-
-    train_x_raw, train_y_raw = encode(train_rows)
-    test_x_raw, test_y_raw = encode(test_rows)
+    train_x_raw, train_y_raw = _encode_adult_rows(train_rows, encoders, numeric_columns, feature_count)
+    test_x_raw, test_y_raw = _encode_adult_rows(test_rows, encoders, numeric_columns, feature_count)
     train_x = torch.tensor(train_x_raw, dtype=torch.float32)
     test_x = torch.tensor(test_x_raw, dtype=torch.float32)
     mean = train_x.mean(dim=0, keepdim=True)
@@ -644,6 +653,18 @@ def _build_adult(batch_size: int) -> TaskBundle:
     )
 
 
+def _parse_smiles_token(
+    smiles: str, index: int
+) -> tuple[str | None, int]:
+    """Return (token, new_index). token is None for non-atom characters."""
+    char = smiles[index]
+    if index + 1 < len(smiles) and smiles[index : index + 2] in {"Cl", "Br"}:
+        return smiles[index : index + 2], index + 2
+    if char.isalpha():
+        return char.upper(), index + 1
+    return None, index + 1
+
+
 def _smiles_to_graph(smiles: str) -> tuple[Any, Any]:
     torch = require_torch()
     atoms: list[str] = []
@@ -653,22 +674,15 @@ def _smiles_to_graph(smiles: str) -> tuple[Any, Any]:
     index = 0
     while index < len(smiles):
         char: str = smiles[index]
-        token = None
-        if index + 1 < len(smiles) and smiles[index : index + 2] in {"Cl", "Br"}:
-            token: str = smiles[index : index + 2]
-            index += 2
-        elif char.isalpha():
-            token: str = char.upper()
-            index += 1
-        elif char.isdigit() and last_atom is not None:
+        if char.isdigit() and last_atom is not None:
             if char in ring_open:
                 edges.append((ring_open.pop(char), last_atom))
             else:
                 ring_open[char] = last_atom
             index += 1
             continue
-        else:
-            index += 1
+        token, index = _parse_smiles_token(smiles, index)
+        if token is None:
             continue
         atom_index: int = len(atoms)
         atoms.append(token)
@@ -814,7 +828,7 @@ def _build_cartpole(batch_size: int) -> TaskBundle:
     torch = require_torch()
     gymnasium = _require_dependency("gymnasium", "gymnasium[classic-control]")
     numpy = _require_dependency("numpy")
-    cache: Path = _data_root() / "cartpole" / "heuristic_rollouts.pt"
+    cache: Path = _data_root() / "cartpole" / HEURISTIC_ROLLOUTS_FILENAME
     if cache.exists():
         payload = torch.load(cache, map_location="cpu")
         x, y = payload["x"], payload["y"]
@@ -844,11 +858,33 @@ def _build_cartpole(batch_size: int) -> TaskBundle:
     )
 
 
+def _lunarlander_heuristic_action(
+    x_pos: float,
+    y_pos: float,
+    x_vel: float,
+    y_vel: float,
+    angle: float,
+    left_contact: bool,
+    right_contact: bool,
+) -> int:
+    if left_contact or right_contact:
+        if abs(x_vel) < 0.2:
+            return 0
+        return 3 if x_vel < 0 else 1
+    if abs(angle) > 0.12:
+        return 1 if angle > 0 else 3
+    if y_vel < -0.25 or y_pos < 0.6:
+        return 2
+    if abs(x_pos) > 0.15:
+        return 3 if x_pos < 0 else 1
+    return 0
+
+
 def _build_lunarlander(batch_size: int) -> TaskBundle:
     torch = require_torch()
     gymnasium = _require_dependency("gymnasium", "gymnasium[box2d]")
     numpy = _require_dependency("numpy")
-    cache: Path = _data_root() / "lunarlander" / "heuristic_rollouts.pt"
+    cache: Path = _data_root() / "lunarlander" / HEURISTIC_ROLLOUTS_FILENAME
     if cache.exists():
         payload = torch.load(cache, map_location="cpu")
         x, y = payload["x"], payload["y"]
@@ -862,17 +898,10 @@ def _build_lunarlander(batch_size: int) -> TaskBundle:
         actions = []
         obs, _ = env.reset(seed=42)
         while len(observations) < 40_000:
-            x_pos, y_pos, x_vel, y_vel, angle, angular_vel, left_contact, right_contact = obs
-            if left_contact or right_contact:
-                action: int = 0 if abs(x_vel) < 0.2 else (3 if x_vel < 0 else 1)
-            elif abs(angle) > 0.12:
-                action: int = 1 if angle > 0 else 3
-            elif y_vel < -0.25 or y_pos < 0.6:
-                action = 2
-            elif abs(x_pos) > 0.15:
-                action: int = 3 if x_pos < 0 else 1
-            else:
-                action = 0
+            x_pos, y_pos, x_vel, y_vel, angle, _, left_contact, right_contact = obs
+            action = _lunarlander_heuristic_action(
+                x_pos, y_pos, x_vel, y_vel, angle, left_contact, right_contact
+            )
             observations.append(obs)
             actions.append(action)
             obs, _, terminated, truncated, _ = env.step(action)
@@ -895,7 +924,7 @@ def _build_bipedalwalker(batch_size: int) -> TaskBundle:
     torch = require_torch()
     gymnasium = _require_dependency("gymnasium", "gymnasium[box2d]")
     numpy = _require_dependency("numpy")
-    cache: Path = _data_root() / "bipedalwalker" / "heuristic_rollouts.pt"
+    cache: Path = _data_root() / "bipedalwalker" / HEURISTIC_ROLLOUTS_FILENAME
     if cache.exists():
         payload = torch.load(cache, map_location="cpu")
         x, y = payload["x"], payload["y"]
@@ -1097,10 +1126,10 @@ class _ISICDataset:
 
     def __getitem__(self, index: int) -> tuple[Any, Any]:
         torch = require_torch()
-        Image = __import__("PIL.Image", fromlist=["Image"])
+        pil_image = __import__("PIL.Image", fromlist=["Image"])
         image_path, mask_path = self.samples[index]
-        image = Image.open(image_path).convert("RGB").resize((self.image_size, self.image_size))
-        mask = Image.open(mask_path).convert("L").resize((self.image_size, self.image_size))
+        image = pil_image.open(image_path).convert("RGB").resize((self.image_size, self.image_size))
+        mask = pil_image.open(mask_path).convert("L").resize((self.image_size, self.image_size))
         image_t = torch.tensor(list(image.getdata()), dtype=torch.float32).view(
             self.image_size, self.image_size, 3
         ).permute(2, 0, 1) / 255.0
@@ -1204,18 +1233,18 @@ def dataset_exists(model_key: str) -> bool:
         "distilbert":           [root / "huggingface" / "glue"],
         "gru_forecaster":       [root / "huggingface" / "dunzane___time-series-dataset"],
         "gcn":                  [root / "cora" / "cora" / "cora.content"],
-        "tabnet":               [root / "adult" / "adult.data"],
-        "saint_adult":          [root / "adult" / "adult.data"],
+        "tabnet":               [root / "adult" / ADULT_DATA_FILENAME],
+        "saint_adult":          [root / "adult" / ADULT_DATA_FILENAME],
         "mpnn":                 [root / "esol" / "delaney-processed.csv"],
         "attentivefp_freesolv": [root / "freesolv" / "SAMPL.csv"],
-        "gin_imdbb":            [root / "imdb_binary" / ".extracted"],
-        "actor_critic":         [root / "cartpole" / "heuristic_rollouts.pt"],
-        "dqn_lunarlander":      [root / "lunarlander" / "heuristic_rollouts.pt"],
-        "ppo_bipedalwalker":    [root / "bipedalwalker" / "heuristic_rollouts.pt"],
+        "gin_imdbb":            [root / "imdb_binary" / EXTRACTED_MARKER],
+        "actor_critic":         [root / "cartpole" / HEURISTIC_ROLLOUTS_FILENAME],
+        "dqn_lunarlander":      [root / "lunarlander" / HEURISTIC_ROLLOUTS_FILENAME],
+        "ppo_bipedalwalker":    [root / "bipedalwalker" / HEURISTIC_ROLLOUTS_FILENAME],
         "lstm_autoencoder":     [root / "mit-bih" / "100.dat"],
         "pointnet_modelnet40":  [root / "modelnet40" / "raw"],
         "snn_nmnist":           [root / "nmnist"],
-        "unet_isic":            [root / "isic2018" / "images" / ".extracted"],
+        "unet_isic":            [root / "isic2018" / "images" / EXTRACTED_MARKER],
         "convlstm_movingmnist": [root / "moving_mnist" / "mnist_test_seq.npy"],
     }
     paths: list[Path] | None = sentinels.get(model_key)

@@ -127,6 +127,64 @@ def write_model_reports(
     )
 
 
+def _process_model_comparison(
+    model_key: str,
+    records: list[dict[str, Any]],
+    baselines: dict[str, dict[str, Any]],
+    condition_order: list[str],
+    quantization_groups: list[list[str]],
+) -> tuple[list[float], list[float], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return (retention_row, quant_row, winner_row, summary_rows, tradeoff_points) for one model."""
+    model_records = [r for r in records if r["model_key"] == model_key]
+    by_condition = {r["condition_key"]: r for r in model_records}
+    baseline = baselines.get(model_key, {})
+    retention_row = [
+        _normalization_score(by_condition[key], baseline) if key in by_condition else 0.0
+        for key in condition_order
+    ]
+    quant_row: list[float] = []
+    winner_row: list[int] = []
+    for group in quantization_groups:
+        scores = [
+            (i, _normalization_score(by_condition[key], baseline))
+            for i, key in enumerate(group)
+            if key in by_condition
+        ]
+        if scores:
+            best_i, best_score = max(scores, key=lambda t: t[1])
+            quant_row.append(best_score)
+            winner_row.append(0 if best_i == 0 else 1)
+        else:
+            quant_row.append(0.0)
+            winner_row.append(0)
+    summary_rows: list[dict[str, Any]] = []
+    tradeoff_points: list[dict[str, Any]] = []
+    for condition_key, record in by_condition.items():
+        if not baseline:
+            continue
+        retention = _normalization_score(record, baseline)
+        size_reduction = _size_reduction(baseline, record)
+        summary_rows.append({
+            "model_key": model_key,
+            "condition_key": condition_key,
+            "metric_name": record["metric_name"],
+            "metric_value": record["metric_value"],
+            "normalized_score_percent": retention,
+            "size_reduction_percent": size_reduction,
+            "file_size_mb": record["file_size_mb"],
+            "param_count": record["param_count"],
+            "nonzero_params": record["nonzero_params"],
+        })
+        tradeoff_points.append({
+            "x": size_reduction,
+            "y": retention,
+            "label": f"{model_key}:{condition_key}",
+            "color": "#2b6cb0" if "dendrites" not in condition_key else "#2f855a",
+            "shape": "square" if "dendrites" in condition_key else "circle",
+        })
+    return retention_row, quant_row, winner_row, summary_rows, tradeoff_points
+
+
 def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     baselines = _baseline_lookup(records)
@@ -146,66 +204,14 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
     tradeoff_points: list[dict[str, Any]] = []
     summary_rows: list[dict[str, Any]] = []
     for model_key in model_order:
-        model_records = [
-            record for record in records if record["model_key"] == model_key
-        ]
-        by_condition = {record["condition_key"]: record for record in model_records}
-        baseline = baselines.get(model_key, {})
-        retention_rows.append(
-            [
-                _normalization_score(by_condition[key], baseline)
-                if key in by_condition
-                else 0.0
-                for key in condition_order
-            ]
+        ret_row, quant_row, winner_row, s_rows, t_points = _process_model_comparison(
+            model_key, records, baselines, condition_order, quantization_groups
         )
-        quant_row: list[float] = []
-        winner_row: list[int] = []
-        for group in quantization_groups:
-            scores = [
-                (i, _normalization_score(by_condition[key], baseline))
-                for i, key in enumerate(group)
-                if key in by_condition
-            ]
-            if scores:
-                best_i, best_score = max(scores, key=lambda t: t[1])
-                quant_row.append(best_score)
-                # 0 = base (first key in group), 1 = dendrites (second key)
-                winner_row.append(0 if best_i == 0 else 1)
-            else:
-                quant_row.append(0.0)
-                winner_row.append(0)
+        retention_rows.append(ret_row)
         best_quant_rows.append(quant_row)
         best_quant_winners.append(winner_row)
-        for condition_key, record in by_condition.items():
-            if not baseline:
-                continue
-            retention = _normalization_score(record, baseline)
-            size_reduction = _size_reduction(baseline, record)
-            summary_rows.append(
-                {
-                    "model_key": model_key,
-                    "condition_key": condition_key,
-                    "metric_name": record["metric_name"],
-                    "metric_value": record["metric_value"],
-                    "normalized_score_percent": retention,
-                    "size_reduction_percent": size_reduction,
-                    "file_size_mb": record["file_size_mb"],
-                    "param_count": record["param_count"],
-                    "nonzero_params": record["nonzero_params"],
-                }
-            )
-            tradeoff_points.append(
-                {
-                    "x": size_reduction,
-                    "y": retention,
-                    "label": f"{model_key}:{condition_key}",
-                    "color": "#2b6cb0"
-                    if "dendrites" not in condition_key
-                    else "#2f855a",
-                    "shape": "square" if "dendrites" in condition_key else "circle",
-                }
-            )
+        summary_rows.extend(s_rows)
+        tradeoff_points.extend(t_points)
 
     heatmap(
         output_dir / "accuracy_retention_heatmap.svg",
@@ -259,7 +265,8 @@ def _graphs_numeric_series(
 
 
 def _graphs_has_real_values(values: list[float]) -> bool:
-    return any(v == v for v in values)
+    import math
+    return any(not math.isnan(v) for v in values)
 
 
 def _graphs_slugify(name: str) -> str:
@@ -269,28 +276,9 @@ def _graphs_slugify(name: str) -> str:
     return cleaned.strip("_") or "metric"
 
 
-def _process_condition_graphs(history_file_str: str, regenerate: bool = False) -> tuple[list[str], int]:
-    """Process one condition directory and return (log_lines, graph_count).
-    Module-level so it is picklable by ProcessPoolExecutor."""
-    import shutil
-
+def _load_history_csv(history_file: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    """Load and parse history.csv. Returns (history_rows, log_lines)."""
     logs: list[str] = []
-    graph_count = 0
-    history_file = Path(history_file_str)
-    condition_dir = history_file.parent
-    model_key = condition_dir.parent.name
-    condition_key = condition_dir.name
-    plots_dir = condition_dir / "plots"
-
-    if plots_dir.exists() and any(plots_dir.iterdir()):
-        if not regenerate:
-            logs.append(f"  Skipping — plots already exist (use --regenerate-graphs to overwrite).")
-            return logs, graph_count
-        logs.append(f"  Clearing existing plots directory: {plots_dir}")
-        shutil.rmtree(plots_dir)
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    logs.append(f"  Plots directory ready: {plots_dir}")
-
     history: list[dict[str, Any]] = []
     try:
         with history_file.open("r", newline="") as fh:
@@ -312,17 +300,91 @@ def _process_condition_graphs(history_file_str: str, regenerate: bool = False) -
         logs.append(f"  Loaded {len(history)} epoch(s) from history.csv")
     except Exception as e:
         logs.append(f"  ERROR reading {history_file}: {e} — skipping.")
-        return logs, graph_count
+    return history, logs
 
-    if not history:
-        logs.append(f"  history.csv is empty — skipping.")
+
+def _build_metric_series(
+    history: list[dict[str, Any]],
+    columns: list[tuple[str, str, str]],
+) -> list[tuple[str, list[float], str | None]]:
+    """Build a list of (label, values, color) series for columns present in history."""
+    series: list[tuple[str, list[float], str | None]] = []
+    for column, label, color in columns:
+        if any(column in row for row in history):
+            values = _graphs_numeric_series(history, column)
+            if _graphs_has_real_values(values):
+                series.append((label, values, color))
+    return series
+
+
+def _write_arch_evolution(
+    plots_dir: Path,
+    best_arch_file: Path,
+    model_key: str,
+    condition_key: str,
+    metric_name: str,
+) -> tuple[list[str], int]:
+    logs: list[str] = []
+    graph_count = 0
+    logs.append("  Found best_arch_scores.csv — generating architecture evolution plot.")
+    try:
+        arch_history = []
+        with best_arch_file.open("r", newline="") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                arch_history.append(
+                    {"cycle": int(row["cycle"]), "best_metric_value": float(row["best_metric_value"])}
+                )
+        if arch_history:
+            out_path = plots_dir / "architecture_evolution.svg"
+            line_chart(
+                out_path,
+                f"{model_key.upper()} - {condition_key}: Architecture Evolution",
+                "Cycle",
+                f"Best {metric_name}",
+                [row["cycle"] for row in arch_history],
+                [row["best_metric_value"] for row in arch_history],
+            )
+            logs.append(f"  Wrote: {out_path.name}  ({len(arch_history)} cycle(s))")
+            graph_count += 1
+        else:
+            logs.append("  best_arch_scores.csv is empty — skipping architecture evolution plot.")
+    except Exception as e:
+        logs.append(f"  ERROR reading {best_arch_file}: {e}")
+    return logs, graph_count
+
+
+def _process_condition_graphs(history_file_str: str, regenerate: bool = False) -> tuple[list[str], int]:
+    """Process one condition directory and return (log_lines, graph_count).
+    Module-level so it is picklable by ProcessPoolExecutor."""
+    import shutil
+
+    logs: list[str] = []
+    graph_count = 0
+    history_file = Path(history_file_str)
+    condition_dir = history_file.parent
+    model_key = condition_dir.parent.name
+    condition_key = condition_dir.name
+    plots_dir = condition_dir / "plots"
+
+    if plots_dir.exists() and any(plots_dir.iterdir()):
+        if not regenerate:
+            logs.append("  Skipping — plots already exist (use --regenerate-graphs to overwrite).")
+            return logs, graph_count
+        logs.append(f"  Clearing existing plots directory: {plots_dir}")
+        shutil.rmtree(plots_dir)
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    logs.append(f"  Plots directory ready: {plots_dir}")
+
+    history, load_logs = _load_history_csv(history_file)
+    logs.extend(load_logs)
+    if not history or any("ERROR" in line for line in load_logs):
         return logs, graph_count
 
     epochs = [row["epoch"] for row in history]
-
-    metrics_file = condition_dir / "metrics.json"
     metric_name = "Validation Metric"
     primary_metric_key = "metric"
+    metrics_file = condition_dir / "metrics.json"
     if metrics_file.exists():
         try:
             metrics_data = json.loads(metrics_file.read_text())
@@ -330,69 +392,48 @@ def _process_condition_graphs(history_file_str: str, regenerate: bool = False) -
             primary_metric_key = metrics_data.get("primary_metric_key", primary_metric_key)
             logs.append(f"  Metric: {metric_name} (key: {primary_metric_key})")
         except Exception:
-            logs.append(f"  WARNING: could not parse metrics.json — using defaults.")
+            logs.append("  WARNING: could not parse metrics.json — using defaults.")
     else:
-        logs.append(f"  metrics.json not found — using default metric labels.")
+        logs.append("  metrics.json not found — using default metric labels.")
 
     if "val_metric" in history[0] and "val_primary_metric" not in history[0]:
         val_metrics = _graphs_numeric_series(history, "val_metric")
-        title = f"{model_key.upper()} - {condition_key}: Training {metric_name}"
         out_path = plots_dir / "training_curve.svg"
-        line_chart(out_path, title, "Epoch", metric_name, epochs, val_metrics)
+        line_chart(out_path, f"{model_key.upper()} - {condition_key}: Training {metric_name}",
+                   "Epoch", metric_name, epochs, val_metrics)
         logs.append(f"  Wrote: {out_path.name}")
         graph_count += 1
         logs.append(f"  Done — {graph_count} graph(s) written.")
         return logs, graph_count
 
-    primary_series: list[tuple[str, list[float], str | None]] = []
-    for column, label, color in (
+    primary_series = _build_metric_series(history, [
         ("train_primary_metric", f"Train {metric_name}", "#2b6cb0"),
         ("val_primary_metric", f"Validation {metric_name}", "#2f855a"),
         ("test_primary_metric", f"Test {metric_name}", "#c05621"),
-    ):
-        if any(column in row for row in history):
-            values = _graphs_numeric_series(history, column)
-            if _graphs_has_real_values(values):
-                primary_series.append((label, values, color))
+    ])
     if primary_series:
         out_path = plots_dir / "primary_metric.svg"
-        multi_line_chart(
-            out_path,
-            f"{model_key.upper()} - {condition_key}: Primary Metric ({primary_metric_key})",
-            "Epoch",
-            metric_name,
-            epochs,
-            primary_series,
-        )
+        multi_line_chart(out_path,
+                         f"{model_key.upper()} - {condition_key}: Primary Metric ({primary_metric_key})",
+                         "Epoch", metric_name, epochs, primary_series)
         logs.append(f"  Wrote: {out_path.name}  ({len(primary_series)} series)")
         graph_count += 1
     else:
-        logs.append(f"  Skipped primary_metric.svg — no valid series found.")
+        logs.append("  Skipped primary_metric.svg — no valid series found.")
 
-    loss_series: list[tuple[str, list[float], str | None]] = []
-    for column, label, color in (
+    loss_series = _build_metric_series(history, [
         ("train_loss", "Train Loss", "#2b6cb0"),
         ("val_loss", "Validation Loss", "#2f855a"),
         ("test_loss", "Test Loss", "#c05621"),
-    ):
-        if any(column in row for row in history):
-            values = _graphs_numeric_series(history, column)
-            if _graphs_has_real_values(values):
-                loss_series.append((label, values, color))
+    ])
     if loss_series:
         out_path = plots_dir / "loss_curves.svg"
-        multi_line_chart(
-            out_path,
-            f"{model_key.upper()} - {condition_key}: Loss Curves",
-            "Epoch",
-            "Loss",
-            epochs,
-            loss_series,
-        )
+        multi_line_chart(out_path, f"{model_key.upper()} - {condition_key}: Loss Curves",
+                         "Epoch", "Loss", epochs, loss_series)
         logs.append(f"  Wrote: {out_path.name}  ({len(loss_series)} series)")
         graph_count += 1
     else:
-        logs.append(f"  Skipped loss_curves.svg — no valid series found.")
+        logs.append("  Skipped loss_curves.svg — no valid series found.")
 
     grouped_suffixes: dict[str, list[tuple[str, list[float], str | None]]] = {}
     for key in sorted({column for row in history for column in row.keys()}):
@@ -416,49 +457,19 @@ def _process_condition_graphs(history_file_str: str, regenerate: bool = False) -
 
     for suffix, series in sorted(grouped_suffixes.items()):
         out_path = plots_dir / f"metric_{_graphs_slugify(suffix)}.svg"
-        multi_line_chart(
-            out_path,
-            f"{model_key.upper()} - {condition_key}: {suffix.replace('_', ' ').title()}",
-            "Epoch",
-            suffix.replace("_", " ").title(),
-            epochs,
-            series,
-        )
+        multi_line_chart(out_path,
+                         f"{model_key.upper()} - {condition_key}: {suffix.replace('_', ' ').title()}",
+                         "Epoch", suffix.replace("_", " ").title(), epochs, series)
         logs.append(f"  Wrote: {out_path.name}  ({len(series)} series)")
         graph_count += 1
 
     best_arch_file = condition_dir / "best_arch_scores.csv"
     if best_arch_file.exists():
-        logs.append(f"  Found best_arch_scores.csv — generating architecture evolution plot.")
-        try:
-            arch_history = []
-            with best_arch_file.open("r", newline="") as fh:
-                reader = csv.DictReader(fh)
-                for row in reader:
-                    arch_history.append(
-                        {
-                            "cycle": int(row["cycle"]),
-                            "best_metric_value": float(row["best_metric_value"]),
-                        }
-                    )
-            if arch_history:
-                cycles = [row["cycle"] for row in arch_history]
-                best_metrics = [row["best_metric_value"] for row in arch_history]
-                out_path = plots_dir / "architecture_evolution.svg"
-                line_chart(
-                    out_path,
-                    f"{model_key.upper()} - {condition_key}: Architecture Evolution",
-                    "Cycle",
-                    f"Best {metric_name}",
-                    cycles,
-                    best_metrics,
-                )
-                logs.append(f"  Wrote: {out_path.name}  ({len(arch_history)} cycle(s))")
-                graph_count += 1
-            else:
-                logs.append(f"  best_arch_scores.csv is empty — skipping architecture evolution plot.")
-        except Exception as e:
-            logs.append(f"  ERROR reading {best_arch_file}: {e}")
+        arch_logs, arch_count = _write_arch_evolution(
+            plots_dir, best_arch_file, model_key, condition_key, metric_name
+        )
+        logs.extend(arch_logs)
+        graph_count += arch_count
 
     logs.append(f"  Done — {graph_count} graph(s) written.")
     return logs, graph_count

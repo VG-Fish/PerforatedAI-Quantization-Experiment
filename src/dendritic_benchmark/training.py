@@ -18,6 +18,21 @@ from .compat import (
     ternary_quantize_tensor,
 )
 
+_MODEL_PT = "model.pt"
+
+
+@dataclass
+class TrainingConfig:
+    bit_width: int | None = None
+    quantization_mode: str | None = None
+    use_dendrites: bool = False
+    use_pruning: bool = False
+    prune_amount: float = 0.4
+    use_qat: bool = False
+    fine_tune_epochs: int = 0
+    max_epochs: int = 8
+    source_condition_key: str | None = None
+
 
 @dataclass
 class TrainingRecord:
@@ -535,21 +550,21 @@ def _history_fieldnames(history: list[dict[str, Any]]) -> list[str]:
     return fieldnames
 
 
-def _forward(model_key: str, model: Any, batch: tuple[Any, ...]) -> tuple[Any, ...]:
+def _forward(model_key: str, model: Any, batch: tuple[Any, ...]) -> tuple[Any, Any, Any]:
     if model_key in {"gcn", "gin_imdbb"}:
         x, adjacency, targets = batch
-        return model(x, adjacency), targets
+        return model(x, adjacency), targets, None
     if model_key in {"mpnn", "attentivefp_freesolv"}:
         node_features, adjacency, targets = batch
-        return model(node_features, adjacency), targets
+        return model(node_features, adjacency), targets, None
     if model_key == "lstm_autoencoder":
         x, target, metric_targets = batch
         return model(x), target, metric_targets
     if model_key == "actor_critic":
         x, targets = batch
-        return model(x), targets
+        return model(x), targets, None
     x, targets = batch
-    return model(x), targets
+    return model(x), targets, None
 
 
 def _compute_loss(model_key: str, criterion: Any, outputs: Any, targets: Any) -> Any:
@@ -591,11 +606,11 @@ def _make_quantized_copy(
 
 def _artifact_path(output_dir: Path, use_dendrites: bool) -> Path:
     if use_dendrites:
-        for candidate in ("final_clean_pai", "best_model", "model.pt"):
+        for candidate in ("final_clean_pai", "best_model", _MODEL_PT):
             path = output_dir / candidate
             if path.exists():
                 return path
-    return output_dir / "model.pt"
+    return output_dir / _MODEL_PT
 
 
 def _format_metric_value(value: float) -> str:
@@ -648,6 +663,85 @@ def _write_dendritic_sidecars(
             )
 
 
+def _apply_pruning(model: Any, torch: Any, prune_amount: float) -> None:
+    try:
+        import torch.nn.utils.prune as prune
+
+        parameters_to_prune = [
+            (module, "weight")
+            for module in model.modules()
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d, torch.nn.Conv2d))
+        ]
+        if parameters_to_prune:
+            prune.global_unstructured(
+                parameters_to_prune,
+                pruning_method=prune.L1Unstructured,
+                amount=prune_amount,
+            )
+            for module, _ in parameters_to_prune:
+                if hasattr(module, "weight_orig"):
+                    prune.remove(module, "weight")
+    except Exception:
+        pass
+
+
+def _apply_torch_compile(
+    model: Any, torch: Any, model_key: str, condition_key: str, device: Any, use_dendrites: bool
+) -> Any:
+    if use_dendrites or not hasattr(torch, "compile") or getattr(device, "type", "") != "mps":
+        return model
+    try:
+        model = torch.compile(model, backend="aot_eager", fullgraph=False)
+        print(f"[compile] torch.compile(aot_eager) applied to {model_key}/{condition_key}")
+    except Exception as _compile_exc:
+        print(f"[compile] torch.compile skipped for {model_key}/{condition_key}: {_compile_exc}")
+    return model
+
+
+def _eval_on_loader(
+    model: Any,
+    model_key: str,
+    loader: Any,
+    device: Any,
+    criterion: Any,
+    metric_name: str,
+    primary_metric_key: str,
+    torch: Any,
+) -> tuple[float, dict[str, Any]]:
+    """Run evaluation on a dataloader, return (loss, metrics)."""
+    running_loss_t = torch.zeros(1, device=device)
+    examples = 0
+    outputs_list: list[Any] = []
+    targets_list: list[Any] = []
+    metric_targets_list: list[Any] = []
+    with torch.no_grad():
+        for batch in loader:
+            batch = tuple(item.to(device, non_blocking=True) for item in batch)
+            outputs, targets, metric_targets = _forward(model_key, model, batch)
+            loss = _compute_loss(model_key, criterion, outputs, targets)
+            batch_examples = _batch_size(targets)
+            running_loss_t = running_loss_t + loss.detach() * batch_examples
+            examples += batch_examples
+            det_outputs, det_targets, det_metric_targets = _detach_metric_payload(
+                model_key, outputs, targets, metric_targets
+            )
+            outputs_list.append(det_outputs)
+            targets_list.append(det_targets)
+            if det_metric_targets is not None:
+                metric_targets_list.append(det_metric_targets)
+    loss_val = (running_loss_t / max(1, examples)).item()
+    metrics: dict[str, Any] = {}
+    if outputs_list:
+        metrics = _compute_all_metrics(
+            model_key,
+            _cat_payload(outputs_list),
+            torch.cat(targets_list, dim=0),
+            torch.cat(metric_targets_list, dim=0) if metric_targets_list else None,
+            metric_name=metric_name,
+        )
+    return loss_val, metrics
+
+
 def train_and_evaluate(
     *,
     model_key: str,
@@ -658,16 +752,19 @@ def train_and_evaluate(
     model: Any,
     bundle: Any,
     output_dir: Path,
-    bit_width: int | None = None,
-    quantization_mode: str | None = None,
-    use_dendrites: bool = False,
-    use_pruning: bool = False,
-    prune_amount: float = 0.4,
-    use_qat: bool = False,
-    fine_tune_epochs: int = 0,
-    max_epochs: int = 8,
-    source_condition_key: str | None = None,
+    config: TrainingConfig | None = None,
 ) -> TrainingRecord:
+    if config is None:
+        config = TrainingConfig()
+    bit_width = config.bit_width
+    quantization_mode = config.quantization_mode
+    use_dendrites = config.use_dendrites
+    use_pruning = config.use_pruning
+    prune_amount = config.prune_amount
+    use_qat = config.use_qat
+    max_epochs = config.max_epochs
+    source_condition_key = config.source_condition_key
+
     torch = require_torch()
     device = choose_device()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -685,51 +782,12 @@ def train_and_evaluate(
             linear.set_this_output_dimensions(torch.tensor([-1, 0], device=device))
 
     if use_pruning:
-        try:
-            import torch.nn.utils.prune as prune
-
-            parameters_to_prune = [
-                (module, "weight")
-                for module in model.modules()
-                if isinstance(
-                    module, (torch.nn.Linear, torch.nn.Conv1d, torch.nn.Conv2d)
-                )
-            ]
-            if parameters_to_prune:
-                prune.global_unstructured(
-                    parameters_to_prune,
-                    pruning_method=prune.L1Unstructured,
-                    amount=prune_amount,
-                )
-                for module, _ in parameters_to_prune:
-                    if hasattr(module, "weight_orig"):
-                        prune.remove(module, "weight")
-        except Exception:
-            pass
+        _apply_pruning(model, torch, prune_amount)
 
     if bit_width is not None and bit_width < 32 and use_qat:
         model = _make_quantized_copy(model, bit_width, quantization_mode)
 
-    # Compile non-dendritic models on MPS to fuse operators and cut Python-dispatch
-    # overhead.  The "aot_eager" backend is used because the default "inductor"
-    # backend requires Triton, which is not available on macOS / Apple Silicon.
-    # PerforatedAI-wrapped (dendritic) models are excluded since their custom
-    # forward logic may not be fully traceable by the compiler.
-    if (
-        not use_dendrites
-        and hasattr(torch, "compile")
-        and getattr(device, "type", "") == "mps"
-    ):
-        try:
-            model = torch.compile(model, backend="aot_eager", fullgraph=False)
-            print(
-                f"[compile] torch.compile(aot_eager) applied to {model_key}/{condition_key}"
-            )
-        except Exception as _compile_exc:
-            print(
-                f"[compile] torch.compile skipped for {model_key}/{condition_key}: "
-                f"{_compile_exc}"
-            )
+    model = _apply_torch_compile(model, torch, model_key, condition_key, device, use_dendrites)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = _binary_or_multi_loss(model_key)
@@ -790,7 +848,7 @@ def train_and_evaluate(
                 # set_to_none=True skips the memset and lets the allocator reuse
                 # gradient buffers, saving a small but consistent amount of work.
                 optimizer.zero_grad(set_to_none=True)
-                outputs, targets, *rest = _forward(model_key, model, batch)
+                outputs, targets, metric_targets = _forward(model_key, model, batch)
                 loss = _compute_loss(model_key, criterion, outputs, targets)
                 loss.backward()
                 optimizer.step()
@@ -798,7 +856,6 @@ def train_and_evaluate(
                 # Accumulate on-device — no CPU–GPU sync in the hot path.
                 running_loss_t = running_loss_t + loss.detach() * batch_examples
                 train_examples += batch_examples
-                metric_targets = rest[0] if rest else None
                 detached_outputs, detached_targets, detached_metric_targets = (
                     _detach_metric_payload(model_key, outputs, targets, metric_targets)
                 )
@@ -825,44 +882,10 @@ def train_and_evaluate(
                 )
 
             model.eval()
-            val_running_loss_t = torch.zeros(1, device=device)
-            val_examples = 0
-            val_outputs: list[Any] = []
-            val_targets: list[Any] = []
-            val_metric_targets: list[Any] = []
-            with torch.no_grad():
-                for batch in bundle.val_loader:
-                    batch = tuple(item.to(device, non_blocking=True) for item in batch)
-                    outputs, targets, *rest = _forward(model_key, model, batch)
-                    metric_targets = rest[0] if rest else None
-                    loss = _compute_loss(model_key, criterion, outputs, targets)
-                    batch_examples = _batch_size(targets)
-                    val_running_loss_t = (
-                        val_running_loss_t + loss.detach() * batch_examples
-                    )
-                    val_examples += batch_examples
-                    detached_outputs, detached_targets, detached_metric_targets = (
-                        _detach_metric_payload(
-                            model_key, outputs, targets, metric_targets
-                        )
-                    )
-                    val_outputs.append(detached_outputs)
-                    val_targets.append(detached_targets)
-                    if detached_metric_targets is not None:
-                        val_metric_targets.append(detached_metric_targets)
-
-            val_loss = (val_running_loss_t / max(1, val_examples)).item()
-            val_metrics = {}
-            if val_outputs:
-                val_metrics = _compute_all_metrics(
-                    model_key,
-                    _cat_payload(val_outputs),
-                    torch.cat(val_targets, dim=0),
-                    torch.cat(val_metric_targets, dim=0)
-                    if val_metric_targets
-                    else None,
-                    metric_name=metric_name,
-                )
+            val_loss, val_metrics = _eval_on_loader(
+                model, model_key, bundle.val_loader, device, criterion,
+                metric_name, primary_metric_key, torch
+            )
             val_metric = float(val_metrics.get(primary_metric_key, 0.0))
 
             history_row: dict[str, Any] = {
@@ -930,43 +953,15 @@ def train_and_evaluate(
         model = _make_quantized_copy(model, bit_width, quantization_mode)
 
     model.eval()
-    test_running_loss_t = torch.zeros(1, device=device)
-    test_examples = 0
-    test_outputs: list[Any] = []
-    test_targets: list[Any] = []
-    test_metric_targets: list[Any] = []
-    with torch.no_grad():
-        for batch in bundle.test_loader:
-            batch = tuple(item.to(device, non_blocking=True) for item in batch)
-            outputs, targets, *rest = _forward(model_key, model, batch)
-            metric_targets = rest[0] if rest else None
-            loss = _compute_loss(model_key, criterion, outputs, targets)
-            batch_examples = _batch_size(targets)
-            test_running_loss_t = test_running_loss_t + loss.detach() * batch_examples
-            test_examples += batch_examples
-            detached_outputs, detached_targets, detached_metric_targets = (
-                _detach_metric_payload(model_key, outputs, targets, metric_targets)
-            )
-            test_outputs.append(detached_outputs)
-            test_targets.append(detached_targets)
-            if detached_metric_targets is not None:
-                test_metric_targets.append(detached_metric_targets)
-
-    test_loss = (test_running_loss_t / max(1, test_examples)).item()
-    test_metrics = {}
-    if test_outputs:
-        test_metrics = _compute_all_metrics(
-            model_key,
-            _cat_payload(test_outputs),
-            torch.cat(test_targets, dim=0),
-            torch.cat(test_metric_targets, dim=0) if test_metric_targets else None,
-            metric_name=metric_name,
-        )
+    test_loss, test_metrics = _eval_on_loader(
+        model, model_key, bundle.test_loader, device, criterion,
+        metric_name, primary_metric_key, torch
+    )
     final_metric = float(test_metrics.get(primary_metric_key, 0.0))
     if best_epoch == 0:
         best_metric = final_metric
 
-    checkpoint_path = output_dir / "model.pt"
+    checkpoint_path = output_dir / _MODEL_PT
     # Always save from the unwrapped module so checkpoint keys are portable
     # (no "_orig_mod." prefix) and can be loaded by any uncompiled model.
     _plain_model = _unwrap_compiled(model)

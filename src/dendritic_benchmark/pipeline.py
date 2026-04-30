@@ -15,9 +15,11 @@ from .results import (
     write_model_reports,
 )
 from .specs import CONDITION_SPECS, MODEL_SPECS, ConditionSpec, condition_by_key, model_by_key
-from .training import TrainingRecord, train_and_evaluate
+from .training import TrainingConfig, TrainingRecord, train_and_evaluate
 
 EPOCH_MULTIPLIER = 10
+_RECORD_JSON = "record.json"
+_MODEL_PT = "model.pt"
 
 
 def _log(msg: str, *, before: bool = False, after: bool = False) -> None:
@@ -90,14 +92,14 @@ class BenchmarkRunner:
     def _artifact_path(
         self, condition_dir: Path, prefer_dendritic: bool = False
     ) -> Path:
-        candidates = ["model.pt"]
+        candidates = [_MODEL_PT]
         if prefer_dendritic:
-            candidates = ["final_clean_pai", "best_model", "model.pt"]
+            candidates = ["final_clean_pai", "best_model", _MODEL_PT]
         for name in candidates:
             path = condition_dir / name
             if path.exists():
                 return path
-        return condition_dir / "model.pt"
+        return condition_dir / _MODEL_PT
 
     def _expand_condition_keys(self, condition_keys: list[str] | None) -> list[str]:
         requested = condition_keys or [spec.key for spec in CONDITION_SPECS]
@@ -161,8 +163,62 @@ class BenchmarkRunner:
                 linear.set_this_output_dimensions([-1, 0])
         return model
 
-    def _base_epoch_budget(self, condition: ConditionSpec) -> int:
+    def _base_epoch_budget(self, _condition: ConditionSpec) -> int:
         return 4 * EPOCH_MULTIPLIER
+
+    def _load_saved_condition(
+        self,
+        model_key: str,
+        condition: ConditionSpec,
+        model_records: list[dict[str, Any]],
+        all_records: list[dict[str, Any]],
+        saved_dirs: dict[str, Path],
+    ) -> None:
+        condition_dir = self.results_root / model_key / condition.key
+        record_path = condition_dir / _RECORD_JSON
+        _log(f"[skip] {model_key} / {condition.key} — record.json found, skipping training.")
+        record = TrainingRecord(**json.loads(record_path.read_text()))
+        model_records.append(record.to_dict())
+        all_records.append(record.to_dict())
+        saved_dirs[condition.key] = condition_dir
+
+    def _train_pending_condition(
+        self,
+        model_spec: Any,
+        condition: ConditionSpec,
+        bundle: Any,
+        ignore_saved: bool,
+        model_records: list[dict[str, Any]],
+        all_records: list[dict[str, Any]],
+        saved_dirs: dict[str, Path],
+    ) -> bool:
+        condition_dir = self.results_root / model_spec.key / condition.key
+        record_path = condition_dir / _RECORD_JSON
+        if record_path.exists() and not ignore_saved:
+            _log(f"[skip] {model_spec.key} / {condition.key} — record.json found, skipping training.")
+            record = TrainingRecord(**json.loads(record_path.read_text()))
+            newly_trained = False
+        else:
+            _log(f"[train] {model_spec.key} / {condition.key} — starting…", before=True)
+            record = self._run_condition(
+                model_spec.key,
+                model_spec.metric_name,
+                model_spec.metric_direction,
+                bundle,
+                condition,
+                saved_dirs,
+            )
+            save_training_record(record, condition_dir)
+            _log(
+                f"[done] {model_spec.key} / {condition.key} — "
+                f"{model_spec.metric_name}: {record.metric_value:.4f}",
+                after=True,
+            )
+            newly_trained = True
+        model_records.append(record.to_dict())
+        all_records.append(record.to_dict())
+        saved_dirs[condition.key] = condition_dir
+        return newly_trained
 
     def run(
         self,
@@ -179,16 +235,13 @@ class BenchmarkRunner:
         all_records: list[dict[str, Any]] = []
 
         for model_spec in selected_models:
-            # Check which conditions still need training before loading the dataset.
             pending = [
                 cond for cond in selected_conditions
                 if ignore_saved or not (
-                    self.results_root / model_spec.key / cond.key / "record.json"
+                    self.results_root / model_spec.key / cond.key / _RECORD_JSON
                 ).exists()
             ]
-            already_done = [
-                cond for cond in selected_conditions if cond not in pending
-            ]
+            already_done = [cond for cond in selected_conditions if cond not in pending]
 
             if not pending:
                 _log(
@@ -206,57 +259,20 @@ class BenchmarkRunner:
             model_records: list[dict[str, Any]] = []
             saved_dirs: dict[str, Path] = {}
 
-            # Load already-recorded conditions first (no dataset needed).
             for condition in already_done:
-                condition_dir = self.results_root / model_spec.key / condition.key
-                record_path = condition_dir / "record.json"
-                _log(
-                    f"[skip] {model_spec.key} / {condition.key} "
-                    "— record.json found, skipping training."
+                self._load_saved_condition(
+                    model_spec.key, condition, model_records, all_records, saved_dirs
                 )
-                record = TrainingRecord(**json.loads(record_path.read_text()))
-                model_records.append(record.to_dict())
-                all_records.append(record.to_dict())
-                saved_dirs[condition.key] = condition_dir
 
-            # Load dataset only when at least one condition needs training.
             newly_trained = False
             if pending:
                 bundle = build_task_bundle(model_spec.key)
                 for condition in pending:
-                    condition_dir = self.results_root / model_spec.key / condition.key
-                    record_path = condition_dir / "record.json"
-                    if record_path.exists() and not ignore_saved:
-                        _log(
-                            f"[skip] {model_spec.key} / {condition.key} "
-                            "— record.json found, skipping training."
-                        )
-                        record = TrainingRecord(**json.loads(record_path.read_text()))
-                    else:
-                        _log(
-                            f"[train] {model_spec.key} / {condition.key} — starting…",
-                            before=True,
-                        )
-                        record = self._run_condition(
-                            model_spec.key,
-                            model_spec.display_name,
-                            model_spec.metric_name,
-                            model_spec.metric_direction,
-                            bundle,
-                            condition,
-                            saved_dirs,
-                        )
-                        save_training_record(record, condition_dir)
-                        _log(
-                            f"[done] {model_spec.key} / {condition.key} — "
-                            f"{model_spec.metric_name}: "
-                            f"{record.metric_value:.4f}",
-                            after=True,
-                        )
+                    if self._train_pending_condition(
+                        model_spec, condition, bundle, ignore_saved,
+                        model_records, all_records, saved_dirs,
+                    ):
                         newly_trained = True
-                    model_records.append(record.to_dict())
-                    all_records.append(record.to_dict())
-                    saved_dirs[condition.key] = condition_dir
 
             write_model_reports(
                 model_spec.display_name,
@@ -264,9 +280,6 @@ class BenchmarkRunner:
                 self.results_root / model_spec.key,
             )
 
-            # Eagerly regenerate comparison outputs as soon as at least 2 models have
-            # finished training, so results are visible without waiting for all models.
-            # Only regenerate when new training actually occurred (not when skipping).
             if newly_trained:
                 completed_model_keys = {r["model_key"] for r in all_records}
                 if len(completed_model_keys) >= 2:
@@ -278,8 +291,6 @@ class BenchmarkRunner:
                     write_manifest(all_records, self.results_root / "manifest.csv")
                     write_comparison_reports(all_records, self.comparison_root)
 
-        # Final write covers the single-model case and ensures the manifest and
-        # comparison outputs always reflect every completed model.
         write_manifest(all_records, self.results_root / "manifest.csv")
         write_comparison_reports(all_records, self.comparison_root)
         return all_records
@@ -287,14 +298,13 @@ class BenchmarkRunner:
     def _run_condition(
         self,
         model_key: str,
-        display_name: str,
         metric_name: str,
         metric_direction: str,
         bundle: Any,
         condition: ConditionSpec,
         saved_dirs: dict[str, Path],
     ) -> TrainingRecord:
-        torch = require_torch()
+        require_torch()
         model = build_model(model_key, **self._model_kwargs(model_key))
         if condition.source_key in saved_dirs:
             checkpoint = self._artifact_path(
@@ -320,15 +330,7 @@ class BenchmarkRunner:
             )
             model = self._configure_perforated_model(model, model_key)
 
-        return train_and_evaluate(
-            model_key=model_key,
-            condition_key=condition.key,
-            display_name=condition.display_name,
-            metric_name=metric_name,
-            metric_direction=metric_direction,
-            model=model,
-            bundle=bundle,
-            output_dir=self.results_root / model_key / condition.key,
+        training_config = TrainingConfig(
             bit_width=condition.bit_width,
             quantization_mode=condition.quantization_mode,
             use_dendrites=condition.use_dendrites,
@@ -338,4 +340,15 @@ class BenchmarkRunner:
             fine_tune_epochs=condition.fine_tune_epochs,
             max_epochs=self._base_epoch_budget(condition),
             source_condition_key=condition.source_key,
+        )
+        return train_and_evaluate(
+            model_key=model_key,
+            condition_key=condition.key,
+            display_name=condition.display_name,
+            metric_name=metric_name,
+            metric_direction=metric_direction,
+            model=model,
+            bundle=bundle,
+            output_dir=self.results_root / model_key / condition.key,
+            config=training_config,
         )

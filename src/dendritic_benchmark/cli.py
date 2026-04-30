@@ -5,6 +5,7 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from .compat import load_project_environment, perforatedai_credentials_present
 from .data import DATA_ROOT_ENV, DEFAULT_DATA_ROOT, build_task_bundle, dataset_exists
@@ -199,6 +200,66 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
+    runner = BenchmarkRunner(results_root=results_root, comparison_root=comparison_root)
+    runner.run(
+        model_keys=args.models,
+        condition_keys=args.conditions,
+        ignore_saved=args.ignore_saved_models,
+    )
+
+
+def _handle_download_data(args: Any) -> None:
+    selected = args.models or [spec.key for spec in MODEL_SPECS]
+    total = len(selected)
+    data_root = Path(os.environ.get(DATA_ROOT_ENV, DEFAULT_DATA_ROOT)).resolve()
+    _log(f"[data] root        : {data_root}")
+    _log(f"[data] models      : {total}")
+    print(f"{'─' * 60}")
+    skipped = 0
+    downloaded = 0
+    failures: list[tuple[str, str]] = []
+    for i, model_key in enumerate(selected, 1):
+        prefix = f"[{i}/{total}] {model_key}"
+        if dataset_exists(model_key):
+            _log(f"{prefix} — already cached, skipping.")
+            skipped += 1
+            continue
+        _log(f"{prefix} — downloading / preparing…")
+        t0 = time.monotonic()
+        try:
+            build_task_bundle(model_key)
+            elapsed = time.monotonic() - t0
+            _log(f"{prefix} — done ({elapsed:.1f}s).")
+            downloaded += 1
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            if args.strict:
+                raise
+            failures.append((model_key, str(exc)))
+            _log(f"{prefix} — FAILED after {elapsed:.1f}s: {exc}")
+    print(f"{'─' * 60}")
+    _log(
+        f"[data] finished — {downloaded} downloaded, "
+        f"{skipped} already cached, {len(failures)} failed."
+    )
+    if failures:
+        _log("[data] failures:")
+        for model_key, message in failures:
+            print(f"  - {model_key}: {message}")
+
+
+def _handle_compare(args: Any, results_root: Path, comparison_root: Path) -> None:
+    records = load_training_records(results_root)
+    if args.manifest:
+        write_manifest(records, results_root / "manifest.csv")
+    for model_spec in MODEL_SPECS:
+        model_records = [record for record in records if record["model_key"] == model_spec.key]
+        if model_records:
+            write_model_reports(model_spec.display_name, model_records, results_root / model_spec.key)
+    write_comparison_reports(records, comparison_root)
+
+
 def main() -> None:
     load_project_environment()
     parser = build_parser()
@@ -212,70 +273,15 @@ def main() -> None:
         _log("PerforatedAI credentials detected in environment; beta-capable features can be used if installed.")
 
     if args.command == "run":
-        runner = BenchmarkRunner(results_root=results_root, comparison_root=comparison_root)
-        runner.run(
-            model_keys=args.models,
-            condition_keys=args.conditions,
-            ignore_saved=args.ignore_saved_models,
-        )
-        return
-
-    if args.command == "download_data":
-        selected = args.models or [spec.key for spec in MODEL_SPECS]
-        total = len(selected)
-        data_root = Path(os.environ.get(DATA_ROOT_ENV, DEFAULT_DATA_ROOT)).resolve()
-        _log(f"[data] root        : {data_root}")
-        _log(f"[data] models      : {total}")
-        print(f"{'─' * 60}")
-        skipped = 0
-        downloaded = 0
-        failures: list[tuple[str, str]] = []
-        for i, model_key in enumerate(selected, 1):
-            prefix = f"[{i}/{total}] {model_key}"
-            if dataset_exists(model_key):
-                _log(f"{prefix} — already cached, skipping.")
-                skipped += 1
-                continue
-            _log(f"{prefix} — downloading / preparing…")
-            t0 = time.monotonic()
-            try:
-                build_task_bundle(model_key)
-                elapsed = time.monotonic() - t0
-                _log(f"{prefix} — done ({elapsed:.1f}s).")
-                downloaded += 1
-            except Exception as exc:
-                elapsed = time.monotonic() - t0
-                if args.strict:
-                    raise
-                failures.append((model_key, str(exc)))
-                _log(f"{prefix} — FAILED after {elapsed:.1f}s: {exc}")
-        print(f"{'─' * 60}")
-        _log(
-            f"[data] finished — {downloaded} downloaded, "
-            f"{skipped} already cached, {len(failures)} failed."
-        )
-        if failures:
-            _log("[data] failures:")
-            for model_key, message in failures:
-                print(f"  - {model_key}: {message}")
-        return
-
-    if args.command == "compare":
-        records = load_training_records(results_root)
-        if args.manifest:
-            write_manifest(records, results_root / "manifest.csv")
-        for model_spec in MODEL_SPECS:
-            model_records = [record for record in records if record["model_key"] == model_spec.key]
-            if model_records:
-                write_model_reports(model_spec.display_name, model_records, results_root / model_spec.key)
-        write_comparison_reports(records, comparison_root)
-        return
-
-    if args.command == "generate_graphs":
+        _handle_run(args, results_root, comparison_root)
+    elif args.command == "download_data":
+        _handle_download_data(args)
+    elif args.command == "compare":
+        _handle_compare(args, results_root, comparison_root)
+    elif args.command == "generate_graphs":
         generate_training_graphs(results_root, regenerate=args.regenerate_graphs)
-        return
-
-    parser.print_help()
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":

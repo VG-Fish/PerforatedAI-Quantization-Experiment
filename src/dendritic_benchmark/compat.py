@@ -104,6 +104,33 @@ def backend_status() -> BackendStatus:
     )
 
 
+def _configure_pai_trackers(
+    GPA: Any,
+    modules_to_track: list[Any] | None,
+    module_names_to_track: list[str] | None,
+    confirm_unwrapped_modules: bool,
+) -> None:
+    for setter_name in (
+        "set_modules_to_track",
+        "set_module_names_to_track",
+        "set_module_ids_to_track",
+        "set_modules_to_perforate",
+        "set_module_names_to_perforate",
+        "set_module_ids_to_perforate",
+    ):
+        setter = getattr(GPA.pc, setter_name, None)
+        if setter is not None:
+            setter([])
+    if modules_to_track:
+        GPA.pc.append_modules_to_track(modules_to_track)
+    if module_names_to_track:
+        GPA.pc.append_module_names_to_track(module_names_to_track)
+    if hasattr(GPA.pc, "set_testing_dendrite_capacity"):
+        GPA.pc.set_testing_dendrite_capacity(False)
+    if confirm_unwrapped_modules:
+        GPA.pc.set_unwrapped_modules_confirmed(True)
+
+
 def perforate_model(
     model: Any,
     save_name: str,
@@ -140,25 +167,7 @@ def perforate_model(
         GPA = importlib.import_module("perforatedai.globals_perforatedai")
         UPA = importlib.import_module("perforatedai.utils_perforatedai")
 
-        for setter_name in (
-            "set_modules_to_track",
-            "set_module_names_to_track",
-            "set_module_ids_to_track",
-            "set_modules_to_perforate",
-            "set_module_names_to_perforate",
-            "set_module_ids_to_perforate",
-        ):
-            setter = getattr(GPA.pc, setter_name, None)
-            if setter is not None:
-                setter([])
-        if modules_to_track:
-            GPA.pc.append_modules_to_track(modules_to_track)
-        if module_names_to_track:
-            GPA.pc.append_module_names_to_track(module_names_to_track)
-        if hasattr(GPA.pc, "set_testing_dendrite_capacity"):
-            GPA.pc.set_testing_dendrite_capacity(False)
-        if confirm_unwrapped_modules:
-            GPA.pc.set_unwrapped_modules_confirmed(True)
+        _configure_pai_trackers(GPA, modules_to_track, module_names_to_track, confirm_unwrapped_modules)
 
         return UPA.perforate_model(
             model,
