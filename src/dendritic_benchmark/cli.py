@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import os
+import time
 from pathlib import Path
 
 from .compat import load_project_environment, perforatedai_credentials_present
-from .data import build_task_bundle
+from .data import DATA_ROOT_ENV, DEFAULT_DATA_ROOT, build_task_bundle, dataset_exists
 from .pipeline import BenchmarkRunner
 from .results import load_training_records, write_comparison_reports, write_manifest, write_model_reports, generate_training_graphs
 from .specs import MODEL_SPECS
@@ -54,18 +56,40 @@ def main() -> None:
 
     if args.command == "download_data":
         selected = args.models or [spec.key for spec in MODEL_SPECS]
-        failures = []
-        for model_key in selected:
-            print(f"[data] preparing {model_key}")
+        total = len(selected)
+        data_root = Path(os.environ.get(DATA_ROOT_ENV, DEFAULT_DATA_ROOT)).resolve()
+        print(f"[data] root        : {data_root}")
+        print(f"[data] models      : {total}")
+        print(f"{'─' * 60}")
+        skipped = 0
+        downloaded = 0
+        failures: list[tuple[str, str]] = []
+        for i, model_key in enumerate(selected, 1):
+            prefix = f"[{i}/{total}] {model_key}"
+            if dataset_exists(model_key):
+                print(f"{prefix} — already cached, skipping.")
+                skipped += 1
+                continue
+            print(f"{prefix} — downloading / preparing…")
+            t0 = time.monotonic()
             try:
                 build_task_bundle(model_key)
+                elapsed = time.monotonic() - t0
+                print(f"{prefix} — done ({elapsed:.1f}s).")
+                downloaded += 1
             except Exception as exc:
+                elapsed = time.monotonic() - t0
                 if args.strict:
                     raise
                 failures.append((model_key, str(exc)))
-                print(f"[data] FAILED {model_key}: {exc}")
+                print(f"{prefix} — FAILED after {elapsed:.1f}s: {exc}")
+        print(f"{'─' * 60}")
+        print(
+            f"[data] finished — {downloaded} downloaded, "
+            f"{skipped} already cached, {len(failures)} failed."
+        )
         if failures:
-            print("[data] completed with failures:")
+            print("[data] failures:")
             for model_key, message in failures:
                 print(f"  - {model_key}: {message}")
         return

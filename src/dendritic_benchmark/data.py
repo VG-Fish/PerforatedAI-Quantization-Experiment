@@ -1184,6 +1184,47 @@ _BATCH_SIZES: dict[str, int] = {
 }
 
 
+def dataset_exists(model_key: str) -> bool:
+    """Return True if the primary data files for *model_key* appear to be cached on disk.
+
+    Uses a per-model sentinel path — a file or directory whose presence indicates
+    that the download and extraction steps have already completed.  A False result
+    is always safe: ``build_task_bundle`` will then run and fill any gaps.
+    """
+    root = _data_root()
+    sentinels: dict[str, list[Path]] = {
+        "lenet5":               [root / "mnist"],
+        "vae_mnist":            [root / "mnist"],
+        "capsnet_mnist":        [root / "mnist"],
+        "resnet18_cifar10":     [root / "cifar10"],
+        "mobilenetv2_cifar10":  [root / "cifar10"],
+        "m5":                   [root / "speechcommands"],
+        "lstm_forecaster":      [root / "etth1" / "ETTh1.csv"],
+        "tcn_forecaster":       [root / "ettm1" / "ETTm1.csv"],
+        "textcnn":              [root / "huggingface" / "ag_news"],
+        "distilbert":           [root / "huggingface" / "glue"],
+        "gru_forecaster":       [root / "huggingface" / "dunzane___time-series-dataset"],
+        "gcn":                  [root / "cora" / "cora" / "cora.content"],
+        "tabnet":               [root / "adult" / "adult.data"],
+        "saint_adult":          [root / "adult" / "adult.data"],
+        "mpnn":                 [root / "esol" / "delaney-processed.csv"],
+        "attentivefp_freesolv": [root / "freesolv" / "SAMPL.csv"],
+        "gin_imdbb":            [root / "imdb_binary" / ".extracted"],
+        "actor_critic":         [root / "cartpole" / "heuristic_rollouts.pt"],
+        "dqn_lunarlander":      [root / "lunarlander" / "heuristic_rollouts.pt"],
+        "ppo_bipedalwalker":    [root / "bipedalwalker" / "heuristic_rollouts.pt"],
+        "lstm_autoencoder":     [root / "mit-bih" / "100.dat"],
+        "pointnet_modelnet40":  [root / "modelnet40" / "raw"],
+        "snn_nmnist":           [root / "nmnist"],
+        "unet_isic":            [root / "isic2018" / "images" / ".extracted"],
+        "convlstm_movingmnist": [root / "moving_mnist" / "mnist_test_seq.npy"],
+    }
+    paths = sentinels.get(model_key)
+    if paths is None:
+        return False
+    return all(p.exists() for p in paths)
+
+
 def build_task_bundle(model_key: str, batch_size: int | None = None) -> TaskBundle:
     """Build the data loaders for *model_key*.
 
