@@ -31,36 +31,36 @@ uv run dqb run --ignore-saved-models
 
 ```mermaid
 flowchart TD
-    A([uv run dqb run]) --> B[Parse args\n--models, --conditions,\n--ignore-saved-models]
-    B --> C[Load .env credentials\nvia compat.py]
-    C --> D[BenchmarkRunner\npipeline.py]
-    D --> E[Create results/ and\ncomparison/ directories]
-    E --> F[Resolve conditions\nin dependency order]
-    F --> G{For each\nmodel × condition}
-    G --> H{record.json\nalready exists?}
-    H -- Yes and not\n--ignore-saved-models --> I[Skip — load\nexisting record]
-    H -- No or\n--ignore-saved-models --> J[data.py\nbuild_task_bundle]
-    J --> K[models.py\nbuild_model]
-    K --> L{Dendritic\ncondition?}
-    L -- Yes --> M[compat.py\nperforate_model via PAI]
+    A([uv run dqb run]) --> B[Parse args --models, --conditions, --ignore-saved-models]
+    B --> C[Load .env credentials via compat.py]
+    C --> D[BenchmarkRunner pipeline.py]
+    D --> E[Create results/ and comparison/ directories]
+    E --> F[Resolve conditions in dependency order]
+    F --> G{For each model × condition}
+    G --> H{record.json already exists?}
+    H -- "Yes, not --ignore-saved-models" --> I[Skip — load existing record]
+    H -- "No or --ignore-saved-models" --> J[data.py build_task_bundle]
+    J --> K[models.py build_model]
+    K --> L{Dendritic condition?}
+    L -- Yes --> M[compat.py perforate_model via PAI]
     L -- No --> N[Standard model]
-    M --> O[training.py\ntrain_and_evaluate]
+    M --> O[training.py train_and_evaluate]
     N --> O
-    O --> P{Pruning\ncondition?}
-    P -- Yes --> Q[Apply L1 unstructured\nglobal pruning 40%]
-    P -- No --> R{Quantization\ncondition?}
+    O --> P{Pruning condition?}
+    P -- Yes --> Q[Apply L1 unstructured global pruning 40%]
+    P -- No --> R{Quantization condition?}
     Q --> R
-    R -- Q8/Q4/Q2/Q1.58/Q1 --> S[Apply torchao\nPTQ or QAT projection]
-    R -- FP32 --> T[Train full epochs\nwith Adam + scheduler]
+    R -- Q8/Q4/Q2/Q1.58/Q1 --> S[Apply torchao PTQ or QAT projection]
+    R -- FP32 --> T[Train full epochs with Adam + scheduler]
     S --> T
-    T --> U[Evaluate val + test\nmetrics]
-    U --> V[Save artifacts:\nmodel.pt, metrics.json,\nhistory.csv, plots/]
-    V --> W{Dendritic\nrun?}
-    W -- Yes --> X[Also save:\nbest_model,\nfinal_clean_pai,\nbest_arch_scores.csv,\nparamCounts.csv]
-    W -- No --> Y[results.py\nsave_training_record\nrecord.json + record.csv]
+    T --> U[Evaluate val + test metrics]
+    U --> V[Save artifacts: model.pt, metrics.json, history.csv, plots/]
+    V --> W{Dendritic run?}
+    W -- Yes --> X[Also save: best_model, final_clean_pai, best_arch_scores.csv, paramCounts.csv]
+    W -- No --> Y[results.py save_training_record record.json + record.csv]
     X --> Y
     Y --> G
-    G -- Done --> Z[results.py\nwrite_model_reports\nwrite_comparison_reports]
+    G -- Done --> Z[results.py write_model_reports write_comparison_reports]
     Z --> ZZ([End])
 
     style A fill:#2d6a4f,color:#fff
@@ -110,20 +110,20 @@ uv run dqb download_data --strict
 
 ```mermaid
 flowchart TD
-    A([uv run dqb download_data]) --> B[Parse args\n--models, --strict]
-    B --> C[Resolve DQB_DATA_ROOT\nenv var or default ./data]
-    C --> D{For each\nselected model}
-    D --> E{dataset_exists\nmodel_key?}
+    A([uv run dqb download_data]) --> B[Parse args --models, --strict]
+    B --> C[Resolve DQB_DATA_ROOT env var or default ./data]
+    C --> D{For each selected model}
+    D --> E{dataset_exists model_key?}
     E -- Yes --> F[Skip — already cached]
-    E -- No --> G[data.py\nbuild_task_bundle\ndownload + prepare]
+    E -- No --> G[data.py build_task_bundle download + prepare]
     G --> H{Success?}
     H -- Yes --> I[Log done + elapsed time]
-    H -- No and --strict --> J[Raise exception\nand abort]
-    H -- No and not --strict --> K[Log FAILED\ncontinue to next model]
+    H -- "No and --strict" --> J[Raise exception and abort]
+    H -- "No and not --strict" --> K[Log FAILED continue to next model]
     F --> D
     I --> D
     K --> D
-    D -- Done --> L[Print summary:\ndownloaded, cached, failed counts]
+    D -- Done --> L[Print summary: downloaded, cached, failed counts]
     L --> ZZ([End])
 
     style A fill:#2d6a4f,color:#fff
@@ -147,22 +147,22 @@ uv run dqb compare --results-root results --comparison-root comparison
 
 ```mermaid
 flowchart TD
-    A([uv run dqb compare]) --> B[Parse args\n--manifest]
-    B --> C[results.py\nload_training_records\nscan results/*/*/record.json]
-    C --> D{--manifest\nflag set?}
-    D -- Yes --> E[results.py\nwrite_manifest\nresults/manifest.csv]
+    A([uv run dqb compare]) --> B[Parse args --manifest]
+    B --> C[results.py load_training_records scan results/*/*/record.json]
+    C --> D{--manifest flag set?}
+    D -- Yes --> E[results.py write_manifest results/manifest.csv]
     D -- No --> F
-    E --> F{For each\nModelSpec in MODEL_SPECS}
-    F --> G[Filter records\nfor this model]
-    G --> H{Any records\nfound?}
-    H -- Yes --> I[results.py\nwrite_model_reports\naccuracy + param + size\nbar charts per model]
+    E --> F{For each ModelSpec in MODEL_SPECS}
+    F --> G[Filter records for this model]
+    G --> H{Any records found?}
+    H -- Yes --> I[results.py write_model_reports accuracy + param + size bar charts per model]
     H -- No --> F
     I --> F
-    F -- Done --> J[results.py\nwrite_comparison_reports\nall records]
-    J --> K[accuracy_retention_heatmap.svg\n10x13 normalized scores]
-    J --> L[size_tradeoff_scatter.svg\n130 model×condition points]
-    J --> M[dendrite_delta.svg\nBase FP32 vs Dendrites FP32]
-    J --> N[best_quantization_heatmap.svg\nbest accuracy per bit level]
+    F -- Done --> J[results.py write_comparison_reports all records]
+    J --> K[accuracy_retention_heatmap.svg 10x13 normalized scores]
+    J --> L[size_tradeoff_scatter.svg 130 model×condition points]
+    J --> M[dendrite_delta.svg Base FP32 vs Dendrites FP32]
+    J --> N[best_quantization_heatmap.svg best accuracy per bit level]
     J --> O[summary.csv]
     K & L & M & N & O --> ZZ([End])
 
@@ -186,17 +186,17 @@ uv run dqb generate_graphs --regenerate-graphs
 
 ```mermaid
 flowchart TD
-    A([uv run dqb generate_graphs]) --> B[Parse args\n--regenerate-graphs]
-    B --> C[results.py\ngenerate_training_graphs\nresults_root, regenerate flag]
-    C --> D{Walk results/\nfor each condition folder}
-    D --> E{history.csv\nexists?}
+    A([uv run dqb generate_graphs]) --> B[Parse args --regenerate-graphs]
+    B --> C[results.py generate_training_graphs results_root, regenerate flag]
+    C --> D{Walk results/ for each condition folder}
+    D --> E{history.csv exists?}
     E -- No --> D
-    E -- Yes --> F{Graph files\nalready exist?}
-    F -- Yes and not\n--regenerate-graphs --> D
-    F -- No or\n--regenerate-graphs --> G[plots/\nCreate or recreate\nplots directory]
-    G --> H[plots.py\nRender training_curve.svg\nprimary_metric.svg\nloss_curves.svg]
-    H --> I{Dendritic\ncondition?}
-    I -- Yes --> J[plots.py\nRender\narchitecture_evolution.svg\nfrom best_arch_scores.csv]
+    E -- Yes --> F{Graph files already exist?}
+    F -- "Yes, not --regenerate-graphs" --> D
+    F -- "No or --regenerate-graphs" --> G[plots/ Create or recreate plots directory]
+    G --> H[plots.py Render training_curve.svg primary_metric.svg loss_curves.svg]
+    H --> I{Dendritic condition?}
+    I -- Yes --> J[plots.py Render architecture_evolution.svg from best_arch_scores.csv]
     I -- No --> D
     J --> D
     D -- Done --> ZZ([End])
@@ -221,8 +221,8 @@ flowchart TD
     C1 --> MJ[metrics.json]
     C1 --> HC[history.csv]
     C1 --> MP[model.pt]
-    C1 --> PL[plots/\ntraining_curve.svg\nprimary_metric.svg\nloss_curves.svg]
-    C1 --> DD[dendritic only:\nbest_model\nfinal_clean_pai\nbest_arch_scores.csv\nparamCounts.csv\narchitecture_evolution.svg]
+    C1 --> PL[plots/ training_curve.svg primary_metric.svg loss_curves.svg]
+    C1 --> DD[dendritic only: best_model final_clean_pai best_arch_scores.csv paramCounts.csv architecture_evolution.svg]
 
     CO[comparison/] --> H1[accuracy_retention_heatmap.svg]
     CO --> H2[size_tradeoff_scatter.svg]
@@ -241,14 +241,14 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    CLI([uv run dqb]) --> RUN[run\nTrain models\nand save results]
-    CLI --> DL[download_data\nPre-cache datasets\noffline-safe]
-    CLI --> CMP[compare\nRebuild comparison\nplots from records]
-    CLI --> GG[generate_graphs\nRender training\ncurves from history]
+    CLI([uv run dqb]) --> RUN[run Train models and save results]
+    CLI --> DL[download_data Pre-cache datasets offline-safe]
+    CLI --> CMP[compare Rebuild comparison plots from records]
+    CLI --> GG[generate_graphs Render training curves from history]
 
-    RUN -->|writes| RES[(results/\nrecords + plots)]
-    RUN -->|writes| COM[(comparison/\ncharts + summary)]
-    DL -->|writes| DAT[(data/\ndataset cache)]
+    RUN -->|writes| RES[(results/ records + plots)]
+    RUN -->|writes| COM[(comparison/ charts + summary)]
+    DL -->|writes| DAT[(data/ dataset cache)]
     CMP -->|reads| RES
     CMP -->|writes| COM
     GG -->|reads| RES
