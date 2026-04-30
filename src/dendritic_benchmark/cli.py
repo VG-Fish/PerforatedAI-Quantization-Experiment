@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 
 from .compat import load_project_environment, perforatedai_credentials_present
@@ -10,6 +11,11 @@ from .data import DATA_ROOT_ENV, DEFAULT_DATA_ROOT, build_task_bundle, dataset_e
 from .pipeline import BenchmarkRunner
 from .results import load_training_records, write_comparison_reports, write_manifest, write_model_reports, generate_training_graphs
 from .specs import MODEL_SPECS
+
+
+def _log(msg: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}")
 
 
 _MODEL_KEYS = (
@@ -92,6 +98,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Space-separated list of condition keys to include. "
             "Omit to run all 13 conditions. "
             f"Valid keys: {_CONDITION_KEYS}"
+        ),
+    )
+    run_parser.add_argument(
+        "--ignore-saved-models",
+        action="store_true",
+        help=(
+            "Redo training for all selected model/condition pairs even if a "
+            "record.json already exists on disk. By default, existing records "
+            "are loaded and that combination is skipped."
         ),
     )
 
@@ -181,19 +196,23 @@ def main() -> None:
     comparison_root = Path(args.comparison_root)
 
     if perforatedai_credentials_present():
-        print("PerforatedAI credentials detected in environment; beta-capable features can be used if installed.")
+        _log("PerforatedAI credentials detected in environment; beta-capable features can be used if installed.")
 
     if args.command == "run":
         runner = BenchmarkRunner(results_root=results_root, comparison_root=comparison_root)
-        runner.run(model_keys=args.models, condition_keys=args.conditions)
+        runner.run(
+            model_keys=args.models,
+            condition_keys=args.conditions,
+            ignore_saved=args.ignore_saved_models,
+        )
         return
 
     if args.command == "download_data":
         selected = args.models or [spec.key for spec in MODEL_SPECS]
         total = len(selected)
         data_root = Path(os.environ.get(DATA_ROOT_ENV, DEFAULT_DATA_ROOT)).resolve()
-        print(f"[data] root        : {data_root}")
-        print(f"[data] models      : {total}")
+        _log(f"[data] root        : {data_root}")
+        _log(f"[data] models      : {total}")
         print(f"{'─' * 60}")
         skipped = 0
         downloaded = 0
@@ -201,29 +220,29 @@ def main() -> None:
         for i, model_key in enumerate(selected, 1):
             prefix = f"[{i}/{total}] {model_key}"
             if dataset_exists(model_key):
-                print(f"{prefix} — already cached, skipping.")
+                _log(f"{prefix} — already cached, skipping.")
                 skipped += 1
                 continue
-            print(f"{prefix} — downloading / preparing…")
+            _log(f"{prefix} — downloading / preparing…")
             t0 = time.monotonic()
             try:
                 build_task_bundle(model_key)
                 elapsed = time.monotonic() - t0
-                print(f"{prefix} — done ({elapsed:.1f}s).")
+                _log(f"{prefix} — done ({elapsed:.1f}s).")
                 downloaded += 1
             except Exception as exc:
                 elapsed = time.monotonic() - t0
                 if args.strict:
                     raise
                 failures.append((model_key, str(exc)))
-                print(f"{prefix} — FAILED after {elapsed:.1f}s: {exc}")
+                _log(f"{prefix} — FAILED after {elapsed:.1f}s: {exc}")
         print(f"{'─' * 60}")
-        print(
+        _log(
             f"[data] finished — {downloaded} downloaded, "
             f"{skipped} already cached, {len(failures)} failed."
         )
         if failures:
-            print("[data] failures:")
+            _log("[data] failures:")
             for model_key, message in failures:
                 print(f"  - {model_key}: {message}")
         return

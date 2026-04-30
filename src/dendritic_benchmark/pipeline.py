@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,11 @@ from .specs import CONDITION_SPECS, MODEL_SPECS, ConditionSpec, condition_by_key
 from .training import TrainingRecord, train_and_evaluate
 
 EPOCH_MULTIPLIER = 10
+
+
+def _log(msg: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}")
 
 
 class BenchmarkRunner:
@@ -158,6 +164,7 @@ class BenchmarkRunner:
         self,
         model_keys: list[str] | None = None,
         condition_keys: list[str] | None = None,
+        ignore_saved: bool = False,
     ) -> list[dict[str, Any]]:
         selected_models = [
             model_by_key(key)
@@ -168,32 +175,71 @@ class BenchmarkRunner:
         all_records: list[dict[str, Any]] = []
 
         for model_spec in selected_models:
-            bundle = build_task_bundle(model_spec.key)
+            # Check which conditions still need training before loading the dataset.
+            pending = [
+                cond for cond in selected_conditions
+                if ignore_saved or not (
+                    self.results_root / model_spec.key / cond.key / "record.json"
+                ).exists()
+            ]
+            already_done = [
+                cond for cond in selected_conditions if cond not in pending
+            ]
+
+            if not pending:
+                _log(
+                    f"[skip] {model_spec.key} — all conditions already recorded, "
+                    "skipping dataset load."
+                )
+            else:
+                _log(
+                    f"[data] {model_spec.key} — loading dataset "
+                    f"({len(pending)} condition(s) to train)…"
+                )
+
             model_records: list[dict[str, Any]] = []
             saved_dirs: dict[str, Path] = {}
-            for condition in selected_conditions:
+
+            # Load already-recorded conditions first (no dataset needed).
+            for condition in already_done:
                 condition_dir = self.results_root / model_spec.key / condition.key
                 record_path = condition_dir / "record.json"
-                if record_path.exists():
-                    print(
-                        f"[skip] {model_spec.key} / {condition.key} "
-                        "— record.json found, skipping training."
-                    )
-                    record = TrainingRecord(**json.loads(record_path.read_text()))
-                else:
-                    record = self._run_condition(
-                        model_spec.key,
-                        model_spec.display_name,
-                        model_spec.metric_name,
-                        model_spec.metric_direction,
-                        bundle,
-                        condition,
-                        saved_dirs,
-                    )
-                    save_training_record(record, condition_dir)
+                _log(
+                    f"[skip] {model_spec.key} / {condition.key} "
+                    "— record.json found, skipping training."
+                )
+                record = TrainingRecord(**json.loads(record_path.read_text()))
                 model_records.append(record.to_dict())
                 all_records.append(record.to_dict())
                 saved_dirs[condition.key] = condition_dir
+
+            # Load dataset only when at least one condition needs training.
+            if pending:
+                bundle = build_task_bundle(model_spec.key)
+                for condition in pending:
+                    condition_dir = self.results_root / model_spec.key / condition.key
+                    record_path = condition_dir / "record.json"
+                    if record_path.exists() and not ignore_saved:
+                        _log(
+                            f"[skip] {model_spec.key} / {condition.key} "
+                            "— record.json found, skipping training."
+                        )
+                        record = TrainingRecord(**json.loads(record_path.read_text()))
+                    else:
+                        record = self._run_condition(
+                            model_spec.key,
+                            model_spec.display_name,
+                            model_spec.metric_name,
+                            model_spec.metric_direction,
+                            bundle,
+                            condition,
+                            saved_dirs,
+                        )
+                        save_training_record(record, condition_dir)
+                    model_records.append(record.to_dict())
+                    all_records.append(record.to_dict())
+                    saved_dirs[condition.key] = condition_dir
+
             write_model_reports(
                 model_spec.display_name,
                 model_records,
@@ -204,7 +250,7 @@ class BenchmarkRunner:
             # finished training, so results are visible without waiting for all models.
             completed_model_keys = {r["model_key"] for r in all_records}
             if len(completed_model_keys) >= 2:
-                print(
+                _log(
                     f"[compare] {len(completed_model_keys)} models complete — "
                     "regenerating comparison reports…"
                 )
