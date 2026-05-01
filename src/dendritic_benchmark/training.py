@@ -755,6 +755,10 @@ def _format_metric_value(value: float) -> str:
     return "n/a"
 
 
+def _metric_display_key(metric_name: str) -> str:
+    return metric_name.strip().lower().replace(" ", "_")
+
+
 def _write_dendritic_sidecars(
     output_dir: Path,
     history: list[dict[str, Any]],
@@ -1080,9 +1084,12 @@ def _run_training_epochs(
                 k: v.detach().cpu().clone()
                 for k, v in _unwrap_compiled(model).state_dict().items()
             }
+        metric_key = _metric_display_key(metric_name)
         epoch_progress.set_postfix(
-            val_metric=_format_metric_value(val_metric),
-            best_metric=_format_metric_value(best_metric),
+            **{
+                f"val_{metric_key}": _format_metric_value(val_metric),
+                f"best_{metric_key}": _format_metric_value(best_metric),
+            },
             best_epoch=best_epoch,
         )
     epoch_progress.close()
