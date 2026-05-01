@@ -47,9 +47,8 @@ Each model is trained/evaluated in the following 12 conditions. Metrics recorded
 | 11 | **+Dendrites + Q1.58** | Dendritic model ternary quantization |
 | 12 | **+Dendrites + Q1** | Dendritic model binary quantization |
 
-With `--allow-PQAT`, only the smaller quantized dendritic conditions run
-quantization-aware fine-tuning. Base quantized conditions remain PTQ-only so
-their results stay directly comparable to the un-fine-tuned baseline.
+With `--allow-PQAT`, all quantized conditions run quantization-aware
+fine-tuning after an initial PTQ snapshot is saved.
 
 ***
 ## Output Graphs (Per Model)
@@ -537,7 +536,7 @@ Declares benchmark model and condition metadata.
 - Loads source checkpoints when a condition depends on a previous result.
 - Perforates models with PerforatedAI for dendritic conditions.
 - Calls `train_and_evaluate()` for every model-condition pair.
-- When `--allow-PQAT` is enabled, quantized dendritic conditions save a PTQ snapshot under `before_pqat/`, fine-tune the completed dendritic model for a short model-aware PQAT budget, and save the post-PQAT artifacts under `after_pqat/`.
+- When `--allow-PQAT` is enabled, all quantized conditions save a PTQ snapshot under `before_pqat/`, fine-tune for a short model-aware PQAT budget, and save the post-PQAT artifacts under `after_pqat/`.
 - Writes per-condition training records and regenerates comparison outputs during the run.
 - Skips dataset loading entirely for models where all conditions are already recorded.
 
@@ -729,8 +728,8 @@ results/
       model.pt
       PAI_config.json        # dendritic runs only
       best_model_stats.csv
-      before_pqat/           # PQAT-enabled quantized dendritic runs only
-      after_pqat/            # PQAT-enabled quantized dendritic runs only
+      before_pqat/           # PQAT-enabled quantized runs only
+      after_pqat/            # PQAT-enabled quantized runs only
       continued_until_complete/  # FP32 dendritic epochs beyond max_epochs
       best_arch_scores.csv    # dendritic runs only
       paramCounts.csv         # dendritic runs only

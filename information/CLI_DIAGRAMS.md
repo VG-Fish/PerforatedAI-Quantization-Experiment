@@ -55,9 +55,9 @@ flowchart TD
     O --> R{"Quantization<br>condition?"}
     R -->|Q8/Q4/Q2/Q1.58/Q1| S["Load source checkpoint and<br>apply PTQ snapshot"]
     R -->|FP32| T["Train full epochs with<br>model-specific recipe"]
-    S --> S2{"--allow-PQAT<br>and dendritic?"}
+    S --> S2{"--allow-PQAT?"}
     S2 -->|No| U
-    S2 -->|Yes| S3["Save before_pqat/<br>then fine-tune completed dendritic model<br>for a model-aware PQAT budget<br>then save after_pqat/"]
+    S2 -->|Yes| S3["Save before_pqat/<br>then fine-tune for a<br>model-aware PQAT budget<br>then save after_pqat/"]
     S3 --> U
     T --> U["Evaluate val + test metrics"]
     U --> V["Save artifacts:<br>model.pt (best), best_model_stats.csv,<br>metrics.json, history.csv, plots/"]

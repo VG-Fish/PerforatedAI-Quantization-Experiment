@@ -61,11 +61,10 @@ active PerforatedAI config to
 own reproducibility config instead of relying only on the latest global
 `PAI/PAI_config.json`.
 
-When `--allow-PQAT` is supplied, PQAT is applied to the smaller quantized
-dendritic conditions (`dendrites_q8` through `dendrites_q1`) after the source
-`dendrites_fp32` checkpoint has finished PerforatedAI training. Base quantized
-conditions remain post-training quantization evaluations so the baseline grid
-does not mix in an extra fine-tuning factor.
+When `--allow-PQAT` is supplied, PQAT is applied to all quantized conditions
+after their source checkpoint has been trained. Each quantized run saves a PTQ
+evaluation under `before_pqat/`, fine-tunes for the model-aware PQAT budget, and
+saves the post-PQAT artifacts under `after_pqat/`.
 
 ## Compare Existing Runs
 

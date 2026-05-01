@@ -474,7 +474,7 @@ class BenchmarkRunner:
         use_qat = condition.use_qat
         fine_tune_epochs = condition.fine_tune_epochs
         if condition.quantized and condition.source_key != condition.key:
-            if allow_pqat and condition.use_dendrites:
+            if allow_pqat:
                 fine_tune_epochs = self._pqat_epoch_budget(model_key)
                 max_epochs = fine_tune_epochs
                 use_qat = True
