@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .benchmark import BenchmarkOrchestrator
 from .compat import load_project_environment, perforatedai_credentials_present
 from .data import DATA_ROOT_ENV, DEFAULT_DATA_ROOT, build_task_bundle, dataset_exists
 from .log_utils import setup_logging
@@ -217,6 +218,71 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    bench_parser: argparse.ArgumentParser = subparsers.add_parser(
+        "bench",
+        help="Benchmark inference latency of trained models using torch.utils.benchmark.Timer.",
+        description=(
+            "Measures wall-clock inference latency for all trained models and conditions. "
+            "Benchmarks each model using batch sizes 1 and 32 (configurable). Results are "
+            "saved to --benchmark-root with per-model subdirectories containing latency "
+            "measurements and a computer_info.json file with system specifications.\n\n"
+            "Requires trained models to exist in --results-root.\n\n"
+            f"Available model keys:\n  {_MODEL_KEYS}\n\n"
+            f"Available condition keys:\n  {_CONDITION_KEYS}"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    bench_parser.add_argument(
+        "--benchmark-root",
+        default="benchmarks",
+        metavar="DIR",
+        help=(
+            "Root directory where benchmark results are written. "
+            "Created if it does not exist. (default: benchmarks)"
+        ),
+    )
+    bench_parser.add_argument(
+        "--models",
+        nargs="*",
+        metavar="KEY",
+        help=(
+            "Space-separated list of model keys to benchmark. "
+            "Omit to benchmark all 25 models. "
+            f"Valid keys: {_MODEL_KEYS}"
+        ),
+    )
+    bench_parser.add_argument(
+        "--conditions",
+        nargs="*",
+        metavar="KEY",
+        help=(
+            "Space-separated list of condition keys to benchmark. "
+            "Omit to benchmark all 12 conditions. "
+            f"Valid keys: {_CONDITION_KEYS}"
+        ),
+    )
+    bench_parser.add_argument(
+        "--batch-sizes",
+        type=int,
+        nargs="*",
+        default=[1, 32],
+        metavar="SIZE",
+        help=(
+            "Space-separated list of batch sizes to test. "
+            "(default: 1 32)"
+        ),
+    )
+    bench_parser.add_argument(
+        "--num-runs",
+        type=int,
+        default=10,
+        metavar="N",
+        help=(
+            "Number of timing runs per benchmark to average. "
+            "(default: 10)"
+        ),
+    )
+
     return parser
 
 
@@ -281,12 +347,24 @@ def _handle_compare(args: Any, results_root: Path, comparison_root: Path) -> Non
     write_comparison_reports(records, comparison_root)
 
 
+def _handle_bench(args: Any, results_root: Path, benchmark_root: Path) -> None:
+    orchestrator = BenchmarkOrchestrator(results_root=results_root)
+    orchestrator.benchmark_all(
+        model_keys=args.models,
+        condition_keys=args.conditions,
+        batch_sizes=args.batch_sizes,
+        num_runs=args.num_runs,
+        benchmark_root=benchmark_root,
+    )
+
+
 def main() -> None:
     load_project_environment()
     parser = build_parser()
     args = parser.parse_args()
     results_root = Path(args.results_root)
     comparison_root = Path(getattr(args, "comparison_root", "comparison"))
+    benchmark_root = Path(getattr(args, "benchmark_root", "benchmarks"))
 
     setup_logging(output_dir=args.logging_dir, script_name=args.command)
 
@@ -301,6 +379,8 @@ def main() -> None:
         _handle_compare(args, results_root, comparison_root)
     elif args.command == "generate_graphs":
         generate_training_graphs(results_root, regenerate=args.regenerate_graphs)
+    elif args.command == "bench":
+        _handle_bench(args, results_root, benchmark_root)
     else:
         parser.print_help()
 

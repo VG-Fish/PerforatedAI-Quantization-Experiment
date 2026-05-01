@@ -763,3 +763,176 @@ uv run dqb run --models mpnn actor_critic --ignore-saved-models
 - If you add new models or conditions, update `src/dendritic_benchmark/specs.py` and rerun the CLI.
 - Conditions are executed in dependency order — omitting an upstream condition will cause its dependents to be skipped.
 - `generate_graphs` only rebuilds per-condition training plots. Use `compare` to create or refresh `comparison/`.
+
+---
+
+# Part N: Inference Latency Benchmarking
+
+## Overview
+
+The `dqb bench` command measures actual wall-clock inference latency for all trained models using `torch.utils.benchmark.Timer`. This allows you to understand the real-world performance characteristics of quantized and dendritic models on your hardware (M3 Pro, M4 Max, GPU, etc.).
+
+## Command
+
+```bash
+uv run dqb bench
+uv run dqb bench --models lenet5 m5 resnet18_cifar10
+uv run dqb bench --conditions base_fp32 base_q4 dendrites_q4
+uv run dqb bench --batch-sizes 1 8 32
+uv run dqb bench --num-runs 20
+uv run dqb bench --benchmark-root my_benchmarks
+```
+
+## Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--benchmark-root DIR` | `benchmarks` | Output directory for benchmark results |
+| `--models KEY [KEY ...]` | all 25 | Space-separated model keys to benchmark |
+| `--conditions KEY [KEY ...]` | all 12 | Space-separated condition keys to benchmark |
+| `--batch-sizes SIZE [SIZE ...]` | `1 32` | Batch sizes to test |
+| `--num-runs N` | 10 | Number of timing runs per benchmark (for averaging) |
+
+## Output Structure
+
+Benchmarks are saved under `--benchmark-root` in a hierarchical structure:
+
+```text
+benchmarks/
+  computer_info.json                    # System specs (CPU, device, PyTorch version)
+  manifest.csv                          # Summary of all benchmarks
+  {model_key}/
+    latency_summary.csv                 # Per-condition latencies for this model
+    {condition_key}.json                # Full latency results for one condition
+```
+
+### computer_info.json
+
+Contains system information captured at benchmark time:
+
+```json
+{
+  "timestamp": "2026-05-01T12:34:56.789012",
+  "platform": "Darwin",
+  "processor": "arm64",
+  "python_version": "3.13.0",
+  "pytorch_version": "2.0.1",
+  "cuda_available": false,
+  "mps_available": true,
+  "cpu_count": 8
+}
+```
+
+### latency_summary.csv
+
+Per-model summary showing latency for each condition at different batch sizes:
+
+```csv
+condition_key,batch_size,mean_latency_ms,median_latency_ms
+base_fp32,1,2.45,2.43
+base_fp32,32,15.12,14.98
+base_q4,1,1.89,1.87
+base_q4,32,11.34,11.21
+dendrites_fp32,1,3.12,3.10
+dendrites_q4,1,2.34,2.32
+```
+
+### {condition_key}.json
+
+Full results for a single model + condition combination:
+
+```json
+{
+  "model_key": "resnet18_cifar10",
+  "condition_key": "base_q4",
+  "display_name": "Base + Q4",
+  "timestamp": "2026-05-01T12:34:56.789012",
+  "batch_sizes": {
+    "1": {
+      "batch_size": 1,
+      "num_runs": 10,
+      "mean_latency_ms": 1.89,
+      "median_latency_ms": 1.87,
+      "stdev_latency_ms": 0.05
+    },
+    "32": {
+      "batch_size": 32,
+      "num_runs": 10,
+      "mean_latency_ms": 11.34,
+      "median_latency_ms": 11.21,
+      "stdev_latency_ms": 0.12
+    }
+  }
+}
+```
+
+### manifest.csv
+
+Cross-model summary of all benchmarks (useful for comparing latencies across models and conditions):
+
+```csv
+model_key,condition_key,batch_size,mean_latency_ms,median_latency_ms
+lenet5,base_fp32,1,0.34,0.33
+lenet5,base_q4,1,0.21,0.20
+m5,base_fp32,1,1.56,1.54
+m5,base_q4,1,1.12,1.10
+```
+
+## Interpretation Guide
+
+### Latency Metrics
+
+- **Mean Latency**: Average inference time across all runs (in milliseconds)
+- **Median Latency**: Middle value of inference times (less affected by outliers)
+- **Stdev**: Standard deviation of timing runs (lower is better — indicates consistency)
+
+### Batch Size Impact
+
+- **Batch size 1**: Single-sample inference (common in real-time applications)
+- **Batch size 32**: Batched inference (common in data-processing pipelines)
+
+Higher batch sizes typically show better throughput per sample but higher absolute latency.
+
+### Quantization Impact
+
+Compare quantized conditions to their baseline (e.g., `base_q4` vs `base_fp32`):
+- **Speedup**: `mean_latency_fp32 / mean_latency_q4` (higher is better)
+- **Latency reduction**: `(mean_latency_fp32 - mean_latency_q4) / mean_latency_fp32 * 100%`
+
+### Dendrite Impact
+
+Compare dendritic conditions to non-dendritic (e.g., `dendrites_q4` vs `base_q4`):
+- Dendrites typically add 10–30% latency overhead due to additional forward passes
+- This trade-off is justified if dendrites improve model quality significantly
+
+## Example Workflows
+
+### Benchmark only small models for quick iteration
+
+```bash
+uv run dqb bench --models lenet5 m5 --batch-sizes 1 32 --num-runs 5
+```
+
+### Benchmark a specific condition across all models
+
+```bash
+uv run dqb bench --conditions base_q4 --batch-sizes 1 32
+```
+
+### Deep benchmark with many runs for statistical confidence
+
+```bash
+uv run dqb bench --num-runs 50 --batch-sizes 1 16 32 64
+```
+
+### Save results to a custom directory for later analysis
+
+```bash
+uv run dqb bench --benchmark-root benchmarks_experiment_e
+```
+
+## Requirements
+
+- Trained models must exist in `--results-root` (run `dqb run` first)
+- PyTorch must be installed
+- Models will be loaded to CPU/MPS/CUDA based on availability

@@ -12,6 +12,7 @@ The benchmark automates training neural networks under different quantization an
 4. **Results**: Training metrics are saved to `results/<model>/<condition>/` with per-epoch histories and final performance records
 5. **Compare**: Generate comparison charts and summary reports using `uv run dqb compare`
 6. **Visualize**: Render training curves and analysis plots with `uv run dqb generate_graphs`
+7. **Benchmark**: Measure inference latency on your hardware with `uv run dqb bench`
 
 Each condition applies only two experimental factors to the same models: quantization level and whether the model is dendritic, allowing cleaner side-by-side comparison of efficiency vs. accuracy tradeoffs.
 
@@ -66,7 +67,7 @@ The repository includes extended documentation under the `information/` director
 	- Round-2 expansion with 15 additional models and research findings from a preliminary run.
 
 - `information/CLI_DIAGRAMS.md` — CLI reference and diagrams:
-	- Command summaries and Mermaid flowcharts for `uv run dqb run`, `uv run dqb download_data`, `uv run dqb compare`, and `uv run dqb generate_graphs`.
+	- Command summaries and Mermaid flowcharts for `uv run dqb run`, `uv run dqb download_data`, `uv run dqb compare`, `uv run dqb generate_graphs`, and `uv run dqb bench`.
 	- Global CLI flags and the recommended output directory layout.
 
 Read the full documents for architecture details, hypotheses, and example commands:
@@ -120,6 +121,18 @@ The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` f
         ```bash
         uv run dqb generate_graphs
         uv run dqb generate_graphs --regenerate-graphs
+        ```
+
+- `uv run dqb bench`
+	- Measures wall-clock inference latency for all trained models using `torch.utils.benchmark.Timer`.
+	- Results are saved to `benchmarks/<model>/` with per-condition latency measurements.
+	- Useful flags: `--models` (subset), `--conditions` (subset), `--batch-sizes` (e.g., `1 8 32`), `--num-runs` (averaging runs), `--benchmark-root`.
+	- Examples:
+        ```bash
+        uv run dqb bench
+        uv run dqb bench --models lenet5 resnet18_cifar10
+        uv run dqb bench --batch-sizes 1 32 --num-runs 20
+        uv run dqb bench --benchmark-root my_benchmarks
         ```
 
 - `uv run dqb --help`

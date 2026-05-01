@@ -10,10 +10,12 @@ These flags are shared by all commands:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--results-root DIR` | `results` | Root directory for per-model result folders |
+| `--results-root DIR` | `results` | Root directory for per-model result folders (also used by `bench` to locate trained models) |
 | `--logging-dir DIR` | `logs` | Directory for timestamped log files |
 
 `--comparison-root DIR` is available only on `uv run dqb run` and `uv run dqb compare`.
+
+`--benchmark-root DIR` is available only on `uv run dqb bench`.
 
 ---
 
@@ -225,10 +227,71 @@ flowchart TD
 
 ---
 
+## `uv run dqb bench`
+
+Measures wall-clock inference latency for all trained models using `torch.utils.benchmark.Timer`.
+
+```bash
+uv run dqb bench
+uv run dqb bench --models lenet5 m5
+uv run dqb bench --conditions base_fp32 base_q4 dendrites_q4
+uv run dqb bench --batch-sizes 1 8 32
+uv run dqb bench --num-runs 20
+uv run dqb bench --benchmark-root my_benchmarks
+```
+
+```mermaid
+flowchart TD
+    A([uv run dqb bench]) --> B["Parse args<br>--models, --conditions,<br>--batch-sizes,<br>--num-runs,<br>--benchmark-root"]
+    B --> C["Create benchmark directory"]
+    C --> D["Capture system info<br>CPU, device, PyTorch version"]
+    D --> E["Write computer_info.json"]
+    E --> F{"For each<br>selected model"}
+    F --> G{"For each<br>selected condition"}
+    G --> H["Load trained model from<br>results/model/condition/model.pt"]
+    H --> I{"Model loaded<br>successfully?"}
+    I -->|No| J["Log error skip condition"]
+    I -->|Yes| K["Generate sample inputs<br>matching model shape"]
+    K --> L["For each batch size"]
+    L --> M["Run torch.utils.benchmark.Timer<br>for num_runs iterations"]
+    M --> N["Collect latency stats<br>mean, median, stdev"]
+    N --> O["Write results to<br>condition_key.json"]
+    O --> P["Aggregate to<br>latency_summary.csv"]
+    P --> L
+    L -->|Done| G
+    J --> G
+    G -->|Done| Q["Write model<br>latency_summary.csv"]
+    Q --> F
+    F -->|Done| R["Write manifest.csv<br>all benchmarks"]
+    R --> ZZ([End])
+
+    style A fill:#2d6a4f,color:#fff
+    style ZZ fill:#2d6a4f,color:#fff
+    style I fill:#457b9d,color:#fff
+    style L fill:#457b9d,color:#fff
+```
+
+### Output Files
+
+Results are organized by model and condition:
+
+- `benchmarks/computer_info.json` — System specification snapshot
+- `benchmarks/manifest.csv` — Cross-model summary of all latency measurements
+- `benchmarks/{model}/latency_summary.csv` — Per-model aggregated latencies
+- `benchmarks/{model}/{condition}.json` — Full results for one model + condition
+
+---
+
 ## Output Directory Layout
 
 ```text
 .
+├── benchmarks/                          # created by dqb bench
+│   ├── computer_info.json
+│   ├── manifest.csv
+│   └── model_key/
+│       ├── latency_summary.csv
+│       └── condition_key.json
 ├── comparison/
 │   ├── accuracy_retention_heatmap.svg
 │   ├── best_quantization_heatmap.svg
@@ -275,15 +338,18 @@ flowchart TD
     CMP["compare<br>Rebuild comparison plots"]
     RUN["run<br>Train models and<br>save results"]
     DL["download_data<br>Pre-cache datasets"]
+    BEN["bench<br>Measure inference<br>latency"]
 
     RES[("results/<br>records + plots")]
     COM[("comparison/<br>charts + summary")]
     DAT[("data/<br>dataset cache")]
+    BEN_OUT[("benchmarks/<br>latency + system info")]
 
     CLI --> GG
     CLI --> CMP
     CLI --> RUN
     CLI --> DL
+    CLI --> BEN
 
     GG <-->|reads & writes| RES
     CMP -->|reads| RES
@@ -291,9 +357,12 @@ flowchart TD
     RUN -->|writes| RES
     RUN -->|writes| COM
     DL -->|writes| DAT
+    BEN -->|reads| RES
+    BEN -->|writes| BEN_OUT
 
     style CLI fill:#1d3557,color:#fff
     style RES fill:#457b9d,color:#fff
     style COM fill:#457b9d,color:#fff
     style DAT fill:#457b9d,color:#fff
+    style BEN_OUT fill:#457b9d,color:#fff
 ```
