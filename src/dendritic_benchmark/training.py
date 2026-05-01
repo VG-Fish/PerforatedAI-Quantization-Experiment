@@ -5,6 +5,7 @@ import importlib
 import json
 import math
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -14,6 +15,7 @@ from tqdm.auto import tqdm
 from .compat import (
     binary_quantize_tensor,
     choose_device,
+    pai_runtime_guard,
     require_torch,
     symmetric_quantize_tensor,
     ternary_quantize_tensor,
@@ -1246,8 +1248,11 @@ def _run_dynamic_dendrite_update(
         if restructured:
             optimizer, _ = _setup_pai_optimizer(context.model, context.torch, context.config)
         return optimizer, pai_tracker, bool(restructured), bool(training_complete)
-    except SystemExit:
-        raise
+    except SystemExit as pai_exit:
+        if pai_exit.code != -1:
+            raise
+        print(f"[pai] dynamic dendrite update skipped: {pai_exit}")
+        return optimizer, None, False, False
     except Exception as pai_exc:
         print(f"[pai] dynamic dendrite update skipped: {pai_exc}")
         return optimizer, None, False, False
@@ -1506,6 +1511,10 @@ def _should_quantize_for_eval(config: TrainingConfig) -> bool:
     return config.bit_width is not None and config.bit_width < 32
 
 
+def _use_pai_runtime_guard(model_key: str) -> bool:
+    return model_key in {"lstm_forecaster", "lstm_autoencoder"}
+
+
 def _prepare_model_for_training(
     model: Any,
     *,
@@ -1599,53 +1608,59 @@ def train_and_evaluate(
         config=config,
     )
 
-    optimizer, pai_tracker = _setup_pai_optimizer(model, torch, config)
-    criterion = _binary_or_multi_loss(model_key)
-    start_time = time.perf_counter()
-    run_label = f"{model_key} | {condition_key}"
-
-    training_skipped, skip_reason = _determine_skip_info(
-        max_epochs, bit_width, use_qat, quantization_mode
+    pai_guard = (
+        pai_runtime_guard()
+        if use_dendrites and _use_pai_runtime_guard(model_key)
+        else nullcontext()
     )
+    with pai_guard:
+        optimizer, pai_tracker = _setup_pai_optimizer(model, torch, config)
+        criterion = _binary_or_multi_loss(model_key)
+        start_time = time.perf_counter()
+        run_label = f"{model_key} | {condition_key}"
 
-    if pqat_enabled:
-        _capture_before_pqat_snapshot(
+        training_skipped, skip_reason = _determine_skip_info(
+            max_epochs, bit_width, use_qat, quantization_mode
+        )
+
+        if pqat_enabled:
+            _capture_before_pqat_snapshot(
+                model=model,
+                model_key=model_key,
+                bundle=bundle,
+                device=device,
+                criterion=criterion,
+                metric_name=metric_name,
+                torch=torch,
+                primary_metric_key=primary_metric_key,
+                metric_direction=metric_direction,
+                output_dir=output_dir,
+                metadata=metadata,
+            )
+
+        epoch_context = EpochTrainingContext(
             model=model,
             model_key=model_key,
             bundle=bundle,
             device=device,
             criterion=criterion,
-            metric_name=metric_name,
             torch=torch,
+            max_epochs=max_epochs,
+            run_label=run_label,
+            config=config,
+            metric_name=metric_name,
             primary_metric_key=primary_metric_key,
             metric_direction=metric_direction,
-            output_dir=output_dir,
-            metadata=metadata,
         )
-
-    epoch_context = EpochTrainingContext(
-        model=model,
-        model_key=model_key,
-        bundle=bundle,
-        device=device,
-        criterion=criterion,
-        torch=torch,
-        max_epochs=max_epochs,
-        run_label=run_label,
-        config=config,
-        metric_name=metric_name,
-        primary_metric_key=primary_metric_key,
-        metric_direction=metric_direction,
-    )
-    history, best_metric, best_epoch, best_state = _run_or_skip_training(
-        context=epoch_context,
-        optimizer=optimizer,
-        pai_tracker=pai_tracker,
-        skip_reason=skip_reason,
-        source_condition_key=source_condition_key,
-        condition_key=condition_key,
-    )
-    model = epoch_context.model
+        history, best_metric, best_epoch, best_state = _run_or_skip_training(
+            context=epoch_context,
+            optimizer=optimizer,
+            pai_tracker=pai_tracker,
+            skip_reason=skip_reason,
+            source_condition_key=source_condition_key,
+            condition_key=condition_key,
+        )
+        model = epoch_context.model
 
     if best_state is not None:
         # Load into the underlying module; the compiled wrapper's forward graph

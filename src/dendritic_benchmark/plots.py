@@ -12,7 +12,7 @@ matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
-from matplotlib.colors import LogNorm
+from matplotlib.colors import Colormap, LogNorm, Normalize
 from matplotlib.patches import Patch
 from matplotlib.transforms import Bbox
 
@@ -294,18 +294,23 @@ def _heatmap_image_values(
     return plot_values, LogNorm(vmin=min_positive, vmax=max(positive_values))
 
 
-def _heatmap_text_color(value: float, minimum: float, span: float) -> str:
-    if span and value < (minimum + span * 0.42):
-        return "white"
-    return "#111827"
+def _heatmap_text_color(value: float, cmap: Colormap, norm: Normalize | None) -> str:
+    normalized_value = norm(value) if norm is not None else value
+    red, green, blue, _alpha = cmap(normalized_value)
+    luminance = (0.2126 * red) + (0.7152 * green) + (0.0722 * blue)
+    return "#111827" if luminance >= 0.58 else "white"
 
 
-def _annotate_heatmap_cells(ax: Axes, matrix: list[list[float]]) -> None:
-    cell_values: list[float] = [value for row in matrix for value in row]
-    minimum: float = min(cell_values) if cell_values else 0.0
-    span: float = (max(cell_values) - minimum) if cell_values else 0.0
+def _annotate_heatmap_cells(
+    ax: Axes,
+    matrix: list[list[float]],
+    plot_values: list[list[float]],
+    cmap: Colormap,
+    norm: Normalize | None,
+) -> None:
     for row_index, row in enumerate(matrix):
         for col_index, value in enumerate(row):
+            color_value = plot_values[row_index][col_index]
             ax.text(
                 col_index,
                 row_index,
@@ -313,7 +318,7 @@ def _annotate_heatmap_cells(ax: Axes, matrix: list[list[float]]) -> None:
                 ha="center",
                 va="center",
                 fontsize=8,
-                color=_heatmap_text_color(value, minimum, span),
+                color=_heatmap_text_color(color_value, cmap, norm),
             )
 
 
@@ -349,7 +354,7 @@ def heatmap(
     ax.grid(which="minor", color=BACKGROUND, linestyle="-", linewidth=2)
     ax.tick_params(which="minor", bottom=False, left=False)
 
-    _annotate_heatmap_cells(ax, matrix)
+    _annotate_heatmap_cells(ax, matrix, plot_values, image.cmap, image.norm)
 
     colorbar = fig.colorbar(image, ax=ax, shrink=0.82)
     colorbar.ax.tick_params(colors=TEXT)

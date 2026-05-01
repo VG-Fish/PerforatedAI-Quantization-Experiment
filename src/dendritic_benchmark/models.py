@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from .compat import F, nn, require_torch
 
@@ -519,6 +519,21 @@ else:  # pragma: no cover - import-time fallback
     DQN = PPOPolicy = AttentiveFPLite = GIN = TCNForecaster = GRUForecaster = PointNet = VAE = SNNLite = TinyUNet = SAINTLite = CapsNetLite = ConvLSTM = object
 
 
+LeNet5 = cast(Any, LeNet5)
+M5 = cast(Any, M5)
+TextCNN = cast(Any, TextCNN)
+GCN = cast(Any, GCN)
+TabNetLite = cast(Any, TabNetLite)
+DistilBertFallback = cast(Any, DistilBertFallback)
+GIN = cast(Any, GIN)
+TCNForecaster = cast(Any, TCNForecaster)
+GRUForecaster = cast(Any, GRUForecaster)
+PointNet = cast(Any, PointNet)
+SNNLite = cast(Any, SNNLite)
+SAINTLite = cast(Any, SAINTLite)
+CapsNetLite = cast(Any, CapsNetLite)
+
+
 def _build_resnet18_cifar10(**_: Any) -> Any:
     torchvision_models = __import__("torchvision.models", fromlist=["models"])
     model = torchvision_models.resnet18(weights=None, num_classes=10)
@@ -534,31 +549,35 @@ def _build_mobilenetv2_cifar10(**_: Any) -> Any:
     return model
 
 
+def _construct(model_class: Any, **kwargs: Any) -> Any:
+    return model_class(**kwargs)
+
+
 MODEL_FACTORIES: dict[str, Callable[..., Any]] = {
-    "lenet5": lambda num_classes=10, **_: LeNet5(num_classes=num_classes),
-    "m5": lambda num_classes=12, **_: M5(num_classes=num_classes),
+    "lenet5": lambda num_classes=10, **_: _construct(LeNet5, num_classes=num_classes),
+    "m5": lambda num_classes=12, **_: _construct(M5, num_classes=num_classes),
     "lstm_forecaster": lambda **_: LSTMForecaster(),
-    "textcnn": lambda num_classes=4, **_: TextCNN(num_classes=num_classes),
-    "gcn": lambda num_classes=7, **_: GCN(num_classes=num_classes),
-    "tabnet": lambda num_classes=2, **_: TabNetLite(num_classes=num_classes),
+    "textcnn": lambda num_classes=4, **_: _construct(TextCNN, num_classes=num_classes),
+    "gcn": lambda num_classes=7, **_: _construct(GCN, num_classes=num_classes),
+    "tabnet": lambda num_classes=2, **_: _construct(TabNetLite, num_classes=num_classes),
     "mpnn": lambda **_: MPNN(),
     "actor_critic": lambda **_: ActorCritic(),
     "lstm_autoencoder": lambda **_: LSTMAutoencoder(),
-    "distilbert": lambda num_classes=2, **_: DistilBertFallback(num_classes=num_classes),
+    "distilbert": lambda num_classes=2, **_: _construct(DistilBertFallback, num_classes=num_classes),
     "dqn_lunarlander": lambda **_: DQN(),
     "ppo_bipedalwalker": lambda **_: PPOPolicy(),
     "attentivefp_freesolv": lambda **_: AttentiveFPLite(),
-    "gin_imdbb": lambda num_classes=2, **_: GIN(num_classes=num_classes),
-    "tcn_forecaster": lambda **_: TCNForecaster(input_size=7),
-    "gru_forecaster": lambda **_: GRUForecaster(input_size=21),
-    "pointnet_modelnet40": lambda num_classes=40, **_: PointNet(num_classes=num_classes),
+    "gin_imdbb": lambda num_classes=2, **_: _construct(GIN, num_classes=num_classes),
+    "tcn_forecaster": lambda **_: _construct(TCNForecaster, input_size=7),
+    "gru_forecaster": lambda **_: _construct(GRUForecaster, input_size=21),
+    "pointnet_modelnet40": lambda num_classes=40, **_: _construct(PointNet, num_classes=num_classes),
     "vae_mnist": lambda **_: VAE(),
-    "snn_nmnist": lambda num_classes=10, **_: SNNLite(num_classes=num_classes),
+    "snn_nmnist": lambda num_classes=10, **_: _construct(SNNLite, num_classes=num_classes),
     "unet_isic": lambda **_: TinyUNet(),
     "resnet18_cifar10": _build_resnet18_cifar10,
     "mobilenetv2_cifar10": _build_mobilenetv2_cifar10,
-    "saint_adult": lambda num_classes=2, **_: SAINTLite(num_classes=num_classes),
-    "capsnet_mnist": lambda num_classes=10, **_: CapsNetLite(num_classes=num_classes),
+    "saint_adult": lambda num_classes=2, **_: _construct(SAINTLite, num_classes=num_classes),
+    "capsnet_mnist": lambda num_classes=10, **_: _construct(CapsNetLite, num_classes=num_classes),
     "convlstm_movingmnist": lambda **_: ConvLSTM(),
 }
 

@@ -2,42 +2,47 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import pdb
 import shutil
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 import builtins
 
 # Module-level flag to ensure the PAI config-saved message is emitted only once
 _PAI_CONFIG_SAVED_PRINTED: bool = False
+_PAI_DEBUGGER_SUPPRESS_REMAINING: int = 0
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any, Callable, Iterator
 
-if TYPE_CHECKING:  # pragma: no cover
-    from dotenv import load_dotenv
-else:
-    try:  # pragma: no cover - optional dependency
-        from dotenv import load_dotenv
-    except Exception:  # pragma: no cover - allow import before deps are installed
-        load_dotenv = None
+load_dotenv: Any
+try:  # pragma: no cover - optional dependency
+    from dotenv import load_dotenv as _load_dotenv
+
+    load_dotenv = _load_dotenv
+except Exception:  # pragma: no cover - allow import before deps are installed
+    load_dotenv = None
 
 
 def module_available(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
-if TYPE_CHECKING:  # pragma: no cover
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-else:
-    try:  # pragma: no cover - optional dependency
-        import torch
-        import torch.nn as nn
-        import torch.nn.functional as F
-    except Exception:  # pragma: no cover - allow import on machines without torch
-        torch = None
-        nn = None
-        F = None
+torch: Any
+nn: Any
+F: Any
+try:  # pragma: no cover - optional dependency
+    import torch as _torch
+    import torch.nn as _nn
+    import torch.nn.functional as _F
+
+    torch = _torch
+    nn = _nn
+    F = _F
+except Exception:  # pragma: no cover - allow import on machines without torch
+    torch = None
+    nn = None
+    F = None
 
 
 def require_torch() -> Any:
@@ -154,6 +159,38 @@ def _consume_pai_config_message(text: str) -> bool:
     return False
 
 
+def _consume_pai_debugger_message(text: str) -> bool:
+    global _PAI_DEBUGGER_SUPPRESS_REMAINING
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("WARNING: Parameter does not have parameter_type attribute"):
+        _PAI_DEBUGGER_SUPPRESS_REMAINING = 8
+        return True
+    if stripped.startswith(
+        (
+            "(Pdb)",
+            "--Call--",
+            "You can find this param",
+            "UPA.find_param_name_by_id(",
+            "Ensure that model is either converted or tracked",
+            "Instructions in customization.md",
+        )
+    ):
+        _PAI_DEBUGGER_SUPPRESS_REMAINING = max(_PAI_DEBUGGER_SUPPRESS_REMAINING - 1, 0)
+        return True
+    if _PAI_DEBUGGER_SUPPRESS_REMAINING:
+        if stripped.startswith((">", "->")):
+            _PAI_DEBUGGER_SUPPRESS_REMAINING -= 1
+            return True
+        _PAI_DEBUGGER_SUPPRESS_REMAINING = 0
+    return False
+
+
+def _consume_pai_output_message(text: str) -> bool:
+    return _consume_pai_config_message(text) or _consume_pai_debugger_message(text)
+
+
 class _PaiConfigFilterStream:
     def __init__(self, stream: Any) -> None:
         self._stream = stream
@@ -166,14 +203,14 @@ class _PaiConfigFilterStream:
         written = 0
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
-            if _consume_pai_config_message(line):
+            if _consume_pai_output_message(line):
                 continue
             written = self._stream.write(f"{line}\n")
         return written
 
     def flush(self) -> None:
         if self._buffer:
-            if not _consume_pai_config_message(self._buffer):
+            if not _consume_pai_output_message(self._buffer):
                 self._stream.write(self._buffer)
             self._buffer = ""
         self._stream.flush()
@@ -188,7 +225,7 @@ def _filtered_print_factory(original_print: Any) -> Any:
             text = " ".join(str(a) for a in args)
         except Exception:
             return original_print(*args, **kwargs)
-        if _consume_pai_config_message(text):
+        if _consume_pai_output_message(text):
             return
         return original_print(*args, **kwargs)
 
@@ -220,6 +257,49 @@ def _restore_pai_output_filters(
     builtins.print = original_print
 
 
+@contextmanager
+def _suppress_pai_debugger() -> Iterator[None]:
+    """Prevent PerforatedAI library warnings from dropping benchmark runs into pdb."""
+
+    original_set_trace: Callable[..., Any] = pdb.set_trace
+    original_pdb_set_trace: Callable[..., Any] = pdb.Pdb.set_trace
+    original_breakpointhook: Callable[..., Any] = sys.breakpointhook
+    original_sys_settrace: Callable[..., Any] = sys.settrace
+
+    def _no_set_trace(*args: Any, **kwargs: Any) -> None:
+        _ = args, kwargs
+
+    def _guarded_settrace(trace_function: Any) -> None:
+        trace_owner = getattr(trace_function, "__self__", None)
+        owner_module = getattr(type(trace_owner), "__module__", "")
+        function_module = getattr(trace_function, "__module__", "")
+        if owner_module in {"pdb", "bdb"} or function_module in {"pdb", "bdb"}:
+            return
+        original_sys_settrace(trace_function)
+
+    setattr(pdb, "set_trace", _no_set_trace)
+    setattr(pdb.Pdb, "set_trace", _no_set_trace)
+    setattr(sys, "breakpointhook", _no_set_trace)
+    setattr(sys, "settrace", _guarded_settrace)
+    try:
+        yield
+    finally:
+        setattr(pdb, "set_trace", original_set_trace)
+        setattr(pdb.Pdb, "set_trace", original_pdb_set_trace)
+        setattr(sys, "breakpointhook", original_breakpointhook)
+        setattr(sys, "settrace", original_sys_settrace)
+
+
+@contextmanager
+def pai_runtime_guard() -> Iterator[None]:
+    original_print, original_stdout, original_stderr = _install_pai_output_filters()
+    try:
+        with _suppress_pai_debugger():
+            yield
+    finally:
+        _restore_pai_output_filters(original_print, original_stdout, original_stderr)
+
+
 def perforate_model(
     model: Any,
     save_name: str,
@@ -229,34 +309,39 @@ def perforate_model(
     module_names_to_track: list[str] | None = None,
     confirm_unwrapped_modules: bool = True,
     config_snapshot_path: Path | str | None = None,
+    use_runtime_guard: bool = False,
 ) -> Any:
     if not has_perforatedai():
         return model
 
-    # Filter repeated "[PAI Config] Saved ..." messages across the process
-    # while PerforatedAI is setting itself up for this call.
-    original_print, original_stdout, original_stderr = _install_pai_output_filters()
     try:  # pragma: no cover - optional dependency
         _mirror_env_aliases()
         GPA = importlib.import_module("perforatedai.globals_perforatedai")
         UPA = importlib.import_module("perforatedai.utils_perforatedai")
+        upa_perforate_model = getattr(UPA, "perforate_model")
 
-        _configure_pai_trackers(GPA, modules_to_track, module_names_to_track, confirm_unwrapped_modules)
+        def _run_perforation() -> Any:
+            _configure_pai_trackers(
+                GPA, modules_to_track, module_names_to_track, confirm_unwrapped_modules
+            )
+            pai_save_name = str(_pai_save_path(save_name))
+            return upa_perforate_model(
+                model,
+                doing_pai=doing_pai,
+                save_name=pai_save_name,
+                maximizing_score=maximizing_score,
+                making_graphs=False,
+            )
 
-        pai_save_name = str(_pai_save_path(save_name))
-        perforated_model = UPA.perforate_model(
-            model,
-            doing_pai=doing_pai,
-            save_name=pai_save_name,
-            maximizing_score=maximizing_score,
-            making_graphs=False,
-        )
+        if use_runtime_guard:
+            with pai_runtime_guard():
+                perforated_model = _run_perforation()
+        else:
+            perforated_model = _run_perforation()
         _snapshot_pai_config(_snapshot_stem(save_name), config_snapshot_path)
         return perforated_model
     except Exception:
         return model
-    finally:
-        _restore_pai_output_filters(original_print, original_stdout, original_stderr)
 
 
 def _pai_save_path(save_name: str) -> Path:
