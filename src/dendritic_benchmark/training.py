@@ -18,12 +18,17 @@ from .compat import (
     choose_device,
     pai_runtime_guard,
     require_torch,
+    set_module_output_dimensions,
     symmetric_quantize_tensor,
     ternary_quantize_tensor,
 )
 
 _MODEL_PT: str = "model.pt"
 _BEST_MODEL_STATS_CSV: str = "best_model_stats.csv"
+_GCN_LINEAR_OUTPUT_DIMENSIONS: dict[str, list[int]] = {
+    ".conv1.linear": [-1, -1, 0],
+    ".conv2.linear": [-1, -1, 0],
+}
 OptimizerName = Literal["adam", "adamw", "sgd"]
 
 
@@ -1050,17 +1055,12 @@ def _eval_on_loader(
 
 
 def _configure_gcn_dendrites(
-    model: Any, model_key: str, use_dendrites: bool, device: Any, torch: Any
+    model: Any, model_key: str, use_dendrites: bool, device: Any
 ) -> None:
-    if (
-        use_dendrites
-        and model_key == "gcn"
-        and hasattr(model, "conv2")
-        and hasattr(model.conv2, "linear")
-    ):
-        linear = model.conv2.linear
-        if hasattr(linear, "set_this_output_dimensions"):
-            linear.set_this_output_dimensions(torch.tensor([-1, 0], device=device))
+    if use_dendrites and model_key == "gcn":
+        set_module_output_dimensions(
+            model, _GCN_LINEAR_OUTPUT_DIMENSIONS, device=device
+        )
 
 
 def _determine_skip_info(
@@ -1287,7 +1287,6 @@ def _run_dynamic_dendrite_update(
             context.model_key,
             context.config.use_dendrites,
             context.device,
-            context.torch,
         )
         if restructured:
             optimizer, _ = _setup_pai_optimizer(context.model, context.torch, context.config)
@@ -1669,7 +1668,7 @@ def _prepare_model_for_training(
     config: TrainingConfig,
 ) -> Any:
     model = model.to(device)
-    _configure_gcn_dendrites(model, model_key, config.use_dendrites, device, torch)
+    _configure_gcn_dendrites(model, model_key, config.use_dendrites, device)
     if config.use_pruning:
         _apply_pruning(model, torch, config.prune_amount)
     if _should_quantize_for_training(config):

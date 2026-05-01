@@ -248,6 +248,29 @@ def _configure_pai_training_schedule(
     )
 
 
+def set_module_output_dimensions(
+    model: Any,
+    module_dimensions: dict[str, list[int]],
+    *,
+    device: Any | None = None,
+) -> None:
+    named_modules = getattr(model, "named_modules", None)
+    if named_modules is None:
+        return
+    modules = dict(named_modules())
+    for module_name, dimensions in module_dimensions.items():
+        module = modules.get(module_name.lstrip("."))
+        if module is None:
+            continue
+        setter = getattr(module, "set_this_output_dimensions", None)
+        if setter is None:
+            continue
+        value: Any = dimensions
+        if device is not None and torch is not None:
+            value = torch.tensor(dimensions, device=device)
+        setter(value)
+
+
 def _consume_pai_config_message(text: str) -> bool:
     global _PAI_CONFIG_SAVED_PRINTED
     if not text.startswith("[PAI Config] Saved"):

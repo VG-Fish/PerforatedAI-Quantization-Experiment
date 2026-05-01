@@ -126,7 +126,7 @@ For each model below, this document captures:
   - `weight_decay=5.0e-4`
 - Perforation registration: default
 - Special dendritic note:
-  - The pipeline adjusts `conv2.linear.set_this_output_dimensions([-1, 0])` when available.
+  - The pipeline adjusts the GCN `GraphConv` linears to `set_this_output_dimensions([-1, -1, 0])` when available.
 - PQAT epoch budget: `10`
 
 ## 6. `tabnet` — TabNet

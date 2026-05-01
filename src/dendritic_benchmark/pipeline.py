@@ -14,6 +14,7 @@ from .compat import (
     nn,
     perforate_model,
     require_torch,
+    set_module_output_dimensions,
 )
 from .data import build_task_bundle
 from .models import build_model
@@ -29,6 +30,10 @@ from .training import OptimizerName, TrainingConfig, TrainingRecord, train_and_e
 EPOCH_MULTIPLIER = 10
 _RECORD_JSON = "record.json"
 _MODEL_PT = "model.pt"
+_GCN_LINEAR_OUTPUT_DIMENSIONS = {
+    ".conv1.linear": [-1, -1, 0],
+    ".conv2.linear": [-1, -1, 0],
+}
 
 
 @dataclass(frozen=True)
@@ -260,14 +265,8 @@ class BenchmarkRunner:
         return True
 
     def _configure_perforated_model(self, model: Any, model_key: str) -> Any:
-        if (
-            model_key == "gcn"
-            and hasattr(model, "conv2")
-            and hasattr(model.conv2, "linear")
-        ):
-            linear = model.conv2.linear
-            if hasattr(linear, "set_this_output_dimensions"):
-                linear.set_this_output_dimensions([-1, 0])
+        if model_key == "gcn":
+            set_module_output_dimensions(model, _GCN_LINEAR_OUTPUT_DIMENSIONS)
         return model
 
     def _training_hyperparameters(
