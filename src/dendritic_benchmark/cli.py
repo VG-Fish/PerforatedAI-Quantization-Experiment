@@ -5,7 +5,7 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from .benchmark import BenchmarkOrchestrator
 from .compat import load_project_environment, perforatedai_credentials_present
@@ -22,10 +22,11 @@ from .results import (
 )
 from .specs import MODEL_SPECS
 
+argcomplete: Optional[Any] = None
 try:
     import argcomplete
 except Exception:  # pragma: no cover - optional runtime enhancement
-    argcomplete = None
+    pass
 
 
 def _log(msg: str) -> None:
