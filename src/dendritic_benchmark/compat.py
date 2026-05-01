@@ -179,10 +179,10 @@ def _configure_pai_trackers(
     _append_pai_module_selection(pc, selection)
     _call_if_available(pc, "set_device", choose_device())
     _call_if_available(pc, "set_testing_dendrite_capacity", False)
+    _call_if_available(pc, "set_debugging_memory_leak", False)
     if confirm_unwrapped_modules:
         _call_if_available(pc, "set_unwrapped_modules_confirmed", True)
-    if no_backward_workaround:
-        _call_if_available(pc, "set_no_backward_workaround", True)
+    _call_if_available(pc, "set_no_backward_workaround", no_backward_workaround)
 
 
 def _bounded_dendrite_schedule(
@@ -310,6 +310,46 @@ def attach_module_output_dimensions(
             {name: list(dimensions) for name, dimensions in module_dimensions.items()},
         )
     return model
+
+
+def _zero_grad_if_available(target: Any) -> None:
+    zero_grad = getattr(target, "zero_grad", None)
+    if zero_grad is None:
+        return
+    try:
+        zero_grad(set_to_none=True)
+    except TypeError:
+        zero_grad()
+
+
+def clear_pai_processor_buffers(model: Any) -> None:
+    try:
+        gpa = importlib.import_module("perforatedai.globals_perforatedai")
+        clear_all_processors = getattr(
+            getattr(gpa, "pai_tracker", None),
+            "clear_all_processors",
+            None,
+        )
+        if clear_all_processors is not None:
+            clear_all_processors()
+    except Exception:
+        pass
+    _zero_grad_if_available(model)
+    modules = getattr(model, "modules", None)
+    if modules is None:
+        return
+    for module in modules():
+        clear_processors = getattr(module, "clear_processors", None)
+        if clear_processors is None and not hasattr(module, "apply_pb_grads"):
+            continue
+        if module is not model:
+            _zero_grad_if_available(module)
+        if clear_processors is None:
+            continue
+        try:
+            clear_processors()
+        except Exception:
+            continue
 
 
 def _consume_pai_config_message(text: str) -> bool:

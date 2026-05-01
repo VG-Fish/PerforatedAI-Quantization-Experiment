@@ -18,6 +18,7 @@ from .compat import (
     attach_module_output_dimensions,
     binary_quantize_tensor,
     choose_device,
+    clear_pai_processor_buffers,
     pai_runtime_guard,
     require_torch,
     set_module_output_dimensions,
@@ -1086,6 +1087,12 @@ def _validate_pai_training_model(model: Any) -> None:
     )
 
 
+def _pai_updates_enabled(config: TrainingConfig) -> bool:
+    return bool(
+        config.enable_pai_dendrite_updates or config.train_dendrites_until_complete
+    )
+
+
 def _setup_pai_optimizer(
     model: Any,
     torch: Any,
@@ -1094,7 +1101,8 @@ def _setup_pai_optimizer(
     optimizer = _build_optimizer(model, torch, config)
     if (
         not config.use_dendrites
-        or not (config.enable_pai_dendrite_updates or config.train_dendrites_until_complete)
+        or config.max_epochs <= 0
+        or not _pai_updates_enabled(config)
     ):
         return optimizer, None
     tracker = _pai_tracker()
@@ -1103,10 +1111,14 @@ def _setup_pai_optimizer(
     _validate_pai_training_model(model)
     try:
         tracker.set_optimizer(_optimizer_class(torch, config))
-        setup_result = tracker.setup_optimizer(model, _optimizer_args(model, config), {})
+        setup_result = tracker.setup_optimizer(
+            model, _optimizer_args(model, config), {}
+        )
     except TypeError:
         try:
-            setup_result = tracker.setup_optimizer(model, _optimizer_args(model, config))
+            setup_result = tracker.setup_optimizer(
+                model, _optimizer_args(model, config)
+            )
         except Exception:
             return optimizer, tracker
     except Exception:
@@ -1235,8 +1247,11 @@ def _run_epoch_batches(
     run_label: str,
     config: "TrainingConfig",
     metric_name: str,
+    clear_pai_buffers: bool = False,
 ) -> tuple[float, dict[str, Any]]:
     model.train()
+    if clear_pai_buffers:
+        clear_pai_processor_buffers(model)
     running_loss_t = torch.zeros(1, device=device)
     train_examples = 0
     train_outputs: list[Any] = []
@@ -1258,10 +1273,14 @@ def _run_epoch_batches(
     for batch in batch_progress:
         batch = tuple(item.to(device, non_blocking=True) for item in batch)
         optimizer.zero_grad(set_to_none=True)
+        if clear_pai_buffers:
+            clear_pai_processor_buffers(model)
         outputs, targets, metric_targets = _forward(model_key, model, batch)
         loss = _compute_loss(model_key, criterion, outputs, targets)
         loss.backward()
         optimizer.step()
+        if clear_pai_buffers:
+            clear_pai_processor_buffers(model)
         batch_examples = _batch_size(targets)
         running_loss_t = running_loss_t + loss.detach() * batch_examples
         train_examples += batch_examples
@@ -1487,6 +1506,7 @@ def _run_training_epochs(
             context.model, context.model_key, context.bundle, context.device,
             context.criterion, optimizer, context.torch, epoch, context.max_epochs,
             context.run_label, context.config, context.metric_name,
+            clear_pai_buffers=context.config.use_dendrites and pai_tracker is None,
         )
         context.model.eval()
         val_loss, val_metrics = _eval_on_loader(

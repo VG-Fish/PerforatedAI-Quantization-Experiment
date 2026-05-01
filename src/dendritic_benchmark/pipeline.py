@@ -38,7 +38,6 @@ from .training import (
 EPOCH_MULTIPLIER = 10
 _RECORD_JSON = "record.json"
 _MODEL_PT = "model.pt"
-_RECURRENT_MODELS = {"lstm_forecaster", "lstm_autoencoder", "convlstm_movingmnist", "gru_forecaster"}
 
 
 @dataclass(frozen=True)
@@ -186,7 +185,7 @@ class BenchmarkRunner:
                     load_config.freeze_dendrite_updates_fraction
                 ),
                 batches_per_epoch=load_config.batches_per_epoch,
-                no_backward_workaround=model_key not in _RECURRENT_MODELS,
+                no_backward_workaround=False,
             )
             model = self._configure_perforated_model(
                 model, load_config.module_output_dimensions
@@ -222,7 +221,7 @@ class BenchmarkRunner:
                     load_config.freeze_dendrite_updates_fraction
                 ),
                 batches_per_epoch=load_config.batches_per_epoch,
-                no_backward_workaround=model_key not in _RECURRENT_MODELS,
+                no_backward_workaround=False,
             )
             model = self._configure_perforated_model(
                 model, load_config.module_output_dimensions
@@ -413,7 +412,7 @@ class BenchmarkRunner:
             dynamic_dendritic_training=dynamic_dendritic_training,
             freeze_dendrite_updates_fraction=0.20,
             batches_per_epoch=batches_per_epoch,
-            no_backward_workaround=model_key not in _RECURRENT_MODELS,
+            no_backward_workaround=False,
         )
         return self._configure_perforated_model(model, module_output_dimensions)
 
