@@ -10,13 +10,13 @@ These flags are shared by all commands:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--results-root DIR` | `results` | Root directory for per-model result folders (also used by `bench` to locate trained models) |
+| `--results-root DIR` | `results` | Root directory for per-model result folders (also used by `benchmark_models` to locate trained models) |
 | `--results-directory NAME` | _unset_ | Optional subdirectory under `--results-root`; when set, results path becomes `<results-root>/<results-directory>` |
 | `--logging-dir DIR` | `logs` | Directory for timestamped log files |
 
 `--comparison-root DIR` is available only on `uv run dqb run` and `uv run dqb compare`.
 
-`--benchmark-root DIR` is available only on `uv run dqb bench`.
+`--benchmark-root DIR` is available only on `uv run dqb benchmark_models`.
 
 ---
 
@@ -231,23 +231,23 @@ flowchart TD
 
 ---
 
-## `uv run dqb bench`
+## `uv run dqb benchmark_models`
 
 Measures wall-clock inference latency for all trained models using `torch.utils.benchmark.Timer`.
 
 ```bash
-uv run dqb bench
-uv run dqb --results-directory experiment_a bench
-uv run dqb bench --models lenet5 m5
-uv run dqb bench --conditions base_fp32 base_q4 dendrites_q4
-uv run dqb bench --batch-sizes 1 8 32
-uv run dqb bench --num-runs 20
-uv run dqb bench --benchmark-root my_benchmarks
+uv run dqb benchmark_models
+uv run dqb --results-directory experiment_a benchmark_models
+uv run dqb benchmark_models --models lenet5 m5
+uv run dqb benchmark_models --conditions base_fp32 base_q4 dendrites_q4
+uv run dqb benchmark_models --batch-sizes 1 8 32
+uv run dqb benchmark_models --num-runs 20
+uv run dqb benchmark_models --benchmark-root my_benchmarks
 ```
 
 ```mermaid
 flowchart TD
-    A([uv run dqb bench]) --> B["Parse args<br>--models, --conditions,<br>--batch-sizes,<br>--num-runs,<br>--benchmark-root"]
+    A([uv run dqb benchmark_models]) --> B["Parse args<br>--models, --conditions,<br>--batch-sizes,<br>--num-runs,<br>--benchmark-root"]
     B --> C["Create benchmark directory"]
     C --> D["Capture system info<br>CPU, device, PyTorch version"]
     D --> E["Write computer_info.json"]
@@ -291,7 +291,7 @@ Results are organized by model and condition:
 
 ```text
 .
-├── benchmarks/                          # created by dqb bench
+├── benchmarks/                          # created by dqb benchmark_models
 │   ├── computer_info.json
 │   ├── manifest.csv
 │   └── model_key/
@@ -344,7 +344,7 @@ flowchart TD
     CMP["compare<br>Rebuild comparison plots"]
     RUN["run<br>Train models and<br>save results"]
     DL["download_data<br>Pre-cache datasets"]
-    BEN["bench<br>Measure inference<br>latency"]
+    BEN["benchmark_models<br>Measure inference<br>latency"]
 
     RES[("results/<br>records + plots")]
     COM[("comparison/<br>charts + summary")]

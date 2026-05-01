@@ -12,8 +12,20 @@ from .compat import load_project_environment, perforatedai_credentials_present
 from .data import DATA_ROOT_ENV, DEFAULT_DATA_ROOT, build_task_bundle, dataset_exists
 from .log_utils import setup_logging
 from .pipeline import BenchmarkRunner
-from .results import load_training_records, write_comparison_reports, write_manifest, write_model_reports, generate_training_graphs
+from .results import (
+    generate_training_graphs,
+    load_training_records,
+    write_benchmark_plots,
+    write_comparison_reports,
+    write_manifest,
+    write_model_reports,
+)
 from .specs import MODEL_SPECS
+
+try:
+    import argcomplete
+except Exception:  # pragma: no cover - optional runtime enhancement
+    argcomplete = None
 
 
 def _log(msg: str) -> None:
@@ -207,6 +219,15 @@ def build_parser() -> argparse.ArgumentParser:
             "editing record files."
         ),
     )
+    compare_parser.add_argument(
+        "--benchmark-root",
+        default="benchmarks",
+        metavar="DIR",
+        help=(
+            "Root directory containing benchmark outputs (manifest.csv) used to build "
+            "latency comparison plots in --comparison-root. (default: benchmarks)"
+        ),
+    )
 
     generate_graphs_parser: argparse.ArgumentParser = subparsers.add_parser(
         "generate_graphs",
@@ -229,7 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     bench_parser: argparse.ArgumentParser = subparsers.add_parser(
-        "bench",
+        "benchmark_models",
         help="Benchmark inference latency of trained models using torch.utils.benchmark.Timer.",
         description=(
             "Measures wall-clock inference latency for all trained models and conditions. "
@@ -355,6 +376,7 @@ def _handle_compare(args: Any, results_root: Path, comparison_root: Path) -> Non
         if model_records:
             write_model_reports(model_spec.display_name, model_records, results_root / model_spec.key)
     write_comparison_reports(records, comparison_root)
+    write_benchmark_plots(Path(getattr(args, "benchmark_root", "benchmarks")), comparison_root)
 
 
 def _handle_bench(args: Any, results_root: Path, benchmark_root: Path) -> None:
@@ -371,6 +393,8 @@ def _handle_bench(args: Any, results_root: Path, benchmark_root: Path) -> None:
 def main() -> None:
     load_project_environment()
     parser = build_parser()
+    if argcomplete is not None:
+        argcomplete.autocomplete(parser)
     args = parser.parse_args()
     results_root = Path(args.results_root)
     if args.results_directory:
@@ -391,7 +415,7 @@ def main() -> None:
         _handle_compare(args, results_root, comparison_root)
     elif args.command == "generate_graphs":
         generate_training_graphs(results_root, regenerate=args.regenerate_graphs)
-    elif args.command == "bench":
+    elif args.command == "benchmark_models":
         _handle_bench(args, results_root, benchmark_root)
     else:
         parser.print_help()

@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "Codex" }]
 dependencies = [
+    "argcomplete>=3.6.2",
     "datasets>=3.0.0",
     "gymnasium[classic-control,box2d]>=1.0.0",
     "matplotlib>=3.10.9",
@@ -26,6 +27,7 @@ dependencies = [
     "pillow>=11.0.0",
     "tonic>=1.5.0",
     "torch-geometric>=2.6.0",
+    "perforatedbp>=3.2.0",
 ]
 
 [project.scripts]

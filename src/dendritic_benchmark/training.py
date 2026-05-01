@@ -1222,6 +1222,15 @@ def _run_dynamic_dendrite_update(
     pai_tracker: Any,
     val_metric: float,
 ) -> tuple[Any, Any | None, bool, bool]:
+    import pdb as _pdb
+    from typing import Any, Callable
+
+    def _no_set_trace(*, header: str | None = None) -> None:
+        _ = header
+
+    pdb_module: Any = _pdb
+    _orig_set_trace: Callable[..., None] = pdb_module.set_trace
+    pdb_module.set_trace = _no_set_trace
     try:
         model, restructured, training_complete = pai_tracker.add_validation_score(
             val_metric, context.model
@@ -1237,9 +1246,13 @@ def _run_dynamic_dendrite_update(
         if restructured:
             optimizer, _ = _setup_pai_optimizer(context.model, context.torch, context.config)
         return optimizer, pai_tracker, bool(restructured), bool(training_complete)
+    except SystemExit:
+        raise
     except Exception as pai_exc:
         print(f"[pai] dynamic dendrite update skipped: {pai_exc}")
         return optimizer, None, False, False
+    finally:
+        pdb_module.set_trace = _orig_set_trace
 
 
 def _set_epoch_progress(

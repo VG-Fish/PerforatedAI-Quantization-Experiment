@@ -484,7 +484,7 @@ For MPNN, Actor-Critic, and LSTM Forecaster, run QAT inside the PAI dendritic tr
 For MPNN, Actor-Critic, and LSTM Forecaster, compare L1 unstructured global pruning at 40% sparsity against L2 structured (channel-level) pruning at equivalent parameter reduction.
 
 ### Experiment E — Inference Latency Benchmarking on M3 Pro
-For the 5 best Q4 conditions per model, measure actual wall-clock inference latency on M3 Pro (batch size 1 and 32) using `torch.utils.benchmark.Timer`. Add `dqb bench` command to `cli.py`.
+For the 5 best Q4 conditions per model, measure actual wall-clock inference latency on M3 Pro (batch size 1 and 32) using `torch.utils.benchmark.Timer`. Add `dqb benchmark_models` command to `cli.py`.
 
 ### Experiment F — Dataset Difficulty Scaling (LSTM Forecaster)
 Run the full 13-condition suite for LSTM Forecaster on ETTh1, ETTh2, ETTm1, ETTm2, and Weather to test whether the +51.4pp Q4 rescue magnitude scales with dataset complexity.
@@ -781,18 +781,18 @@ uv run dqb --results-directory experiment_b run --models mpnn actor_critic --ign
 
 ## Overview
 
-The `dqb bench` command measures actual wall-clock inference latency for all trained models using `torch.utils.benchmark.Timer`. This allows you to understand the real-world performance characteristics of quantized and dendritic models on your hardware (M3 Pro, M4 Max, GPU, etc.).
+The `dqb benchmark_models` command measures actual wall-clock inference latency for all trained models using `torch.utils.benchmark.Timer`. This allows you to understand the real-world performance characteristics of quantized and dendritic models on your hardware (M3 Pro, M4 Max, GPU, etc.).
 
 ## Command
 
 ```bash
-uv run dqb bench
-uv run dqb --results-directory experiment_a bench
-uv run dqb bench --models lenet5 m5 resnet18_cifar10
-uv run dqb bench --conditions base_fp32 base_q4 dendrites_q4
-uv run dqb bench --batch-sizes 1 8 32
-uv run dqb bench --num-runs 20
-uv run dqb bench --benchmark-root my_benchmarks
+uv run dqb benchmark_models
+uv run dqb --results-directory experiment_a benchmark_models
+uv run dqb benchmark_models --models lenet5 m5 resnet18_cifar10
+uv run dqb benchmark_models --conditions base_fp32 base_q4 dendrites_q4
+uv run dqb benchmark_models --batch-sizes 1 8 32
+uv run dqb benchmark_models --num-runs 20
+uv run dqb benchmark_models --benchmark-root my_benchmarks
 ```
 
 ## Options
@@ -922,30 +922,30 @@ Compare dendritic conditions to non-dendritic (e.g., `dendrites_q4` vs `base_q4`
 ### Benchmark only small models for quick iteration
 
 ```bash
-uv run dqb bench --models lenet5 m5 --batch-sizes 1 32 --num-runs 5
+uv run dqb benchmark_models --models lenet5 m5 --batch-sizes 1 32 --num-runs 5
 ```
 
 ### Benchmark a specific condition across all models
 
 ```bash
-uv run dqb bench --conditions base_q4 --batch-sizes 1 32
+uv run dqb benchmark_models --conditions base_q4 --batch-sizes 1 32
 ```
 
 ### Deep benchmark with many runs for statistical confidence
 
 ```bash
-uv run dqb bench --num-runs 50 --batch-sizes 1 16 32 64
+uv run dqb benchmark_models --num-runs 50 --batch-sizes 1 16 32 64
 ```
 
 ### Save results to a custom directory for later analysis
 
 ```bash
-uv run dqb bench --benchmark-root benchmarks_experiment_e
+uv run dqb benchmark_models --benchmark-root benchmarks_experiment_e
 ```
 
 ## Requirements
 
 - Trained models must exist in `--results-root` (run `dqb run` first)
-- If `--results-directory` is used, `bench` reads trained models from `--results-root/<results-directory>`
+- If `--results-directory` is used, `benchmark_models` reads trained models from `--results-root/<results-directory>`
 - PyTorch must be installed
 - Models will be loaded to CPU/MPS/CUDA based on availability

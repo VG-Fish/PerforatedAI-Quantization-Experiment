@@ -22,6 +22,7 @@ _RECORD_JSON = "record.json"
 _COERCE_INT_KEYS = {"best_epoch", "param_count", "nonzero_params"}
 _COERCE_FLOAT_KEYS = {"metric_value", "best_metric_value", "file_size_mb", "train_seconds"}
 _COERCE_BOOL_KEYS = {"training_skipped"}
+_BENCHMARK_MANIFEST_FIELDS = {"model_key", "condition_key", "batch_size", "mean_latency_ms", "median_latency_ms"}
 
 
 def _iter_condition_dirs(results_root: Path):
@@ -660,3 +661,52 @@ def generate_training_graphs(results_root: Path, regenerate: bool = False) -> No
 
     print(f"{'─' * 64}")
     print(f"[generate_graphs] Finished. {graph_count} graph(s) written across {total_conditions} condition(s).")
+
+
+def _load_benchmark_manifest_rows(benchmark_root: Path) -> list[dict[str, Any]]:
+    manifest_path = benchmark_root / "manifest.csv"
+    if not manifest_path.exists():
+        return []
+    with manifest_path.open("r", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+
+    parsed_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if not _BENCHMARK_MANIFEST_FIELDS.issubset(row.keys()):
+            continue
+        try:
+            parsed_rows.append({
+                "model_key": row["model_key"],
+                "condition_key": row["condition_key"],
+                "batch_size": int(row["batch_size"]),
+                "mean_latency_ms": float(row["mean_latency_ms"]),
+                "median_latency_ms": float(row["median_latency_ms"]),
+            })
+        except (TypeError, ValueError):
+            continue
+    return parsed_rows
+
+
+def write_benchmark_plots(benchmark_root: Path, comparison_root: Path) -> None:
+    rows = _load_benchmark_manifest_rows(benchmark_root)
+    if not rows:
+        return
+
+    comparison_root.mkdir(parents=True, exist_ok=True)
+    rows.sort(key=lambda row: (row["batch_size"], row["model_key"], row["condition_key"]))
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(row["batch_size"], []).append(row)
+
+    for batch_size, batch_rows in grouped.items():
+        labels = [f'{row["model_key"]}:{row["condition_key"]}' for row in batch_rows]
+        grouped_bar_chart(
+            comparison_root / f"latency_comparison_batch_{batch_size}.svg",
+            f"Inference Latency Comparison (Batch Size {batch_size})",
+            labels,
+            [
+                ("Mean latency (ms)", [row["mean_latency_ms"] for row in batch_rows], "#2b6cb0"),
+                ("Median latency (ms)", [row["median_latency_ms"] for row in batch_rows], "#2f855a"),
+            ],
+            "Latency (ms)",
+        )

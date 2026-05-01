@@ -67,6 +67,81 @@ own reproducibility config instead of relying only on the latest global
 uv run dqb compare
 ```
 
+## Shell Commands
+
+```bash
+# Show top-level help
+uv run dqb --help
+
+# Show help for each subcommand
+uv run dqb run --help
+uv run dqb download_data --help
+uv run dqb compare --help
+uv run dqb generate_graphs --help
+uv run dqb bench --help
+
+# Download datasets
+uv run dqb download_data
+uv run dqb download_data --models lenet5 mpnn
+uv run dqb download_data --strict
+
+# Train runs
+uv run dqb run
+uv run dqb run --models lenet5 textcnn
+uv run dqb run --conditions base_fp32 dendrites_fp32
+uv run dqb run --allow-PQAT
+uv run dqb run --ignore-saved-models
+
+# Compare outputs (includes benchmark timing plots when benchmarks/manifest.csv exists)
+uv run dqb compare
+uv run dqb compare --manifest
+uv run dqb compare --benchmark-root benchmarks
+
+# Generate training graphs
+uv run dqb generate_graphs
+uv run dqb generate_graphs --regenerate-graphs
+
+# Run latency benchmarks
+uv run dqb bench
+uv run dqb bench --models lenet5 resnet18_cifar10
+uv run dqb bench --batch-sizes 1 32 --num-runs 20
+uv run dqb bench --benchmark-root my_benchmarks
+
+# Use an experiment namespace under results/
+uv run dqb --results-directory experiment_a run
+uv run dqb --results-directory experiment_a compare
+uv run dqb --results-directory experiment_a generate_graphs
+uv run dqb --results-directory experiment_a bench
+```
+
+## Shell Completion (Tab)
+
+Enable completions once, then restart your shell:
+
+```bash
+uv sync
+echo 'eval "$(register-python-argcomplete dqb)"' >> ~/.zshrc
+echo 'eval "$(register-python-argcomplete uv)"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+After this, `Tab` completion works for:
+- `dqb ...`
+- `uv run dqb ...`
+
+Optional equivalents:
+
+```bash
+# bash
+echo 'eval "$(register-python-argcomplete dqb)"' >> ~/.bashrc
+echo 'eval "$(register-python-argcomplete uv)"' >> ~/.bashrc
+source ~/.bashrc
+
+# fish
+register-python-argcomplete --shell fish dqb > ~/.config/fish/completions/dqb.fish
+register-python-argcomplete --shell fish uv > ~/.config/fish/completions/uv.fish
+```
+
 ## Documentation
 
 The repository includes extended documentation under the `information/` directory. Below are short summaries with links to the full markdown files.
