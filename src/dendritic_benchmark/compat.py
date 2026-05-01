@@ -144,6 +144,82 @@ def _configure_pai_trackers(
         gpa.pc.set_unwrapped_modules_confirmed(True)
 
 
+def _consume_pai_config_message(text: str) -> bool:
+    global _PAI_CONFIG_SAVED_PRINTED
+    if not text.startswith("[PAI Config] Saved"):
+        return False
+    if _PAI_CONFIG_SAVED_PRINTED:
+        return True
+    _PAI_CONFIG_SAVED_PRINTED = True
+    return False
+
+
+class _PaiConfigFilterStream:
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+        self._buffer = ""
+
+    def write(self, data: str) -> Any:
+        if not data:
+            return self._stream.write(data)
+        self._buffer += data
+        written = 0
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if _consume_pai_config_message(line):
+                continue
+            written = self._stream.write(f"{line}\n")
+        return written
+
+    def flush(self) -> None:
+        if self._buffer:
+            if not _consume_pai_config_message(self._buffer):
+                self._stream.write(self._buffer)
+            self._buffer = ""
+        self._stream.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+def _filtered_print_factory(original_print: Any) -> Any:
+    def _filtered_print(*args: Any, **kwargs: Any) -> None:
+        try:
+            text = " ".join(str(a) for a in args)
+        except Exception:
+            return original_print(*args, **kwargs)
+        if _consume_pai_config_message(text):
+            return
+        return original_print(*args, **kwargs)
+
+    return _filtered_print
+
+
+def _install_pai_output_filters() -> tuple[Any, Any, Any]:
+    original_print = builtins.print
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    setattr(builtins, "print", _filtered_print_factory(original_print))
+    sys.stdout = _PaiConfigFilterStream(original_stdout)
+    sys.stderr = _PaiConfigFilterStream(original_stderr)
+    return original_print, original_stdout, original_stderr
+
+
+def _restore_pai_output_filters(
+    original_print: Any,
+    original_stdout: Any,
+    original_stderr: Any,
+) -> None:
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    sys.stdout = original_stdout
+    sys.stderr = original_stderr
+    builtins.print = original_print
+
+
 def perforate_model(
     model: Any,
     save_name: str,
@@ -157,63 +233,10 @@ def perforate_model(
     if not has_perforatedai():
         return model
 
-    # Wrap builtins.print temporarily to filter repeated PerforatedAI config
-    # messages that look like: "[PAI Config] Saved ...". Keep a module-level
-    # flag so only the first such message is printed across the process.
-    global _PAI_CONFIG_SAVED_PRINTED
-    original_print = builtins.print
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
-
-    def _consume_pai_config_message(text: str) -> bool:
-        global _PAI_CONFIG_SAVED_PRINTED
-        if not text.startswith("[PAI Config] Saved"):
-            return False
-        if _PAI_CONFIG_SAVED_PRINTED:
-            return True
-        _PAI_CONFIG_SAVED_PRINTED = True
-        return False
-
-    class _PaiConfigFilterStream:
-        def __init__(self, stream: Any) -> None:
-            self._stream = stream
-            self._buffer = ""
-
-        def write(self, data: str) -> Any:
-            if not data:
-                return self._stream.write(data)
-            self._buffer += data
-            written = 0
-            while "\n" in self._buffer:
-                line, self._buffer = self._buffer.split("\n", 1)
-                if _consume_pai_config_message(line):
-                    continue
-                written = self._stream.write(f"{line}\n")
-            return written
-
-        def flush(self) -> None:
-            if self._buffer:
-                if not _consume_pai_config_message(self._buffer):
-                    self._stream.write(self._buffer)
-                self._buffer = ""
-            self._stream.flush()
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(self._stream, name)
-
-    def _filtered_print(*args: Any, **kwargs: Any) -> None:
-        try:
-            text = " ".join(str(a) for a in args)
-        except Exception:
-            return original_print(*args, **kwargs)
-        if _consume_pai_config_message(text):
-            return
-        return original_print(*args, **kwargs)
-
+    # Filter repeated "[PAI Config] Saved ..." messages across the process
+    # while PerforatedAI is setting itself up for this call.
+    original_print, original_stdout, original_stderr = _install_pai_output_filters()
     try:  # pragma: no cover - optional dependency
-        setattr(builtins, "print", _filtered_print)
-        sys.stdout = _PaiConfigFilterStream(original_stdout)
-        sys.stderr = _PaiConfigFilterStream(original_stderr)
         _mirror_env_aliases()
         GPA = importlib.import_module("perforatedai.globals_perforatedai")
         UPA = importlib.import_module("perforatedai.utils_perforatedai")
@@ -233,14 +256,7 @@ def perforate_model(
     except Exception:
         return model
     finally:
-        try:
-            sys.stdout.flush()
-            sys.stderr.flush()
-        except Exception:
-            pass
-        sys.stdout = original_stdout
-        sys.stderr = original_stderr
-        builtins.print = original_print
+        _restore_pai_output_filters(original_print, original_stdout, original_stderr)
 
 
 def _pai_save_path(save_name: str) -> Path:

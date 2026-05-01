@@ -933,7 +933,7 @@ def _setup_pai_optimizer(
     optimizer = _build_optimizer(model, torch, config)
     tracker = _pai_tracker()
     if not config.use_dendrites or tracker is None:
-        return optimizer, tracker
+        return optimizer, None if not config.use_dendrites else tracker
     try:
         tracker.set_optimizer(_optimizer_class(torch, config))
         setup_result = tracker.setup_optimizer(model, _optimizer_args(model, config), {})
