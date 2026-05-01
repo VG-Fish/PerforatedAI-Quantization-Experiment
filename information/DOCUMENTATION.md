@@ -153,16 +153,23 @@ optimizer, PAIscheduler = GPA.pai_tracker.setup_optimizer(model, optimArgs, sche
 ```
 
 #### Step 4 — Validation Loop Hook
-```python
-model, restructured, training_complete = GPA.pai_tracker.add_validation_score(
-    score, model
-)
-model.to(device)
+The benchmark now enables live dendrite restructuring for dendritic training
+runs by wiring PerforatedAI's tracker into the optimizer and validation loop.
+Dynamic insertion is active for the first 80% of the configured epochs, then
+the final 20% trains with the current dendrite layout frozen so weights can
+settle before final evaluation.
 
-if training_complete:
-    break
-elif restructured:
-    optimizer, PAIscheduler = GPA.pai_tracker.setup_optimizer(model, optimArgs, schedArgs)
+```python
+if epoch < int(max_epochs * 0.8):
+    model, restructured, training_complete = GPA.pai_tracker.add_validation_score(
+        score, model
+    )
+    model.to(device)
+
+    if training_complete:
+        break
+    elif restructured:
+        optimizer, PAIscheduler = GPA.pai_tracker.setup_optimizer(model, optimArgs, schedArgs)
 ```
 
 #### Step 5 — Training Loop Structure
@@ -179,7 +186,14 @@ while True:
 device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
 GPA.pc.set_device(device)
 model = model.to(device)
+torch.set_float32_matmul_precision('high')
 ```
+
+The implementation keeps CUDA-only pinned-memory transfers disabled, reuses
+persistent DataLoader workers, uses larger per-model batch sizes to amortize
+Python dispatch, and applies `torch.compile(..., backend='aot_eager')` for
+non-dendritic MPS models when PyTorch supports it. Dendritic models are not
+compiled because PerforatedAI may restructure modules during the live phase.
 
 ### Quantization via torchao
 ```python
@@ -533,9 +547,11 @@ Isolates optional dependencies and PerforatedAI integration.
 ### `src/dendritic_benchmark/training.py`
 Runs each individual condition.
 - Moves the model to the selected device.
+- Sets high float32 matmul precision on MPS to improve Apple Silicon throughput where supported.
 - Applies L1 unstructured global pruning for pruned conditions.
 - Applies quantization for low-bit conditions and optionally QAT-style weight projection during the training loop.
 - Compiles non-dendritic MPS models with `torch.compile(..., backend='aot_eager')` when available.
+- Uses `GPA.pai_tracker.set_optimizer`, `setup_optimizer`, and `add_validation_score` for dendritic runs; live restructuring stops for the last 20% of epochs.
 - Trains for the condition-specific epoch budget, or skips training for post-training quantization conditions (printing a skip-reason banner).
 - Evaluates validation and test metrics with a rich set of per-task metrics (accuracy, MAE, RMSE, AUC, Dice, SSIM, ELBO, etc.).
 - Saves the best model state to `model.pt` and writes `best_model_stats.csv` for the `compare` command.

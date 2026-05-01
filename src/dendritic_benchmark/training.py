@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import importlib
 import json
 import math
 import time
@@ -90,6 +91,30 @@ class ArtifactPayload:
     training_skipped: bool
     skip_reason: str
     stage_name: str | None = None
+
+
+@dataclass
+class EpochTrainingContext:
+    model: Any
+    model_key: str
+    bundle: Any
+    device: Any
+    criterion: Any
+    torch: Any
+    max_epochs: int
+    run_label: str
+    config: TrainingConfig
+    metric_name: str
+    primary_metric_key: str
+    metric_direction: str
+
+
+@dataclass
+class EpochTrainingState:
+    history: list[dict[str, Any]]
+    best_metric: float
+    best_epoch: int
+    best_state: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -870,6 +895,62 @@ def _build_optimizer(model: Any, torch: Any, config: TrainingConfig) -> Any:
     )
 
 
+def _optimizer_class(torch: Any, config: TrainingConfig) -> Any:
+    if config.optimizer_name == "sgd":
+        return torch.optim.SGD
+    if config.optimizer_name == "adamw":
+        return torch.optim.AdamW
+    return torch.optim.Adam
+
+
+def _optimizer_args(model: Any, config: TrainingConfig) -> dict[str, Any]:
+    args: dict[str, Any] = {
+        "params": model.parameters(),
+        "lr": config.learning_rate,
+        "weight_decay": config.weight_decay,
+    }
+    if config.optimizer_name == "sgd":
+        args["momentum"] = config.momentum
+    return args
+
+
+def _pai_tracker() -> Any | None:
+    try:
+        gpa = importlib.import_module("perforatedai.globals_perforatedai")
+    except Exception:
+        return None
+    tracker = getattr(gpa, "pai_tracker", None)
+    if tracker is None or not hasattr(tracker, "add_validation_score"):
+        return None
+    return tracker
+
+
+def _setup_pai_optimizer(
+    model: Any,
+    torch: Any,
+    config: TrainingConfig,
+) -> tuple[Any, Any | None]:
+    optimizer = _build_optimizer(model, torch, config)
+    tracker = _pai_tracker()
+    if not config.use_dendrites or tracker is None:
+        return optimizer, tracker
+    try:
+        tracker.set_optimizer(_optimizer_class(torch, config))
+        setup_result = tracker.setup_optimizer(model, _optimizer_args(model, config), {})
+    except TypeError:
+        try:
+            setup_result = tracker.setup_optimizer(model, _optimizer_args(model, config))
+        except Exception:
+            return optimizer, tracker
+    except Exception:
+        return optimizer, tracker
+    if isinstance(setup_result, tuple) and setup_result:
+        return setup_result[0], tracker
+    if setup_result is not None:
+        return setup_result, tracker
+    return optimizer, tracker
+
+
 def _eval_on_loader(
     model: Any,
     model_key: str,
@@ -1035,76 +1116,155 @@ def _run_epoch_batches(
     return train_loss, train_metrics
 
 
-def _run_training_epochs(
-    model: Any,
-    model_key: str,
-    bundle: Any,
-    device: Any,
-    criterion: Any,
-    optimizer: Any,
-    torch: Any,
-    max_epochs: int,
-    run_label: str,
-    config: "TrainingConfig",
-    metric_name: str,
-    primary_metric_key: str,
-    metric_direction: str,
-) -> tuple[list[dict[str, Any]], float, int, dict[str, Any] | None]:
-    history: list[dict[str, Any]] = []
+def _initial_epoch_state(metric_direction: str) -> EpochTrainingState:
     best_metric = -math.inf if metric_direction == "maximize" else math.inf
-    best_epoch = 0
-    best_state: dict[str, Any] | None = None
+    return EpochTrainingState([], best_metric, 0, None)
+
+
+def _build_history_row(
+    *,
+    epoch: int,
+    epoch_start: float,
+    optimizer: Any,
+    train_loss: float,
+    train_metrics: dict[str, Any],
+    val_loss: float,
+    val_metrics: dict[str, Any],
+    context: EpochTrainingContext,
+) -> dict[str, Any]:
+    primary_metric_key = context.primary_metric_key
+    val_metric = float(val_metrics.get(primary_metric_key, 0.0))
+    history_row: dict[str, Any] = {
+        "epoch": epoch + 1,
+        "primary_metric_name": context.metric_name,
+        "primary_metric_key": primary_metric_key,
+        "metric_direction": context.metric_direction,
+        "learning_rate": float(optimizer.param_groups[0]["lr"]),
+        "epoch_seconds": time.perf_counter() - epoch_start,
+        "train_loss": train_loss,
+        "train_primary_metric": float(train_metrics.get(primary_metric_key, 0.0)),
+        "val_loss": val_loss,
+        "val_primary_metric": val_metric,
+        "val_metric": val_metric,
+    }
+    history_row.update(_prefix_metrics("train", train_metrics))
+    history_row.update(_prefix_metrics("val", val_metrics))
+    return history_row
+
+
+def _record_best_epoch(
+    state: EpochTrainingState,
+    model: Any,
+    epoch: int,
+    val_metric: float,
+    metric_direction: str,
+) -> None:
+    is_first_best = state.best_state is None
+    if not is_first_best and not _metric_is_better(
+        val_metric, state.best_metric, metric_direction
+    ):
+        return
+    state.best_metric = val_metric
+    state.best_epoch = epoch + 1
+    state.best_state = {
+        k: v.detach().cpu().clone()
+        for k, v in _unwrap_compiled(model).state_dict().items()
+    }
+
+
+def _run_dynamic_dendrite_update(
+    *,
+    context: EpochTrainingContext,
+    optimizer: Any,
+    pai_tracker: Any,
+    val_metric: float,
+) -> tuple[Any, Any, bool]:
+    try:
+        model, restructured, training_complete = pai_tracker.add_validation_score(
+            val_metric, context.model
+        )
+        context.model = model.to(context.device)
+        _configure_gcn_dendrites(
+            context.model,
+            context.model_key,
+            context.config.use_dendrites,
+            context.device,
+            context.torch,
+        )
+        if restructured:
+            optimizer, _ = _setup_pai_optimizer(context.model, context.torch, context.config)
+        return optimizer, pai_tracker, bool(training_complete)
+    except Exception as pai_exc:
+        print(f"[pai] dynamic dendrite update skipped: {pai_exc}")
+        return optimizer, None, False
+
+
+def _set_epoch_progress(
+    epoch_progress: Any,
+    metric_name: str,
+    val_metric: float,
+    best_metric: float,
+    best_epoch: int,
+) -> None:
+    metric_key = _metric_display_key(metric_name)
+    epoch_progress.set_postfix(
+        **{
+            f"val_{metric_key}": _format_metric_value(val_metric),
+            f"best_{metric_key}": _format_metric_value(best_metric),
+        },
+        best_epoch=best_epoch,
+    )
+
+
+def _run_training_epochs(
+    context: EpochTrainingContext,
+    optimizer: Any,
+    pai_tracker: Any | None = None,
+) -> tuple[list[dict[str, Any]], float, int, dict[str, Any] | None]:
+    state = _initial_epoch_state(context.metric_direction)
     epoch_progress = tqdm(
-        range(max_epochs),
-        desc=run_label,
+        range(context.max_epochs),
+        desc=context.run_label,
         unit="epoch",
         leave=True,
         dynamic_ncols=True,
     )
+    dynamic_freeze_epoch = math.floor(context.max_epochs * 0.8)
     for epoch in epoch_progress:
         epoch_start = time.perf_counter()
         train_loss, train_metrics = _run_epoch_batches(
-            model, model_key, bundle, device, criterion, optimizer, torch,
-            epoch, max_epochs, run_label, config, metric_name,
+            context.model, context.model_key, context.bundle, context.device,
+            context.criterion, optimizer, context.torch, epoch, context.max_epochs,
+            context.run_label, context.config, context.metric_name,
         )
-        model.eval()
+        context.model.eval()
         val_loss, val_metrics = _eval_on_loader(
-            model, model_key, bundle.val_loader, device, criterion, metric_name, torch
+            context.model, context.model_key, context.bundle.val_loader,
+            context.device, context.criterion, context.metric_name, context.torch
         )
-        val_metric = float(val_metrics.get(primary_metric_key, 0.0))
-        history_row: dict[str, Any] = {
-            "epoch": epoch + 1,
-            "primary_metric_name": metric_name,
-            "primary_metric_key": primary_metric_key,
-            "metric_direction": metric_direction,
-            "learning_rate": float(optimizer.param_groups[0]["lr"]),
-            "epoch_seconds": time.perf_counter() - epoch_start,
-            "train_loss": train_loss,
-            "train_primary_metric": float(train_metrics.get(primary_metric_key, 0.0)),
-            "val_loss": val_loss,
-            "val_primary_metric": val_metric,
-            "val_metric": val_metric,
-        }
-        history_row.update(_prefix_metrics("train", train_metrics))
-        history_row.update(_prefix_metrics("val", val_metrics))
-        history.append(history_row)
-        if best_state is None or _metric_is_better(val_metric, best_metric, metric_direction):
-            best_metric = val_metric
-            best_epoch = epoch + 1
-            best_state = {
-                k: v.detach().cpu().clone()
-                for k, v in _unwrap_compiled(model).state_dict().items()
-            }
-        metric_key = _metric_display_key(metric_name)
-        epoch_progress.set_postfix(
-            **{
-                f"val_{metric_key}": _format_metric_value(val_metric),
-                f"best_{metric_key}": _format_metric_value(best_metric),
-            },
-            best_epoch=best_epoch,
+        history_row = _build_history_row(
+            epoch=epoch, epoch_start=epoch_start, optimizer=optimizer,
+            train_loss=train_loss, train_metrics=train_metrics,
+            val_loss=val_loss, val_metrics=val_metrics, context=context,
+        )
+        state.history.append(history_row)
+        val_metric = float(history_row["val_metric"])
+        _record_best_epoch(
+            state, context.model, epoch, val_metric, context.metric_direction
+        )
+        if pai_tracker is not None and epoch < dynamic_freeze_epoch:
+            optimizer, pai_tracker, training_complete = _run_dynamic_dendrite_update(
+                context=context, optimizer=optimizer, pai_tracker=pai_tracker,
+                val_metric=val_metric,
+            )
+            if training_complete:
+                break
+        _set_epoch_progress(
+            epoch_progress, context.metric_name, val_metric,
+            state.best_metric, state.best_epoch,
         )
     epoch_progress.close()
-    return history, best_metric, best_epoch, best_state
+    return state.history, state.best_metric, state.best_epoch, state.best_state
 
 
 def _build_artifact_metadata(
@@ -1254,6 +1414,72 @@ def _persist_post_pqat_snapshot(
     )
 
 
+def _configure_mps_matmul_precision(torch: Any, device: Any) -> None:
+    if getattr(device, "type", "") == "mps" and hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+
+def _is_pqat_enabled(config: TrainingConfig, condition_key: str) -> bool:
+    return (
+        config.bit_width is not None
+        and config.bit_width < 32
+        and config.use_qat
+        and config.fine_tune_epochs > 0
+        and config.source_condition_key is not None
+        and config.source_condition_key != condition_key
+    )
+
+
+def _should_quantize_for_training(config: TrainingConfig) -> bool:
+    return config.bit_width is not None and config.bit_width < 32 and config.use_qat
+
+
+def _should_quantize_for_eval(config: TrainingConfig) -> bool:
+    return config.bit_width is not None and config.bit_width < 32
+
+
+def _prepare_model_for_training(
+    model: Any,
+    *,
+    torch: Any,
+    device: Any,
+    model_key: str,
+    condition_key: str,
+    config: TrainingConfig,
+) -> Any:
+    model = model.to(device)
+    _configure_gcn_dendrites(model, model_key, config.use_dendrites, device, torch)
+    if config.use_pruning:
+        _apply_pruning(model, torch, config.prune_amount)
+    if _should_quantize_for_training(config):
+        model = _make_quantized_copy(model, config.bit_width, config.quantization_mode)
+    return _apply_torch_compile(
+        model, torch, model_key, condition_key, device, config.use_dendrites
+    )
+
+
+def _run_or_skip_training(
+    *,
+    context: EpochTrainingContext,
+    optimizer: Any,
+    pai_tracker: Any | None,
+    skip_reason: str,
+    source_condition_key: str | None,
+    condition_key: str,
+) -> tuple[list[dict[str, Any]], float, int, dict[str, Any] | None]:
+    if context.max_epochs > 0:
+        return _run_training_epochs(context, optimizer, pai_tracker)
+    _print_skip_banner(
+        context.run_label,
+        skip_reason,
+        source_condition_key,
+        condition_key,
+        context.config.bit_width,
+        context.config.quantization_mode,
+    )
+    return [], _initial_epoch_state(context.metric_direction).best_metric, 0, None
+
+
 def train_and_evaluate(
     *,
     model_key: str,
@@ -1271,8 +1497,6 @@ def train_and_evaluate(
     bit_width = config.bit_width
     quantization_mode = config.quantization_mode
     use_dendrites = config.use_dendrites
-    use_pruning = config.use_pruning
-    prune_amount = config.prune_amount
     use_qat = config.use_qat
     fine_tune_epochs = config.fine_tune_epochs
     max_epochs = config.max_epochs
@@ -1280,8 +1504,8 @@ def train_and_evaluate(
 
     torch = require_torch()
     device = choose_device()
+    _configure_mps_matmul_precision(torch, device)
     output_dir.mkdir(parents=True, exist_ok=True)
-    model = model.to(device)
     primary_metric_key = _PRIMARY_METRIC_KEY.get(model_key, "accuracy")
     metadata = _build_artifact_metadata(
         model_key=model_key,
@@ -1291,32 +1515,23 @@ def train_and_evaluate(
         metric_direction=metric_direction,
         primary_metric_key=primary_metric_key,
         use_dendrites=use_dendrites,
-        use_pruning=use_pruning,
+        use_pruning=config.use_pruning,
         bit_width=bit_width,
         use_qat=use_qat,
         fine_tune_epochs=fine_tune_epochs,
     )
 
-    _configure_gcn_dendrites(model, model_key, use_dendrites, device, torch)
-
-    if use_pruning:
-        _apply_pruning(model, torch, prune_amount)
-
-    pqat_enabled = (
-        bit_width is not None
-        and bit_width < 32
-        and use_qat
-        and fine_tune_epochs > 0
-        and source_condition_key is not None
-        and source_condition_key != condition_key
+    pqat_enabled = _is_pqat_enabled(config, condition_key)
+    model = _prepare_model_for_training(
+        model,
+        torch=torch,
+        device=device,
+        model_key=model_key,
+        condition_key=condition_key,
+        config=config,
     )
 
-    if bit_width is not None and bit_width < 32 and use_qat:
-        model = _make_quantized_copy(model, bit_width, quantization_mode)
-
-    model = _apply_torch_compile(model, torch, model_key, condition_key, device, use_dendrites)
-
-    optimizer = _build_optimizer(model, torch, config)
+    optimizer, pai_tracker = _setup_pai_optimizer(model, torch, config)
     criterion = _binary_or_multi_loss(model_key)
     start_time = time.perf_counter()
     run_label = f"{model_key} | {condition_key}"
@@ -1340,28 +1555,36 @@ def train_and_evaluate(
             metadata=metadata,
         )
 
-    if max_epochs > 0:
-        history, best_metric, best_epoch, best_state = _run_training_epochs(
-            model, model_key, bundle, device, criterion, optimizer, torch,
-            max_epochs, run_label, config,
-            metric_name, primary_metric_key, metric_direction,
-        )
-    else:
-        history = []
-        best_metric = -math.inf if metric_direction == "maximize" else math.inf
-        best_epoch = 0
-        best_state = None
-        _print_skip_banner(
-            run_label, skip_reason, source_condition_key, condition_key,
-            bit_width, quantization_mode
-        )
+    epoch_context = EpochTrainingContext(
+        model=model,
+        model_key=model_key,
+        bundle=bundle,
+        device=device,
+        criterion=criterion,
+        torch=torch,
+        max_epochs=max_epochs,
+        run_label=run_label,
+        config=config,
+        metric_name=metric_name,
+        primary_metric_key=primary_metric_key,
+        metric_direction=metric_direction,
+    )
+    history, best_metric, best_epoch, best_state = _run_or_skip_training(
+        context=epoch_context,
+        optimizer=optimizer,
+        pai_tracker=pai_tracker,
+        skip_reason=skip_reason,
+        source_condition_key=source_condition_key,
+        condition_key=condition_key,
+    )
+    model = epoch_context.model
 
     if best_state is not None:
         # Load into the underlying module; the compiled wrapper's forward graph
         # reads parameters in-place from the same tensors, so it stays in sync.
         _unwrap_compiled(model).load_state_dict(best_state)
 
-    if bit_width is not None and bit_width < 32:
+    if _should_quantize_for_eval(config):
         model = _make_quantized_copy(model, bit_width, quantization_mode)
 
     model.eval()

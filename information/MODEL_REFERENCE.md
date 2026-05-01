@@ -25,7 +25,7 @@ For each model below, this document captures:
   - `momentum`
   - `weight_decay`
 - Derived PQAT budget:
-  - `ceil(max_epochs * 0.10)`, capped to the range `1..10`
+  - `ceil(max_epochs * 0.30)`, capped to the range `1..10`
 - Model kwargs:
   - Only listed when the pipeline passes non-empty kwargs to `build_model(...)`
 - Perforation tracking:

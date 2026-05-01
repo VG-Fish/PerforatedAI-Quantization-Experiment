@@ -15,6 +15,10 @@ The benchmark automates training neural networks under different quantization an
 
 Each condition applies only two experimental factors to the same models: quantization level and whether the model is dendritic, allowing cleaner side-by-side comparison of efficiency vs. accuracy tradeoffs.
 
+Dendritic training uses PerforatedAI's dynamic tracker hooks (`set_optimizer`, `setup_optimizer`, and `add_validation_score`) during validation. Live dendrite insertion runs for the first 80% of each dendritic training schedule, then freezes for the final 20% so the selected architecture can stabilize before test evaluation.
+
+For Apple Silicon runs, the training path selects MPS automatically, disables CUDA-only pinned memory, keeps DataLoader workers persistent, uses larger per-model batch sizes, sets high float32 matmul precision where supported, and compiles non-dendritic MPS models with `torch.compile(..., backend="aot_eager")` when available.
+
 ## Setup
 
 ```bash

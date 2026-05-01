@@ -16,3 +16,5 @@ uv.lock
 logs/
 sonar-project.properties
 .scannerwork/
+.uv-cache/
+.uv-tools/
