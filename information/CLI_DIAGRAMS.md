@@ -244,11 +244,13 @@ flowchart TD
             ├── model.pt
             ├── record.csv
             ├── record.json
+            ├── before_pqat/                 # quantized runs only when --allow-PQAT is enabled
+            ├── after_pqat/                  # quantized runs only when --allow-PQAT is enabled
             ├── plots/
+            │   ├── architecture_evolution.svg  # dendritic only
             │   ├── loss_curves.svg
             │   ├── primary_metric.svg
             │   └── training_curve.svg
-            ├── architecture_evolution.svg    # dendritic only
             ├── best_arch_scores.csv          # dendritic only
             ├── best_model                    # dendritic only
             ├── final_clean_pai               # dendritic only
