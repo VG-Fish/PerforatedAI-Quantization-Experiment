@@ -16,7 +16,7 @@ The benchmark automates training neural networks under different quantization an
 
 Each condition applies only two experimental factors to the same models: quantization level and whether the model is dendritic, allowing cleaner side-by-side comparison of efficiency vs. accuracy tradeoffs.
 
-Dendritic training uses PerforatedAI's dynamic tracker hooks (`set_optimizer`, `setup_optimizer`, and `add_validation_score`) during validation. Live dendrite insertion runs for the first 80% of each dendritic training schedule, then freezes for the final 20% so the selected architecture can stabilize before test evaluation.
+Dendritic FP32 training uses PerforatedAI's dynamic tracker hooks (`set_optimizer`, `setup_optimizer`, and `add_validation_score`) during validation and keeps training until PerforatedAI returns `training_complete=True`. The model's configured `max_epochs` is treated as the canonical base-model budget, not as a hard stop for dendrite growth. Any dendritic epochs beyond that canonical budget are written under `results/<model>/<condition>/continued_until_complete/` so the over-budget PAI completion phase is explicit in the artifacts.
 
 For Apple Silicon runs, the training path selects MPS automatically, disables CUDA-only pinned memory, keeps DataLoader workers persistent, uses larger per-model batch sizes, sets high float32 matmul precision where supported, and compiles non-dendritic MPS models with `torch.compile(..., backend="aot_eager")` when available.
 
@@ -60,6 +60,12 @@ active PerforatedAI config to
 `PAI/<model>_<condition>_PAI_config.json`, so each model/condition keeps its
 own reproducibility config instead of relying only on the latest global
 `PAI/PAI_config.json`.
+
+When `--allow-PQAT` is supplied, PQAT is applied to the smaller quantized
+dendritic conditions (`dendrites_q8` through `dendrites_q1`) after the source
+`dendrites_fp32` checkpoint has finished PerforatedAI training. Base quantized
+conditions remain post-training quantization evaluations so the baseline grid
+does not mix in an extra fine-tuning factor.
 
 ## Compare Existing Runs
 

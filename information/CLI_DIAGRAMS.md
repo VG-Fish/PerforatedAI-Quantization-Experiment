@@ -50,14 +50,14 @@ flowchart TD
     K --> L{"Dendritic<br>condition?"}
     L -->|Yes| M["compat.py perforate_model<br>via PAI"]
     L -->|No| N["Standard model"]
-    M --> O["training.py<br>train_and_evaluate<br>same max_epochs as base<br>PAI tracker live for first 80%<br>then frozen for final 20%"]
+    M --> O["training.py<br>train_and_evaluate<br>FP32 dendrites train until<br>PAI training_complete"]
     N --> O
     O --> R{"Quantization<br>condition?"}
     R -->|Q8/Q4/Q2/Q1.58/Q1| S["Load source checkpoint and<br>apply PTQ snapshot"]
     R -->|FP32| T["Train full epochs with<br>model-specific recipe"]
-    S --> S2{"--allow-PQAT?"}
+    S --> S2{"--allow-PQAT<br>and dendritic?"}
     S2 -->|No| U
-    S2 -->|Yes| S3["Save before_pqat/<br>then fine-tune for a model-aware PQAT budget<br>then save after_pqat/"]
+    S2 -->|Yes| S3["Save before_pqat/<br>then fine-tune completed dendritic model<br>for a model-aware PQAT budget<br>then save after_pqat/"]
     S3 --> U
     T --> U["Evaluate val + test metrics"]
     U --> V["Save artifacts:<br>model.pt (best), best_model_stats.csv,<br>metrics.json, history.csv, plots/"]
@@ -323,6 +323,7 @@ Results are organized by model and condition:
                 ├── record.json
                 ├── before_pqat/                 # quantized runs only when --allow-PQAT is enabled
                 ├── after_pqat/                  # quantized runs only when --allow-PQAT is enabled
+                ├── continued_until_complete/    # FP32 dendritic epochs beyond max_epochs
                 ├── plots/
                 │   ├── architecture_evolution.svg  # dendritic only
                 │   ├── loss_curves.svg

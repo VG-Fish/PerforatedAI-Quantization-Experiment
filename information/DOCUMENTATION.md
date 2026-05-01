@@ -47,6 +47,10 @@ Each model is trained/evaluated in the following 12 conditions. Metrics recorded
 | 11 | **+Dendrites + Q1.58** | Dendritic model ternary quantization |
 | 12 | **+Dendrites + Q1** | Dendritic model binary quantization |
 
+With `--allow-PQAT`, only the smaller quantized dendritic conditions run
+quantization-aware fine-tuning. Base quantized conditions remain PTQ-only so
+their results stay directly comparable to the un-fine-tuned baseline.
+
 ***
 ## Output Graphs (Per Model)
 For each of the 10 models, generate **3 comparison bar charts** — one for each metric — with all 12 conditions on the x-axis:
@@ -98,9 +102,9 @@ Run in isolation. For Q1 and Q1.58, use QAT (quantization-aware training) via `t
 ### Recommended Execution Order per Model
 1. **Base FP32** → train with `doing_pai=False`; save checkpoint
 2. **Base + Q8/Q4/Q2/Q1.58/Q1** → load Base FP32 checkpoint; apply PTQ/QAT via `torchao`; evaluate
-3. **+Dendrites FP32** → retrain from scratch with `doing_pai=True`; train for the same `max_epochs` budget as the matching base FP32 run
-4. **+Dendrites FP32** → use the dendritic checkpoint as the source state for all dendritic quantized evaluations
-5. **+Dendrites+Q8 through Q1** → load dendritic FP32 checkpoint; apply quantization in sequence
+3. **+Dendrites FP32** → retrain from scratch with `doing_pai=True`; continue until PerforatedAI reports `training_complete=True`
+4. **+Dendrites FP32** → use the completed dendritic checkpoint as the source state for all dendritic quantized evaluations
+5. **+Dendrites+Q8 through Q1** → load the completed dendritic FP32 checkpoint; apply quantization, or run short PQAT fine-tuning when `--allow-PQAT` is enabled
 
 ### PerforatedAI Output Files
 The benchmark passes PerforatedAI save names under `PAI/`, so library-created
@@ -117,7 +121,7 @@ The library's active `PAI/PAI_config.json` is also snapshotted after each
 perforation as `PAI/<model>_<condition>_PAI_config.json` and, for the run
 artifact, as `results/<model>/<condition>/PAI_config.json`.
 
-This benchmark suite itself saves the best model state it evaluated to `results/<model>/<condition>/model.pt` and uses that file for comparisons and file-size reporting. If PerforatedAI changes bookkeeping tensor shapes during live restructuring, the restore step reloads only shape-compatible tensors and leaves incompatible tracker metadata at the current model value.
+This benchmark suite itself saves the best model state it evaluated to `results/<model>/<condition>/model.pt` and uses that file for comparisons and file-size reporting. For dendritic FP32 runs, the configured `max_epochs` value is the canonical base-model comparison budget rather than the dendrite-training stop condition. If PerforatedAI needs more epochs to reach `training_complete=True`, those later epochs are saved separately in `results/<model>/<condition>/continued_until_complete/`. If PerforatedAI changes bookkeeping tensor shapes during live restructuring, the restore step reloads only shape-compatible tensors and leaves incompatible tracker metadata at the current model value.
 
 ***
 ## PyTorch Implementation Notes
@@ -166,35 +170,35 @@ optimizer, PAIscheduler = GPA.pai_tracker.setup_optimizer(model, optimArgs, sche
 #### Step 4 — Validation Loop Hook
 The benchmark now enables live dendrite restructuring for dendritic training
 runs by wiring PerforatedAI's tracker into the optimizer and validation loop.
-Dynamic insertion is active for the first 80% of the configured epochs, then
-the final 20% trains with the current dendrite layout frozen so weights can
-settle before final evaluation. Dendritic and non-dendritic runs always keep
-the same configured epoch budget; if PerforatedAI reports `training_complete`
-early, the benchmark freezes further insertion and continues training instead
-of ending the run.
+FP32 dendritic conditions keep calling `add_validation_score(...)` until
+PerforatedAI reports `training_complete=True`. The configured `max_epochs`
+remains the reference budget used by the matching base model, and any epochs
+after that budget are isolated under `continued_until_complete/`.
 
 ```python
-dynamic_freeze_epoch = int(max_epochs * 0.8)
-for epoch in range(max_epochs):
+epoch = -1
+while True:
+    epoch += 1
     # train and validate as normal
-    if pai_tracker is not None and epoch < dynamic_freeze_epoch:
-        model, restructured, training_complete = GPA.pai_tracker.add_validation_score(
-            score, model
-        )
-        model.to(device)
+    model, restructured, training_complete = GPA.pai_tracker.add_validation_score(
+        score, model
+    )
+    model.to(device)
 
-        if training_complete:
-            pai_tracker = None  # freeze insertion, but keep training to max_epochs
-        elif restructured:
-            optimizer, PAIscheduler = GPA.pai_tracker.setup_optimizer(model, optimArgs, schedArgs)
+    if restructured:
+        optimizer, PAIscheduler = GPA.pai_tracker.setup_optimizer(model, optimArgs, schedArgs)
+    if training_complete:
+        break
 ```
 
 #### Step 5 — Training Loop Structure
 ```python
 for epoch in range(max_epochs):
-    # train as normal
-    # validation loop may add dendrites during the first 80% only
-    # the last 20% always trains with insertion frozen
+    # non-dendritic and PTQ/PQAT runs use a fixed epoch budget
+
+while not training_complete:
+    # FP32 dendritic runs use PerforatedAI's completion signal
+    # epochs greater than max_epochs are saved in continued_until_complete/
 ```
 
 #### MPS Device Handling (M3 Pro)
@@ -533,11 +537,11 @@ Declares benchmark model and condition metadata.
 - Loads source checkpoints when a condition depends on a previous result.
 - Perforates models with PerforatedAI for dendritic conditions.
 - Calls `train_and_evaluate()` for every model-condition pair.
-- When `--allow-PQAT` is enabled, quantized conditions save a PTQ snapshot under `before_pqat/`, fine-tune for a short model-aware PQAT budget, and save the post-PQAT artifacts under `after_pqat/`.
+- When `--allow-PQAT` is enabled, quantized dendritic conditions save a PTQ snapshot under `before_pqat/`, fine-tune the completed dendritic model for a short model-aware PQAT budget, and save the post-PQAT artifacts under `after_pqat/`.
 - Writes per-condition training records and regenerates comparison outputs during the run.
 - Skips dataset loading entirely for models where all conditions are already recorded.
 
-The run method also computes `max_epochs` from `_base_epoch_budget()` so baseline and dendritic FP32 conditions receive larger budgets than post-training quantized conditions.
+The run method also computes `max_epochs` from the model recipe. Baseline conditions use it as a hard epoch budget; dendritic FP32 conditions use it as the canonical comparison budget and continue until PerforatedAI reports completion.
 
 ## Real Data
 
@@ -725,8 +729,9 @@ results/
       model.pt
       PAI_config.json        # dendritic runs only
       best_model_stats.csv
-      before_pqat/           # PQAT-enabled quantized runs only
-      after_pqat/            # PQAT-enabled quantized runs only
+      before_pqat/           # PQAT-enabled quantized dendritic runs only
+      after_pqat/            # PQAT-enabled quantized dendritic runs only
+      continued_until_complete/  # FP32 dendritic epochs beyond max_epochs
       best_arch_scores.csv    # dendritic runs only
       paramCounts.csv         # dendritic runs only
       plots/
@@ -769,7 +774,7 @@ uv run dqb --results-directory experiment_b run --models mpnn actor_critic --ign
 
 ## Notes
 - Real datasets are downloaded automatically into `data/` by default. Set `DQB_DATA_ROOT` to keep the cache outside the repository.
-- Dendritic runs use the same `max_epochs` as their non-dendritic counterparts. Dynamic dendrite insertion is allowed only during the first 80% of that budget; the final 20% is a fixed-architecture settling phase.
+- Dendritic FP32 runs use the non-dendritic `max_epochs` as the canonical comparison budget, then continue until PerforatedAI reports `training_complete=True`; any over-budget epochs are saved under `continued_until_complete/`.
 - Dendritic runs are expected to produce additional PerforatedAI sidecar artifacts.
 - If you add new models or conditions, update `src/dendritic_benchmark/specs.py` and rerun the CLI.
 - Conditions are executed in dependency order — omitting an upstream condition will cause its dependents to be skipped.

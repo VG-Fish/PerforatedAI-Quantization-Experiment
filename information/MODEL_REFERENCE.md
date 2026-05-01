@@ -32,9 +32,9 @@ For each model below, this document captures:
   - Most models use the default perforation behavior with no extra registered modules.
   - Model-specific non-standard modules below are registered with both PerforatedAI tracking and perforation APIs when available.
 - Dendritic epoch policy:
-  - Dendritic FP32 runs use the same `max_epochs` value listed for the matching base FP32 run.
-  - Dynamic PerforatedAI insertion is active for `floor(max_epochs * 0.80)` epochs.
-  - The remaining epochs train with insertion frozen, even if PerforatedAI reports `training_complete` before the 80% boundary.
+  - Dendritic FP32 runs use the listed `max_epochs` value as the canonical base-model comparison budget.
+  - Training continues past that budget until PerforatedAI reports `training_complete=True`.
+  - Any epochs beyond `max_epochs` are saved under `continued_until_complete/`.
 
 ## 1. `lenet5` — LeNet-5
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import importlib
+import itertools
 import json
 import math
 import time
@@ -41,6 +42,7 @@ class TrainingConfig:
     momentum: float = 0.9
     weight_decay: float = 0.0
     source_condition_key: str | None = None
+    train_dendrites_until_complete: bool = False
 
 
 @dataclass
@@ -948,8 +950,12 @@ def _setup_pai_optimizer(
 ) -> tuple[Any, Any | None]:
     optimizer = _build_optimizer(model, torch, config)
     tracker = _pai_tracker()
-    if not config.use_dendrites or tracker is None:
-        return optimizer, None if not config.use_dendrites else tracker
+    if (
+        not config.use_dendrites
+        or not config.train_dendrites_until_complete
+        or tracker is None
+    ):
+        return optimizer, None
     try:
         tracker.set_optimizer(_optimizer_class(torch, config))
         setup_result = tracker.setup_optimizer(model, _optimizer_args(model, config), {})
@@ -1093,9 +1099,14 @@ def _run_epoch_batches(
     train_outputs: list[Any] = []
     train_targets: list[Any] = []
     train_metric_targets: list[Any] = []
+    epoch_limit_label = (
+        "until PAI complete"
+        if config.train_dendrites_until_complete
+        else str(max_epochs)
+    )
     batch_progress = tqdm(
         bundle.train_loader,
-        desc=f"{run_label} | epoch {epoch + 1}/{max_epochs}",
+        desc=f"{run_label} | epoch {epoch + 1}/{epoch_limit_label}",
         unit="batch",
         leave=False,
         dynamic_ncols=True,
@@ -1283,14 +1294,18 @@ def _run_training_epochs(
     pai_tracker: Any | None = None,
 ) -> tuple[list[dict[str, Any]], float, int, dict[str, Any] | None]:
     state = _initial_epoch_state(context.metric_direction)
+    run_until_pai_complete = bool(
+        context.config.train_dendrites_until_complete and pai_tracker is not None
+    )
+    epoch_iterable = itertools.count() if run_until_pai_complete else range(context.max_epochs)
     epoch_progress = tqdm(
-        range(context.max_epochs),
+        epoch_iterable,
+        total=None if run_until_pai_complete else context.max_epochs,
         desc=context.run_label,
         unit="epoch",
         leave=True,
         dynamic_ncols=True,
     )
-    dynamic_freeze_epoch = math.floor(context.max_epochs * 0.8)
     for epoch in epoch_progress:
         epoch_start = time.perf_counter()
         train_loss, train_metrics = _run_epoch_batches(
@@ -1314,11 +1329,11 @@ def _run_training_epochs(
             state, context.model, epoch, val_metric, context.metric_direction
         )
         history_row["pai_dynamic_insertion_active"] = bool(
-            pai_tracker is not None and epoch < dynamic_freeze_epoch
+            pai_tracker is not None
         )
         history_row["pai_restructured"] = False
         history_row["pai_training_complete"] = False
-        if pai_tracker is not None and epoch < dynamic_freeze_epoch:
+        if pai_tracker is not None:
             (
                 optimizer,
                 pai_tracker,
@@ -1332,6 +1347,12 @@ def _run_training_epochs(
             history_row["pai_training_complete"] = training_complete
             if training_complete:
                 pai_tracker = None
+                if run_until_pai_complete:
+                    _set_epoch_progress(
+                        epoch_progress, context.metric_name, val_metric,
+                        state.best_metric, state.best_epoch,
+                    )
+                    break
         _set_epoch_progress(
             epoch_progress, context.metric_name, val_metric,
             state.best_metric, state.best_epoch,
@@ -1484,6 +1505,62 @@ def _persist_post_pqat_snapshot(
         plain_model=plain_model,
         metadata=metadata,
         payload=payload,
+    )
+
+
+def _persist_over_budget_snapshot(
+    *,
+    enabled: bool,
+    output_dir: Path,
+    plain_model: Any,
+    metadata: ArtifactMetadata,
+    payload: ArtifactPayload,
+    max_epochs: int,
+) -> ArtifactPayload:
+    if not enabled:
+        return payload
+    canonical_history = [
+        row for row in payload.history if int(row.get("epoch", 0)) <= max_epochs
+    ]
+    over_budget_history = [
+        row for row in payload.history if int(row.get("epoch", 0)) > max_epochs
+    ]
+    if not over_budget_history:
+        return payload
+    if canonical_history:
+        final_test_fields = {
+            key: value
+            for key, value in payload.history[-1].items()
+            if key.startswith("test_")
+        }
+        canonical_history[-1].update(final_test_fields)
+    over_payload = ArtifactPayload(
+        best_metric=payload.best_metric,
+        final_metric=payload.final_metric,
+        best_epoch=payload.best_epoch,
+        history=over_budget_history,
+        test_loss=payload.test_loss,
+        test_metrics=payload.test_metrics,
+        training_skipped=payload.training_skipped,
+        skip_reason=payload.skip_reason,
+        stage_name="continued_until_complete",
+    )
+    _persist_stage_artifacts(
+        output_dir=output_dir / "continued_until_complete",
+        plain_model=plain_model,
+        metadata=metadata,
+        payload=over_payload,
+    )
+    return ArtifactPayload(
+        best_metric=payload.best_metric,
+        final_metric=payload.final_metric,
+        best_epoch=payload.best_epoch,
+        history=canonical_history,
+        test_loss=payload.test_loss,
+        test_metrics=payload.test_metrics,
+        training_skipped=payload.training_skipped,
+        skip_reason=payload.skip_reason,
+        stage_name=payload.stage_name,
     )
 
 
@@ -1706,6 +1783,14 @@ def train_and_evaluate(
         plain_model=_plain_model,
         metadata=metadata,
         payload=payload,
+    )
+    payload = _persist_over_budget_snapshot(
+        enabled=use_dendrites and config.train_dendrites_until_complete,
+        output_dir=output_dir,
+        plain_model=_plain_model,
+        metadata=metadata,
+        payload=payload,
+        max_epochs=max_epochs,
     )
 
     _, file_size_mb, param_count, nonzero_params = _persist_stage_artifacts(

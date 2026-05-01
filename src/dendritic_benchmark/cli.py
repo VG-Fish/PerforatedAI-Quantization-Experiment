@@ -150,8 +150,8 @@ def build_parser() -> argparse.ArgumentParser:
         dest="allow_pqat",
         action="store_true",
         help=(
-            "Enable post-quantization-aware training for quantized conditions. "
-            "When set, quantized runs save a PTQ evaluation to "
+            "Enable post-quantization-aware training for quantized dendritic "
+            "conditions. When set, dendritic quantized runs save a PTQ evaluation to "
             "`before_pqat/`, fine-tune for a model-specific PQAT epoch budget, "
             "and save the post-PQAT artifacts to `after_pqat/`."
         ),

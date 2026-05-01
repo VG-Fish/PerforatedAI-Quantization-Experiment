@@ -474,12 +474,13 @@ class BenchmarkRunner:
         use_qat = condition.use_qat
         fine_tune_epochs = condition.fine_tune_epochs
         if condition.quantized and condition.source_key != condition.key:
-            if allow_pqat:
+            if allow_pqat and condition.use_dendrites:
                 fine_tune_epochs = self._pqat_epoch_budget(model_key)
                 max_epochs = fine_tune_epochs
                 use_qat = True
             else:
                 max_epochs = 0
+        weight_decay = 0.0 if condition.use_dendrites else training_hyperparameters.weight_decay
         training_config = TrainingConfig(
             bit_width=condition.bit_width,
             quantization_mode=condition.quantization_mode,
@@ -492,8 +493,9 @@ class BenchmarkRunner:
             learning_rate=training_hyperparameters.learning_rate,
             optimizer_name=training_hyperparameters.optimizer_name,
             momentum=training_hyperparameters.momentum,
-            weight_decay=training_hyperparameters.weight_decay,
+            weight_decay=weight_decay,
             source_condition_key=condition.source_key,
+            train_dendrites_until_complete=condition.use_dendrites and not condition.quantized,
         )
         return train_and_evaluate(
             model_key=model_key,
