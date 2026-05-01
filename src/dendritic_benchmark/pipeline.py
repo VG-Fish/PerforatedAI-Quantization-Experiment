@@ -216,7 +216,7 @@ class BenchmarkRunner:
         recipe = self._training_hyperparameters(
             model_key, condition_by_key("base_fp32")
         )
-        return max(1, min(10, math.ceil(recipe.max_epochs * 0.10)))
+        return max(1, min(10, math.ceil(recipe.max_epochs * 0.30)))
 
     def _load_saved_condition(
         self,
