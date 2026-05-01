@@ -663,6 +663,20 @@ def _unwrap_compiled(model: Any) -> Any:
     return getattr(model, "_orig_mod", model)
 
 
+def _is_ignorable_state_key(key: str) -> bool:
+    return key.endswith("tracker_string")
+
+
+def _tensor_shape(value: Any) -> tuple[int, ...] | None:
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        return None
+    try:
+        return tuple(shape)
+    except TypeError:
+        return None
+
+
 def _make_quantized_copy(
     model: Any, bit_width: int | None, mode: str | None = None
 ) -> Any:
@@ -1178,8 +1192,12 @@ def _load_compatible_best_state(model: Any, best_state: dict[str, Any]) -> None:
     compatible_state: dict[str, Any] = {}
     skipped: list[str] = []
     for key, value in best_state.items():
+        if _is_ignorable_state_key(key):
+            continue
         current_value = current_state.get(key)
-        if current_value is None or tuple(current_value.shape) != tuple(value.shape):
+        current_shape = _tensor_shape(current_value)
+        source_shape = _tensor_shape(value)
+        if current_shape is None or source_shape is None or current_shape != source_shape:
             skipped.append(key)
             continue
         compatible_state[key] = value
@@ -1192,7 +1210,7 @@ def _load_compatible_best_state(model: Any, best_state: dict[str, Any]) -> None:
         )
     if unexpected:
         print(f"[state] ignored unexpected best-state tensors: {unexpected[:5]}")
-    real_missing = [key for key in missing if not key.endswith("tracker_string")]
+    real_missing = [key for key in missing if not _is_ignorable_state_key(key)]
     if real_missing:
         print(f"[state] retained current values for missing tensors: {real_missing[:5]}")
 

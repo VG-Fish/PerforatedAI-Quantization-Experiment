@@ -43,6 +43,30 @@ def _log(msg: str, *, before: bool = False, after: bool = False) -> None:
         print()
 
 
+def _is_ignorable_state_key(key: str) -> bool:
+    return key.endswith("tracker_string")
+
+
+def _tensor_shape(value: Any) -> tuple[int, ...] | None:
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        return None
+    try:
+        return tuple(shape)
+    except TypeError:
+        return None
+
+
+def _is_compatible_state_value(current_value: Any, source_value: Any) -> bool:
+    current_shape = _tensor_shape(current_value)
+    source_shape = _tensor_shape(source_value)
+    return (
+        current_shape is not None
+        and source_shape is not None
+        and current_shape == source_shape
+    )
+
+
 class BenchmarkRunner:
     def __init__(
         self,
@@ -54,6 +78,33 @@ class BenchmarkRunner:
         self.results_root.mkdir(parents=True, exist_ok=True)
         self.comparison_root.mkdir(parents=True, exist_ok=True)
 
+    def _split_compatible_state(
+        self, state: dict[str, Any], current_state: dict[str, Any]
+    ) -> tuple[dict[str, Any], list[str]]:
+        compatible_state: dict[str, Any] = {}
+        skipped: list[str] = []
+        for key, value in state.items():
+            if _is_ignorable_state_key(key):
+                continue
+            current_value = current_state.get(key)
+            if not _is_compatible_state_value(current_value, value):
+                skipped.append(key)
+                continue
+            compatible_state[key] = value
+        return compatible_state, skipped
+
+    def _load_compatible_state(self, model: Any, state: dict[str, Any]) -> None:
+        compatible_state, skipped = self._split_compatible_state(
+            state, model.state_dict()
+        )
+        model.load_state_dict(compatible_state, strict=False)
+        if skipped:
+            print(
+                "[state] skipped incompatible source-checkpoint tensors: "
+                + ", ".join(sorted(skipped)[:5])
+                + ("..." if len(skipped) > 5 else "")
+            )
+
     def _load_state(
         self, model: Any, checkpoint_path: Path, *, strict: bool = True
     ) -> Any:
@@ -63,21 +114,7 @@ class BenchmarkRunner:
             if strict:
                 model.load_state_dict(state, strict=True)
             else:
-                current_state = model.state_dict()
-                compatible_state = {
-                    key: value
-                    for key, value in state.items()
-                    if key in current_state
-                    and tuple(current_state[key].shape) == tuple(value.shape)
-                }
-                skipped = sorted(set(state) - set(compatible_state))
-                model.load_state_dict(compatible_state, strict=False)
-                if skipped:
-                    print(
-                        "[state] skipped incompatible source-checkpoint tensors: "
-                        + ", ".join(skipped[:5])
-                        + ("..." if len(skipped) > 5 else "")
-                    )
+                self._load_compatible_state(model, cast(dict[str, Any], state))
         return model
 
     def _load_source_checkpoint(
