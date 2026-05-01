@@ -111,6 +111,10 @@ The library writes these automatically to the `save_name/` folder:
 - `paramCounts.csv` — parameter count at each epoch
 - `Scores.csv` — validation + extra scores per epoch
 
+The library's active `PAI/PAI_config.json` is also snapshotted after each
+perforation as `PAI/<model>_<condition>_PAI_config.json` and, for the run
+artifact, as `results/<model>/<condition>/PAI_config.json`.
+
 This benchmark suite itself saves the best model state it evaluated to `results/<model>/<condition>/model.pt` and uses that file for comparisons and file-size reporting.
 
 ***
@@ -690,6 +694,7 @@ results/
       metrics.json
       history.csv
       model.pt
+      PAI_config.json        # dendritic runs only
       best_model_stats.csv
       before_pqat/           # PQAT-enabled quantized runs only
       after_pqat/            # PQAT-enabled quantized runs only

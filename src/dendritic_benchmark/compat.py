@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 from dataclasses import dataclass
 import builtins
 
@@ -139,6 +140,7 @@ def perforate_model(
     modules_to_track: list[Any] | None = None,
     module_names_to_track: list[str] | None = None,
     confirm_unwrapped_modules: bool = True,
+    config_snapshot_path: Path | str | None = None,
 ) -> Any:
     if not has_perforatedai():
         return model
@@ -169,17 +171,34 @@ def perforate_model(
 
         _configure_pai_trackers(GPA, modules_to_track, module_names_to_track, confirm_unwrapped_modules)
 
-        return UPA.perforate_model(
+        perforated_model = UPA.perforate_model(
             model,
             doing_pai=doing_pai,
             save_name=save_name,
             maximizing_score=maximizing_score,
             making_graphs=False,
         )
+        _snapshot_pai_config(save_name, config_snapshot_path)
+        return perforated_model
     except Exception:
         return model
     finally:
         builtins.print = original_print
+
+
+def _snapshot_pai_config(save_name: str, config_snapshot_path: Path | str | None) -> None:
+    config_path = Path("PAI") / "PAI_config.json"
+    if not config_path.exists():
+        return
+    named_snapshot = config_path.with_name(f"{save_name}_PAI_config.json")
+    try:
+        shutil.copy2(config_path, named_snapshot)
+        if config_snapshot_path is not None:
+            artifact_path = Path(config_snapshot_path)
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(config_path, artifact_path)
+    except Exception:
+        return
 
 
 def choose_device() -> Any:

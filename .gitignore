@@ -18,3 +18,4 @@ sonar-project.properties
 .scannerwork/
 .uv-cache/
 .uv-tools/
+.github/

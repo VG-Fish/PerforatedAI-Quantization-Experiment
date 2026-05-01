@@ -72,6 +72,7 @@ class BenchmarkRunner:
         target_uses_dendrites: bool,
         save_name: str,
         maximizing_score: bool,
+        config_snapshot_path: Path | str | None = None,
     ) -> Any:
         source_condition = condition_by_key(source_key)
 
@@ -85,6 +86,7 @@ class BenchmarkRunner:
                 doing_pai=True,
                 maximizing_score=maximizing_score,
                 modules_to_track=self._perforation_track_modules(model_key),
+                config_snapshot_path=config_snapshot_path,
             )
             model = self._configure_perforated_model(model, model_key)
             return self._load_state(model, checkpoint_path, strict=False)
@@ -97,6 +99,7 @@ class BenchmarkRunner:
                 doing_pai=True,
                 maximizing_score=maximizing_score,
                 modules_to_track=self._perforation_track_modules(model_key),
+                config_snapshot_path=config_snapshot_path,
             )
             model = self._configure_perforated_model(model, model_key)
         return model
@@ -378,6 +381,8 @@ class BenchmarkRunner:
     ) -> TrainingRecord:
         require_torch()
         model = build_model(model_key, **self._model_kwargs(model_key))
+        condition_dir = self.results_root / model_key / condition.key
+        pai_config_snapshot = condition_dir / "PAI_config.json"
         if condition.source_key in saved_dirs:
             checkpoint = self._artifact_path(
                 saved_dirs[condition.source_key],
@@ -391,6 +396,7 @@ class BenchmarkRunner:
                 condition.use_dendrites,
                 save_name=f"{model_key}_{condition.key}",
                 maximizing_score=metric_direction == "maximize",
+                config_snapshot_path=pai_config_snapshot,
             )
         elif condition.use_dendrites:
             model = perforate_model(
@@ -399,6 +405,7 @@ class BenchmarkRunner:
                 doing_pai=True,
                 maximizing_score=metric_direction == "maximize",
                 modules_to_track=self._perforation_track_modules(model_key),
+                config_snapshot_path=pai_config_snapshot,
             )
             model = self._configure_perforated_model(model, model_key)
 
@@ -436,6 +443,6 @@ class BenchmarkRunner:
             metric_direction=metric_direction,
             model=model,
             bundle=bundle,
-            output_dir=self.results_root / model_key / condition.key,
+            output_dir=condition_dir,
             config=training_config,
         )

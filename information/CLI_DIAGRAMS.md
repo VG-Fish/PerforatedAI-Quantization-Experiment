@@ -58,7 +58,7 @@ flowchart TD
     T --> U["Evaluate val + test metrics"]
     U --> V["Save artifacts:<br>model.pt (best), best_model_stats.csv,<br>metrics.json, history.csv, plots/"]
     V --> W{"Dendritic<br>run?"}
-    W -->|Yes| X["Also save:<br>best_arch_scores.csv<br>and paramCounts.csv"]
+    W -->|Yes| X["Also save:<br>PAI_config.json<br>best_arch_scores.csv<br>and paramCounts.csv"]
     W -->|No| Y["results.py:<br>save_training_record<br>record.json + record.csv"]
     X --> Y
     Y --> G
@@ -242,6 +242,7 @@ flowchart TD
             ├── history.csv
             ├── metrics.json
             ├── model.pt
+            ├── PAI_config.json              # dendritic only
             ├── best_model_stats.csv
             ├── record.csv
             ├── record.json
