@@ -159,12 +159,24 @@ def _consume_pai_config_message(text: str) -> bool:
     return False
 
 
+def _print_pai_debugger_notice(text: str) -> None:
+    stream = sys.__stderr__ or sys.stderr
+    if stream is None:
+        return
+    stream.write(
+        "\033[31m[PAI debugger suppressed] PerforatedAI attempted to print a "
+        f"debugger warning: {text.strip()}\033[0m\n"
+    )
+    stream.flush()
+
+
 def _consume_pai_debugger_message(text: str) -> bool:
     global _PAI_DEBUGGER_SUPPRESS_REMAINING
     stripped = text.strip()
     if not stripped:
         return False
     if stripped.startswith("WARNING: Parameter does not have parameter_type attribute"):
+        _print_pai_debugger_notice(stripped)
         _PAI_DEBUGGER_SUPPRESS_REMAINING = 8
         return True
     if stripped.startswith(

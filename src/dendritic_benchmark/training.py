@@ -1511,8 +1511,8 @@ def _should_quantize_for_eval(config: TrainingConfig) -> bool:
     return config.bit_width is not None and config.bit_width < 32
 
 
-def _use_pai_runtime_guard(model_key: str) -> bool:
-    return model_key in {"lstm_forecaster", "lstm_autoencoder"}
+def _use_pai_runtime_guard() -> bool:
+    return True
 
 
 def _prepare_model_for_training(
@@ -1610,7 +1610,7 @@ def train_and_evaluate(
 
     pai_guard = (
         pai_runtime_guard()
-        if use_dendrites and _use_pai_runtime_guard(model_key)
+        if use_dendrites and _use_pai_runtime_guard()
         else nullcontext()
     )
     with pai_guard:

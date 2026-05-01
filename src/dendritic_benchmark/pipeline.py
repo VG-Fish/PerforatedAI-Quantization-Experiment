@@ -141,7 +141,7 @@ class BenchmarkRunner:
                 maximizing_score=maximizing_score,
                 modules_to_track=self._perforation_track_modules(model_key),
                 config_snapshot_path=config_snapshot_path,
-                use_runtime_guard=self._use_pai_runtime_guard(model_key),
+                use_runtime_guard=self._use_pai_runtime_guard(),
             )
             model = self._configure_perforated_model(model, model_key)
             return self._load_state(model, checkpoint_path, strict=False)
@@ -155,7 +155,7 @@ class BenchmarkRunner:
                 maximizing_score=maximizing_score,
                 modules_to_track=self._perforation_track_modules(model_key),
                 config_snapshot_path=config_snapshot_path,
-                use_runtime_guard=self._use_pai_runtime_guard(model_key),
+                use_runtime_guard=self._use_pai_runtime_guard(),
             )
             model = self._configure_perforated_model(model, model_key)
         return model
@@ -225,8 +225,8 @@ class BenchmarkRunner:
             return [nn.MultiheadAttention]
         return []
 
-    def _use_pai_runtime_guard(self, model_key: str) -> bool:
-        return model_key in {"lstm_forecaster", "lstm_autoencoder"}
+    def _use_pai_runtime_guard(self) -> bool:
+        return True
 
     def _configure_perforated_model(self, model: Any, model_key: str) -> Any:
         if (
@@ -465,7 +465,7 @@ class BenchmarkRunner:
                 maximizing_score=metric_direction == "maximize",
                 modules_to_track=self._perforation_track_modules(model_key),
                 config_snapshot_path=pai_config_snapshot,
-                use_runtime_guard=self._use_pai_runtime_guard(model_key),
+                use_runtime_guard=self._use_pai_runtime_guard(),
             )
             model = self._configure_perforated_model(model, model_key)
 
