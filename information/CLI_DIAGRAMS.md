@@ -56,9 +56,9 @@ flowchart TD
     S2 -->|Yes| S3["Save before_pqat/<br>then fine-tune for a model-aware PQAT budget<br>then save after_pqat/"]
     S3 --> U
     T --> U["Evaluate val + test metrics"]
-    U --> V["Save artifacts:<br>model.pt, metrics.json,<br>history.csv, plots/"]
+    U --> V["Save artifacts:<br>model.pt (best), best_model_stats.csv,<br>metrics.json, history.csv, plots/"]
     V --> W{"Dendritic<br>run?"}
-    W -->|Yes| X["Also save:<br>best_model,<br>final_clean_pai,<br>best_arch_scores.csv,<br>and paramCounts.csv"]
+    W -->|Yes| X["Also save:<br>best_arch_scores.csv<br>and paramCounts.csv"]
     W -->|No| Y["results.py:<br>save_training_record<br>record.json + record.csv"]
     X --> Y
     Y --> G
@@ -242,6 +242,7 @@ flowchart TD
             ├── history.csv
             ├── metrics.json
             ├── model.pt
+            ├── best_model_stats.csv
             ├── record.csv
             ├── record.json
             ├── before_pqat/                 # quantized runs only when --allow-PQAT is enabled
@@ -252,8 +253,6 @@ flowchart TD
             │   ├── primary_metric.svg
             │   └── training_curve.svg
             ├── best_arch_scores.csv          # dendritic only
-            ├── best_model                    # dendritic only
-            ├── final_clean_pai               # dendritic only
             └── paramCounts.csv               # dendritic only
 ```
 

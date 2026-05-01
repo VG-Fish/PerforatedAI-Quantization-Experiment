@@ -104,14 +104,16 @@ class BenchmarkRunner:
     def _artifact_path(
         self, condition_dir: Path, prefer_dendritic: bool = False
     ) -> Path:
-        candidates = [_MODEL_PT]
+        preferred = condition_dir / _MODEL_PT
+        if preferred.exists():
+            return preferred
+        # Backwards compatibility for older runs that wrote multiple checkpoint names.
         if prefer_dendritic:
-            candidates = ["final_clean_pai", "best_model", _MODEL_PT]
-        for name in candidates:
-            path = condition_dir / name
-            if path.exists():
-                return path
-        return condition_dir / _MODEL_PT
+            for name in ["best_model", "final_clean_pai"]:
+                path = condition_dir / name
+                if path.exists():
+                    return path
+        return preferred
 
     def _expand_condition_keys(self, condition_keys: list[str] | None) -> list[str]:
         requested = condition_keys or [spec.key for spec in CONDITION_SPECS]

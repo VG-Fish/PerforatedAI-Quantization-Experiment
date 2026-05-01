@@ -105,13 +105,13 @@ Run in isolation. For Q1 and Q1.58, use QAT (quantization-aware training) via `t
 ### PerforatedAI Output Files
 The library writes these automatically to the `save_name/` folder:
 - `best_model` — best checkpoint by validation score
-- `final_clean_pai` — best model optimized for inference; smaller file; open-source compatible
+- `final_clean_pai` — inference-optimized checkpoint (when enabled by the library)
 - `latest` — most recent checkpoint; use to resume if training crashes
 - `best_arch_scores.csv` — best test scores + parameter counts per dendrite cycle
 - `paramCounts.csv` — parameter count at each epoch
 - `Scores.csv` — validation + extra scores per epoch
 
-For the **model file size** metric, always measure `final_clean_pai` for dendritic conditions and a plain `torch.save(model.state_dict(), path)` for base conditions.
+This benchmark suite itself saves the best model state it evaluated to `results/<model>/<condition>/model.pt` and uses that file for comparisons and file-size reporting.
 
 ***
 ## PyTorch Implementation Notes
@@ -478,7 +478,7 @@ Round 1 produced three clean scientific findings: (1) dendritic models provide t
 ### `src/dendritic_benchmark/cli.py`
 The package exposes the `dqb` entry point via `pyproject.toml`.
 - `uv run dqb run` constructs a `BenchmarkRunner` and executes the selected models and conditions.
-- `uv run dqb compare` loads saved `record.json` files and rebuilds per-model and cross-model comparison outputs.
+- `uv run dqb compare` loads saved `best_model_stats.csv` files (falling back to `record.json`) and rebuilds per-model and cross-model comparison outputs.
 - `uv run dqb generate_graphs` regenerates training plots from existing `history.csv` files.
 - `--results-root` controls where per-model results are read from or written to.
 - `--comparison-root` controls where comparison outputs are written for `run` and `compare`.
@@ -538,7 +538,7 @@ Runs each individual condition.
 - Compiles non-dendritic MPS models with `torch.compile(..., backend='aot_eager')` when available.
 - Trains for the condition-specific epoch budget, or skips training for post-training quantization conditions (printing a skip-reason banner).
 - Evaluates validation and test metrics with a rich set of per-task metrics (accuracy, MAE, RMSE, AUC, Dice, SSIM, ELBO, etc.).
-- Saves `model.pt`, and for dendritic runs also writes `best_model` and `final_clean_pai`.
+- Saves the best model state to `model.pt` and writes `best_model_stats.csv` for the `compare` command.
 - Writes `metrics.json`, `history.csv`, and returns a normalized `TrainingRecord`.
 - For dendritic runs, also writes `best_arch_scores.csv` and `paramCounts.csv`.
 
@@ -547,7 +547,7 @@ Runs each individual condition.
 ### `src/dendritic_benchmark/results.py`
 Reads and writes benchmark records and generates final visualizations.
 - `save_training_record()` writes `record.json` and `record.csv` for each condition.
-- `load_training_records()` scans saved records under `results/*/*/record.json`.
+- `load_training_records()` prefers `results/*/*/best_model_stats.csv` and falls back to `record.json` for older runs.
 - `write_manifest()` writes `results/manifest.csv`.
 - `write_model_reports()` generates per-model metric, parameter, and size comparison charts.
 - `write_comparison_reports()` generates cross-model heatmaps, a tradeoff scatter plot, a dendrite delta chart, and `summary.csv`.
@@ -674,10 +674,9 @@ results/
       metrics.json
       history.csv
       model.pt
+      best_model_stats.csv
       before_pqat/           # PQAT-enabled quantized runs only
       after_pqat/            # PQAT-enabled quantized runs only
-      best_model              # dendritic runs only
-      final_clean_pai         # dendritic runs only
       best_arch_scores.csv    # dendritic runs only
       paramCounts.csv         # dendritic runs only
       plots/

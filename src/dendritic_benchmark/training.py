@@ -19,6 +19,7 @@ from .compat import (
 )
 
 _MODEL_PT: str = "model.pt"
+_BEST_MODEL_STATS_CSV: str = "best_model_stats.csv"
 OptimizerName = Literal["adam", "adamw", "sgd"]
 
 
@@ -97,6 +98,15 @@ class ArtifactStats:
     nonzero_params: int
     file_size_mb: float
     artifact_path: Path
+
+
+def _write_best_model_stats_csv(output_dir: Path, record: TrainingRecord) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload = record.to_dict()
+    with (output_dir / _BEST_MODEL_STATS_CSV).open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(payload.keys()))
+        writer.writeheader()
+        writer.writerow(payload)
 
 
 def _metric_is_better(new: float, old: float, direction: str) -> bool:
@@ -646,12 +656,16 @@ def _make_quantized_copy(
 
 
 def _artifact_path(output_dir: Path, use_dendrites: bool) -> Path:
+    preferred = output_dir / _MODEL_PT
+    if preferred.exists():
+        return preferred
+    # Backwards compatibility for older runs that wrote multiple checkpoint names.
     if use_dendrites:
-        for candidate in ("final_clean_pai", "best_model", _MODEL_PT):
+        for candidate in ("best_model", "final_clean_pai"):
             path = output_dir / candidate
             if path.exists():
                 return path
-    return output_dir / _MODEL_PT
+    return preferred
 
 
 def _count_parameters(model: Any) -> tuple[int, int]:
@@ -717,9 +731,6 @@ def _persist_stage_artifacts(
     checkpoint_path = output_dir / _MODEL_PT
     torch = require_torch()
     torch.save(plain_model.state_dict(), checkpoint_path)
-    if metadata.use_dendrites:
-        torch.save(plain_model.state_dict(), output_dir / "best_model")
-        torch.save(plain_model.state_dict(), output_dir / "final_clean_pai")
     artifact_path = _artifact_path(output_dir, metadata.use_dendrites)
     file_size_mb = artifact_path.stat().st_size / (1024 * 1024)
     param_count, nonzero_params = _count_parameters(plain_model)
@@ -1398,7 +1409,7 @@ def train_and_evaluate(
         payload=payload,
     )
 
-    return TrainingRecord(
+    record = TrainingRecord(
         model_key=model_key,
         condition_key=condition_key,
         display_name=display_name,
@@ -1415,3 +1426,5 @@ def train_and_evaluate(
         training_skipped=training_skipped,
         skip_reason=skip_reason,
     )
+    _write_best_model_stats_csv(output_dir, record)
+    return record

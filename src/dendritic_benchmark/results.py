@@ -17,6 +17,74 @@ from .plots import (
 from .specs import CONDITION_SPECS, MODEL_SPECS, condition_by_key
 from .training import TrainingRecord
 
+_BEST_MODEL_STATS_CSV = "best_model_stats.csv"
+_RECORD_JSON = "record.json"
+_COERCE_INT_KEYS = {"best_epoch", "param_count", "nonzero_params"}
+_COERCE_FLOAT_KEYS = {"metric_value", "best_metric_value", "file_size_mb", "train_seconds"}
+_COERCE_BOOL_KEYS = {"training_skipped"}
+
+
+def _iter_condition_dirs(results_root: Path):
+    for condition_dir in results_root.glob("*/*"):
+        if condition_dir.is_dir():
+            yield condition_dir
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
+def _coerce_csv_row_types(row: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = dict(row)
+    for key in _COERCE_INT_KEYS:
+        value = out.get(key)
+        if value not in (None, ""):
+            try:
+                out[key] = int(value)
+            except (TypeError, ValueError):
+                pass
+    for key in _COERCE_FLOAT_KEYS:
+        value = out.get(key)
+        if value not in (None, ""):
+            try:
+                out[key] = float(value)
+            except (TypeError, ValueError):
+                pass
+    for key in _COERCE_BOOL_KEYS:
+        if key in out:
+            out[key] = _coerce_bool(out[key])
+    return out
+
+
+def _load_best_model_stats(condition_dir: Path) -> dict[str, Any] | None:
+    stats_path = condition_dir / _BEST_MODEL_STATS_CSV
+    if not stats_path.exists():
+        return None
+    with stats_path.open("r", newline="") as fh:
+        reader = csv.DictReader(fh)
+        row = next(reader, None)
+    if not row:
+        return None
+    return _coerce_csv_row_types(row)
+
+
+def _load_record_json(condition_dir: Path) -> dict[str, Any] | None:
+    record_path = condition_dir / _RECORD_JSON
+    if not record_path.exists():
+        return None
+    return json.loads(record_path.read_text())
+
+
+def _load_condition_record(condition_dir: Path) -> dict[str, Any] | None:
+    # Prefer best-model stats (written alongside model.pt) when present; fall back to
+    # record.json for backwards compatibility.
+    record = _load_best_model_stats(condition_dir)
+    return record if record is not None else _load_record_json(condition_dir)
+
 
 def save_training_record(record: TrainingRecord, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -29,11 +97,13 @@ def save_training_record(record: TrainingRecord, output_dir: Path) -> None:
 
 
 def load_training_records(results_root: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
     if not results_root.exists():
-        return records
-    for record_file in results_root.glob("*/*/record.json"):
-        records.append(json.loads(record_file.read_text()))
+        return []
+    records: list[dict[str, Any]] = []
+    for condition_dir in _iter_condition_dirs(results_root):
+        record = _load_condition_record(condition_dir)
+        if record is not None:
+            records.append(record)
     return records
 
 
