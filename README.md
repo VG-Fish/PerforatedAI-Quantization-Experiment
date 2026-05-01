@@ -42,6 +42,17 @@ Results are written to:
 - `data/` for downloaded datasets, unless `DQB_DATA_ROOT` is set
 - `logs/` for command logs
 
+To scope outputs for a specific experiment, use `--results-directory`:
+
+```bash
+uv run dqb --results-directory experiment_a run
+uv run dqb --results-directory experiment_a compare
+uv run dqb --results-directory experiment_a generate_graphs
+uv run dqb --results-directory experiment_a bench
+```
+
+When set, results are read/written under `results/<results-directory>/...`.
+
 Dendritic runs pass PerforatedAI save names under `PAI/`, so library-created
 checkpoints and sidecars stay in the `PAI/` tree. They also snapshot the
 active PerforatedAI config to
@@ -83,10 +94,11 @@ The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` f
 
 - `uv run dqb run`
 	- Train models across one or more conditions. By default runs all models & conditions defined in the project.
-	- Useful flags: `--models`, `--conditions`, `--results-root`, `--comparison-root`, `--ignore-saved-models`, `--allow-PQAT`.
+	- Useful flags: `--models`, `--conditions`, `--results-root`, `--results-directory`, `--comparison-root`, `--ignore-saved-models`, `--allow-PQAT`.
 	- Examples:
         ```bash
         uv run dqb run
+        uv run dqb --results-directory experiment_a run
         uv run dqb run --models lenet5 textcnn
         uv run dqb run --conditions base_fp32 dendrites_fp32
         uv run dqb run --allow-PQAT
@@ -95,7 +107,7 @@ The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` f
 
 - `uv run dqb download_data`
 	- Pre-downloads and prepares datasets required by the selected models.
-	- Useful flags: `--models` (subset), `--strict` (fail on any download error), `--results-root`.
+	- Useful flags: `--models` (subset), `--strict` (fail on any download error), `--results-root`, `--results-directory` (accepted but not used by this command).
 	- Examples:
         ```bash
         uv run dqb download_data
@@ -105,31 +117,34 @@ The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` f
 
 - `uv run dqb compare`
 	- Rebuilds comparison charts and summary reports from saved `record.json` files in `results/` without retraining.
-	- Useful flags: `--manifest` (write a manifest CSV), `--results-root`, `--comparison-root`.
+	- Useful flags: `--manifest` (write a manifest CSV), `--results-root`, `--results-directory`, `--comparison-root`.
 	- Examples:
         ```bash
         uv run dqb compare
+        uv run dqb --results-directory experiment_a compare
         uv run dqb compare --manifest
         uv run dqb compare --results-root results --comparison-root comparison
         ```
 
 - `uv run dqb generate_graphs`
 	- Renders per-epoch training curves and other plots from saved `history.csv` files.
-	- Useful flags: `--results-root`, `--regenerate-graphs` (force re-render even if plots exist).
+	- Useful flags: `--results-root`, `--results-directory`, `--regenerate-graphs` (force re-render even if plots exist).
 	- Comparison outputs are intentionally not managed here; use `uv run dqb compare` for `comparison/`.
 	- Examples:
         ```bash
         uv run dqb generate_graphs
+        uv run dqb --results-directory experiment_a generate_graphs
         uv run dqb generate_graphs --regenerate-graphs
         ```
 
 - `uv run dqb bench`
 	- Measures wall-clock inference latency for all trained models using `torch.utils.benchmark.Timer`.
 	- Results are saved to `benchmarks/<model>/` with per-condition latency measurements.
-	- Useful flags: `--models` (subset), `--conditions` (subset), `--batch-sizes` (e.g., `1 8 32`), `--num-runs` (averaging runs), `--benchmark-root`.
+	- Useful flags: `--models` (subset), `--conditions` (subset), `--batch-sizes` (e.g., `1 8 32`), `--num-runs` (averaging runs), `--results-root`, `--results-directory`, `--benchmark-root`.
 	- Examples:
         ```bash
         uv run dqb bench
+        uv run dqb --results-directory experiment_a bench
         uv run dqb bench --models lenet5 resnet18_cifar10
         uv run dqb bench --batch-sizes 1 32 --num-runs 20
         uv run dqb bench --benchmark-root my_benchmarks

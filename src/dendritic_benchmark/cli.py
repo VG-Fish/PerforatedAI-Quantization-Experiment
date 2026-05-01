@@ -58,6 +58,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--results-directory",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Optional directory name under --results-root to scope a training run "
+            "or analysis set. When provided, commands read/write results under "
+            "<results-root>/<results-directory>."
+        ),
+    )
+    parser.add_argument(
         "--logging-dir",
         default="logs",
         metavar="DIR",
@@ -363,6 +373,8 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     results_root = Path(args.results_root)
+    if args.results_directory:
+        results_root = results_root / args.results_directory
     comparison_root = Path(getattr(args, "comparison_root", "comparison"))
     benchmark_root = Path(getattr(args, "benchmark_root", "benchmarks"))
 

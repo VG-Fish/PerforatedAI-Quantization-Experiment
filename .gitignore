@@ -19,3 +19,4 @@ sonar-project.properties
 .uv-cache/
 .uv-tools/
 .github/
+benchmarks/

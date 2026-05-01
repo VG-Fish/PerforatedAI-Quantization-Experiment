@@ -511,6 +511,7 @@ The package exposes the `dqb` entry point via `pyproject.toml`.
 - `uv run dqb compare` loads saved `best_model_stats.csv` files (falling back to `record.json`) and rebuilds per-model and cross-model comparison outputs.
 - `uv run dqb generate_graphs` regenerates training plots from existing `history.csv` files.
 - `--results-root` controls where per-model results are read from or written to.
+- `--results-directory` optionally scopes results to a named subdirectory under `--results-root`.
 - `--comparison-root` controls where comparison outputs are written for `run` and `compare`.
 - `.env` credentials are loaded before running so PerforatedAI aliases and API variables are mirrored into the environment.
 
@@ -600,6 +601,7 @@ Creates charts using Matplotlib's non-interactive `Agg` backend.
 ### Full benchmark
 ```bash
 uv run dqb run
+uv run dqb --results-directory experiment_a run
 ```
 1. `cli.py` parses the command and global options.
 2. `pipeline.py` loops over selected models and conditions.
@@ -612,6 +614,7 @@ uv run dqb run
 ### Regenerate plots after training
 ```bash
 uv run dqb compare --manifest
+uv run dqb --results-directory experiment_a compare --manifest
 ```
 1. `cli.py` loads saved record files.
 2. `results.py` optionally rewrites `manifest.csv`.
@@ -621,6 +624,7 @@ uv run dqb compare --manifest
 ### Generate training graphs
 ```bash
 uv run dqb generate_graphs --results-root results
+uv run dqb --results-directory experiment_a generate_graphs
 ```
 1. `cli.py` loads the results root.
 2. `results.py` scans existing `history.csv` files.
@@ -661,9 +665,11 @@ Runs the benchmark pipeline for selected models and conditions.
 
 ```bash
 uv run dqb run
+uv run dqb --results-directory experiment_a run
 uv run dqb run --models lenet5 textcnn
 uv run dqb run --conditions base_fp32 base_q8 dendrites_fp32
 uv run dqb run --results-root results
+uv run dqb --results-directory experiment_a run --results-root results
 uv run dqb run --comparison-root comparison
 uv run dqb run --allow-PQAT
 uv run dqb run --ignore-saved-models
@@ -683,6 +689,7 @@ Rebuilds comparison outputs from previously saved records.
 
 ```bash
 uv run dqb compare
+uv run dqb --results-directory experiment_a compare
 uv run dqb compare --manifest
 uv run dqb compare --results-root results --comparison-root comparison
 ```
@@ -693,6 +700,7 @@ Generates training curves from saved result histories without retraining.
 ```bash
 uv run dqb generate_graphs
 uv run dqb generate_graphs --results-root results
+uv run dqb --results-directory experiment_a generate_graphs
 uv run dqb generate_graphs --regenerate-graphs
 ```
 
@@ -745,15 +753,18 @@ comparison/
 ```bash
 # Smoke test
 uv run dqb run --models lenet5 --conditions base_fp32 base_q8
+uv run dqb --results-directory smoke_test run --models lenet5 --conditions base_fp32 base_q8
 
 # Download all data before a long run
 uv run dqb download_data
 
 # Regenerate plots from existing results
 uv run dqb compare --manifest
+uv run dqb --results-directory smoke_test compare --manifest
 
 # Re-run specific models ignoring cached results
 uv run dqb run --models mpnn actor_critic --ignore-saved-models
+uv run dqb --results-directory experiment_b run --models mpnn actor_critic --ignore-saved-models
 ```
 
 ## Notes
@@ -776,6 +787,7 @@ The `dqb bench` command measures actual wall-clock inference latency for all tra
 
 ```bash
 uv run dqb bench
+uv run dqb --results-directory experiment_a bench
 uv run dqb bench --models lenet5 m5 resnet18_cifar10
 uv run dqb bench --conditions base_fp32 base_q4 dendrites_q4
 uv run dqb bench --batch-sizes 1 8 32
@@ -934,5 +946,6 @@ uv run dqb bench --benchmark-root benchmarks_experiment_e
 ## Requirements
 
 - Trained models must exist in `--results-root` (run `dqb run` first)
+- If `--results-directory` is used, `bench` reads trained models from `--results-root/<results-directory>`
 - PyTorch must be installed
 - Models will be loaded to CPU/MPS/CUDA based on availability

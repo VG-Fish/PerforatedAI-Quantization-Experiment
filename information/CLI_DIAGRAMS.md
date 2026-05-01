@@ -11,6 +11,7 @@ These flags are shared by all commands:
 | Flag | Default | Description |
 |---|---|---|
 | `--results-root DIR` | `results` | Root directory for per-model result folders (also used by `bench` to locate trained models) |
+| `--results-directory NAME` | _unset_ | Optional subdirectory under `--results-root`; when set, results path becomes `<results-root>/<results-directory>` |
 | `--logging-dir DIR` | `logs` | Directory for timestamped log files |
 
 `--comparison-root DIR` is available only on `uv run dqb run` and `uv run dqb compare`.
@@ -25,6 +26,7 @@ Trains models across all (or a subset of) conditions and saves results.
 
 ```bash
 uv run dqb run
+uv run dqb --results-directory experiment_a run
 uv run dqb run --models lenet5 textcnn
 uv run dqb run --conditions base_fp32 base_q8 dendrites_fp32
 uv run dqb run --results-root results
@@ -157,6 +159,7 @@ Rebuilds all comparison outputs from previously saved `record.json` files withou
 
 ```bash
 uv run dqb compare
+uv run dqb --results-directory experiment_a compare
 uv run dqb compare --manifest
 uv run dqb compare --results-root results --comparison-root comparison
 ```
@@ -196,6 +199,7 @@ Renders per-epoch training-curve plots from saved result histories without retra
 
 ```bash
 uv run dqb generate_graphs
+uv run dqb --results-directory experiment_a generate_graphs
 uv run dqb generate_graphs --results-root results
 uv run dqb generate_graphs --regenerate-graphs
 ```
@@ -233,6 +237,7 @@ Measures wall-clock inference latency for all trained models using `torch.utils.
 
 ```bash
 uv run dqb bench
+uv run dqb --results-directory experiment_a bench
 uv run dqb bench --models lenet5 m5
 uv run dqb bench --conditions base_fp32 base_q4 dendrites_q4
 uv run dqb bench --batch-sizes 1 8 32
@@ -305,25 +310,26 @@ Results are organized by model and condition:
 │   ├── model_key_condition_key_PAI_config.json
 │   └── model_key_condition_key/
 └── results/
-    ├── manifest.csv
-    └── model_key/
-        └── condition_key/
-            ├── history.csv
-            ├── metrics.json
-            ├── model.pt
-            ├── PAI_config.json              # dendritic only
-            ├── best_model_stats.csv
-            ├── record.csv
-            ├── record.json
-            ├── before_pqat/                 # quantized runs only when --allow-PQAT is enabled
-            ├── after_pqat/                  # quantized runs only when --allow-PQAT is enabled
-            ├── plots/
-            │   ├── architecture_evolution.svg  # dendritic only
-            │   ├── loss_curves.svg
-            │   ├── primary_metric.svg
-            │   └── training_curve.svg
-            ├── best_arch_scores.csv          # dendritic only
-            └── paramCounts.csv               # dendritic only
+    └── [results-directory]/                # optional, from --results-directory
+        ├── manifest.csv
+        └── model_key/
+            └── condition_key/
+                ├── history.csv
+                ├── metrics.json
+                ├── model.pt
+                ├── PAI_config.json              # dendritic only
+                ├── best_model_stats.csv
+                ├── record.csv
+                ├── record.json
+                ├── before_pqat/                 # quantized runs only when --allow-PQAT is enabled
+                ├── after_pqat/                  # quantized runs only when --allow-PQAT is enabled
+                ├── plots/
+                │   ├── architecture_evolution.svg  # dendritic only
+                │   ├── loss_curves.svg
+                │   ├── primary_metric.svg
+                │   └── training_curve.svg
+                ├── best_arch_scores.csv          # dendritic only
+                └── paramCounts.csv               # dendritic only
 ```
 
 ---
