@@ -243,7 +243,7 @@ uv run dqb --results-directory experiment_a benchmark_models
 uv run dqb benchmark_models --models lenet5 m5
 uv run dqb benchmark_models --conditions base_fp32 base_q4 dendrites_q4
 uv run dqb benchmark_models --batch-sizes 1 8 32
-uv run dqb benchmark_models --num-runs 20
+uv run dqb benchmark_models --num-runs 10
 uv run dqb benchmark_models --benchmark-root my_benchmarks
 uv run dqb benchmark_models --comparison-root my_comparison
 ```
@@ -261,8 +261,8 @@ flowchart TD
     I -->|No| J["Log error skip condition"]
     I -->|Yes| K["Generate sample inputs<br>matching model shape"]
     K --> L["For each batch size"]
-    L --> M["Run torch.utils.benchmark.Timer<br>for num_runs iterations"]
-    M --> N["Collect latency stats<br>mean, median, stdev"]
+    L --> M["Run num_runs independent<br>torch.utils.benchmark.Timer calls<br>(default: 5 per batch size)"]
+    M --> N["Collect latency stats<br>mean + median across<br>num_runs independent runs"]
     N --> O["Write results to<br>condition_key.json"]
     O --> P["Aggregate to<br>latency_summary.csv"]
     P --> L

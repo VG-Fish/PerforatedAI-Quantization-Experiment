@@ -832,7 +832,7 @@ uv run dqb benchmark_models --comparison-root my_comparison
 | `--models KEY [KEY ...]` | all 25 | Space-separated model keys to benchmark |
 | `--conditions KEY [KEY ...]` | all 12 | Space-separated condition keys to benchmark |
 | `--batch-sizes SIZE [SIZE ...]` | `1 32` | Batch sizes to test |
-| `--num-runs N` | 10 | Number of timing runs per benchmark (for averaging) |
+| `--num-runs N` | 5 | Number of independent timing runs per batch size; mean and median are computed across these runs |
 
 ## Output Structure
 
@@ -896,14 +896,14 @@ Full results for a single model + condition combination:
   "batch_sizes": {
     "1": {
       "batch_size": 1,
-      "num_runs": 10,
+      "num_runs": 5,
       "mean_latency_ms": 1.89,
       "median_latency_ms": 1.87,
       "stdev_latency_ms": 0.05
     },
     "32": {
       "batch_size": 32,
-      "num_runs": 10,
+      "num_runs": 5,
       "mean_latency_ms": 11.34,
       "median_latency_ms": 11.21,
       "stdev_latency_ms": 0.12
@@ -928,9 +928,11 @@ m5,base_q4,1,1.12,1.10
 
 ### Latency Metrics
 
-- **Mean Latency**: Average inference time across all runs (in milliseconds)
-- **Median Latency**: Middle value of inference times (less affected by outliers)
-- **Stdev**: Standard deviation of timing runs (lower is better — indicates consistency)
+Each batch size is timed with `num_runs` (default: 5) independent forward-pass measurements. Mean and median are computed across those individual run times, providing outlier-robust estimates.
+
+- **Mean Latency**: Average of the `num_runs` individual run times (in milliseconds)
+- **Median Latency**: Middle value of the `num_runs` run times (less affected by outliers)
+- **Stdev**: Standard deviation across the `num_runs` run times (lower is better — indicates consistency)
 
 ### Batch Size Impact
 

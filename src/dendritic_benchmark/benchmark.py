@@ -96,8 +96,10 @@ def benchmark_model_latency(
     model: Any,
     inputs: tuple[Any, Any],
     batch_size: int,
-    num_runs: int = 10,
+    num_runs: int = 5,
 ) -> dict[str, Any]:
+    import statistics
+
     torch = require_torch()
     from torch.utils.benchmark import Timer
 
@@ -120,14 +122,18 @@ def benchmark_model_latency(
                 globals={"model": model, "x": primary},
             )
 
-        result = timer.timeit(number=num_runs)
+        run_times_ms = [timer.timeit(number=1).mean * 1000 for _ in range(num_runs)]
+
+    mean_ms = statistics.mean(run_times_ms)
+    median_ms = statistics.median(run_times_ms)
+    stdev_ms = statistics.stdev(run_times_ms) if num_runs > 1 else 0.0
 
     return {
         "batch_size": batch_size,
         "num_runs": num_runs,
-        "mean_latency_ms": result.mean * 1000,
-        "median_latency_ms": result.median * 1000,
-        "stdev_latency_ms": (result.stdev if hasattr(result, "stdev") else 0) * 1000,
+        "mean_latency_ms": mean_ms,
+        "median_latency_ms": median_ms,
+        "stdev_latency_ms": stdev_ms,
     }
 
 
@@ -165,7 +171,7 @@ class BenchmarkOrchestrator:
         model_key: str,
         condition_key: str,
         batch_sizes: list[int],
-        num_runs: int = 10,
+        num_runs: int = 5,
     ) -> dict[str, Any]:
         device = choose_device()
         condition_spec = condition_by_key(condition_key)
@@ -271,7 +277,7 @@ class BenchmarkOrchestrator:
         model_keys: list[str] | None = None,
         condition_keys: list[str] | None = None,
         batch_sizes: list[int] | None = None,
-        num_runs: int = 10,
+        num_runs: int = 5,
         benchmark_root: Path | str = "benchmarks",
         comparison_root: Path | str | None = None,
     ) -> None:

@@ -110,7 +110,7 @@ uv run dqb generate_graphs --regenerate-graphs
 # Run latency benchmarks
 uv run dqb benchmark_models
 uv run dqb benchmark_models --models lenet5 resnet18_cifar10
-uv run dqb benchmark_models --batch-sizes 1 32 --num-runs 20
+uv run dqb benchmark_models --batch-sizes 1 32 --num-runs 10
 uv run dqb benchmark_models --benchmark-root my_benchmarks
 uv run dqb benchmark_models --comparison-root comparison
 
@@ -205,13 +205,13 @@ The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` f
 - `uv run dqb benchmark_models`
 	- Measures wall-clock inference latency for all trained models using `torch.utils.benchmark.Timer`.
 	- Results are saved to `benchmarks/<model>/` with per-condition latency measurements. Per-model latency charts are written to `comparison/<model>/`.
-	- Useful flags: `--models` (subset), `--conditions` (subset), `--batch-sizes` (e.g., `1 8 32`), `--num-runs` (averaging runs), `--results-root`, `--results-directory`, `--benchmark-root`, `--comparison-root`.
+	- Useful flags: `--models` (subset), `--conditions` (subset), `--batch-sizes` (e.g., `1 8 32`), `--num-runs` (independent timing runs per batch, default 5), `--results-root`, `--results-directory`, `--benchmark-root`, `--comparison-root`.
 	- Examples:
         ```bash
         uv run dqb benchmark_models
         uv run dqb --results-directory experiment_a benchmark_models
         uv run dqb benchmark_models --models lenet5 resnet18_cifar10
-        uv run dqb benchmark_models --batch-sizes 1 32 --num-runs 20
+        uv run dqb benchmark_models --batch-sizes 1 32 --num-runs 10
         uv run dqb benchmark_models --benchmark-root my_benchmarks
         uv run dqb benchmark_models --comparison-root my_comparison
         ```

@@ -326,11 +326,11 @@ def build_parser() -> argparse.ArgumentParser:
     bench_parser.add_argument(
         "--num-runs",
         type=int,
-        default=10,
+        default=5,
         metavar="N",
         help=(
-            "Number of timing runs per benchmark to average. "
-            "(default: 10)"
+            "Number of independent timing runs per batch size. Mean and median "
+            "are computed across these runs. (default: 5)"
         ),
     )
 
