@@ -29,8 +29,8 @@ For each model below, this document captures:
 - Model kwargs:
   - Only listed when the pipeline passes non-empty kwargs to `build_model(...)`
 - Perforation registration:
-  - Most models use the default perforation behavior with no extra registered modules.
-  - Model-specific non-standard modules below are registered with both PerforatedAI tracking and perforation APIs when available.
+  - Most models register the default Conv/Linear module classes for PerforatedAI perforation.
+  - Model-specific non-standard modules below are registered with PerforatedAI perforation APIs when available.
 - Dendritic epoch policy:
   - Dendritic FP32 runs use the listed `max_epochs` value as the canonical base-model comparison budget.
   - Training continues past that budget until PerforatedAI reports `training_complete=True`.

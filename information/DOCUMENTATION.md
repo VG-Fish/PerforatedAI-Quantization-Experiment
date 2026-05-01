@@ -152,10 +152,9 @@ GPA.pc.append_module_names_to_perforate(['encoder_block'])
 GPA.pc.append_module_ids_to_perforate(['.layer1.0.conv1'])
 ```
 
-The benchmark compatibility wrapper mirrors model-specific non-standard
-modules into both the PerforatedAI tracking and perforation lists when those
-APIs are available, and it forwards the selected runtime device into
-`GPA.pc.set_device(...)`.
+The benchmark compatibility wrapper registers model-specific non-standard
+modules with PerforatedAI's perforation list when those APIs are available, and
+it forwards the selected runtime device into `GPA.pc.set_device(...)`.
 
 #### Step 3 — Optimizer & Scheduler Setup
 ```python

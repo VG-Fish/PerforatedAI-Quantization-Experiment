@@ -943,19 +943,42 @@ def _pai_tracker() -> Any | None:
     return tracker
 
 
+def _pai_module_count(model: Any) -> int | None:
+    try:
+        upa = importlib.import_module("perforatedai.utils_perforatedai")
+        return len(upa.get_pai_modules(model, 0))
+    except Exception:
+        return None
+
+
+def _validate_pai_training_model(model: Any) -> None:
+    pai_module_count = _pai_module_count(model)
+    if pai_module_count is None or pai_module_count > 0:
+        return
+    raise RuntimeError(
+        "PerforatedAI did not create any PAINeuronModule wrappers for this "
+        "dendritic run. The model would fail at the first dynamic switch with "
+        "'does not have any pai_modules'. Check the PerforatedAI module "
+        "registration and ensure layers are registered for perforation, not "
+        "track-only wrapping."
+    )
+
+
 def _setup_pai_optimizer(
     model: Any,
     torch: Any,
     config: TrainingConfig,
 ) -> tuple[Any, Any | None]:
     optimizer = _build_optimizer(model, torch, config)
-    tracker = _pai_tracker()
     if (
         not config.use_dendrites
         or not config.train_dendrites_until_complete
-        or tracker is None
     ):
         return optimizer, None
+    tracker = _pai_tracker()
+    if tracker is None:
+        return optimizer, None
+    _validate_pai_training_model(model)
     try:
         tracker.set_optimizer(_optimizer_class(torch, config))
         setup_result = tracker.setup_optimizer(model, _optimizer_args(model, config), {})
@@ -1262,11 +1285,19 @@ def _run_dynamic_dendrite_update(
     except SystemExit as pai_exit:
         if pai_exit.code != -1:
             raise
-        print(f"[pai] dynamic dendrite update skipped: {pai_exit}")
-        return optimizer, None, False, False
+        raise RuntimeError(
+            "PerforatedAI aborted during dynamic dendrite insertion "
+            "(SystemExit -1). This usually means the model handed to "
+            "add_validation_score is not a valid perforated model for the "
+            "current PAI state. The dendritic run is invalid, so training has "
+            "been stopped instead of continuing forever."
+        ) from pai_exit
     except Exception as pai_exc:
-        print(f"[pai] dynamic dendrite update skipped: {pai_exc}")
-        return optimizer, None, False, False
+        raise RuntimeError(
+            "PerforatedAI failed during dynamic dendrite insertion. The "
+            "dendritic run is invalid, so training has been stopped instead "
+            "of continuing without PAI."
+        ) from pai_exc
     finally:
         pdb_module.set_trace = _orig_set_trace
 

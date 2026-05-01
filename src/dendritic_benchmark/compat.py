@@ -128,13 +128,14 @@ def _configure_pai_trackers(
         setter = getattr(gpa.pc, setter_name, None)
         if setter is not None:
             setter([])
+    # In PerforatedAI 3.2, entries in *_to_track become tracked-only wrappers.
+    # Dendrite insertion requires PAINeuronModule wrappers, so benchmark-selected
+    # modules must be registered only with the perforation lists.
     if modules_to_track:
-        gpa.pc.append_modules_to_track(modules_to_track)
         append_modules_to_perforate = getattr(gpa.pc, "append_modules_to_perforate", None)
         if append_modules_to_perforate is not None:
             append_modules_to_perforate(modules_to_track)
     if module_names_to_track:
-        gpa.pc.append_module_names_to_track(module_names_to_track)
         append_module_names_to_perforate = getattr(
             gpa.pc, "append_module_names_to_perforate", None
         )

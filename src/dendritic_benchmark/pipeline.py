@@ -223,7 +223,10 @@ class BenchmarkRunner:
             return [nn.GRUCell]
         if model_key == "saint_adult":
             return [nn.MultiheadAttention]
-        return []
+        # The compat wrapper registers these with PAI's perforation list. If no
+        # default Conv/Linear classes are supplied, PAI initializes the tracker
+        # but leaves ordinary layers unwrapped for dynamic dendrite insertion.
+        return [nn.Linear, nn.Conv1d, nn.Conv2d]
 
     def _use_pai_runtime_guard(self) -> bool:
         return True
