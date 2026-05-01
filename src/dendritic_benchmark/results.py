@@ -358,7 +358,7 @@ def _write_arch_evolution(
                 arch_history.append(
                     {"cycle": int(row["cycle"]), "best_metric_value": float(row["best_metric_value"])}
                 )
-        if arch_history:
+        if len(arch_history) >= 2:
             out_path = plots_dir / "architecture_evolution.svg"
             line_chart(
                 out_path,
@@ -370,6 +370,10 @@ def _write_arch_evolution(
             )
             logs.append(f"  Wrote: {out_path.name}  ({len(arch_history)} cycle(s))")
             graph_count += 1
+        elif arch_history:
+            logs.append(
+                "  best_arch_scores.csv has only one data point — skipping architecture evolution plot."
+            )
         else:
             logs.append("  best_arch_scores.csv is empty — skipping architecture evolution plot.")
     except Exception as e:
@@ -499,6 +503,9 @@ def _process_condition_graphs(history_file_str: str, regenerate: bool = False) -
     history, load_logs = _load_history_csv(history_file)
     logs.extend(load_logs)
     if not history or any("ERROR" in line for line in load_logs):
+        return logs, graph_count
+    if len(history) < 2:
+        logs.append("  history.csv has fewer than two data points — skipping plot generation.")
         return logs, graph_count
 
     epochs = [row["epoch"] for row in history]
