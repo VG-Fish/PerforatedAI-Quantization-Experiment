@@ -348,6 +348,7 @@ class BenchmarkRunner:
             newly_trained = self._process_one_model_spec(
                 model_spec, selected_conditions, ignore_saved, all_records, allow_pqat
             )
+            print("-" * 50)
             if newly_trained:
                 completed_model_keys = {r["model_key"] for r in all_records}
                 if len(completed_model_keys) >= 2:
