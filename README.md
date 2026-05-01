@@ -12,7 +12,7 @@ The benchmark automates training neural networks under different quantization an
 4. **Results**: Training metrics are saved to `results/<model>/<condition>/` with per-epoch histories and final performance records
 5. **Compare**: Generate comparison charts and summary reports using `uv run dqb compare`
 6. **Visualize**: Render training curves and analysis plots with `uv run dqb generate_graphs`
-7. **Benchmark**: Measure inference latency on your hardware with `uv run dqb bench`
+7. **Benchmark**: Measure inference latency on your hardware with `uv run dqb benchmark_models`
 
 Each condition applies only two experimental factors to the same models: quantization level and whether the model is dendritic, allowing cleaner side-by-side comparison of efficiency vs. accuracy tradeoffs.
 
@@ -48,7 +48,7 @@ To scope outputs for a specific experiment, use `--results-directory`:
 uv run dqb --results-directory experiment_a run
 uv run dqb --results-directory experiment_a compare
 uv run dqb --results-directory experiment_a generate_graphs
-uv run dqb --results-directory experiment_a bench
+uv run dqb --results-directory experiment_a benchmark_models
 ```
 
 When set, results are read/written under `results/<results-directory>/...`.
@@ -78,7 +78,7 @@ uv run dqb run --help
 uv run dqb download_data --help
 uv run dqb compare --help
 uv run dqb generate_graphs --help
-uv run dqb bench --help
+uv run dqb benchmark_models --help
 
 # Download datasets
 uv run dqb download_data
@@ -102,45 +102,27 @@ uv run dqb generate_graphs
 uv run dqb generate_graphs --regenerate-graphs
 
 # Run latency benchmarks
-uv run dqb bench
-uv run dqb bench --models lenet5 resnet18_cifar10
-uv run dqb bench --batch-sizes 1 32 --num-runs 20
-uv run dqb bench --benchmark-root my_benchmarks
+uv run dqb benchmark_models
+uv run dqb benchmark_models --models lenet5 resnet18_cifar10
+uv run dqb benchmark_models --batch-sizes 1 32 --num-runs 20
+uv run dqb benchmark_models --benchmark-root my_benchmarks
 
 # Use an experiment namespace under results/
 uv run dqb --results-directory experiment_a run
 uv run dqb --results-directory experiment_a compare
 uv run dqb --results-directory experiment_a generate_graphs
-uv run dqb --results-directory experiment_a bench
+uv run dqb --results-directory experiment_a benchmark_models
 ```
 
 ## Shell Completion (Tab)
 
-Enable completions once, then restart your shell:
+Tab completion is installed automatically with the project, so no manual shell
+setup is required. After installation, `Tab` completion works for
+`uv run dqb` subcommands and flags.
 
-```bash
-uv sync
-echo 'eval "$(register-python-argcomplete dqb)"' >> ~/.zshrc
-echo 'eval "$(register-python-argcomplete uv)"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-After this, `Tab` completion works for:
-- `dqb ...`
-- `uv run dqb ...`
-
-Optional equivalents:
-
-```bash
-# bash
-echo 'eval "$(register-python-argcomplete dqb)"' >> ~/.bashrc
-echo 'eval "$(register-python-argcomplete uv)"' >> ~/.bashrc
-source ~/.bashrc
-
-# fish
-register-python-argcomplete --shell fish dqb > ~/.config/fish/completions/dqb.fish
-register-python-argcomplete --shell fish uv > ~/.config/fish/completions/uv.fish
-```
+The completion bridge only returns completions when the command starts with
+`uv run dqb`; other `uv` commands fall back to your shell's normal behavior. If
+an existing terminal does not pick up completion immediately, open a new shell.
 
 ## Documentation
 
@@ -153,7 +135,7 @@ The repository includes extended documentation under the `information/` director
 	- Round-2 expansion with 15 additional models and research findings from a preliminary run.
 
 - `information/CLI_DIAGRAMS.md` — CLI reference and diagrams:
-	- Command summaries and Mermaid flowcharts for `uv run dqb run`, `uv run dqb download_data`, `uv run dqb compare`, `uv run dqb generate_graphs`, and `uv run dqb bench`.
+	- Command summaries and Mermaid flowcharts for `uv run dqb run`, `uv run dqb download_data`, `uv run dqb compare`, `uv run dqb generate_graphs`, and `uv run dqb benchmark_models`.
 	- Global CLI flags and the recommended output directory layout.
 
 Read the full documents for architecture details, hypotheses, and example commands:
@@ -212,17 +194,17 @@ The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` f
         uv run dqb generate_graphs --regenerate-graphs
         ```
 
-- `uv run dqb bench`
+- `uv run dqb benchmark_models`
 	- Measures wall-clock inference latency for all trained models using `torch.utils.benchmark.Timer`.
 	- Results are saved to `benchmarks/<model>/` with per-condition latency measurements.
 	- Useful flags: `--models` (subset), `--conditions` (subset), `--batch-sizes` (e.g., `1 8 32`), `--num-runs` (averaging runs), `--results-root`, `--results-directory`, `--benchmark-root`.
 	- Examples:
         ```bash
-        uv run dqb bench
-        uv run dqb --results-directory experiment_a bench
-        uv run dqb bench --models lenet5 resnet18_cifar10
-        uv run dqb bench --batch-sizes 1 32 --num-runs 20
-        uv run dqb bench --benchmark-root my_benchmarks
+        uv run dqb benchmark_models
+        uv run dqb --results-directory experiment_a benchmark_models
+        uv run dqb benchmark_models --models lenet5 resnet18_cifar10
+        uv run dqb benchmark_models --batch-sizes 1 32 --num-runs 20
+        uv run dqb benchmark_models --benchmark-root my_benchmarks
         ```
 
 - `uv run dqb --help`

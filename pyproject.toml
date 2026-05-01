@@ -35,6 +35,7 @@ dqb = "dendritic_benchmark.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+script-files = ["scripts/uv_dqb_argcomplete"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
