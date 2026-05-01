@@ -53,6 +53,10 @@ def _normalization_score(record: dict[str, Any], baseline: dict[str, Any]) -> fl
     if baseline_metric == 0:
         return 0.0
     if baseline["metric_direction"] == "maximize":
+        if baseline_metric < 0 and current_metric < 0:
+            return 100.0 * baseline_metric / current_metric
+        if baseline_metric < 0 <= current_metric:
+            return 100.0 * (1.0 + current_metric / abs(baseline_metric))
         return 100.0 * current_metric / baseline_metric
     if current_metric == 0:
         return 0.0
@@ -192,11 +196,11 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
     condition_order = [spec.key for spec in CONDITION_SPECS]
     quantization_groups = [
         ["base_fp32", "dendrites_fp32"],
-        ["base_q8", "dendrites_pruned_q8"],
-        ["base_q4", "dendrites_pruned_q4"],
-        ["base_q2", "dendrites_pruned_q2"],
-        ["base_q1_58", "dendrites_pruned_q1_58"],
-        ["base_q1", "dendrites_pruned_q1"],
+        ["base_q8", "dendrites_q8"],
+        ["base_q4", "dendrites_q4"],
+        ["base_q2", "dendrites_q2"],
+        ["base_q1_58", "dendrites_q1_58"],
+        ["base_q1", "dendrites_q1"],
     ]
     retention_rows: list[list[float]] = []
     best_quant_rows: list[list[float]] = []
@@ -213,13 +217,31 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
         summary_rows.extend(s_rows)
         tradeoff_points.extend(t_points)
 
+    finite_retention_values: list[float] = [
+        value
+        for row in retention_rows
+        for value in row
+        if value > 0.0
+    ]
+    use_log_retention_scale: bool = (
+        bool(finite_retention_values)
+        and max(finite_retention_values) / min(finite_retention_values) >= 25.0
+    )
+    retention_subtitle: str = "Score vs. Base FP32 (%)"
+    if use_log_retention_scale:
+        retention_subtitle = (
+            "Score vs. Base FP32 (%) — color scale is logarithmic because "
+            "retention spans >25x"
+        )
+
     heatmap(
         output_dir / "accuracy_retention_heatmap.svg",
         "Accuracy Retention Heatmap",
         [spec.display_name for spec in MODEL_SPECS],
         [spec.display_name for spec in CONDITION_SPECS],
         retention_rows,
-        subtitle="Score vs. Base FP32 (%)",
+        subtitle=retention_subtitle,
+        scale="log" if use_log_retention_scale else "linear",
     )
     scatter(
         output_dir / "size_tradeoff_scatter.svg",
@@ -246,6 +268,7 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
         best_quant_winners,
         best_quant_rows,
         subtitle="Which variant achieves the best retention per quantization level (%)",
+        metric_labels=[spec.metric_name for spec in MODEL_SPECS],
     )
     with (output_dir / "summary.csv").open("w", newline="") as fh:
         if summary_rows:

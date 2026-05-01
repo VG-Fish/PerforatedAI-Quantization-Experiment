@@ -6,7 +6,7 @@ import math
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from tqdm.auto import tqdm
 
@@ -19,6 +19,7 @@ from .compat import (
 )
 
 _MODEL_PT: str = "model.pt"
+OptimizerName = Literal["adam", "adamw", "sgd"]
 
 
 @dataclass
@@ -31,6 +32,10 @@ class TrainingConfig:
     use_qat: bool = False
     fine_tune_epochs: int = 0
     max_epochs: int = 8
+    learning_rate: float = 1e-3
+    optimizer_name: OptimizerName = "adam"
+    momentum: float = 0.9
+    weight_decay: float = 0.0
     source_condition_key: str | None = None
 
 
@@ -56,6 +61,42 @@ class TrainingRecord:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class ArtifactMetadata:
+    model_key: str
+    condition_key: str
+    display_name: str
+    metric_name: str
+    metric_direction: str
+    primary_metric_key: str
+    use_dendrites: bool
+    use_pruning: bool
+    bit_width: int | None
+    use_qat: bool
+    fine_tune_epochs: int
+
+
+@dataclass(frozen=True)
+class ArtifactPayload:
+    best_metric: float
+    final_metric: float
+    best_epoch: int
+    history: list[dict[str, Any]]
+    test_loss: float
+    test_metrics: dict[str, Any]
+    training_skipped: bool
+    skip_reason: str
+    stage_name: str | None = None
+
+
+@dataclass(frozen=True)
+class ArtifactStats:
+    param_count: int
+    nonzero_params: int
+    file_size_mb: float
+    artifact_path: Path
 
 
 def _metric_is_better(new: float, old: float, direction: str) -> bool:
@@ -124,7 +165,7 @@ def _vae_metrics(outputs: Any, targets: Any) -> dict[str, float]:
 
 def _reward_proxy(preds: Any, targets: Any) -> float:
     if preds.shape == targets.shape and preds.dtype.is_floating_point:
-        return -_mae(preds, targets)
+        return 1.0 / (1.0 + _mae(preds, targets))
     return _accuracy(preds, targets)
 
 
@@ -503,7 +544,7 @@ def _compute_all_metrics(
     if model_key == "lstm_autoencoder":
         return _anomaly_metrics(outputs, targets, metric_targets)
     metrics = _classification_metrics(outputs, targets)
-    if model_key == "actor_critic":
+    if model_key in {"actor_critic", "dqn_lunarlander"}:
         metrics["reward_proxy"] = metrics["accuracy"]
     if metric_name.lower() == "accuracy":
         metrics["primary_alias"] = metrics["accuracy"]
@@ -613,6 +654,101 @@ def _artifact_path(output_dir: Path, use_dendrites: bool) -> Path:
     return output_dir / _MODEL_PT
 
 
+def _count_parameters(model: Any) -> tuple[int, int]:
+    param_count = sum(p.numel() for p in model.parameters())
+    nonzero_params = sum((p != 0).sum().item() for p in model.parameters())
+    return param_count, nonzero_params
+
+
+def _write_metrics_and_history(
+    *,
+    output_dir: Path,
+    metadata: ArtifactMetadata,
+    payload: ArtifactPayload,
+    stats: ArtifactStats,
+) -> None:
+    metrics_path = output_dir / "metrics.json"
+    metrics_path.write_text(
+        json.dumps(
+            {
+                "model_key": metadata.model_key,
+                "condition_key": metadata.condition_key,
+                "display_name": metadata.display_name,
+                "metric_name": metadata.metric_name,
+                "metric_direction": metadata.metric_direction,
+                "primary_metric_key": metadata.primary_metric_key,
+                "best_metric_value": payload.best_metric,
+                "metric_value": payload.final_metric,
+                "best_epoch": payload.best_epoch,
+                "train_history_columns": _history_fieldnames(payload.history),
+                "test_loss": payload.test_loss,
+                "test_metrics": payload.test_metrics,
+                "param_count": stats.param_count,
+                "nonzero_params": stats.nonzero_params,
+                "file_size_mb": stats.file_size_mb,
+                "use_dendrites": metadata.use_dendrites,
+                "use_pruning": metadata.use_pruning,
+                "bit_width": metadata.bit_width,
+                "use_qat": metadata.use_qat,
+                "fine_tune_epochs": metadata.fine_tune_epochs,
+                "artifact_path": str(stats.artifact_path),
+                "training_skipped": payload.training_skipped,
+                "skip_reason": payload.skip_reason,
+                "stage_name": payload.stage_name,
+            },
+            indent=2,
+        )
+    )
+    with (output_dir / "history.csv").open("w", newline="") as fh:
+        fieldnames = _history_fieldnames(payload.history)
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(payload.history)
+
+
+def _persist_stage_artifacts(
+    *,
+    output_dir: Path,
+    plain_model: Any,
+    metadata: ArtifactMetadata,
+    payload: ArtifactPayload,
+) -> tuple[Path, float, int, int]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / _MODEL_PT
+    torch = require_torch()
+    torch.save(plain_model.state_dict(), checkpoint_path)
+    if metadata.use_dendrites:
+        torch.save(plain_model.state_dict(), output_dir / "best_model")
+        torch.save(plain_model.state_dict(), output_dir / "final_clean_pai")
+    artifact_path = _artifact_path(output_dir, metadata.use_dendrites)
+    file_size_mb = artifact_path.stat().st_size / (1024 * 1024)
+    param_count, nonzero_params = _count_parameters(plain_model)
+    if metadata.use_dendrites:
+        _write_dendritic_sidecars(
+            output_dir=output_dir,
+            history=payload.history,
+            best_metric=payload.best_metric,
+            best_epoch=payload.best_epoch,
+            param_count=param_count,
+            nonzero_params=nonzero_params,
+            metric_name=metadata.metric_name,
+            metric_direction=metadata.metric_direction,
+        )
+    stats = ArtifactStats(
+        param_count=param_count,
+        nonzero_params=nonzero_params,
+        file_size_mb=file_size_mb,
+        artifact_path=artifact_path,
+    )
+    _write_metrics_and_history(
+        output_dir=output_dir,
+        metadata=metadata,
+        payload=payload,
+        stats=stats,
+    )
+    return artifact_path, file_size_mb, param_count, nonzero_params
+
+
 def _format_metric_value(value: float) -> str:
     if math.isfinite(value):
         return f"{value:.4f}"
@@ -696,6 +832,27 @@ def _apply_torch_compile(
     except Exception as _compile_exc:
         print(f"[compile] torch.compile skipped for {model_key}/{condition_key}: {_compile_exc}")
     return model
+
+
+def _build_optimizer(model: Any, torch: Any, config: TrainingConfig) -> Any:
+    if config.optimizer_name == "sgd":
+        return torch.optim.SGD(
+            model.parameters(),
+            lr=config.learning_rate,
+            momentum=config.momentum,
+            weight_decay=config.weight_decay,
+        )
+    if config.optimizer_name == "adamw":
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+    return torch.optim.Adam(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
 
 
 def _eval_on_loader(
@@ -932,6 +1089,153 @@ def _run_training_epochs(
     return history, best_metric, best_epoch, best_state
 
 
+def _build_artifact_metadata(
+    *,
+    model_key: str,
+    condition_key: str,
+    display_name: str,
+    metric_name: str,
+    metric_direction: str,
+    primary_metric_key: str,
+    use_dendrites: bool,
+    use_pruning: bool,
+    bit_width: int | None,
+    use_qat: bool,
+    fine_tune_epochs: int,
+) -> ArtifactMetadata:
+    return ArtifactMetadata(
+        model_key=model_key,
+        condition_key=condition_key,
+        display_name=display_name,
+        metric_name=metric_name,
+        metric_direction=metric_direction,
+        primary_metric_key=primary_metric_key,
+        use_dendrites=use_dendrites,
+        use_pruning=use_pruning,
+        bit_width=bit_width,
+        use_qat=use_qat,
+        fine_tune_epochs=fine_tune_epochs,
+    )
+
+
+def _metadata_for_stage(
+    metadata: ArtifactMetadata,
+    *,
+    use_qat: bool | None = None,
+    fine_tune_epochs: int | None = None,
+) -> ArtifactMetadata:
+    return ArtifactMetadata(
+        model_key=metadata.model_key,
+        condition_key=metadata.condition_key,
+        display_name=metadata.display_name,
+        metric_name=metadata.metric_name,
+        metric_direction=metadata.metric_direction,
+        primary_metric_key=metadata.primary_metric_key,
+        use_dendrites=metadata.use_dendrites,
+        use_pruning=metadata.use_pruning,
+        bit_width=metadata.bit_width,
+        use_qat=metadata.use_qat if use_qat is None else use_qat,
+        fine_tune_epochs=(
+            metadata.fine_tune_epochs
+            if fine_tune_epochs is None
+            else fine_tune_epochs
+        ),
+    )
+
+
+def _capture_before_pqat_snapshot(
+    *,
+    model: Any,
+    model_key: str,
+    bundle: Any,
+    device: Any,
+    criterion: Any,
+    metric_name: str,
+    torch: Any,
+    primary_metric_key: str,
+    metric_direction: str,
+    output_dir: Path,
+    metadata: ArtifactMetadata,
+) -> None:
+    before_test_loss, before_test_metrics = _eval_on_loader(
+        model, model_key, bundle.test_loader, device, criterion, metric_name, torch
+    )
+    before_final_metric = float(before_test_metrics.get(primary_metric_key, 0.0))
+    payload = ArtifactPayload(
+        best_metric=before_final_metric,
+        final_metric=before_final_metric,
+        best_epoch=0,
+        history=[
+            {
+                "epoch": 0,
+                "primary_metric_name": metric_name,
+                "primary_metric_key": primary_metric_key,
+                "metric_direction": metric_direction,
+                "test_loss": before_test_loss,
+                "test_primary_metric": before_final_metric,
+                **_prefix_metrics("test", before_test_metrics),
+            }
+        ],
+        test_loss=before_test_loss,
+        test_metrics=before_test_metrics,
+        training_skipped=True,
+        skip_reason="pre-PQAT PTQ snapshot",
+        stage_name="before_pqat",
+    )
+    before_metadata = _metadata_for_stage(
+        metadata, use_qat=False, fine_tune_epochs=0
+    )
+    _persist_stage_artifacts(
+        output_dir=output_dir / "before_pqat",
+        plain_model=_unwrap_compiled(model),
+        metadata=before_metadata,
+        payload=payload,
+    )
+
+
+def _attach_test_metrics_to_history(
+    history: list[dict[str, Any]],
+    *,
+    metric_name: str,
+    primary_metric_key: str,
+    metric_direction: str,
+    test_loss: float,
+    final_metric: float,
+    test_metrics: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not history:
+        history.append(
+            {
+                "epoch": 0,
+                "primary_metric_name": metric_name,
+                "primary_metric_key": primary_metric_key,
+                "metric_direction": metric_direction,
+            }
+        )
+    history[-1]["test_loss"] = test_loss
+    history[-1]["test_primary_metric"] = final_metric
+    history[-1].update(_prefix_metrics("test", test_metrics))
+    return history
+
+
+def _persist_post_pqat_snapshot(
+    *,
+    enabled: bool,
+    output_dir: Path,
+    plain_model: Any,
+    metadata: ArtifactMetadata,
+    payload: ArtifactPayload,
+) -> None:
+    if not enabled:
+        return
+    _persist_stage_artifacts(
+        output_dir=output_dir / "after_pqat",
+        plain_model=plain_model,
+        metadata=metadata,
+        payload=payload,
+    )
+
+
 def train_and_evaluate(
     *,
     model_key: str,
@@ -961,18 +1265,40 @@ def train_and_evaluate(
     output_dir.mkdir(parents=True, exist_ok=True)
     model = model.to(device)
     primary_metric_key = _PRIMARY_METRIC_KEY.get(model_key, "accuracy")
+    metadata = _build_artifact_metadata(
+        model_key=model_key,
+        condition_key=condition_key,
+        display_name=display_name,
+        metric_name=metric_name,
+        metric_direction=metric_direction,
+        primary_metric_key=primary_metric_key,
+        use_dendrites=use_dendrites,
+        use_pruning=use_pruning,
+        bit_width=bit_width,
+        use_qat=use_qat,
+        fine_tune_epochs=fine_tune_epochs,
+    )
 
     _configure_gcn_dendrites(model, model_key, use_dendrites, device, torch)
 
     if use_pruning:
         _apply_pruning(model, torch, prune_amount)
 
+    pqat_enabled = (
+        bit_width is not None
+        and bit_width < 32
+        and use_qat
+        and fine_tune_epochs > 0
+        and source_condition_key is not None
+        and source_condition_key != condition_key
+    )
+
     if bit_width is not None and bit_width < 32 and use_qat:
         model = _make_quantized_copy(model, bit_width, quantization_mode)
 
     model = _apply_torch_compile(model, torch, model_key, condition_key, device, use_dendrites)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = _build_optimizer(model, torch, config)
     criterion = _binary_or_multi_loss(model_key)
     start_time = time.perf_counter()
     run_label = f"{model_key} | {condition_key}"
@@ -980,6 +1306,21 @@ def train_and_evaluate(
     training_skipped, skip_reason = _determine_skip_info(
         max_epochs, bit_width, use_qat, quantization_mode
     )
+
+    if pqat_enabled:
+        _capture_before_pqat_snapshot(
+            model=model,
+            model_key=model_key,
+            bundle=bundle,
+            device=device,
+            criterion=criterion,
+            metric_name=metric_name,
+            torch=torch,
+            primary_metric_key=primary_metric_key,
+            metric_direction=metric_direction,
+            output_dir=output_dir,
+            metadata=metadata,
+        )
 
     if max_epochs > 0:
         history, best_metric, best_epoch, best_state = _run_training_epochs(
@@ -1014,81 +1355,41 @@ def train_and_evaluate(
     if best_epoch == 0:
         best_metric = final_metric
 
-    checkpoint_path = output_dir / _MODEL_PT
-    # Always save from the unwrapped module so checkpoint keys are portable
-    # (no "_orig_mod." prefix) and can be loaded by any uncompiled model.
     _plain_model = _unwrap_compiled(model)
-    torch.save(_plain_model.state_dict(), checkpoint_path)
-    if use_dendrites:
-        torch.save(_plain_model.state_dict(), output_dir / "best_model")
-        torch.save(_plain_model.state_dict(), output_dir / "final_clean_pai")
-    artifact_path = _artifact_path(output_dir, use_dendrites)
-    file_size_mb = artifact_path.stat().st_size / (1024 * 1024)
-
-    param_count = sum(p.numel() for p in model.parameters())
-    nonzero_params = sum((p != 0).sum().item() for p in model.parameters())
-
-    if use_dendrites:
-        _write_dendritic_sidecars(
-            output_dir=output_dir,
-            history=history,
-            best_metric=best_metric,
-            best_epoch=best_epoch,
-            param_count=param_count,
-            nonzero_params=nonzero_params,
-            metric_name=metric_name,
-            metric_direction=metric_direction,
-        )
-
-    if not history:
-        history.append(
-            {
-                "epoch": 0,
-                "primary_metric_name": metric_name,
-                "primary_metric_key": primary_metric_key,
-                "metric_direction": metric_direction,
-            }
-        )
-    history[-1]["test_loss"] = test_loss
-    history[-1]["test_primary_metric"] = final_metric
-    history[-1].update(_prefix_metrics("test", test_metrics))
-
-    metrics_path = output_dir / "metrics.json"
-    metrics_path.write_text(
-        json.dumps(
-            {
-                "model_key": model_key,
-                "condition_key": condition_key,
-                "display_name": display_name,
-                "metric_name": metric_name,
-                "metric_direction": metric_direction,
-                "primary_metric_key": primary_metric_key,
-                "best_metric_value": best_metric,
-                "metric_value": final_metric,
-                "best_epoch": best_epoch,
-                "train_history_columns": _history_fieldnames(history),
-                "test_loss": test_loss,
-                "test_metrics": test_metrics,
-                "param_count": param_count,
-                "nonzero_params": nonzero_params,
-                "file_size_mb": file_size_mb,
-                "use_dendrites": use_dendrites,
-                "use_pruning": use_pruning,
-                "bit_width": bit_width,
-                "use_qat": use_qat,
-                "fine_tune_epochs": fine_tune_epochs,
-                "artifact_path": str(artifact_path),
-                "training_skipped": training_skipped,
-                "skip_reason": skip_reason,
-            },
-            indent=2,
-        )
+    history = _attach_test_metrics_to_history(
+        history,
+        metric_name=metric_name,
+        primary_metric_key=primary_metric_key,
+        metric_direction=metric_direction,
+        test_loss=test_loss,
+        final_metric=final_metric,
+        test_metrics=test_metrics,
     )
-    with (output_dir / "history.csv").open("w", newline="") as fh:
-        fieldnames = _history_fieldnames(history)
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(history)
+    payload = ArtifactPayload(
+        best_metric=best_metric,
+        final_metric=final_metric,
+        best_epoch=best_epoch,
+        history=history,
+        test_loss=test_loss,
+        test_metrics=test_metrics,
+        training_skipped=training_skipped,
+        skip_reason=skip_reason,
+        stage_name="after_pqat" if pqat_enabled else None,
+    )
+    _persist_post_pqat_snapshot(
+        enabled=pqat_enabled,
+        output_dir=output_dir,
+        plain_model=_plain_model,
+        metadata=metadata,
+        payload=payload,
+    )
+
+    _, file_size_mb, param_count, nonzero_params = _persist_stage_artifacts(
+        output_dir=output_dir,
+        plain_model=_plain_model,
+        metadata=metadata,
+        payload=payload,
+    )
 
     return TrainingRecord(
         model_key=model_key,

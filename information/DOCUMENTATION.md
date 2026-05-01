@@ -7,9 +7,9 @@ This document consolidates all project documentation: the experiment plan, exten
 # Part 1: 10-Model, 10-Domain Experiment Plan
 
 ## Overview
-This experiment investigates whether quantized dendritic models (created via Perforated Backpropagation) outperform non-dendritic counterparts across diverse fields. Ten models are selected — one per domain — spanning complexities from ~50K to ~66M parameters. Each model is trained and evaluated under **13 experimental conditions**, yielding 130 total training runs.
+This experiment investigates whether quantized dendritic models (created via Perforated Backpropagation) outperform non-dendritic counterparts across diverse fields. Ten models are selected — one per domain — spanning complexities from ~50K to ~66M parameters. Each model is trained and evaluated under **12 experimental conditions**, yielding 120 total training runs.
 
-The hardware target is an **Apple M3 Pro** chip using PyTorch's MPS backend, with a total budget of 12–48 hours. All quantization uses `torchao` (PyTorch-native), pruning uses `torch.nn.utils.prune`, and dendrites are added via the `PerforatedAI` library.
+The hardware target is an **Apple M3 Pro** chip using PyTorch's MPS backend, with a total budget of 12–48 hours. All quantization uses `torchao` (PyTorch-native), and dendrites are added via the `PerforatedAI` library.
 
 ***
 ## The 10 Benchmark Models
@@ -26,11 +26,11 @@ The hardware target is an **Apple M3 Pro** chip using PyTorch's MPS backend, wit
 | 9 | **LSTM Autoencoder** | Anomaly Detection (ECG) | MIT-BIH | Small | 800K | 1.5h |
 | 10 | **DistilBERT (fine-tune)** | NLP / Seq Classification | SST-2 | Large | 66M | 10h |
 
-> Models 1–9 are intentionally lightweight to allow all 13 conditions to complete within the 12–48h budget. Model 10 (DistilBERT) serves as the large-model anchor.
+> Models 1–9 are intentionally lightweight to allow all 12 conditions to complete within the 12–48h budget. Model 10 (DistilBERT) serves as the large-model anchor.
 
 ***
-## Experimental Conditions (13 per model)
-Each model is trained/evaluated in the following 13 conditions. Metrics recorded for every condition: **accuracy (or task-equivalent metric)**, **parameter count**, and **model file size on disk**.
+## Experimental Conditions (12 per model)
+Each model is trained/evaluated in the following 12 conditions. Metrics recorded for every condition: **accuracy (or task-equivalent metric)**, **parameter count**, and **model file size on disk**. The benchmark now isolates only two experimental factors within a model: quantization level and whether the model uses dendrites.
 
 | # | Condition Label | Description |
 |---|----------------|-------------|
@@ -41,30 +41,29 @@ Each model is trained/evaluated in the following 13 conditions. Metrics recorded
 | 5 | **Base + Q1.58** | Ternary quantization {−1, 0, +1} (BitNet-style) |
 | 6 | **Base + Q1** | Binary quantization {−1, +1} |
 | 7 | **+Dendrites** | Base model with dendritic compartments via Perforated Backpropagation, FP32 |
-| 8 | **+Dend + Prune** | Dendritic model with L1 unstructured pruning (30–50% sparsity) |
-| 9 | **+Dend + Prune + Q8** | Pruned dendritic model, then quantized to 8-bit |
-| 10 | **+Dend + Prune + Q4** | Pruned dendritic model, then quantized to 4-bit |
-| 11 | **+Dend + Prune + Q2** | Pruned dendritic model, then quantized to 2-bit |
-| 12 | **+Dend + Prune + Q1.58** | Pruned dendritic model, ternary quantization |
-| 13 | **+Dend + Prune + Q1** | Pruned dendritic model, binary quantization |
+| 8 | **+Dendrites + Q8** | Dendritic model post-training quantized to 8-bit |
+| 9 | **+Dendrites + Q4** | Dendritic model post-training quantized to 4-bit |
+| 10 | **+Dendrites + Q2** | Dendritic model post-training quantized to 2-bit |
+| 11 | **+Dendrites + Q1.58** | Dendritic model ternary quantization |
+| 12 | **+Dendrites + Q1** | Dendritic model binary quantization |
 
 ***
 ## Output Graphs (Per Model)
-For each of the 10 models, generate **3 comparison bar charts** — one for each metric — with all 13 conditions on the x-axis:
+For each of the 10 models, generate **3 comparison bar charts** — one for each metric — with all 12 conditions on the x-axis:
 
 ### Graph Set A: Accuracy (or Task Metric)
 - Y-axis: Accuracy % (classification), MAE/MSE (regression/forecasting), Reward (RL), AUC (anomaly), ELBO (VAE)
-- X-axis: All 13 conditions
+- X-axis: All 12 conditions
 - Color coding: Base conditions in blue family, Dendrite conditions in green family
 
 ### Graph Set B: Parameter Count
 - Y-axis: Number of non-zero parameters (after pruning)
-- X-axis: All 13 conditions
+- X-axis: All 12 conditions
 - Highlights the structural compression achieved by pruning + quantization
 
 ### Graph Set C: Model File Size (MB)
 - Y-axis: Saved model size in MB (using `torch.save` or ONNX export)
-- X-axis: All 13 conditions
+- X-axis: All 12 conditions
 - Shows real storage savings across the quantization spectrum
 
 ***
@@ -91,7 +90,7 @@ After all individual runs, produce the following **cross-domain comparison plots
 ## Training Plan (M3 Pro, 12–48h Budget)
 
 ### Phase 1 — Tiny/Small Models (Models 1–9): ~12–20h total
-Run sequentially overnight. All 13 conditions per model. Use `doing_pai=False` in `perforate_model` for all base conditions (conditions 1–6) to skip dendrite overhead entirely.
+Run sequentially overnight. All 12 conditions per model. Use `doing_pai=False` in `perforate_model` for all base conditions (conditions 1–6) to skip dendrite overhead entirely.
 
 ### Phase 2 — Large Model (DistilBERT, Model 10): ~25–30h total
 Run in isolation. For Q1 and Q1.58, use QAT (quantization-aware training) via `torchao` rather than PTQ for better accuracy retention.
@@ -100,8 +99,8 @@ Run in isolation. For Q1 and Q1.58, use QAT (quantization-aware training) via `t
 1. **Base FP32** → train with `doing_pai=False`; save checkpoint
 2. **Base + Q8/Q4/Q2/Q1.58/Q1** → load Base FP32 checkpoint; apply PTQ/QAT via `torchao`; evaluate
 3. **+Dendrites FP32** → retrain from scratch with `doing_pai=True`; use `DOING_FIXED_SWITCH` to bound time
-4. **+Dend+Prune** → load best dendritic checkpoint; apply L1 unstructured global pruning at 40% sparsity; fine-tune 5 epochs
-5. **+Dend+Prune+Q8 through Q1** → load pruned dendritic checkpoint; apply quantization in sequence
+4. **+Dendrites FP32** → use the dendritic checkpoint as the source state for all dendritic quantized evaluations
+5. **+Dendrites+Q8 through Q1** → load dendritic FP32 checkpoint; apply quantization in sequence
 
 ### PerforatedAI Output Files
 The library writes these automatically to the `save_name/` folder:
@@ -205,7 +204,7 @@ prune.global_unstructured(parameters_to_prune,
 prune.remove(module, 'weight')  # make permanent before quantization
 ```
 
-Always apply pruning **before** quantization.
+For the current benchmark, pruning is not part of the primary condition grid so the dendritic/non-dendritic comparison stays clean.
 
 ***
 ## Key Research Hypotheses
@@ -464,11 +463,11 @@ Run the full 13-condition suite for LSTM Forecaster on ETTh1, ETTh2, ETTm1, ETTm
 For LSTM Autoencoder, add Gaussian noise injection at σ ∈ {0.01, 0.05, 0.10, 0.20} during training to validate whether the Q4 inversion (+123.5% AUC) is due to implicit noise injection.
 
 ### Experiment H — Cross-Architecture Tabular Comparison (SAINT vs TabNet)
-Once SAINT is trained in Round 2, plot a side-by-side comparison of all 13 conditions between SAINT, TabNet, and XGBoost baseline on Adult Income to determine whether the null result is domain-specific or architecture-specific.
+Once SAINT is trained in Round 2, plot a side-by-side comparison of all 12 conditions between SAINT, TabNet, and XGBoost baseline on Adult Income to determine whether the null result is domain-specific or architecture-specific.
 
 ***
 ## Conclusion
-Round 1 produced three clean scientific findings: (1) dendritic models provide the largest gains in domains with strong temporal dynamics and continuous optimization landscapes (RL, molecular, audio); (2) dendrites rescue Q4 accuracy specifically in RNN-based time-series, suggesting recurrent hidden-state precision is the mechanism; (3) Q2 is a near-universal floor not addressable by dendrites alone, requiring QAT from the start. The 15 new models stress-test each of these findings across new architectures and domains. The complete 25-model suite with 13 conditions yields 325 training runs, providing strong statistical power for cross-domain claims about dendritic quantization robustness.
+Round 1 produced three clean scientific findings: (1) dendritic models provide the largest gains in domains with strong temporal dynamics and continuous optimization landscapes (RL, molecular, audio); (2) dendrites rescue Q4 accuracy specifically in RNN-based time-series, suggesting recurrent hidden-state precision is the mechanism; (3) Q2 is a near-universal floor not addressable by dendrites alone, requiring QAT from the start. The 15 new models stress-test each of these findings across new architectures and domains. The complete 25-model suite with 12 conditions yields 300 training runs, providing strong statistical power for cross-domain claims about dendritic quantization robustness.
 
 ---
 
@@ -482,7 +481,7 @@ The package exposes the `dqb` entry point via `pyproject.toml`.
 - `uv run dqb compare` loads saved `record.json` files and rebuilds per-model and cross-model comparison outputs.
 - `uv run dqb generate_graphs` regenerates training plots from existing `history.csv` files.
 - `--results-root` controls where per-model results are read from or written to.
-- `--comparison-root` controls where comparison outputs are written.
+- `--comparison-root` controls where comparison outputs are written for `run` and `compare`.
 - `.env` credentials are loaded before running so PerforatedAI aliases and API variables are mirrored into the environment.
 
 ## Experiment Configuration
@@ -503,6 +502,7 @@ Declares benchmark model and condition metadata.
 - Loads source checkpoints when a condition depends on a previous result.
 - Perforates models with PerforatedAI for dendritic conditions.
 - Calls `train_and_evaluate()` for every model-condition pair.
+- When `--allow-PQAT` is enabled, quantized conditions save a PTQ snapshot under `before_pqat/`, fine-tune for a short model-aware PQAT budget, and save the post-PQAT artifacts under `after_pqat/`.
 - Writes per-condition training records and regenerates comparison outputs during the run.
 - Skips dataset loading entirely for models where all conditions are already recorded.
 
@@ -632,6 +632,7 @@ uv run dqb run --models lenet5 textcnn
 uv run dqb run --conditions base_fp32 base_q8 dendrites_fp32
 uv run dqb run --results-root results
 uv run dqb run --comparison-root comparison
+uv run dqb run --allow-PQAT
 uv run dqb run --ignore-saved-models
 ```
 
@@ -673,6 +674,8 @@ results/
       metrics.json
       history.csv
       model.pt
+      before_pqat/           # PQAT-enabled quantized runs only
+      after_pqat/            # PQAT-enabled quantized runs only
       best_model              # dendritic runs only
       final_clean_pai         # dendritic runs only
       best_arch_scores.csv    # dendritic runs only
@@ -694,7 +697,7 @@ comparison/
 `lenet5`, `m5`, `lstm_forecaster`, `textcnn`, `gcn`, `tabnet`, `mpnn`, `actor_critic`, `lstm_autoencoder`, `distilbert`, `dqn_lunarlander`, `ppo_bipedalwalker`, `attentivefp_freesolv`, `gin_imdbb`, `tcn_forecaster`, `gru_forecaster`, `pointnet_modelnet40`, `vae_mnist`, `snn_nmnist`, `unet_isic`, `resnet18_cifar10`, `mobilenetv2_cifar10`, `saint_adult`, `capsnet_mnist`, `convlstm_movingmnist`
 
 ## Condition Keys
-`base_fp32`, `base_q8`, `base_q4`, `base_q2`, `base_q1_58`, `base_q1`, `dendrites_fp32`, `dendrites_pruned`, `dendrites_pruned_q8`, `dendrites_pruned_q4`, `dendrites_pruned_q2`, `dendrites_pruned_q1_58`, `dendrites_pruned_q1`
+`base_fp32`, `base_q8`, `base_q4`, `base_q2`, `base_q1_58`, `base_q1`, `dendrites_fp32`, `dendrites_q8`, `dendrites_q4`, `dendrites_q2`, `dendrites_q1_58`, `dendrites_q1`
 
 ## Common Workflows
 
@@ -717,3 +720,4 @@ uv run dqb run --models mpnn actor_critic --ignore-saved-models
 - Dendritic runs are expected to produce additional PerforatedAI sidecar artifacts.
 - If you add new models or conditions, update `src/dendritic_benchmark/specs.py` and rerun the CLI.
 - Conditions are executed in dependency order — omitting an upstream condition will cause its dependents to be skipped.
+- `generate_graphs` only rebuilds per-condition training plots. Use `compare` to create or refresh `comparison/`.

@@ -4,15 +4,16 @@ Mermaid flowcharts for all `uv run dqb` commands.
 
 ---
 
-## Global Options
+## Shared Options
 
-All commands share these top-level flags:
+These flags are shared by all commands:
 
 | Flag | Default | Description |
 |---|---|---|
 | `--results-root DIR` | `results` | Root directory for per-model result folders |
-| `--comparison-root DIR` | `comparison` | Root directory for cross-model comparison outputs |
 | `--logging-dir DIR` | `logs` | Directory for timestamped log files |
+
+`--comparison-root DIR` is available only on `uv run dqb run` and `uv run dqb compare`.
 
 ---
 
@@ -26,12 +27,13 @@ uv run dqb run --models lenet5 textcnn
 uv run dqb run --conditions base_fp32 base_q8 dendrites_fp32
 uv run dqb run --results-root results
 uv run dqb run --comparison-root comparison
+uv run dqb run --allow-PQAT
 uv run dqb run --ignore-saved-models
 ```
 
 ```mermaid
 flowchart TD
-    A([uv run dqb run]) --> B["Parse args<br>--models, --conditions,<br>--ignore-saved-models"]
+    A([uv run dqb run]) --> B["Parse args<br>--models, --conditions,<br>--ignore-saved-models,<br>--allow-PQAT"]
     B --> C["Load .env credentials<br>via compat.py"]
     C --> D["BenchmarkRunner<br>pipeline.py"]
     D --> E["Create results/ and<br>comparison/ directories"]
@@ -46,13 +48,13 @@ flowchart TD
     L -->|No| N["Standard model"]
     M --> O["training.py<br>train_and_evaluate"]
     N --> O
-    O --> P{"Pruning<br>condition?"}
-    P -->|Yes| Q["Apply L1 unstructured<br>global pruning 40%"]
-    P -->|No| R{"Quantization<br>condition?"}
-    Q --> R
-    R -->|Q8/Q4/Q2/Q1.58/Q1| S["Apply torchao PTQ or<br>QAT projection"]
-    R -->|FP32| T["Train full epochs with<br>Adam + scheduler"]
-    S --> T
+    O --> R{"Quantization<br>condition?"}
+    R -->|Q8/Q4/Q2/Q1.58/Q1| S["Load source checkpoint and<br>apply PTQ snapshot"]
+    R -->|FP32| T["Train full epochs with<br>model-specific recipe"]
+    S --> S2{"--allow-PQAT?"}
+    S2 -->|No| U
+    S2 -->|Yes| S3["Save before_pqat/<br>then fine-tune for a model-aware PQAT budget<br>then save after_pqat/"]
+    S3 --> U
     T --> U["Evaluate val + test metrics"]
     U --> V["Save artifacts:<br>model.pt, metrics.json,<br>history.csv, plots/"]
     V --> W{"Dendritic<br>run?"}
@@ -84,12 +86,11 @@ flowchart LR
     A --> E[base_q1_58]
     A --> F[base_q1]
     A --> G[dendrites_fp32]
-    G --> H[dendrites_pruned]
-    H --> I[dendrites_pruned_q8]
-    H --> J[dendrites_pruned_q4]
-    H --> K[dendrites_pruned_q2]
-    H --> L[dendrites_pruned_q1_58]
-    H --> M[dendrites_pruned_q1]
+    G --> H[dendrites_q8]
+    G --> I[dendrites_q4]
+    G --> J[dendrites_q2]
+    G --> K[dendrites_q1_58]
+    G --> L[dendrites_q1]
 
     style A fill:#1d3557,color:#fff
     style G fill:#2d6a4f,color:#fff
@@ -201,7 +202,8 @@ uv run dqb generate_graphs --regenerate-graphs
 flowchart TD
     A([uv run dqb generate_graphs]) --> B["Parse args<br>--regenerate-graphs"]
     B --> C["results.py<br>generate_training_graphs<br>results_root,<br>regenerate flag"]
-    C --> D{"Walk results/<br>for each condition folder"}
+    C --> C2["Comparison outputs are not managed here;<br>use dqb compare for comparison/"]
+    C2 --> D{"Walk results/<br>for each condition folder"}
     D --> E{"history.csv<br>exists?"}
     E -->|No| D
     E -->|Yes| F{"Graph files<br>already exist?"}

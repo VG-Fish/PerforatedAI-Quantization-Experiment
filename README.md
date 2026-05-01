@@ -8,12 +8,12 @@ The benchmark automates training neural networks under different quantization an
 
 1. **Setup**: Initialize a Python environment with all dependencies (`uv sync`)
 2. **Download Data** (optional): Pre-download datasets for specific models with `uv run dqb download_data`
-3. **Train**: Run `uv run dqb run` to train models across 13 conditions (baseline, quantized, pruned, combined)
+3. **Train**: Run `uv run dqb run` to train models across 12 conditions that isolate baseline vs dendritic models at each quantization level
 4. **Results**: Training metrics are saved to `results/<model>/<condition>/` with per-epoch histories and final performance records
 5. **Compare**: Generate comparison charts and summary reports using `uv run dqb compare`
 6. **Visualize**: Render training curves and analysis plots with `uv run dqb generate_graphs`
 
-Each condition applies different quantization and pruning strategies to the same models, allowing side-by-side comparison of model efficiency vs. accuracy tradeoffs.
+Each condition applies only two experimental factors to the same models: quantization level and whether the model is dendritic, allowing cleaner side-by-side comparison of efficiency vs. accuracy tradeoffs.
 
 ## Setup
 
@@ -47,7 +47,7 @@ uv run dqb compare
 The repository includes extended documentation under the `information/` directory. Below are short summaries with links to the full markdown files.
 
 - `information/DOCUMENTATION.md` — Comprehensive project documentation (recommended start):
-	- Experiment plan for 10 models across 13 conditions (per-model and cross-model graphs).
+	- Experiment plan for 10 models across the benchmark condition grid (per-model and cross-model graphs).
 	- Execution strategy targeting Apple M3 Pro (MPS) and PyTorch integration notes.
 	- Detailed PerforatedAI (PAI) integration steps, quantization (`torchao`) and pruning examples, and training loop hooks.
 	- Round-2 expansion with 15 additional models and research findings from a preliminary run.
@@ -69,12 +69,13 @@ The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` f
 
 - `uv run dqb run`
 	- Train models across one or more conditions. By default runs all models & conditions defined in the project.
-	- Useful flags: `--models`, `--conditions`, `--results-root`, `--comparison-root`, `--ignore-saved-models`.
+	- Useful flags: `--models`, `--conditions`, `--results-root`, `--comparison-root`, `--ignore-saved-models`, `--allow-PQAT`.
 	- Examples:
         ```bash
         uv run dqb run
         uv run dqb run --models lenet5 textcnn
         uv run dqb run --conditions base_fp32 dendrites_fp32
+        uv run dqb run --allow-PQAT
         uv run dqb run --ignore-saved-models
         ```
 
@@ -101,6 +102,7 @@ The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` f
 - `uv run dqb generate_graphs`
 	- Renders per-epoch training curves and other plots from saved `history.csv` files.
 	- Useful flags: `--results-root`, `--regenerate-graphs` (force re-render even if plots exist).
+	- Comparison outputs are intentionally not managed here; use `uv run dqb compare` for `comparison/`.
 	- Examples:
         ```bash
         uv run dqb generate_graphs
@@ -111,4 +113,3 @@ The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` f
 	- Show help for the `dqb` command and available subcommands/flags.
 
 For full command flow diagrams and more flags, open `information/CLI_DIAGRAMS.md`.
-

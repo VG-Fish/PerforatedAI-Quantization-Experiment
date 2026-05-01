@@ -12,6 +12,7 @@ matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from matplotlib.colors import LogNorm
 from matplotlib.patches import Patch
 from matplotlib.transforms import Bbox
 
@@ -269,6 +270,53 @@ def grouped_bar_chart(
     _save(fig, path)
 
 
+def _heatmap_image_values(
+    matrix: list[list[float]], scale: Literal["linear", "log"]
+) -> tuple[list[list[float]], LogNorm | None]:
+    raw_values: list[list[float]] = matrix or [[0.0]]
+    positive_values: list[float] = [
+        value
+        for row in raw_values
+        for value in row
+        if value > 0 and math.isfinite(value)
+    ]
+    if scale != "log" or not positive_values:
+        return raw_values, None
+
+    min_positive: float = min(positive_values)
+    plot_values: list[list[float]] = [
+        [
+            value if value > 0 and math.isfinite(value) else min_positive
+            for value in row
+        ]
+        for row in raw_values
+    ]
+    return plot_values, LogNorm(vmin=min_positive, vmax=max(positive_values))
+
+
+def _heatmap_text_color(value: float, minimum: float, span: float) -> str:
+    if span and value < (minimum + span * 0.42):
+        return "white"
+    return "#111827"
+
+
+def _annotate_heatmap_cells(ax: Axes, matrix: list[list[float]]) -> None:
+    cell_values: list[float] = [value for row in matrix for value in row]
+    minimum: float = min(cell_values) if cell_values else 0.0
+    span: float = (max(cell_values) - minimum) if cell_values else 0.0
+    for row_index, row in enumerate(matrix):
+        for col_index, value in enumerate(row):
+            ax.text(
+                col_index,
+                row_index,
+                f"{value:.2f}",
+                ha="center",
+                va="center",
+                fontsize=8,
+                color=_heatmap_text_color(value, minimum, span),
+            )
+
+
 def heatmap(
     path: Path,
     title: str,
@@ -276,14 +324,15 @@ def heatmap(
     col_labels: list[str],
     matrix: list[list[float]],
     subtitle: str | None = None,
+    scale: Literal["linear", "log"] = "linear",
 ) -> None:
     rows = len(row_labels)
     cols = len(col_labels)
     fig_width = max(12.0, 1.02 * cols + 4.0)
     fig_height = max(6.6, 0.52 * rows + 3.2)
     fig, ax = _setup_figure(fig_width, fig_height)
-    values = matrix or [[0.0]]
-    image = ax.imshow(values, aspect="auto", cmap="RdYlBu_r")
+    plot_values, norm = _heatmap_image_values(matrix, scale)
+    image = ax.imshow(plot_values, aspect="auto", cmap="RdYlBu_r", norm=norm)
 
     ax.set_title(
         title if subtitle is None else f"{title}\n{subtitle}",
@@ -300,27 +349,12 @@ def heatmap(
     ax.grid(which="minor", color=BACKGROUND, linestyle="-", linewidth=2)
     ax.tick_params(which="minor", bottom=False, left=False)
 
-    cell_values = [value for row in matrix for value in row]
-    span = (max(cell_values) - min(cell_values)) if cell_values else 0
-    for row_index, row in enumerate(matrix):
-        for col_index, value in enumerate(row):
-            color = (
-                "white"
-                if span and value < (min(cell_values) + span * 0.42)
-                else "#111827"
-            )
-            ax.text(
-                col_index,
-                row_index,
-                f"{value:.2f}",
-                ha="center",
-                va="center",
-                fontsize=8,
-                color=color,
-            )
+    _annotate_heatmap_cells(ax, matrix)
 
     colorbar = fig.colorbar(image, ax=ax, shrink=0.82)
     colorbar.ax.tick_params(colors=TEXT)
+    colorbar_label: str = "Log-scaled retention %" if scale == "log" else "Retention %"
+    colorbar.set_label(colorbar_label, color=TEXT)
     _autosize_axis_labels(fig, ax)
     _save(fig, path)
 
@@ -333,11 +367,12 @@ def winner_heatmap(
     winner_matrix: list[list[int]],
     score_matrix: list[list[float]],
     subtitle: str | None = None,
+    metric_labels: list[str] | None = None,
 ) -> None:
     """Categorical heatmap: 0 = base wins (blue), 1 = dendrites wins (green)."""
     rows = len(row_labels)
     cols = len(col_labels)
-    fig_width = max(12.0, 1.02 * cols + 4.0)
+    fig_width = max(14.0, 1.02 * cols + 7.2)
     fig_height = max(6.6, 0.52 * rows + 3.2)
     fig, ax = _setup_figure(fig_width, fig_height)
 
@@ -356,6 +391,24 @@ def winner_heatmap(
     )
     ax.set_xticks(range(cols), [_wrap_label(label, width=10) for label in col_labels])
     ax.set_yticks(range(rows), row_labels)
+    if metric_labels:
+        ax.set_xlim(-0.5, cols + 2.35)
+        for row_index, metric_label in enumerate(metric_labels):
+            ax.text(
+                cols + 0.08,
+                row_index,
+                f"Metric: {metric_label}\nCell: best retention vs Base FP32",
+                ha="left",
+                va="center",
+                fontsize=7.2,
+                color=TEXT,
+                bbox={
+                    "boxstyle": "round,pad=0.28",
+                    "facecolor": "#fffdfa",
+                    "edgecolor": GRID,
+                    "linewidth": 0.8,
+                },
+            )
     ax.tick_params(axis="x", labeltop=True, labelbottom=False, colors=TEXT, pad=4)
     ax.tick_params(axis="y", colors=TEXT)
     ax.set_xticks([index - 0.5 for index in range(1, cols)], minor=True)
@@ -383,11 +436,13 @@ def winner_heatmap(
     ]
     ax.legend(
         handles=legend_patches,
-        loc="lower right",
+        loc="upper right",
+        bbox_to_anchor=(1.0, -0.1),
         framealpha=0.85,
         fontsize=9,
         title="Best variant",
         title_fontsize=9,
+        ncols=2,
     )
     _autosize_axis_labels(fig, ax)
     _save(fig, path)

@@ -1209,20 +1209,20 @@ _BATCH_SIZES: dict[str, int] = {
     "actor_critic": 1024,  # CartPole 4-D observations — negligible per-sample cost
     "lstm_autoencoder": 256,  # MIT-BIH 128-sample ECG windows
     "distilbert": 128,  # SST-2 token sequences
-    "dqn_lunarlander": 1024,
-    "ppo_bipedalwalker": 1024,
+    "dqn_lunarlander": 128,  # Matches tuned SB3 RL Zoo DQN batch size.
+    "ppo_bipedalwalker": 64,  # Matches tuned SB3 RL Zoo PPO minibatch size.
     "attentivefp_freesolv": 32,
     "gin_imdbb": 32,
     "tcn_forecaster": 128,
-    "gru_forecaster": 128,
-    "pointnet_modelnet40": 32,
-    "vae_mnist": 512,
-    "snn_nmnist": 128,
-    "unet_isic": 16,
-    "resnet18_cifar10": 256,
-    "mobilenetv2_cifar10": 256,
-    "saint_adult": 512,
-    "capsnet_mnist": 128,
+    "gru_forecaster": 24,  # Forecasting horizon-sized batches stabilize GRU training.
+    "pointnet_modelnet40": 16,  # PointNet++/ModelNet40 reference batch size.
+    "vae_mnist": 128,  # PyTorch MNIST VAE example default.
+    "snn_nmnist": 16,  # N-MNIST SNN literature setting.
+    "unet_isic": 8,  # ISIC lesion segmentation studies favor small batches.
+    "resnet18_cifar10": 64,  # CIFAR SGD recipe batch size.
+    "mobilenetv2_cifar10": 64,  # CIFAR SGD recipe batch size.
+    "saint_adult": 256,  # Official SAINT implementation default.
+    "capsnet_mnist": 64,  # Efficient-CapsNet MNIST recipe.
     "convlstm_movingmnist": 16,
 }
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .compat import choose_device, nn, perforate_model, require_torch
 from .data import build_task_bundle
@@ -15,11 +17,21 @@ from .results import (
     write_model_reports,
 )
 from .specs import CONDITION_SPECS, MODEL_SPECS, ConditionSpec, condition_by_key, model_by_key
-from .training import TrainingConfig, TrainingRecord, train_and_evaluate
+from .training import OptimizerName, TrainingConfig, TrainingRecord, train_and_evaluate
 
 EPOCH_MULTIPLIER = 10
 _RECORD_JSON = "record.json"
 _MODEL_PT = "model.pt"
+
+
+@dataclass(frozen=True)
+class ModelTrainingRecipe:
+    batch_size: int
+    max_epochs: int
+    learning_rate: float
+    optimizer_name: OptimizerName = "adam"
+    momentum: float = 0.9
+    weight_decay: float = 0.0
 
 
 def _log(msg: str, *, before: bool = False, after: bool = False) -> None:
@@ -163,8 +175,48 @@ class BenchmarkRunner:
                 linear.set_this_output_dimensions([-1, 0])
         return model
 
-    def _base_epoch_budget(self, _condition: ConditionSpec) -> int:
-        return 4 * EPOCH_MULTIPLIER
+    def _training_hyperparameters(
+        self, model_key: str, _condition: ConditionSpec
+    ) -> ModelTrainingRecipe:
+        """Return model-specific training knobs adapted from canonical recipes."""
+        recipes: dict[str, ModelTrainingRecipe] = {
+            "lenet5": ModelTrainingRecipe(256, 20, 1.0e-2, "sgd", 0.9, 0.0),
+            "m5": ModelTrainingRecipe(128, 30, 1.0e-2, "adam", 0.9, 1.0e-4),
+            "lstm_forecaster": ModelTrainingRecipe(256, 40, 1.0e-3),
+            "textcnn": ModelTrainingRecipe(128, 10, 1.0e-3, "adam", 0.9, 1.0e-4),
+            "gcn": ModelTrainingRecipe(32, 200, 1.0e-2, "adam", 0.9, 5.0e-4),
+            "tabnet": ModelTrainingRecipe(1024, 100, 2.0e-3, "adamw", 0.9, 1.0e-5),
+            "mpnn": ModelTrainingRecipe(32, 100, 1.0e-3, "adam", 0.9, 1.0e-5),
+            "actor_critic": ModelTrainingRecipe(512, 40, 3.0e-4),
+            "lstm_autoencoder": ModelTrainingRecipe(128, 50, 1.0e-3),
+            "distilbert": ModelTrainingRecipe(32, 4, 1.0e-4, "adamw", 0.9, 1.0e-2),
+            "dqn_lunarlander": ModelTrainingRecipe(128, 120, 6.3e-4),
+            "ppo_bipedalwalker": ModelTrainingRecipe(64, 120, 3.0e-4),
+            "attentivefp_freesolv": ModelTrainingRecipe(32, 100, 1.0e-3, "adam", 0.9, 1.0e-5),
+            "gin_imdbb": ModelTrainingRecipe(32, 100, 1.0e-2, "adam", 0.9, 5.0e-4),
+            "tcn_forecaster": ModelTrainingRecipe(128, 60, 1.0e-3, "adam", 0.9, 1.0e-4),
+            "gru_forecaster": ModelTrainingRecipe(24, 50, 1.0e-3),
+            "pointnet_modelnet40": ModelTrainingRecipe(32, 60, 1.0e-3, "adam", 0.9, 1.0e-4),
+            "vae_mnist": ModelTrainingRecipe(128, 20, 1.0e-3),
+            "snn_nmnist": ModelTrainingRecipe(16, 50, 1.0e-3),
+            "unet_isic": ModelTrainingRecipe(8, 100, 1.0e-3, "adam", 0.9, 1.0e-5),
+            "resnet18_cifar10": ModelTrainingRecipe(128, 90, 5.0e-2, "sgd", 0.9, 5.0e-4),
+            "mobilenetv2_cifar10": ModelTrainingRecipe(128, 150, 5.0e-2, "sgd", 0.9, 4.0e-5),
+            "saint_adult": ModelTrainingRecipe(256, 100, 1.0e-4, "adamw", 0.9, 1.0e-5),
+            "capsnet_mnist": ModelTrainingRecipe(128, 30, 3.0e-3, "adam", 0.9, 0.0),
+            "convlstm_movingmnist": ModelTrainingRecipe(16, 50, 1.0e-3),
+        }
+        return recipes.get(
+            model_key,
+            ModelTrainingRecipe(64, 4 * EPOCH_MULTIPLIER, 1.0e-3),
+        )
+
+    def _pqat_epoch_budget(self, model_key: str) -> int:
+        """Allocate a short PQAT phase from the model's canonical epoch recipe."""
+        recipe = self._training_hyperparameters(
+            model_key, condition_by_key("base_fp32")
+        )
+        return max(1, min(10, math.ceil(recipe.max_epochs * 0.10)))
 
     def _load_saved_condition(
         self,
@@ -191,6 +243,7 @@ class BenchmarkRunner:
         model_records: list[dict[str, Any]],
         all_records: list[dict[str, Any]],
         saved_dirs: dict[str, Path],
+        allow_pqat: bool,
     ) -> bool:
         condition_dir = self.results_root / model_spec.key / condition.key
         record_path = condition_dir / _RECORD_JSON
@@ -207,6 +260,7 @@ class BenchmarkRunner:
                 bundle,
                 condition,
                 saved_dirs,
+                allow_pqat,
             )
             save_training_record(record, condition_dir)
             _log(
@@ -226,6 +280,7 @@ class BenchmarkRunner:
         selected_conditions: list[Any],
         ignore_saved: bool,
         all_records: list[dict[str, Any]],
+        allow_pqat: bool,
     ) -> bool:
         pending = [
             cond for cond in selected_conditions
@@ -258,11 +313,12 @@ class BenchmarkRunner:
 
         newly_trained = False
         if pending:
-            bundle = build_task_bundle(model_spec.key)
+            recipe = self._training_hyperparameters(model_spec.key, selected_conditions[0])
+            bundle = build_task_bundle(model_spec.key, batch_size=recipe.batch_size)
             for condition in pending:
                 if self._train_pending_condition(
                     model_spec, condition, bundle, ignore_saved,
-                    model_records, all_records, saved_dirs,
+                    model_records, all_records, saved_dirs, allow_pqat,
                 ):
                     newly_trained = True
 
@@ -278,6 +334,7 @@ class BenchmarkRunner:
         model_keys: list[str] | None = None,
         condition_keys: list[str] | None = None,
         ignore_saved: bool = False,
+        allow_pqat: bool = False,
     ) -> list[dict[str, Any]]:
         selected_models = [
             model_by_key(key)
@@ -289,7 +346,7 @@ class BenchmarkRunner:
 
         for model_spec in selected_models:
             newly_trained = self._process_one_model_spec(
-                model_spec, selected_conditions, ignore_saved, all_records
+                model_spec, selected_conditions, ignore_saved, all_records, allow_pqat
             )
             if newly_trained:
                 completed_model_keys = {r["model_key"] for r in all_records}
@@ -314,6 +371,7 @@ class BenchmarkRunner:
         bundle: Any,
         condition: ConditionSpec,
         saved_dirs: dict[str, Path],
+        allow_pqat: bool,
     ) -> TrainingRecord:
         require_torch()
         model = build_model(model_key, **self._model_kwargs(model_key))
@@ -341,15 +399,30 @@ class BenchmarkRunner:
             )
             model = self._configure_perforated_model(model, model_key)
 
+        training_hyperparameters = self._training_hyperparameters(model_key, condition)
+        max_epochs = training_hyperparameters.max_epochs
+        use_qat = condition.use_qat
+        fine_tune_epochs = condition.fine_tune_epochs
+        if condition.quantized and condition.source_key != condition.key:
+            if allow_pqat:
+                fine_tune_epochs = self._pqat_epoch_budget(model_key)
+                max_epochs = fine_tune_epochs
+                use_qat = True
+            else:
+                max_epochs = 0
         training_config = TrainingConfig(
             bit_width=condition.bit_width,
             quantization_mode=condition.quantization_mode,
             use_dendrites=condition.use_dendrites,
             use_pruning=condition.use_pruning,
             prune_amount=condition.prune_amount,
-            use_qat=condition.use_qat,
-            fine_tune_epochs=condition.fine_tune_epochs,
-            max_epochs=self._base_epoch_budget(condition),
+            use_qat=use_qat,
+            fine_tune_epochs=fine_tune_epochs,
+            max_epochs=max_epochs,
+            learning_rate=training_hyperparameters.learning_rate,
+            optimizer_name=training_hyperparameters.optimizer_name,
+            momentum=training_hyperparameters.momentum,
+            weight_decay=training_hyperparameters.weight_decay,
             source_condition_key=condition.source_key,
         )
         return train_and_evaluate(

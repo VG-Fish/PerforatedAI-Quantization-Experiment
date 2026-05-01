@@ -30,8 +30,8 @@ _MODEL_KEYS: str = (
 
 _CONDITION_KEYS: str = (
     "base_fp32, base_q8, base_q4, base_q2, base_q1_58, base_q1, "
-    "dendrites_fp32, dendrites_pruned, dendrites_pruned_q8, dendrites_pruned_q4, "
-    "dendrites_pruned_q2, dendrites_pruned_q1_58, dendrites_pruned_q1"
+    "dendrites_fp32, dendrites_q8, dendrites_q4, dendrites_q2, "
+    "dendrites_q1_58, dendrites_q1"
 )
 
 
@@ -39,9 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
         description=(
             "Dendritic quantization benchmark runner.\n\n"
-            "Trains 25 models across 13 conditions that combine baseline FP32 training, "
-            "PerforatedAI dendritic augmentation, magnitude pruning, and post-training "
-            "quantization (INT8 down to binary). Results are saved under --results-root "
+            "Trains 25 models across 12 conditions that isolate two factors: "
+            "PerforatedAI dendritic augmentation and post-training quantization "
+            "(INT8 down to binary). Results are saved under --results-root "
             "and cross-model comparisons under --comparison-root."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -54,15 +54,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Root directory where per-model result folders are written. "
             "Each model gets a subdirectory named by its key containing JSON "
             "training records and PNG plots. (default: results)"
-        ),
-    )
-    parser.add_argument(
-        "--comparison-root",
-        default="comparison",
-        metavar="DIR",
-        help=(
-            "Root directory for cross-model comparison outputs such as summary "
-            "CSVs and aggregate plots. (default: comparison)"
         ),
     )
     parser.add_argument(
@@ -84,13 +75,22 @@ def build_parser() -> argparse.ArgumentParser:
             "Runs the full benchmark pipeline: trains each selected model under each "
             "selected condition, evaluates it, and writes JSON records plus plots to "
             "--results-root.\n\n"
-            "Conditions are executed in dependency order — e.g. dendrites_pruned_q8 "
-            "requires dendrites_pruned, which in turn requires dendrites_fp32 — so "
+            "Conditions are executed in dependency order — e.g. dendrites_q8 "
+            "requires dendrites_fp32 — so "
             "omitting an upstream condition will cause its dependents to be skipped.\n\n"
             f"Available model keys:\n  {_MODEL_KEYS}\n\n"
             f"Available condition keys:\n  {_CONDITION_KEYS}"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    run_parser.add_argument(
+        "--comparison-root",
+        default="comparison",
+        metavar="DIR",
+        help=(
+            "Root directory for cross-model comparison outputs such as summary "
+            "CSVs and aggregate plots. (default: comparison)"
+        ),
     )
     run_parser.add_argument(
         "--models",
@@ -108,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY",
         help=(
             "Space-separated list of condition keys to include. "
-            "Omit to run all 13 conditions. "
+            "Omit to run all 12 conditions. "
             f"Valid keys: {_CONDITION_KEYS}"
         ),
     )
@@ -119,6 +119,17 @@ def build_parser() -> argparse.ArgumentParser:
             "Redo training for all selected model/condition pairs even if a "
             "record.json already exists on disk. By default, existing records "
             "are loaded and that combination is skipped."
+        ),
+    )
+    run_parser.add_argument(
+        "--allow-PQAT",
+        dest="allow_pqat",
+        action="store_true",
+        help=(
+            "Enable post-quantization-aware training for quantized conditions. "
+            "When set, quantized runs save a PTQ evaluation to "
+            "`before_pqat/`, fine-tune for a model-specific PQAT epoch budget, "
+            "and save the post-PQAT artifacts to `after_pqat/`."
         ),
     )
 
@@ -168,6 +179,15 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     compare_parser.add_argument(
+        "--comparison-root",
+        default="comparison",
+        metavar="DIR",
+        help=(
+            "Root directory for cross-model comparison outputs such as summary "
+            "CSVs and aggregate plots. (default: comparison)"
+        ),
+    )
+    compare_parser.add_argument(
         "--manifest",
         action="store_true",
         help=(
@@ -206,6 +226,7 @@ def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
         model_keys=args.models,
         condition_keys=args.conditions,
         ignore_saved=args.ignore_saved_models,
+        allow_pqat=args.allow_pqat,
     )
 
 
@@ -265,7 +286,7 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     results_root = Path(args.results_root)
-    comparison_root = Path(args.comparison_root)
+    comparison_root = Path(getattr(args, "comparison_root", "comparison"))
 
     setup_logging(output_dir=args.logging_dir, script_name=args.command)
 
