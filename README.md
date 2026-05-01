@@ -39,8 +39,11 @@ Results are written to:
 - `results/<model>/<condition>/`
 - `comparison/`
 - `data/` for downloaded datasets, unless `DQB_DATA_ROOT` is set
+- `logs/` for command logs
 
-Dendritic runs also snapshot the active PerforatedAI config to
+Dendritic runs pass PerforatedAI save names under `PAI/`, so library-created
+checkpoints and sidecars stay in the `PAI/` tree. They also snapshot the
+active PerforatedAI config to
 `results/<model>/<condition>/PAI_config.json` and
 `PAI/<model>_<condition>_PAI_config.json`, so each model/condition keeps its
 own reproducibility config instead of relying only on the latest global

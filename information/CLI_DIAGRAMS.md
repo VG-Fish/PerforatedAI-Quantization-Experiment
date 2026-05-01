@@ -235,6 +235,12 @@ flowchart TD
 │   ├── dendrite_delta.svg
 │   ├── size_tradeoff_scatter.svg
 │   └── summary.csv
+├── logs/
+│   └── command_timestamp.txt
+├── PAI/
+│   ├── PAI_config.json
+│   ├── model_key_condition_key_PAI_config.json
+│   └── model_key_condition_key/
 └── results/
     ├── manifest.csv
     └── model_key/

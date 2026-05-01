@@ -182,19 +182,33 @@ def perforate_model(
 
         _configure_pai_trackers(GPA, modules_to_track, module_names_to_track, confirm_unwrapped_modules)
 
+        pai_save_name = str(_pai_save_path(save_name))
         perforated_model = UPA.perforate_model(
             model,
             doing_pai=doing_pai,
-            save_name=save_name,
+            save_name=pai_save_name,
             maximizing_score=maximizing_score,
             making_graphs=False,
         )
-        _snapshot_pai_config(save_name, config_snapshot_path)
+        _snapshot_pai_config(_snapshot_stem(save_name), config_snapshot_path)
         return perforated_model
     except Exception:
         return model
     finally:
         builtins.print = original_print
+
+
+def _pai_save_path(save_name: str) -> Path:
+    path = Path(save_name)
+    if path.is_absolute():
+        return Path("PAI") / path.name
+    if path.parts and path.parts[0] == "PAI":
+        return path
+    return Path("PAI") / path
+
+
+def _snapshot_stem(save_name: str) -> str:
+    return "_".join(Path(save_name).parts)
 
 
 def _snapshot_pai_config(save_name: str, config_snapshot_path: Path | str | None) -> None:

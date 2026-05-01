@@ -103,7 +103,9 @@ Run in isolation. For Q1 and Q1.58, use QAT (quantization-aware training) via `t
 5. **+Dendrites+Q8 through Q1** → load dendritic FP32 checkpoint; apply quantization in sequence
 
 ### PerforatedAI Output Files
-The library writes these automatically to the `save_name/` folder:
+The benchmark passes PerforatedAI save names under `PAI/`, so library-created
+checkpoints and sidecars stay in the `PAI/` tree. The library writes these
+automatically to the `save_name/` folder:
 - `best_model` — best checkpoint by validation score
 - `final_clean_pai` — inference-optimized checkpoint (when enabled by the library)
 - `latest` — most recent checkpoint; use to resume if training crashes
@@ -115,7 +117,7 @@ The library's active `PAI/PAI_config.json` is also snapshotted after each
 perforation as `PAI/<model>_<condition>_PAI_config.json` and, for the run
 artifact, as `results/<model>/<condition>/PAI_config.json`.
 
-This benchmark suite itself saves the best model state it evaluated to `results/<model>/<condition>/model.pt` and uses that file for comparisons and file-size reporting.
+This benchmark suite itself saves the best model state it evaluated to `results/<model>/<condition>/model.pt` and uses that file for comparisons and file-size reporting. If PerforatedAI changes bookkeeping tensor shapes during live restructuring, the restore step reloads only shape-compatible tensors and leaves incompatible tracker metadata at the current model value.
 
 ***
 ## PyTorch Implementation Notes
@@ -566,6 +568,7 @@ Runs each individual condition.
 - Applies quantization for low-bit conditions and optionally QAT-style weight projection during the training loop.
 - Compiles non-dendritic MPS models with `torch.compile(..., backend='aot_eager')` when available.
 - Uses `GPA.pai_tracker.set_optimizer`, `setup_optimizer`, and `add_validation_score` for dendritic runs; live restructuring stops for the last 20% of epochs, and early PAI completion freezes insertion without shortening the configured run.
+- Restores best checkpoints with shape-compatible loading so PerforatedAI tracker metadata changes do not abort evaluation after a restructure.
 - Trains for the condition-specific epoch budget, or skips training for post-training quantization conditions (printing a skip-reason banner).
 - Evaluates validation and test metrics with a rich set of per-task metrics (accuracy, MAE, RMSE, AUC, Dice, SSIM, ELBO, etc.).
 - Saves the best model state to `model.pt` and writes `best_model_stats.csv` for the `compare` command.
@@ -696,6 +699,14 @@ uv run dqb generate_graphs --regenerate-graphs
 ## Output Layout
 
 ```text
+logs/
+  <command>_<timestamp>.txt
+
+PAI/
+  PAI_config.json
+  <model>_<condition>_PAI_config.json
+  <model>_<condition>/
+
 results/
   <model>/
     <condition>/

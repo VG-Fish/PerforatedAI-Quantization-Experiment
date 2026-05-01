@@ -60,7 +60,24 @@ class BenchmarkRunner:
         torch = require_torch()
         if checkpoint_path.exists():
             state = torch.load(checkpoint_path, map_location=choose_device())
-            model.load_state_dict(state, strict=strict)
+            if strict:
+                model.load_state_dict(state, strict=True)
+            else:
+                current_state = model.state_dict()
+                compatible_state = {
+                    key: value
+                    for key, value in state.items()
+                    if key in current_state
+                    and tuple(current_state[key].shape) == tuple(value.shape)
+                }
+                skipped = sorted(set(state) - set(compatible_state))
+                model.load_state_dict(compatible_state, strict=False)
+                if skipped:
+                    print(
+                        "[state] skipped incompatible source-checkpoint tensors: "
+                        + ", ".join(skipped[:5])
+                        + ("..." if len(skipped) > 5 else "")
+                    )
         return model
 
     def _load_source_checkpoint(

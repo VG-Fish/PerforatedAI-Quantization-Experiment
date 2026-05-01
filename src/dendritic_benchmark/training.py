@@ -1172,6 +1172,31 @@ def _record_best_epoch(
     }
 
 
+def _load_compatible_best_state(model: Any, best_state: dict[str, Any]) -> None:
+    plain_model = _unwrap_compiled(model)
+    current_state = plain_model.state_dict()
+    compatible_state: dict[str, Any] = {}
+    skipped: list[str] = []
+    for key, value in best_state.items():
+        current_value = current_state.get(key)
+        if current_value is None or tuple(current_value.shape) != tuple(value.shape):
+            skipped.append(key)
+            continue
+        compatible_state[key] = value
+    missing, unexpected = plain_model.load_state_dict(compatible_state, strict=False)
+    if skipped:
+        print(
+            "[state] skipped incompatible best-state tensors: "
+            + ", ".join(skipped[:5])
+            + ("..." if len(skipped) > 5 else "")
+        )
+    if unexpected:
+        print(f"[state] ignored unexpected best-state tensors: {unexpected[:5]}")
+    real_missing = [key for key in missing if not key.endswith("tracker_string")]
+    if real_missing:
+        print(f"[state] retained current values for missing tensors: {real_missing[:5]}")
+
+
 def _run_dynamic_dendrite_update(
     *,
     context: EpochTrainingContext,
@@ -1594,7 +1619,7 @@ def train_and_evaluate(
     if best_state is not None:
         # Load into the underlying module; the compiled wrapper's forward graph
         # reads parameters in-place from the same tensors, so it stays in sync.
-        _unwrap_compiled(model).load_state_dict(best_state)
+        _load_compatible_best_state(model, best_state)
 
     if _should_quantize_for_eval(config):
         model = _make_quantized_copy(model, bit_width, quantization_mode)
