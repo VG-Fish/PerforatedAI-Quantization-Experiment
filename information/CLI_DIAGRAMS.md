@@ -14,7 +14,7 @@ These flags are shared by all commands:
 | `--results-directory NAME` | _unset_ | Optional subdirectory under `--results-root`; when set, results path becomes `<results-root>/<results-directory>` |
 | `--logging-dir DIR` | `logs` | Directory for timestamped log files |
 
-`--comparison-root DIR` is available only on `uv run dqb run` and `uv run dqb compare`.
+`--comparison-root DIR` is available on `uv run dqb run`, `uv run dqb compare`, and `uv run dqb benchmark_models`.
 
 `--benchmark-root DIR` is available only on `uv run dqb benchmark_models`.
 
@@ -184,7 +184,8 @@ flowchart TD
     J --> M["dendrite_delta.svg<br>Base FP32 vs Dendrites FP32"]
     J --> N["best_quantization_heatmap.svg<br>best accuracy per bit level"]
     J --> O[summary.csv]
-    K & L & M & N & O --> ZZ([End])
+    K & L & M & N & O --> P["results.py write_per_model_benchmark_plots<br>comparison/model_key/ per model<br>(when benchmarks/manifest.csv exists)"]
+    P --> ZZ([End])
 
     style A fill:#2d6a4f,color:#fff
     style ZZ fill:#2d6a4f,color:#fff
@@ -244,11 +245,12 @@ uv run dqb benchmark_models --conditions base_fp32 base_q4 dendrites_q4
 uv run dqb benchmark_models --batch-sizes 1 8 32
 uv run dqb benchmark_models --num-runs 20
 uv run dqb benchmark_models --benchmark-root my_benchmarks
+uv run dqb benchmark_models --comparison-root my_comparison
 ```
 
 ```mermaid
 flowchart TD
-    A([uv run dqb benchmark_models]) --> B["Parse args<br>--models, --conditions,<br>--batch-sizes,<br>--num-runs,<br>--benchmark-root"]
+    A([uv run dqb benchmark_models]) --> B["Parse args<br>--models, --conditions,<br>--batch-sizes, --num-runs,<br>--benchmark-root, --comparison-root"]
     B --> C["Create benchmark directory"]
     C --> D["Capture system info<br>CPU, device, PyTorch version"]
     D --> E["Write computer_info.json"]
@@ -269,7 +271,8 @@ flowchart TD
     G -->|Done| Q["Write model<br>latency_summary.csv"]
     Q --> F
     F -->|Done| R["Write manifest.csv<br>all benchmarks"]
-    R --> ZZ([End])
+    R --> S["results.py write_per_model_benchmark_plots<br>comparison/model_key/ per model"]
+    S --> ZZ([End])
 
     style A fill:#2d6a4f,color:#fff
     style ZZ fill:#2d6a4f,color:#fff
@@ -285,6 +288,7 @@ Results are organized by model and condition:
 - `benchmarks/manifest.csv` — Cross-model summary of all latency measurements
 - `benchmarks/{model}/latency_summary.csv` — Per-model aggregated latencies
 - `benchmarks/{model}/{condition}.json` — Full results for one model + condition
+- `comparison/{model}/latency_comparison_batch_{N}.svg` — Per-model latency bar chart (one per batch size)
 
 ---
 
@@ -303,7 +307,10 @@ Results are organized by model and condition:
 │   ├── best_quantization_heatmap.svg
 │   ├── dendrite_delta.svg
 │   ├── size_tradeoff_scatter.svg
-│   └── summary.csv
+│   ├── summary.csv
+│   └── model_key/                       # created by dqb benchmark_models / dqb compare
+│       ├── latency_comparison_batch_1.svg
+│       └── latency_comparison_batch_32.svg
 ├── logs/
 │   └── command_timestamp.txt
 ├── PAI/
@@ -367,6 +374,7 @@ flowchart TD
     DL -->|writes| DAT
     BEN -->|reads| RES
     BEN -->|writes| BEN_OUT
+    BEN -->|writes| COM
 
     style CLI fill:#1d3557,color:#fff
     style RES fill:#457b9d,color:#fff

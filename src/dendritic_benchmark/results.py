@@ -687,26 +687,33 @@ def _load_benchmark_manifest_rows(benchmark_root: Path) -> list[dict[str, Any]]:
     return parsed_rows
 
 
-def write_benchmark_plots(benchmark_root: Path, comparison_root: Path) -> None:
+def write_per_model_benchmark_plots(benchmark_root: Path, comparison_root: Path) -> None:
     rows = _load_benchmark_manifest_rows(benchmark_root)
     if not rows:
         return
 
-    comparison_root.mkdir(parents=True, exist_ok=True)
-    rows.sort(key=lambda row: (row["batch_size"], row["model_key"], row["condition_key"]))
-    grouped: dict[int, list[dict[str, Any]]] = {}
+    model_groups: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        grouped.setdefault(row["batch_size"], []).append(row)
+        model_groups.setdefault(row["model_key"], []).append(row)
 
-    for batch_size, batch_rows in grouped.items():
-        labels = [f'{row["model_key"]}:{row["condition_key"]}' for row in batch_rows]
-        grouped_bar_chart(
-            comparison_root / f"latency_comparison_batch_{batch_size}.svg",
-            f"Inference Latency Comparison (Batch Size {batch_size})",
-            labels,
-            [
-                ("Mean latency (ms)", [row["mean_latency_ms"] for row in batch_rows], "#2b6cb0"),
-                ("Median latency (ms)", [row["median_latency_ms"] for row in batch_rows], "#2f855a"),
-            ],
-            "Latency (ms)",
-        )
+    for model_key, model_rows in sorted(model_groups.items()):
+        model_comparison_dir = comparison_root / model_key
+        model_comparison_dir.mkdir(parents=True, exist_ok=True)
+
+        by_batch: dict[int, list[dict[str, Any]]] = {}
+        for row in model_rows:
+            by_batch.setdefault(row["batch_size"], []).append(row)
+
+        for batch_size, batch_rows in sorted(by_batch.items()):
+            batch_rows.sort(key=lambda r: r["condition_key"])
+            labels = [row["condition_key"] for row in batch_rows]
+            grouped_bar_chart(
+                model_comparison_dir / f"latency_comparison_batch_{batch_size}.svg",
+                f"{model_key} Inference Latency (Batch Size {batch_size})",
+                labels,
+                [
+                    ("Mean latency (ms)", [row["mean_latency_ms"] for row in batch_rows], "#2b6cb0"),
+                    ("Median latency (ms)", [row["median_latency_ms"] for row in batch_rows], "#2f855a"),
+                ],
+                "Latency (ms)",
+            )

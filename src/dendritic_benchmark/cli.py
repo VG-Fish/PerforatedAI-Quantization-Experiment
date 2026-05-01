@@ -15,10 +15,10 @@ from .pipeline import BenchmarkRunner
 from .results import (
     generate_training_graphs,
     load_training_records,
-    write_benchmark_plots,
     write_comparison_reports,
     write_manifest,
     write_model_reports,
+    write_per_model_benchmark_plots,
 )
 from .specs import MODEL_SPECS
 
@@ -284,6 +284,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     bench_parser.add_argument(
+        "--comparison-root",
+        default="comparison",
+        metavar="DIR",
+        help=(
+            "Root directory for per-model comparison plots. "
+            "A subdirectory is created for each model. (default: comparison)"
+        ),
+    )
+    bench_parser.add_argument(
         "--models",
         nargs="*",
         metavar="KEY",
@@ -388,10 +397,10 @@ def _handle_compare(args: Any, results_root: Path, comparison_root: Path) -> Non
         if model_records:
             write_model_reports(model_spec.display_name, model_records, results_root / model_spec.key)
     write_comparison_reports(records, comparison_root)
-    write_benchmark_plots(Path(getattr(args, "benchmark_root", "benchmarks")), comparison_root)
+    write_per_model_benchmark_plots(Path(getattr(args, "benchmark_root", "benchmarks")), comparison_root)
 
 
-def _handle_bench(args: Any, results_root: Path, benchmark_root: Path) -> None:
+def _handle_bench(args: Any, results_root: Path, benchmark_root: Path, comparison_root: Path) -> None:
     orchestrator = BenchmarkOrchestrator(results_root=results_root)
     orchestrator.benchmark_all(
         model_keys=args.models,
@@ -399,6 +408,7 @@ def _handle_bench(args: Any, results_root: Path, benchmark_root: Path) -> None:
         batch_sizes=args.batch_sizes,
         num_runs=args.num_runs,
         benchmark_root=benchmark_root,
+        comparison_root=comparison_root,
     )
 
 
@@ -428,7 +438,7 @@ def main() -> None:
     elif args.command == "generate_graphs":
         generate_training_graphs(results_root, regenerate=args.regenerate_graphs)
     elif args.command == "benchmark_models":
-        _handle_bench(args, results_root, benchmark_root)
+        _handle_bench(args, results_root, benchmark_root, comparison_root)
     else:
         parser.print_help()
 

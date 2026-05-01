@@ -517,7 +517,7 @@ The package exposes the `dqb` entry point via `pyproject.toml`.
 - `uv run dqb generate_graphs` regenerates training plots from existing `history.csv` files.
 - `--results-root` controls where per-model results are read from or written to.
 - `--results-directory` optionally scopes results to a named subdirectory under `--results-root`.
-- `--comparison-root` controls where comparison outputs are written for `run` and `compare`.
+- `--comparison-root` controls where comparison outputs are written for `run`, `compare`, and `benchmark_models`.
 - `--dynamic-dendritic-training` makes FP32 dendritic runs continue until PerforatedAI reports completion; without it, dendritic FP32 runs use the fixed base-model epoch budget.
 - `.env` credentials are loaded before running so PerforatedAI aliases and API variables are mirrored into the environment.
 
@@ -592,6 +592,7 @@ Reads and writes benchmark records and generates final visualizations.
 - `write_manifest()` writes `results/manifest.csv`.
 - `write_model_reports()` generates per-model metric, parameter, and size comparison charts.
 - `write_comparison_reports()` generates cross-model heatmaps, a tradeoff scatter plot, a dendrite delta chart, and `summary.csv`.
+- `write_per_model_benchmark_plots()` generates per-model latency bar charts under `comparison/<model_key>/`, one SVG per batch size, with conditions on the x-axis. Called by both `benchmark_models` and `compare`.
 - `generate_training_graphs()` regenerates training plots from `history.csv` and architecture evolution plots from `best_arch_scores.csv`.
 
 ## Plotting
@@ -712,6 +713,20 @@ uv run dqb --results-directory experiment_a generate_graphs
 uv run dqb generate_graphs --regenerate-graphs
 ```
 
+### `dqb benchmark_models`
+Measures wall-clock inference latency for all trained models and writes per-model latency charts to the comparison directory.
+
+```bash
+uv run dqb benchmark_models
+uv run dqb --results-directory experiment_a benchmark_models
+uv run dqb benchmark_models --models lenet5 m5 resnet18_cifar10
+uv run dqb benchmark_models --conditions base_fp32 base_q4 dendrites_q4
+uv run dqb benchmark_models --batch-sizes 1 8 32
+uv run dqb benchmark_models --num-runs 20
+uv run dqb benchmark_models --benchmark-root my_benchmarks
+uv run dqb benchmark_models --comparison-root my_comparison
+```
+
 ## Output Layout
 
 ```text
@@ -749,6 +764,9 @@ comparison/
   dendrite_delta.svg
   best_quantization_heatmap.svg
   summary.csv
+  <model_key>/                          # created by dqb benchmark_models / dqb compare
+    latency_comparison_batch_1.svg
+    latency_comparison_batch_32.svg
 ```
 
 ## Model Keys
@@ -802,6 +820,7 @@ uv run dqb benchmark_models --conditions base_fp32 base_q4 dendrites_q4
 uv run dqb benchmark_models --batch-sizes 1 8 32
 uv run dqb benchmark_models --num-runs 20
 uv run dqb benchmark_models --benchmark-root my_benchmarks
+uv run dqb benchmark_models --comparison-root my_comparison
 ```
 
 ## Options
@@ -809,6 +828,7 @@ uv run dqb benchmark_models --benchmark-root my_benchmarks
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--benchmark-root DIR` | `benchmarks` | Output directory for benchmark results |
+| `--comparison-root DIR` | `comparison` | Root directory for per-model latency charts; a subdirectory is created for each model |
 | `--models KEY [KEY ...]` | all 25 | Space-separated model keys to benchmark |
 | `--conditions KEY [KEY ...]` | all 12 | Space-separated condition keys to benchmark |
 | `--batch-sizes SIZE [SIZE ...]` | `1 32` | Batch sizes to test |
@@ -816,7 +836,7 @@ uv run dqb benchmark_models --benchmark-root my_benchmarks
 
 ## Output Structure
 
-Benchmarks are saved under `--benchmark-root` in a hierarchical structure:
+Benchmarks are saved under `--benchmark-root` and per-model latency charts are written to `--comparison-root`:
 
 ```text
 benchmarks/
@@ -825,6 +845,11 @@ benchmarks/
   {model_key}/
     latency_summary.csv                 # Per-condition latencies for this model
     {condition_key}.json                # Full latency results for one condition
+
+comparison/
+  {model_key}/
+    latency_comparison_batch_1.svg      # Per-condition latency bar chart at batch size 1
+    latency_comparison_batch_32.svg     # Per-condition latency bar chart at batch size 32
 ```
 
 ### computer_info.json

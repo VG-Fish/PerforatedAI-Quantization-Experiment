@@ -273,6 +273,7 @@ class BenchmarkOrchestrator:
         batch_sizes: list[int] | None = None,
         num_runs: int = 10,
         benchmark_root: Path | str = "benchmarks",
+        comparison_root: Path | str | None = None,
     ) -> None:
         if batch_sizes is None:
             batch_sizes = [1, 32]
@@ -297,4 +298,7 @@ class BenchmarkOrchestrator:
                 manifest_data.extend(self._collect_manifest_rows(result, model_key))
 
         self._write_manifest(benchmark_root, manifest_data)
+        if comparison_root is not None:
+            from .results import write_per_model_benchmark_plots
+            write_per_model_benchmark_plots(benchmark_root, Path(comparison_root))
         _log(f"Benchmarking complete. Results written to {benchmark_root}")
