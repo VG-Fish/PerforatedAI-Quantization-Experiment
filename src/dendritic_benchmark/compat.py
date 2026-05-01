@@ -4,6 +4,7 @@ import importlib.util
 import math
 import os
 import pdb
+import re
 import shutil
 import sys
 from contextlib import contextmanager
@@ -478,6 +479,57 @@ def _snapshot_pai_config(save_name: str, config_snapshot_path: Path | str | None
             shutil.copy2(config_path, artifact_path)
     except Exception:
         return
+
+
+def latest_pai_switch_checkpoint(save_name: str) -> str | None:
+    """Return the latest source PAI switch checkpoint name, without ``.pt``."""
+    folder = _pai_save_path(save_name)
+    if not folder.is_dir():
+        return None
+    latest_switch: int | None = None
+    for path in folder.glob("switch_*.pt"):
+        match = re.fullmatch(r"switch_(\d+)", path.stem)
+        if match is None:
+            continue
+        switch_num = int(match.group(1))
+        if latest_switch is None or switch_num > latest_switch:
+            latest_switch = switch_num
+    if latest_switch is None:
+        return None
+    return f"switch_{latest_switch}"
+
+
+def load_pai_system_checkpoint(
+    model: Any,
+    save_name: str,
+    checkpoint_name: str,
+) -> Any:
+    """Rebuild a PerforatedAI model architecture from a saved PAI switch."""
+    if not has_perforatedai():
+        return model
+    try:  # pragma: no cover - optional dependency
+        UPA = importlib.import_module("perforatedai.utils_perforatedai")
+        load_system = getattr(UPA, "load_system")
+        with pai_runtime_guard():
+            return load_system(
+                model,
+                str(_pai_save_path(save_name)),
+                checkpoint_name,
+                True,
+            )
+    except SystemExit as exc:
+        print(
+            f"[state] PerforatedAI system load aborted from "
+            f"{_pai_save_path(save_name)}/{checkpoint_name}.pt: {exc}"
+        )
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            "PerforatedAI system checkpoint could not be loaded from "
+            f"{_pai_save_path(save_name)}/{checkpoint_name}.pt. The dendritic "
+            "source architecture is required before loading the benchmark "
+            "checkpoint."
+        ) from exc
 
 
 def choose_device() -> Any:

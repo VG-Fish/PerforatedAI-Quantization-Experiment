@@ -7,7 +7,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
-from .compat import choose_device, nn, perforate_model, require_torch
+from .compat import (
+    choose_device,
+    latest_pai_switch_checkpoint,
+    load_pai_system_checkpoint,
+    nn,
+    perforate_model,
+    require_torch,
+)
 from .data import build_task_bundle
 from .models import build_model
 from .results import (
@@ -150,6 +157,15 @@ class BenchmarkRunner:
                 freeze_dendrite_updates_fraction=freeze_dendrite_updates_fraction,
             )
             model = self._configure_perforated_model(model, model_key)
+            source_save_name = f"{model_key}_{source_key}"
+            pai_checkpoint_name = latest_pai_switch_checkpoint(source_save_name)
+            if pai_checkpoint_name is not None:
+                model = load_pai_system_checkpoint(
+                    model,
+                    source_save_name,
+                    pai_checkpoint_name,
+                )
+                model = self._configure_perforated_model(model, model_key)
             return self._load_state(model, checkpoint_path, strict=False)
 
         model = self._load_state(model, checkpoint_path)
