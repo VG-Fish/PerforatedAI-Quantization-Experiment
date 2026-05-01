@@ -63,8 +63,8 @@ if nn is not None:  # pragma: no branch - optional dependency gating
             self.head = nn.Linear(hidden_size, 1)
 
         def forward(self, x: Any) -> Any:
-            _, (hidden, _) = self.lstm(x)
-            return self.head(hidden[-1]).squeeze(-1)
+            output, _ = self.lstm(x)
+            return self.head(output[:, -1]).squeeze(-1)
 
 
     class TextCNN(nn.Module):

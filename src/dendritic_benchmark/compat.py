@@ -113,6 +113,34 @@ def backend_status() -> BackendStatus:
     )
 
 
+def _configure_pai_rnn_processors(gpa: Any, modules_to_track: list[Any] | None) -> None:
+    if not modules_to_track or nn is None:
+        return
+    try:
+        lpa = importlib.import_module("perforatedai.library_perforatedai")
+    except Exception:
+        return
+    proc_modules: list[Any] = []
+    proc_classes: list[Any] = []
+    for mod_type in modules_to_track:
+        if mod_type is nn.LSTM:
+            cls = getattr(lpa, "LSTMProcessor", None)
+        elif mod_type is nn.GRU:
+            cls = getattr(lpa, "MultiOutputProcessor", None)
+        else:
+            continue
+        if cls is not None:
+            proc_modules.append(mod_type)
+            proc_classes.append(cls())
+    if not proc_modules:
+        return
+    set_mwp = getattr(gpa.pc, "set_modules_with_processing", None)
+    set_mpc = getattr(gpa.pc, "set_modules_processing_classes", None)
+    if set_mwp is not None and set_mpc is not None:
+        set_mwp(proc_modules)
+        set_mpc(proc_classes)
+
+
 def _configure_pai_trackers(
     gpa: Any,
     modules_to_track: list[Any] | None,
@@ -143,6 +171,7 @@ def _configure_pai_trackers(
         )
         if append_module_names_to_perforate is not None:
             append_module_names_to_perforate(module_names_to_track)
+    _configure_pai_rnn_processors(gpa, modules_to_track)
     set_device = getattr(gpa.pc, "set_device", None)
     if set_device is not None:
         set_device(choose_device())
