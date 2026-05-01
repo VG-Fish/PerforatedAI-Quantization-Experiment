@@ -127,6 +127,9 @@ class BenchmarkRunner:
         save_name: str,
         maximizing_score: bool,
         config_snapshot_path: Path | str | None = None,
+        dendrite_training_max_epochs: int | None = None,
+        dynamic_dendritic_training: bool = False,
+        freeze_dendrite_updates_fraction: float = 0.20,
     ) -> Any:
         source_condition = condition_by_key(source_key)
 
@@ -142,6 +145,9 @@ class BenchmarkRunner:
                 modules_to_track=self._perforation_track_modules(model_key),
                 config_snapshot_path=config_snapshot_path,
                 use_runtime_guard=self._use_pai_runtime_guard(),
+                dendrite_training_max_epochs=dendrite_training_max_epochs,
+                dynamic_dendritic_training=dynamic_dendritic_training,
+                freeze_dendrite_updates_fraction=freeze_dendrite_updates_fraction,
             )
             model = self._configure_perforated_model(model, model_key)
             return self._load_state(model, checkpoint_path, strict=False)
@@ -156,6 +162,9 @@ class BenchmarkRunner:
                 modules_to_track=self._perforation_track_modules(model_key),
                 config_snapshot_path=config_snapshot_path,
                 use_runtime_guard=self._use_pai_runtime_guard(),
+                dendrite_training_max_epochs=dendrite_training_max_epochs,
+                dynamic_dendritic_training=dynamic_dendritic_training,
+                freeze_dendrite_updates_fraction=freeze_dendrite_updates_fraction,
             )
             model = self._configure_perforated_model(model, model_key)
         return model
@@ -311,6 +320,7 @@ class BenchmarkRunner:
         all_records: list[dict[str, Any]],
         saved_dirs: dict[str, Path],
         allow_pqat: bool,
+        dynamic_dendritic_training: bool,
     ) -> bool:
         condition_dir = self.results_root / model_spec.key / condition.key
         record_path = condition_dir / _RECORD_JSON
@@ -328,6 +338,7 @@ class BenchmarkRunner:
                 condition,
                 saved_dirs,
                 allow_pqat,
+                dynamic_dendritic_training,
             )
             save_training_record(record, condition_dir)
             _log(
@@ -348,6 +359,7 @@ class BenchmarkRunner:
         ignore_saved: bool,
         all_records: list[dict[str, Any]],
         allow_pqat: bool,
+        dynamic_dendritic_training: bool,
     ) -> bool:
         pending = [
             cond for cond in selected_conditions
@@ -386,6 +398,7 @@ class BenchmarkRunner:
                 if self._train_pending_condition(
                     model_spec, condition, bundle, ignore_saved,
                     model_records, all_records, saved_dirs, allow_pqat,
+                    dynamic_dendritic_training,
                 ):
                     newly_trained = True
 
@@ -402,6 +415,7 @@ class BenchmarkRunner:
         condition_keys: list[str] | None = None,
         ignore_saved: bool = False,
         allow_pqat: bool = False,
+        dynamic_dendritic_training: bool = False,
     ) -> list[dict[str, Any]]:
         selected_models = [
             model_by_key(key)
@@ -413,7 +427,12 @@ class BenchmarkRunner:
 
         for model_spec in selected_models:
             newly_trained = self._process_one_model_spec(
-                model_spec, selected_conditions, ignore_saved, all_records, allow_pqat
+                model_spec,
+                selected_conditions,
+                ignore_saved,
+                all_records,
+                allow_pqat,
+                dynamic_dendritic_training,
             )
             print("-" * 50)
             if newly_trained:
@@ -440,8 +459,21 @@ class BenchmarkRunner:
         condition: ConditionSpec,
         saved_dirs: dict[str, Path],
         allow_pqat: bool,
+        dynamic_dendritic_training: bool,
     ) -> TrainingRecord:
         require_torch()
+        training_hyperparameters = self._training_hyperparameters(model_key, condition)
+        max_epochs = training_hyperparameters.max_epochs
+        use_qat = condition.use_qat
+        fine_tune_epochs = condition.fine_tune_epochs
+        if condition.quantized and condition.source_key != condition.key:
+            if allow_pqat:
+                fine_tune_epochs = self._pqat_epoch_budget(model_key)
+                max_epochs = fine_tune_epochs
+                use_qat = True
+            else:
+                max_epochs = 0
+        update_dendrites_during_training = condition.use_dendrites and not condition.quantized
         model = build_model(model_key, **self._model_kwargs(model_key))
         condition_dir = self.results_root / model_key / condition.key
         pai_config_snapshot = condition_dir / "PAI_config.json"
@@ -459,6 +491,11 @@ class BenchmarkRunner:
                 save_name=f"{model_key}_{condition.key}",
                 maximizing_score=metric_direction == "maximize",
                 config_snapshot_path=pai_config_snapshot,
+                dendrite_training_max_epochs=(
+                    max_epochs if update_dendrites_during_training else None
+                ),
+                dynamic_dendritic_training=dynamic_dendritic_training,
+                freeze_dendrite_updates_fraction=0.20,
             )
         elif condition.use_dendrites:
             model = perforate_model(
@@ -469,20 +506,14 @@ class BenchmarkRunner:
                 modules_to_track=self._perforation_track_modules(model_key),
                 config_snapshot_path=pai_config_snapshot,
                 use_runtime_guard=self._use_pai_runtime_guard(),
+                dendrite_training_max_epochs=(
+                    max_epochs if update_dendrites_during_training else None
+                ),
+                dynamic_dendritic_training=dynamic_dendritic_training,
+                freeze_dendrite_updates_fraction=0.20,
             )
             model = self._configure_perforated_model(model, model_key)
 
-        training_hyperparameters = self._training_hyperparameters(model_key, condition)
-        max_epochs = training_hyperparameters.max_epochs
-        use_qat = condition.use_qat
-        fine_tune_epochs = condition.fine_tune_epochs
-        if condition.quantized and condition.source_key != condition.key:
-            if allow_pqat:
-                fine_tune_epochs = self._pqat_epoch_budget(model_key)
-                max_epochs = fine_tune_epochs
-                use_qat = True
-            else:
-                max_epochs = 0
         weight_decay = 0.0 if condition.use_dendrites else training_hyperparameters.weight_decay
         training_config = TrainingConfig(
             bit_width=condition.bit_width,
@@ -498,7 +529,11 @@ class BenchmarkRunner:
             momentum=training_hyperparameters.momentum,
             weight_decay=weight_decay,
             source_condition_key=condition.source_key,
-            train_dendrites_until_complete=condition.use_dendrites and not condition.quantized,
+            enable_pai_dendrite_updates=update_dendrites_during_training,
+            train_dendrites_until_complete=(
+                update_dendrites_during_training and dynamic_dendritic_training
+            ),
+            freeze_dendrite_updates_fraction=0.20,
         )
         return train_and_evaluate(
             model_key=model_key,

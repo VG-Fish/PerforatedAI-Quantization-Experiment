@@ -32,9 +32,10 @@ For each model below, this document captures:
   - Most models register the default Conv/Linear module classes for PerforatedAI perforation.
   - Model-specific non-standard modules below are registered with PerforatedAI perforation APIs when available.
 - Dendritic epoch policy:
-  - Dendritic FP32 runs use the listed `max_epochs` value as the canonical base-model comparison budget.
-  - Training continues past that budget until PerforatedAI reports `training_complete=True`.
-  - Any epochs beyond `max_epochs` are saved under `continued_until_complete/`.
+  - By default, dendritic FP32 runs use the listed `max_epochs` value as a hard budget matching Base FP32.
+  - PerforatedAI insertion is active for the first 80% of that budget with fixed switch intervals, then frozen for the last 20%.
+  - With `uv run dqb run --dynamic-dendritic-training`, training continues past that budget until PerforatedAI reports `training_complete=True`.
+  - Dynamic epochs beyond `max_epochs` are saved under `continued_until_complete/`.
 
 ## 1. `lenet5` — LeNet-5
 

@@ -156,6 +156,16 @@ def build_parser() -> argparse.ArgumentParser:
             "and save the post-PQAT artifacts to `after_pqat/`."
         ),
     )
+    run_parser.add_argument(
+        "--dynamic-dendritic-training",
+        action="store_true",
+        help=(
+            "Use PerforatedAI's open-ended dynamic FP32 dendritic training mode. "
+            "By default, dendritic FP32 runs use the same fixed epoch budget as "
+            "the matching non-dendritic run and freeze dendrite insertion for "
+            "the final 20%% of epochs."
+        ),
+    )
 
     download_parser: argparse.ArgumentParser = subparsers.add_parser(
         "download_data",
@@ -325,6 +335,7 @@ def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
         condition_keys=args.conditions,
         ignore_saved=args.ignore_saved_models,
         allow_pqat=args.allow_pqat,
+        dynamic_dendritic_training=args.dynamic_dendritic_training,
     )
 
 

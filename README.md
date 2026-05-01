@@ -16,7 +16,7 @@ The benchmark automates training neural networks under different quantization an
 
 Each condition applies only two experimental factors to the same models: quantization level and whether the model is dendritic, allowing cleaner side-by-side comparison of efficiency vs. accuracy tradeoffs.
 
-Dendritic FP32 training uses PerforatedAI's dynamic tracker hooks (`set_optimizer`, `setup_optimizer`, and `add_validation_score`) during validation and keeps training until PerforatedAI returns `training_complete=True`. The model's configured `max_epochs` is treated as the canonical base-model budget, not as a hard stop for dendrite growth. Any dendritic epochs beyond that canonical budget are written under `results/<model>/<condition>/continued_until_complete/` so the over-budget PAI completion phase is explicit in the artifacts.
+Dendritic FP32 training defaults to the same fixed epoch budget as the matching non-dendritic model. PerforatedAI dendrite insertion is active during the first 80% of those epochs with a fixed switch cadence tuned to the budget, then dendrite insertion is frozen for the final 20% so the selected architecture can settle. Pass `--dynamic-dendritic-training` to restore the open-ended PerforatedAI mode that keeps training until `training_complete=True`; any epochs beyond the canonical budget are written under `results/<model>/<condition>/continued_until_complete/`.
 
 For Apple Silicon runs, the training path selects MPS automatically, disables CUDA-only pinned memory, keeps DataLoader workers persistent, uses larger per-model batch sizes, sets high float32 matmul precision where supported, and compiles non-dendritic MPS models with `torch.compile(..., backend="aot_eager")` when available.
 
@@ -95,6 +95,7 @@ uv run dqb run
 uv run dqb run --models lenet5 textcnn
 uv run dqb run --conditions base_fp32 dendrites_fp32
 uv run dqb run --allow-PQAT
+uv run dqb run --dynamic-dendritic-training
 uv run dqb run --ignore-saved-models
 
 # Compare outputs (includes benchmark timing plots when benchmarks/manifest.csv exists)
@@ -156,7 +157,7 @@ The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` f
 
 - `uv run dqb run`
 	- Train models across one or more conditions. By default runs all models & conditions defined in the project.
-	- Useful flags: `--models`, `--conditions`, `--results-root`, `--results-directory`, `--comparison-root`, `--ignore-saved-models`, `--allow-PQAT`.
+	- Useful flags: `--models`, `--conditions`, `--results-root`, `--results-directory`, `--comparison-root`, `--ignore-saved-models`, `--allow-PQAT`, `--dynamic-dendritic-training`.
 	- Examples:
         ```bash
         uv run dqb run
@@ -164,6 +165,7 @@ The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` f
         uv run dqb run --models lenet5 textcnn
         uv run dqb run --conditions base_fp32 dendrites_fp32
         uv run dqb run --allow-PQAT
+        uv run dqb run --dynamic-dendritic-training
         uv run dqb run --ignore-saved-models
         ```
 

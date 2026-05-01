@@ -32,12 +32,13 @@ uv run dqb run --conditions base_fp32 base_q8 dendrites_fp32
 uv run dqb run --results-root results
 uv run dqb run --comparison-root comparison
 uv run dqb run --allow-PQAT
+uv run dqb run --dynamic-dendritic-training
 uv run dqb run --ignore-saved-models
 ```
 
 ```mermaid
 flowchart TD
-    A([uv run dqb run]) --> B["Parse args<br>--models, --conditions,<br>--ignore-saved-models,<br>--allow-PQAT"]
+    A([uv run dqb run]) --> B["Parse args<br>--models, --conditions,<br>--ignore-saved-models,<br>--allow-PQAT,<br>--dynamic-dendritic-training"]
     B --> C["Load .env credentials<br>via compat.py"]
     C --> D["BenchmarkRunner<br>pipeline.py"]
     D --> E["Create results/ and<br>comparison/ directories"]
@@ -50,7 +51,7 @@ flowchart TD
     K --> L{"Dendritic<br>condition?"}
     L -->|Yes| M["compat.py perforate_model<br>via PAI"]
     L -->|No| N["Standard model"]
-    M --> O["training.py<br>train_and_evaluate<br>FP32 dendrites train until<br>PAI training_complete"]
+    M --> O["training.py<br>train_and_evaluate<br>FP32 dendrites fixed budget by default;<br>dynamic flag trains until PAI complete"]
     N --> O
     O --> R{"Quantization<br>condition?"}
     R -->|Q8/Q4/Q2/Q1.58/Q1| S["Load source checkpoint and<br>apply PTQ snapshot"]
@@ -323,7 +324,7 @@ Results are organized by model and condition:
                 ├── record.json
                 ├── before_pqat/                 # quantized runs only when --allow-PQAT is enabled
                 ├── after_pqat/                  # quantized runs only when --allow-PQAT is enabled
-                ├── continued_until_complete/    # FP32 dendritic epochs beyond max_epochs
+                ├── continued_until_complete/    # dynamic FP32 dendritic epochs beyond max_epochs
                 ├── plots/
                 │   ├── architecture_evolution.svg  # dendritic only
                 │   ├── loss_curves.svg

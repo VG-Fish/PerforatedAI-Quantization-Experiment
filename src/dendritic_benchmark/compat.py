@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 import pdb
 import shutil
@@ -148,6 +149,90 @@ def _configure_pai_trackers(
         gpa.pc.set_testing_dendrite_capacity(False)
     if confirm_unwrapped_modules:
         gpa.pc.set_unwrapped_modules_confirmed(True)
+
+
+def _bounded_dendrite_schedule(
+    max_epochs: int,
+    freeze_fraction: float,
+) -> tuple[int, int, int, int]:
+    freeze_epochs = 0
+    if max_epochs > 1 and freeze_fraction > 0:
+        freeze_epochs = max(
+            1, min(max_epochs - 1, math.ceil(max_epochs * freeze_fraction))
+        )
+    active_epochs = max(1, max_epochs - freeze_epochs)
+    target_switches = max(1, min(4, active_epochs // 4))
+    switch_interval = max(1, active_epochs // target_switches)
+    p_epochs = max(1, min(2, switch_interval // 2))
+    return active_epochs, target_switches, switch_interval, p_epochs
+
+
+def _call_pai_setter(pc: Any, setter_name: str, value: Any) -> None:
+    setter = getattr(pc, setter_name, None)
+    if setter is not None:
+        setter(value)
+
+
+def _set_pai_switch_mode(pc: Any, mode_name: str) -> None:
+    mode = getattr(pc, mode_name, None)
+    if mode is not None:
+        _call_pai_setter(pc, "set_switch_mode", mode)
+
+
+def _apply_pai_schedule_values(pc: Any, values: dict[str, Any]) -> None:
+    for setter_name, value in values.items():
+        _call_pai_setter(pc, setter_name, value)
+
+
+def _configure_dynamic_pai_schedule(pc: Any) -> None:
+    _set_pai_switch_mode(pc, "DOING_HISTORY")
+    _apply_pai_schedule_values(
+        pc,
+        {
+            "set_n_epochs_to_switch": 10,
+            "set_p_epochs_to_switch": 2,
+            "set_max_dendrites": 100,
+        },
+    )
+
+
+def _configure_bounded_pai_schedule(
+    pc: Any,
+    *,
+    max_epochs: int,
+    freeze_fraction: float,
+) -> None:
+    _, target_switches, switch_interval, p_epochs = _bounded_dendrite_schedule(
+        max_epochs, freeze_fraction
+    )
+    _set_pai_switch_mode(pc, "DOING_FIXED_SWITCH")
+    _apply_pai_schedule_values(
+        pc,
+        {
+            "set_first_fixed_switch_num": switch_interval,
+            "set_fixed_switch_num": switch_interval,
+            "set_n_epochs_to_switch": switch_interval,
+            "set_p_epochs_to_switch": p_epochs,
+            "set_max_dendrites": target_switches,
+        },
+    )
+
+
+def _configure_pai_training_schedule(
+    gpa: Any,
+    *,
+    max_epochs: int,
+    dynamic_dendritic_training: bool,
+    freeze_fraction: float,
+) -> None:
+    pc = gpa.pc
+    if dynamic_dendritic_training:
+        _configure_dynamic_pai_schedule(pc)
+        return
+
+    _configure_bounded_pai_schedule(
+        pc, max_epochs=max_epochs, freeze_fraction=freeze_fraction
+    )
 
 
 def _consume_pai_config_message(text: str) -> bool:
@@ -323,6 +408,9 @@ def perforate_model(
     confirm_unwrapped_modules: bool = True,
     config_snapshot_path: Path | str | None = None,
     use_runtime_guard: bool = False,
+    dendrite_training_max_epochs: int | None = None,
+    dynamic_dendritic_training: bool = True,
+    freeze_dendrite_updates_fraction: float = 0.20,
 ) -> Any:
     if not has_perforatedai():
         return model
@@ -337,6 +425,13 @@ def perforate_model(
             _configure_pai_trackers(
                 GPA, modules_to_track, module_names_to_track, confirm_unwrapped_modules
             )
+            if dendrite_training_max_epochs is not None:
+                _configure_pai_training_schedule(
+                    GPA,
+                    max_epochs=dendrite_training_max_epochs,
+                    dynamic_dendritic_training=dynamic_dendritic_training,
+                    freeze_fraction=freeze_dendrite_updates_fraction,
+                )
             pai_save_name = str(_pai_save_path(save_name))
             return upa_perforate_model(
                 model,

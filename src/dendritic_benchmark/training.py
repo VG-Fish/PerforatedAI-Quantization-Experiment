@@ -42,7 +42,9 @@ class TrainingConfig:
     momentum: float = 0.9
     weight_decay: float = 0.0
     source_condition_key: str | None = None
+    enable_pai_dendrite_updates: bool = False
     train_dendrites_until_complete: bool = False
+    freeze_dendrite_updates_fraction: float = 0.20
 
 
 @dataclass
@@ -82,6 +84,9 @@ class ArtifactMetadata:
     bit_width: int | None
     use_qat: bool
     fine_tune_epochs: int
+    enable_pai_dendrite_updates: bool
+    train_dendrites_until_complete: bool
+    freeze_dendrite_updates_fraction: float
 
 
 @dataclass(frozen=True)
@@ -748,6 +753,11 @@ def _write_metrics_and_history(
                 "bit_width": metadata.bit_width,
                 "use_qat": metadata.use_qat,
                 "fine_tune_epochs": metadata.fine_tune_epochs,
+                "enable_pai_dendrite_updates": metadata.enable_pai_dendrite_updates,
+                "train_dendrites_until_complete": metadata.train_dendrites_until_complete,
+                "freeze_dendrite_updates_fraction": (
+                    metadata.freeze_dendrite_updates_fraction
+                ),
                 "artifact_path": str(stats.artifact_path),
                 "training_skipped": payload.training_skipped,
                 "skip_reason": payload.skip_reason,
@@ -972,7 +982,7 @@ def _setup_pai_optimizer(
     optimizer = _build_optimizer(model, torch, config)
     if (
         not config.use_dendrites
-        or not config.train_dendrites_until_complete
+        or not (config.enable_pai_dendrite_updates or config.train_dendrites_until_complete)
     ):
         return optimizer, None
     tracker = _pai_tracker()
@@ -1302,6 +1312,27 @@ def _run_dynamic_dendrite_update(
         pdb_module.set_trace = _orig_set_trace
 
 
+def _dendrite_freeze_start_epoch(max_epochs: int, freeze_fraction: float) -> int | None:
+    if max_epochs <= 1 or freeze_fraction <= 0:
+        return None
+    freeze_epochs = max(1, min(max_epochs - 1, math.ceil(max_epochs * freeze_fraction)))
+    return max_epochs - freeze_epochs
+
+
+def _pai_updates_frozen(
+    context: EpochTrainingContext,
+    epoch: int,
+    *,
+    run_until_pai_complete: bool,
+) -> bool:
+    if run_until_pai_complete or not context.config.enable_pai_dendrite_updates:
+        return False
+    freeze_start = _dendrite_freeze_start_epoch(
+        context.max_epochs, context.config.freeze_dendrite_updates_fraction
+    )
+    return freeze_start is not None and epoch >= freeze_start
+
+
 def _set_epoch_progress(
     epoch_progress: Any,
     metric_name: str,
@@ -1359,12 +1390,15 @@ def _run_training_epochs(
         _record_best_epoch(
             state, context.model, epoch, val_metric, context.metric_direction
         )
-        history_row["pai_dynamic_insertion_active"] = bool(
-            pai_tracker is not None
+        pai_updates_frozen = _pai_updates_frozen(
+            context, epoch, run_until_pai_complete=run_until_pai_complete
         )
+        pai_updates_active = bool(pai_tracker is not None and not pai_updates_frozen)
+        history_row["pai_dynamic_insertion_active"] = pai_updates_active
+        history_row["pai_dendrite_updates_frozen"] = pai_updates_frozen
         history_row["pai_restructured"] = False
         history_row["pai_training_complete"] = False
-        if pai_tracker is not None:
+        if pai_updates_active:
             (
                 optimizer,
                 pai_tracker,
@@ -1400,11 +1434,7 @@ def _build_artifact_metadata(
     metric_name: str,
     metric_direction: str,
     primary_metric_key: str,
-    use_dendrites: bool,
-    use_pruning: bool,
-    bit_width: int | None,
-    use_qat: bool,
-    fine_tune_epochs: int,
+    config: TrainingConfig,
 ) -> ArtifactMetadata:
     return ArtifactMetadata(
         model_key=model_key,
@@ -1413,11 +1443,14 @@ def _build_artifact_metadata(
         metric_name=metric_name,
         metric_direction=metric_direction,
         primary_metric_key=primary_metric_key,
-        use_dendrites=use_dendrites,
-        use_pruning=use_pruning,
-        bit_width=bit_width,
-        use_qat=use_qat,
-        fine_tune_epochs=fine_tune_epochs,
+        use_dendrites=config.use_dendrites,
+        use_pruning=config.use_pruning,
+        bit_width=config.bit_width,
+        use_qat=config.use_qat,
+        fine_tune_epochs=config.fine_tune_epochs,
+        enable_pai_dendrite_updates=config.enable_pai_dendrite_updates,
+        train_dendrites_until_complete=config.train_dendrites_until_complete,
+        freeze_dendrite_updates_fraction=config.freeze_dendrite_updates_fraction,
     )
 
 
@@ -1443,6 +1476,9 @@ def _metadata_for_stage(
             if fine_tune_epochs is None
             else fine_tune_epochs
         ),
+        enable_pai_dendrite_updates=metadata.enable_pai_dendrite_updates,
+        train_dendrites_until_complete=metadata.train_dendrites_until_complete,
+        freeze_dendrite_updates_fraction=metadata.freeze_dendrite_updates_fraction,
     )
 
 
@@ -1683,7 +1719,6 @@ def train_and_evaluate(
     quantization_mode = config.quantization_mode
     use_dendrites = config.use_dendrites
     use_qat = config.use_qat
-    fine_tune_epochs = config.fine_tune_epochs
     max_epochs = config.max_epochs
     source_condition_key = config.source_condition_key
 
@@ -1699,11 +1734,7 @@ def train_and_evaluate(
         metric_name=metric_name,
         metric_direction=metric_direction,
         primary_metric_key=primary_metric_key,
-        use_dendrites=use_dendrites,
-        use_pruning=config.use_pruning,
-        bit_width=bit_width,
-        use_qat=use_qat,
-        fine_tune_epochs=fine_tune_epochs,
+        config=config,
     )
 
     pqat_enabled = _is_pqat_enabled(config, condition_key)
