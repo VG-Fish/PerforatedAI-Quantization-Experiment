@@ -1178,7 +1178,7 @@ def _run_dynamic_dendrite_update(
     optimizer: Any,
     pai_tracker: Any,
     val_metric: float,
-) -> tuple[Any, Any, bool]:
+) -> tuple[Any, Any | None, bool, bool]:
     try:
         model, restructured, training_complete = pai_tracker.add_validation_score(
             val_metric, context.model
@@ -1193,10 +1193,10 @@ def _run_dynamic_dendrite_update(
         )
         if restructured:
             optimizer, _ = _setup_pai_optimizer(context.model, context.torch, context.config)
-        return optimizer, pai_tracker, bool(training_complete)
+        return optimizer, pai_tracker, bool(restructured), bool(training_complete)
     except Exception as pai_exc:
         print(f"[pai] dynamic dendrite update skipped: {pai_exc}")
-        return optimizer, None, False
+        return optimizer, None, False, False
 
 
 def _set_epoch_progress(
@@ -1252,13 +1252,25 @@ def _run_training_epochs(
         _record_best_epoch(
             state, context.model, epoch, val_metric, context.metric_direction
         )
+        history_row["pai_dynamic_insertion_active"] = bool(
+            pai_tracker is not None and epoch < dynamic_freeze_epoch
+        )
+        history_row["pai_restructured"] = False
+        history_row["pai_training_complete"] = False
         if pai_tracker is not None and epoch < dynamic_freeze_epoch:
-            optimizer, pai_tracker, training_complete = _run_dynamic_dendrite_update(
+            (
+                optimizer,
+                pai_tracker,
+                restructured,
+                training_complete,
+            ) = _run_dynamic_dendrite_update(
                 context=context, optimizer=optimizer, pai_tracker=pai_tracker,
                 val_metric=val_metric,
             )
+            history_row["pai_restructured"] = restructured
+            history_row["pai_training_complete"] = training_complete
             if training_complete:
-                break
+                pai_tracker = None
         _set_epoch_progress(
             epoch_progress, context.metric_name, val_metric,
             state.best_metric, state.best_epoch,

@@ -124,8 +124,19 @@ def _configure_pai_trackers(
             setter([])
     if modules_to_track:
         gpa.pc.append_modules_to_track(modules_to_track)
+        append_modules_to_perforate = getattr(gpa.pc, "append_modules_to_perforate", None)
+        if append_modules_to_perforate is not None:
+            append_modules_to_perforate(modules_to_track)
     if module_names_to_track:
         gpa.pc.append_module_names_to_track(module_names_to_track)
+        append_module_names_to_perforate = getattr(
+            gpa.pc, "append_module_names_to_perforate", None
+        )
+        if append_module_names_to_perforate is not None:
+            append_module_names_to_perforate(module_names_to_track)
+    set_device = getattr(gpa.pc, "set_device", None)
+    if set_device is not None:
+        set_device(choose_device())
     if hasattr(gpa.pc, "set_testing_dendrite_capacity"):
         gpa.pc.set_testing_dendrite_capacity(False)
     if confirm_unwrapped_modules:

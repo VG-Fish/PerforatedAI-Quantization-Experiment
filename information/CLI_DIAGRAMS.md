@@ -46,7 +46,7 @@ flowchart TD
     K --> L{"Dendritic<br>condition?"}
     L -->|Yes| M["compat.py perforate_model<br>via PAI"]
     L -->|No| N["Standard model"]
-    M --> O["training.py<br>train_and_evaluate<br>PAI tracker live for first 80%<br>then frozen for final 20%"]
+    M --> O["training.py<br>train_and_evaluate<br>same max_epochs as base<br>PAI tracker live for first 80%<br>then frozen for final 20%"]
     N --> O
     O --> R{"Quantization<br>condition?"}
     R -->|Q8/Q4/Q2/Q1.58/Q1| S["Load source checkpoint and<br>apply PTQ snapshot"]

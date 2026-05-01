@@ -28,8 +28,13 @@ For each model below, this document captures:
   - `ceil(max_epochs * 0.30)`, capped to the range `1..10`
 - Model kwargs:
   - Only listed when the pipeline passes non-empty kwargs to `build_model(...)`
-- Perforation tracking:
-  - Most models use the default perforation behavior with no extra tracked modules
+- Perforation registration:
+  - Most models use the default perforation behavior with no extra registered modules.
+  - Model-specific non-standard modules below are registered with both PerforatedAI tracking and perforation APIs when available.
+- Dendritic epoch policy:
+  - Dendritic FP32 runs use the same `max_epochs` value listed for the matching base FP32 run.
+  - Dynamic PerforatedAI insertion is active for `floor(max_epochs * 0.80)` epochs.
+  - The remaining epochs train with insertion frozen, even if PerforatedAI reports `training_complete` before the 80% boundary.
 
 ## 1. `lenet5` — LeNet-5
 
@@ -46,7 +51,7 @@ For each model below, this document captures:
   - `optimizer_name=sgd`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `2`
 
 ## 2. `m5` — M5 (1D-CNN)
@@ -64,7 +69,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=1.0e-4`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `3`
 
 ## 3. `lstm_forecaster` — LSTM Univariate
@@ -82,7 +87,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation tracking: `nn.LSTM`
+- Perforation registration: `nn.LSTM`
 - PQAT epoch budget: `4`
 
 ## 4. `textcnn` — TextCNN
@@ -100,7 +105,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=1.0e-4`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `1`
 
 ## 5. `gcn` — GCN
@@ -118,7 +123,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=5.0e-4`
-- Perforation tracking: default
+- Perforation registration: default
 - Special dendritic note:
   - The pipeline adjusts `conv2.linear.set_this_output_dimensions([-1, 0])` when available.
 - PQAT epoch budget: `10`
@@ -138,7 +143,7 @@ For each model below, this document captures:
   - `optimizer_name=adamw`
   - `momentum=0.9`
   - `weight_decay=1.0e-5`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `10`
 
 ## 7. `mpnn` — MPNN
@@ -156,7 +161,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=1.0e-5`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `10`
 
 ## 8. `actor_critic` — Actor-Critic
@@ -174,7 +179,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `4`
 
 ## 9. `lstm_autoencoder` — LSTM Autoencoder
@@ -192,7 +197,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation tracking: `nn.LSTM`
+- Perforation registration: `nn.LSTM`
 - PQAT epoch budget: `5`
 
 ## 10. `distilbert` — DistilBERT
@@ -210,7 +215,7 @@ For each model below, this document captures:
   - `optimizer_name=adamw`
   - `momentum=0.9`
   - `weight_decay=1.0e-2`
-- Perforation tracking: `nn.GRU`
+- Perforation registration: `nn.GRU`
 - PQAT epoch budget: `1`
 
 ## 11. `dqn_lunarlander` — DQN (LunarLander)
@@ -228,7 +233,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `10`
 
 ## 12. `ppo_bipedalwalker` — PPO Policy Network
@@ -246,7 +251,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `10`
 
 ## 13. `attentivefp_freesolv` — AttentiveFP
@@ -264,7 +269,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=1.0e-5`
-- Perforation tracking: `nn.GRUCell`
+- Perforation registration: `nn.GRUCell`
 - PQAT epoch budget: `10`
 
 ## 14. `gin_imdbb` — GIN
@@ -282,7 +287,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=5.0e-4`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `10`
 
 ## 15. `tcn_forecaster` — TCN Forecaster
@@ -300,7 +305,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=1.0e-4`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `6`
 
 ## 16. `gru_forecaster` — GRU Forecaster
@@ -318,7 +323,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation tracking: `nn.GRU`
+- Perforation registration: `nn.GRU`
 - PQAT epoch budget: `5`
 
 ## 17. `pointnet_modelnet40` — PointNet
@@ -336,7 +341,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=1.0e-4`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `6`
 
 ## 18. `vae_mnist` — VAE
@@ -354,7 +359,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `2`
 
 ## 19. `snn_nmnist` — Spiking Neural Network
@@ -372,7 +377,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `5`
 
 ## 20. `unet_isic` — Tiny U-Net
@@ -390,7 +395,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=1.0e-5`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `10`
 
 ## 21. `resnet18_cifar10` — ResNet-18
@@ -408,7 +413,7 @@ For each model below, this document captures:
   - `optimizer_name=sgd`
   - `momentum=0.9`
   - `weight_decay=5.0e-4`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `9`
 
 ## 22. `mobilenetv2_cifar10` — MobileNetV2
@@ -426,7 +431,7 @@ For each model below, this document captures:
   - `optimizer_name=sgd`
   - `momentum=0.9`
   - `weight_decay=4.0e-5`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `10`
 
 ## 23. `saint_adult` — SAINT
@@ -444,7 +449,7 @@ For each model below, this document captures:
   - `optimizer_name=adamw`
   - `momentum=0.9`
   - `weight_decay=1.0e-5`
-- Perforation tracking: `nn.MultiheadAttention`
+- Perforation registration: `nn.MultiheadAttention`
 - PQAT epoch budget: `10`
 
 ## 24. `capsnet_mnist` — CapsNet
@@ -462,7 +467,7 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `3`
 
 ## 25. `convlstm_movingmnist` — ConvLSTM
@@ -480,5 +485,5 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation tracking: default
+- Perforation registration: default
 - PQAT epoch budget: `5`

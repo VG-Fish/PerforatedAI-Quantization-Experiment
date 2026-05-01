@@ -98,7 +98,7 @@ Run in isolation. For Q1 and Q1.58, use QAT (quantization-aware training) via `t
 ### Recommended Execution Order per Model
 1. **Base FP32** → train with `doing_pai=False`; save checkpoint
 2. **Base + Q8/Q4/Q2/Q1.58/Q1** → load Base FP32 checkpoint; apply PTQ/QAT via `torchao`; evaluate
-3. **+Dendrites FP32** → retrain from scratch with `doing_pai=True`; use `DOING_FIXED_SWITCH` to bound time
+3. **+Dendrites FP32** → retrain from scratch with `doing_pai=True`; train for the same `max_epochs` budget as the matching base FP32 run
 4. **+Dendrites FP32** → use the dendritic checkpoint as the source state for all dendritic quantized evaluations
 5. **+Dendrites+Q8 through Q1** → load dendritic FP32 checkpoint; apply quantization in sequence
 
@@ -147,6 +147,11 @@ GPA.pc.append_module_names_to_perforate(['encoder_block'])
 GPA.pc.append_module_ids_to_perforate(['.layer1.0.conv1'])
 ```
 
+The benchmark compatibility wrapper mirrors model-specific non-standard
+modules into both the PerforatedAI tracking and perforation lists when those
+APIs are available, and it forwards the selected runtime device into
+`GPA.pc.set_device(...)`.
+
 #### Step 3 — Optimizer & Scheduler Setup
 ```python
 GPA.pai_tracker.set_optimizer(torch.optim.Adam)
@@ -161,28 +166,33 @@ The benchmark now enables live dendrite restructuring for dendritic training
 runs by wiring PerforatedAI's tracker into the optimizer and validation loop.
 Dynamic insertion is active for the first 80% of the configured epochs, then
 the final 20% trains with the current dendrite layout frozen so weights can
-settle before final evaluation.
+settle before final evaluation. Dendritic and non-dendritic runs always keep
+the same configured epoch budget; if PerforatedAI reports `training_complete`
+early, the benchmark freezes further insertion and continues training instead
+of ending the run.
 
 ```python
-if epoch < int(max_epochs * 0.8):
-    model, restructured, training_complete = GPA.pai_tracker.add_validation_score(
-        score, model
-    )
-    model.to(device)
+dynamic_freeze_epoch = int(max_epochs * 0.8)
+for epoch in range(max_epochs):
+    # train and validate as normal
+    if pai_tracker is not None and epoch < dynamic_freeze_epoch:
+        model, restructured, training_complete = GPA.pai_tracker.add_validation_score(
+            score, model
+        )
+        model.to(device)
 
-    if training_complete:
-        break
-    elif restructured:
-        optimizer, PAIscheduler = GPA.pai_tracker.setup_optimizer(model, optimArgs, schedArgs)
+        if training_complete:
+            pai_tracker = None  # freeze insertion, but keep training to max_epochs
+        elif restructured:
+            optimizer, PAIscheduler = GPA.pai_tracker.setup_optimizer(model, optimArgs, schedArgs)
 ```
 
 #### Step 5 — Training Loop Structure
 ```python
-epoch = -1
-while True:
-    epoch += 1
+for epoch in range(max_epochs):
     # train as normal
-    # validation loop ends with add_validation_score call above
+    # validation loop may add dendrites during the first 80% only
+    # the last 20% always trains with insertion frozen
 ```
 
 #### MPS Device Handling (M3 Pro)
@@ -543,7 +553,7 @@ Isolates optional dependencies and PerforatedAI integration.
 - Safely imports PyTorch and optional `dotenv`.
 - Detects MPS, CUDA, or CPU at runtime.
 - Mirrors PerforatedAI token and email aliases from environment variables.
-- Wraps and configures models with PerforatedAI when available. Suppresses repeated `[PAI Config] Saved` messages by patching `builtins.print`.
+- Wraps and configures models with PerforatedAI when available. Model-specific non-standard modules are registered for both tracking and perforation, and the selected runtime device is forwarded to PerforatedAI when supported. Suppresses repeated `[PAI Config] Saved` messages by patching `builtins.print`.
 - Provides simple symmetric, ternary, and binary quantization helpers.
 
 ## Training and Evaluation
@@ -555,7 +565,7 @@ Runs each individual condition.
 - Applies L1 unstructured global pruning for pruned conditions.
 - Applies quantization for low-bit conditions and optionally QAT-style weight projection during the training loop.
 - Compiles non-dendritic MPS models with `torch.compile(..., backend='aot_eager')` when available.
-- Uses `GPA.pai_tracker.set_optimizer`, `setup_optimizer`, and `add_validation_score` for dendritic runs; live restructuring stops for the last 20% of epochs.
+- Uses `GPA.pai_tracker.set_optimizer`, `setup_optimizer`, and `add_validation_score` for dendritic runs; live restructuring stops for the last 20% of epochs, and early PAI completion freezes insertion without shortening the configured run.
 - Trains for the condition-specific epoch budget, or skips training for post-training quantization conditions (printing a skip-reason banner).
 - Evaluates validation and test metrics with a rich set of per-task metrics (accuracy, MAE, RMSE, AUC, Dice, SSIM, ELBO, etc.).
 - Saves the best model state to `model.pt` and writes `best_model_stats.csv` for the `compare` command.
@@ -737,6 +747,7 @@ uv run dqb run --models mpnn actor_critic --ignore-saved-models
 
 ## Notes
 - Real datasets are downloaded automatically into `data/` by default. Set `DQB_DATA_ROOT` to keep the cache outside the repository.
+- Dendritic runs use the same `max_epochs` as their non-dendritic counterparts. Dynamic dendrite insertion is allowed only during the first 80% of that budget; the final 20% is a fixed-architecture settling phase.
 - Dendritic runs are expected to produce additional PerforatedAI sidecar artifacts.
 - If you add new models or conditions, update `src/dendritic_benchmark/specs.py` and rerun the CLI.
 - Conditions are executed in dependency order — omitting an upstream condition will cause its dependents to be skipped.
