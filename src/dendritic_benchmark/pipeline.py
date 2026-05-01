@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, cast
 
 from .compat import (
+    PAIModuleSelection,
+    attach_module_output_dimensions,
     choose_device,
     latest_pai_switch_checkpoint,
     load_pai_system_checkpoint,
@@ -25,15 +27,18 @@ from .results import (
     write_model_reports,
 )
 from .specs import CONDITION_SPECS, MODEL_SPECS, ConditionSpec, condition_by_key, model_by_key
-from .training import OptimizerName, TrainingConfig, TrainingRecord, train_and_evaluate
+from .training import (
+    OptimizerName,
+    TrainingConfig,
+    TrainingRecord,
+    infer_module_output_dimensions,
+    train_and_evaluate,
+)
 
 EPOCH_MULTIPLIER = 10
 _RECORD_JSON = "record.json"
 _MODEL_PT = "model.pt"
-_GCN_LINEAR_OUTPUT_DIMENSIONS = {
-    ".conv1.linear": [-1, -1, 0],
-    ".conv2.linear": [-1, -1, 0],
-}
+_RECURRENT_MODELS = {"lstm_forecaster", "lstm_autoencoder", "convlstm_movingmnist", "gru_forecaster"}
 
 
 @dataclass(frozen=True)
@@ -44,6 +49,27 @@ class ModelTrainingRecipe:
     optimizer_name: OptimizerName = "adam"
     momentum: float = 0.9
     weight_decay: float = 0.0
+
+
+@dataclass(frozen=True)
+class ConditionTrainingPlan:
+    max_epochs: int
+    use_qat: bool
+    fine_tune_epochs: int
+    update_dendrites_during_training: bool
+
+
+@dataclass(frozen=True)
+class SourceCheckpointLoadConfig:
+    save_name: str
+    maximizing_score: bool
+    module_selection: PAIModuleSelection
+    config_snapshot_path: Path | str | None = None
+    dendrite_training_max_epochs: int | None = None
+    dynamic_dendritic_training: bool = False
+    freeze_dendrite_updates_fraction: float = 0.20
+    batches_per_epoch: int | None = None
+    module_output_dimensions: dict[str, list[int]] | None = None
 
 
 def _log(msg: str, *, before: bool = False, after: bool = False) -> None:
@@ -136,13 +162,7 @@ class BenchmarkRunner:
         source_key: str,
         checkpoint_path: Path,
         target_uses_dendrites: bool,
-        save_name: str,
-        maximizing_score: bool,
-        config_snapshot_path: Path | str | None = None,
-        dendrite_training_max_epochs: int | None = None,
-        dynamic_dendritic_training: bool = False,
-        freeze_dendrite_updates_fraction: float = 0.20,
-        batches_per_epoch: int | None = None,
+        load_config: SourceCheckpointLoadConfig,
     ) -> Any:
         source_condition = condition_by_key(source_key)
 
@@ -152,18 +172,25 @@ class BenchmarkRunner:
         if source_condition.use_dendrites and target_uses_dendrites:
             model = perforate_model(
                 model,
-                save_name=save_name,
+                save_name=load_config.save_name,
                 doing_pai=True,
-                maximizing_score=maximizing_score,
-                modules_to_track=self._perforation_track_modules(model_key),
-                config_snapshot_path=config_snapshot_path,
+                maximizing_score=load_config.maximizing_score,
+                module_selection=load_config.module_selection,
+                config_snapshot_path=load_config.config_snapshot_path,
                 use_runtime_guard=self._use_pai_runtime_guard(),
-                dendrite_training_max_epochs=dendrite_training_max_epochs,
-                dynamic_dendritic_training=dynamic_dendritic_training,
-                freeze_dendrite_updates_fraction=freeze_dendrite_updates_fraction,
-                batches_per_epoch=batches_per_epoch,
+                dendrite_training_max_epochs=(
+                    load_config.dendrite_training_max_epochs
+                ),
+                dynamic_dendritic_training=load_config.dynamic_dendritic_training,
+                freeze_dendrite_updates_fraction=(
+                    load_config.freeze_dendrite_updates_fraction
+                ),
+                batches_per_epoch=load_config.batches_per_epoch,
+                no_backward_workaround=model_key not in _RECURRENT_MODELS,
             )
-            model = self._configure_perforated_model(model, model_key)
+            model = self._configure_perforated_model(
+                model, load_config.module_output_dimensions
+            )
             source_save_name = f"{model_key}_{source_key}"
             pai_checkpoint_name = latest_pai_switch_checkpoint(source_save_name)
             if pai_checkpoint_name is not None:
@@ -172,25 +199,34 @@ class BenchmarkRunner:
                     source_save_name,
                     pai_checkpoint_name,
                 )
-                model = self._configure_perforated_model(model, model_key)
+                model = self._configure_perforated_model(
+                    model, load_config.module_output_dimensions
+                )
             return self._load_state(model, checkpoint_path, strict=False)
 
         model = self._load_state(model, checkpoint_path)
         if target_uses_dendrites:
             model = perforate_model(
                 model,
-                save_name=save_name,
+                save_name=load_config.save_name,
                 doing_pai=True,
-                maximizing_score=maximizing_score,
-                modules_to_track=self._perforation_track_modules(model_key),
-                config_snapshot_path=config_snapshot_path,
+                maximizing_score=load_config.maximizing_score,
+                module_selection=load_config.module_selection,
+                config_snapshot_path=load_config.config_snapshot_path,
                 use_runtime_guard=self._use_pai_runtime_guard(),
-                dendrite_training_max_epochs=dendrite_training_max_epochs,
-                dynamic_dendritic_training=dynamic_dendritic_training,
-                freeze_dendrite_updates_fraction=freeze_dendrite_updates_fraction,
-                batches_per_epoch=batches_per_epoch,
+                dendrite_training_max_epochs=(
+                    load_config.dendrite_training_max_epochs
+                ),
+                dynamic_dendritic_training=load_config.dynamic_dendritic_training,
+                freeze_dendrite_updates_fraction=(
+                    load_config.freeze_dendrite_updates_fraction
+                ),
+                batches_per_epoch=load_config.batches_per_epoch,
+                no_backward_workaround=model_key not in _RECURRENT_MODELS,
             )
-            model = self._configure_perforated_model(model, model_key)
+            model = self._configure_perforated_model(
+                model, load_config.module_output_dimensions
+            )
         return model
 
     def _artifact_path(
@@ -245,29 +281,141 @@ class BenchmarkRunner:
             return {"num_classes": 2}
         return {}
 
-    def _perforation_track_modules(self, model_key: str) -> list[Any]:
+    def _perforation_track_modules(self) -> list[Any]:
         if nn is None:
             return []
-        if model_key in {"lstm_forecaster", "lstm_autoencoder"}:
-            return [nn.Linear]
-        if model_key in {"distilbert", "gru_forecaster"}:
-            return [nn.GRU]
-        if model_key == "attentivefp_freesolv":
-            return [nn.GRUCell]
-        if model_key == "saint_adult":
-            return [nn.MultiheadAttention]
         # The compat wrapper registers these with PAI's perforation list. If no
         # default Conv/Linear classes are supplied, PAI initializes the tracker
         # but leaves ordinary layers unwrapped for dynamic dendrite insertion.
+        # Tuple-returning modules such as GRU and MultiheadAttention require
+        # custom PAI processors; the benchmark stays on tensor-returning layers.
         return [nn.Linear, nn.Conv1d, nn.Conv2d]
+
+    def _perforation_track_only_module_ids(self, model_key: str) -> list[str]:
+        return {
+            "actor_critic": [".value"],
+            "ppo_bipedalwalker": [".critic"],
+            "capsnet_mnist": [".decoder.0", ".decoder.2"],
+        }.get(model_key, [])
 
     def _use_pai_runtime_guard(self) -> bool:
         return True
 
-    def _configure_perforated_model(self, model: Any, model_key: str) -> Any:
-        if model_key == "gcn":
-            set_module_output_dimensions(model, _GCN_LINEAR_OUTPUT_DIMENSIONS)
+    def _configure_perforated_model(
+        self,
+        model: Any,
+        module_output_dimensions: dict[str, list[int]] | None = None,
+    ) -> Any:
+        if module_output_dimensions:
+            attach_module_output_dimensions(model, module_output_dimensions)
+            set_module_output_dimensions(model, module_output_dimensions)
         return model
+
+    def _condition_training_plan(
+        self,
+        model_key: str,
+        condition: ConditionSpec,
+        training_hyperparameters: ModelTrainingRecipe,
+        allow_pqat: bool,
+    ) -> ConditionTrainingPlan:
+        max_epochs = training_hyperparameters.max_epochs
+        use_qat = condition.use_qat
+        fine_tune_epochs = condition.fine_tune_epochs
+        if condition.quantized and condition.source_key != condition.key:
+            if allow_pqat:
+                fine_tune_epochs = self._pqat_epoch_budget(model_key)
+                max_epochs = fine_tune_epochs
+                use_qat = True
+            else:
+                max_epochs = 0
+        return ConditionTrainingPlan(
+            max_epochs=max_epochs,
+            use_qat=use_qat,
+            fine_tune_epochs=fine_tune_epochs,
+            update_dendrites_during_training=(
+                condition.use_dendrites and not condition.quantized
+            ),
+        )
+
+    def _dendrite_initialization_metadata(
+        self,
+        model: Any,
+        model_key: str,
+        bundle: Any,
+        condition: ConditionSpec,
+    ) -> tuple[PAIModuleSelection, dict[str, list[int]] | None]:
+        if not condition.use_dendrites:
+            return PAIModuleSelection(), None
+        modules_to_perforate = self._perforation_track_modules()
+        module_selection = PAIModuleSelection(
+            modules_to_perforate=modules_to_perforate,
+            track_only_module_ids=self._perforation_track_only_module_ids(model_key),
+        )
+        module_output_dimensions = infer_module_output_dimensions(
+            model, model_key, bundle, modules_to_perforate
+        )
+        return module_selection, module_output_dimensions
+
+    def _prepare_condition_model(
+        self,
+        *,
+        model: Any,
+        model_key: str,
+        metric_direction: str,
+        condition: ConditionSpec,
+        saved_dirs: dict[str, Path],
+        pai_config_snapshot: Path,
+        training_plan: ConditionTrainingPlan,
+        dynamic_dendritic_training: bool,
+        batches_per_epoch: int | None,
+        module_selection: PAIModuleSelection,
+        module_output_dimensions: dict[str, list[int]] | None,
+    ) -> Any:
+        dendrite_training_max_epochs = (
+            training_plan.max_epochs
+            if training_plan.update_dendrites_during_training
+            else None
+        )
+        if condition.source_key in saved_dirs:
+            checkpoint = self._artifact_path(
+                saved_dirs[condition.source_key],
+                prefer_dendritic="dendrites" in condition.source_key,
+            )
+            return self._load_source_checkpoint(
+                model,
+                model_key,
+                condition.source_key,
+                checkpoint,
+                condition.use_dendrites,
+                SourceCheckpointLoadConfig(
+                    save_name=f"{model_key}_{condition.key}",
+                    maximizing_score=metric_direction == "maximize",
+                    module_selection=module_selection,
+                    config_snapshot_path=pai_config_snapshot,
+                    dendrite_training_max_epochs=dendrite_training_max_epochs,
+                    dynamic_dendritic_training=dynamic_dendritic_training,
+                    freeze_dendrite_updates_fraction=0.20,
+                    batches_per_epoch=batches_per_epoch,
+                    module_output_dimensions=module_output_dimensions,
+                ),
+            )
+        if not condition.use_dendrites:
+            return model
+        model = perforate_model(
+            model,
+            save_name=f"{model_key}_{condition.key}",
+            doing_pai=True,
+            maximizing_score=metric_direction == "maximize",
+            module_selection=module_selection,
+            config_snapshot_path=pai_config_snapshot,
+            use_runtime_guard=self._use_pai_runtime_guard(),
+            dendrite_training_max_epochs=dendrite_training_max_epochs,
+            dynamic_dendritic_training=dynamic_dendritic_training,
+            freeze_dendrite_updates_fraction=0.20,
+            batches_per_epoch=batches_per_epoch,
+            no_backward_workaround=model_key not in _RECURRENT_MODELS,
+        )
+        return self._configure_perforated_model(model, module_output_dimensions)
 
     def _training_hyperparameters(
         self, model_key: str, _condition: ConditionSpec
@@ -491,60 +639,29 @@ class BenchmarkRunner:
     ) -> TrainingRecord:
         require_torch()
         training_hyperparameters = self._training_hyperparameters(model_key, condition)
-        max_epochs = training_hyperparameters.max_epochs
-        use_qat = condition.use_qat
-        fine_tune_epochs = condition.fine_tune_epochs
-        if condition.quantized and condition.source_key != condition.key:
-            if allow_pqat:
-                fine_tune_epochs = self._pqat_epoch_budget(model_key)
-                max_epochs = fine_tune_epochs
-                use_qat = True
-            else:
-                max_epochs = 0
-        update_dendrites_during_training = condition.use_dendrites and not condition.quantized
+        training_plan = self._condition_training_plan(
+            model_key, condition, training_hyperparameters, allow_pqat
+        )
         model = build_model(model_key, **self._model_kwargs(model_key))
         condition_dir = self.results_root / model_key / condition.key
         pai_config_snapshot = condition_dir / "PAI_config.json"
         batches_per_epoch = self._batches_per_epoch(bundle)
-
-        if condition.source_key in saved_dirs:
-            checkpoint = self._artifact_path(
-                saved_dirs[condition.source_key],
-                prefer_dendritic="dendrites" in condition.source_key,
-            )
-            model = self._load_source_checkpoint(
-                model,
-                model_key,
-                condition.source_key,
-                checkpoint,
-                condition.use_dendrites,
-                save_name=f"{model_key}_{condition.key}",
-                maximizing_score=metric_direction == "maximize",
-                config_snapshot_path=pai_config_snapshot,
-                dendrite_training_max_epochs=(
-                    max_epochs if update_dendrites_during_training else None
-                ),
-                dynamic_dendritic_training=dynamic_dendritic_training,
-                freeze_dendrite_updates_fraction=0.20,
-                batches_per_epoch=batches_per_epoch,
-            )
-        elif condition.use_dendrites:
-            model = perforate_model(
-                model,
-                save_name=f"{model_key}_{condition.key}",
-                doing_pai=True,
-                maximizing_score=metric_direction == "maximize",
-                modules_to_track=self._perforation_track_modules(model_key),
-                config_snapshot_path=pai_config_snapshot,
-                use_runtime_guard=self._use_pai_runtime_guard(),
-                dendrite_training_max_epochs=(
-                    max_epochs if update_dendrites_during_training else None
-                ),
-                dynamic_dendritic_training=dynamic_dendritic_training,
-                freeze_dendrite_updates_fraction=0.20,
-                batches_per_epoch=batches_per_epoch,
-            )
-            model = self._configure_perforated_model(model, model_key)
+        module_selection, module_output_dimensions = (
+            self._dendrite_initialization_metadata(model, model_key, bundle, condition)
+        )
+        model = self._prepare_condition_model(
+            model=model,
+            model_key=model_key,
+            metric_direction=metric_direction,
+            condition=condition,
+            saved_dirs=saved_dirs,
+            pai_config_snapshot=pai_config_snapshot,
+            training_plan=training_plan,
+            dynamic_dendritic_training=dynamic_dendritic_training,
+            batches_per_epoch=batches_per_epoch,
+            module_selection=module_selection,
+            module_output_dimensions=module_output_dimensions,
+        )
 
         weight_decay = 0.0 if condition.use_dendrites else training_hyperparameters.weight_decay
         training_config = TrainingConfig(
@@ -553,17 +670,18 @@ class BenchmarkRunner:
             use_dendrites=condition.use_dendrites,
             use_pruning=condition.use_pruning,
             prune_amount=condition.prune_amount,
-            use_qat=use_qat,
-            fine_tune_epochs=fine_tune_epochs,
-            max_epochs=max_epochs,
+            use_qat=training_plan.use_qat,
+            fine_tune_epochs=training_plan.fine_tune_epochs,
+            max_epochs=training_plan.max_epochs,
             learning_rate=training_hyperparameters.learning_rate,
             optimizer_name=training_hyperparameters.optimizer_name,
             momentum=training_hyperparameters.momentum,
             weight_decay=weight_decay,
             source_condition_key=condition.source_key,
-            enable_pai_dendrite_updates=update_dendrites_during_training,
+            enable_pai_dendrite_updates=training_plan.update_dendrites_during_training,
             train_dendrites_until_complete=(
-                update_dendrites_during_training and dynamic_dendritic_training
+                training_plan.update_dendrites_during_training
+                and dynamic_dendritic_training
             ),
             freeze_dendrite_updates_fraction=0.20,
         )

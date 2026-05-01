@@ -14,6 +14,8 @@ from typing import Any, Literal
 from tqdm.auto import tqdm
 
 from .compat import (
+    MODULE_OUTPUT_DIMENSIONS_ATTR,
+    attach_module_output_dimensions,
     binary_quantize_tensor,
     choose_device,
     pai_runtime_guard,
@@ -25,9 +27,15 @@ from .compat import (
 
 _MODEL_PT: str = "model.pt"
 _BEST_MODEL_STATS_CSV: str = "best_model_stats.csv"
-_GCN_LINEAR_OUTPUT_DIMENSIONS: dict[str, list[int]] = {
-    ".conv1.linear": [-1, -1, 0],
-    ".conv2.linear": [-1, -1, 0],
+_FALLBACK_MODULE_OUTPUT_DIMENSIONS: dict[str, dict[str, list[int]]] = {
+    "gcn": {
+        ".conv1.linear": [-1, -1, 0],
+        ".conv2.linear": [-1, -1, 0],
+    },
+    "mpnn": {
+        ".message.0": [-1, -1, 0],
+        ".message.2": [-1, -1, 0],
+    },
 }
 OptimizerName = Literal["adam", "adamw", "sgd"]
 
@@ -657,6 +665,105 @@ def _forward(model_key: str, model: Any, batch: tuple[Any, ...]) -> tuple[Any, A
     return model(x), targets, None
 
 
+def _first_tensor(value: Any) -> Any | None:
+    torch = require_torch()
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            tensor = _first_tensor(item)
+            if tensor is not None:
+                return tensor
+    if isinstance(value, dict):
+        for item in value.values():
+            tensor = _first_tensor(item)
+            if tensor is not None:
+                return tensor
+    return None
+
+
+def _dimension_vector_for_module_output(module: Any, output: Any) -> list[int] | None:
+    tensor = _first_tensor(output)
+    if tensor is None:
+        return None
+    rank = getattr(tensor, "ndim", 0)
+    if rank < 2:
+        return None
+    dimensions = [-1] * rank
+    module_type = type(module).__name__.lower()
+    output_axis = 1 if "conv" in module_type and rank > 1 else rank - 1
+    dimensions[output_axis] = 0
+    return dimensions
+
+
+def _module_matches_any(module: Any, module_classes: tuple[Any, ...]) -> bool:
+    return any(isinstance(module, module_class) for module_class in module_classes)
+
+
+def _sample_batch_from_loader(train_loader: Any) -> Any:
+    dataset = getattr(train_loader, "dataset", None)
+    collate_fn = getattr(train_loader, "collate_fn", None)
+    batch_size = getattr(train_loader, "batch_size", None) or 1
+    if (
+        dataset is not None
+        and hasattr(dataset, "__getitem__")
+        and hasattr(dataset, "__len__")
+    ):
+        sample_count = min(max(1, int(batch_size)), len(dataset), 2)
+        samples = [dataset[index] for index in range(sample_count)]
+        if collate_fn is not None:
+            return collate_fn(samples)
+        return samples[0] if sample_count == 1 else samples
+    return next(iter(train_loader))
+
+
+def infer_module_output_dimensions(
+    model: Any,
+    model_key: str,
+    bundle: Any,
+    module_classes: list[Any],
+) -> dict[str, list[int]]:
+    valid_classes = tuple(
+        module_class for module_class in module_classes if isinstance(module_class, type)
+    )
+    if not valid_classes:
+        return {}
+
+    torch = require_torch()
+    device = next(
+        (parameter.device for parameter in model.parameters()),
+        torch.device("cpu"),
+    )
+    dimensions: dict[str, list[int]] = {}
+    handles = []
+
+    def make_hook(module_name: str) -> Any:
+        def hook(module: Any, _inputs: Any, output: Any) -> None:
+            vector = _dimension_vector_for_module_output(module, output)
+            if vector is not None:
+                dimensions[f".{module_name}"] = vector
+
+        return hook
+
+    for module_name, module in model.named_modules():
+        if module_name and _module_matches_any(module, valid_classes):
+            handles.append(module.register_forward_hook(make_hook(module_name)))
+
+    was_training = bool(getattr(model, "training", False))
+    try:
+        model.eval()
+        batch = _sample_batch_from_loader(bundle.train_loader)
+        batch = tuple(item.to(device, non_blocking=True) for item in batch)
+        with torch.no_grad():
+            _forward(model_key, model, batch)
+    finally:
+        for handle in handles:
+            handle.remove()
+        model.train(was_training)
+
+    return dimensions
+
+
 def _compute_loss(model_key: str, criterion: Any, outputs: Any, targets: Any) -> Any:
     if model_key == "actor_critic":
         return criterion(outputs[0], targets)
@@ -1054,13 +1161,16 @@ def _eval_on_loader(
     return loss_val, metrics
 
 
-def _configure_gcn_dendrites(
+def _configure_dendrite_output_dimensions(
     model: Any, model_key: str, use_dendrites: bool, device: Any
 ) -> None:
-    if use_dendrites and model_key == "gcn":
-        set_module_output_dimensions(
-            model, _GCN_LINEAR_OUTPUT_DIMENSIONS, device=device
-        )
+    if not use_dendrites:
+        return
+    module_dimensions = getattr(model, MODULE_OUTPUT_DIMENSIONS_ATTR, None)
+    if not module_dimensions:
+        module_dimensions = _FALLBACK_MODULE_OUTPUT_DIMENSIONS.get(model_key, {})
+        attach_module_output_dimensions(model, module_dimensions)
+    set_module_output_dimensions(model, module_dimensions, device=device)
 
 
 def _determine_skip_info(
@@ -1278,11 +1388,15 @@ def _run_dynamic_dendrite_update(
     _orig_set_trace: Callable[..., None] = pdb_module.set_trace
     pdb_module.set_trace = _no_set_trace
     try:
+        module_dimensions = getattr(
+            context.model, MODULE_OUTPUT_DIMENSIONS_ATTR, None
+        )
         model, restructured, training_complete = pai_tracker.add_validation_score(
             val_metric, context.model
         )
+        attach_module_output_dimensions(model, module_dimensions)
         context.model = model.to(context.device)
-        _configure_gcn_dendrites(
+        _configure_dendrite_output_dimensions(
             context.model,
             context.model_key,
             context.config.use_dendrites,
@@ -1668,7 +1782,9 @@ def _prepare_model_for_training(
     config: TrainingConfig,
 ) -> Any:
     model = model.to(device)
-    _configure_gcn_dendrites(model, model_key, config.use_dendrites, device)
+    _configure_dendrite_output_dimensions(
+        model, model_key, config.use_dendrites, device
+    )
     if config.use_pruning:
         _apply_pruning(model, torch, config.prune_amount)
     if _should_quantize_for_training(config):

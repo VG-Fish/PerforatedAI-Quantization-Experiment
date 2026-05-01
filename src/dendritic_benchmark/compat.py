@@ -7,15 +7,29 @@ import pdb
 import re
 import shutil
 import sys
+import builtins
 from contextlib import contextmanager
 from dataclasses import dataclass
-import builtins
+from pathlib import Path
+from typing import Any, Callable, Iterator
 
 # Module-level flag to ensure the PAI config-saved message is emitted only once
 _PAI_CONFIG_SAVED_PRINTED: bool = False
 _PAI_DEBUGGER_SUPPRESS_REMAINING: int = 0
-from pathlib import Path
-from typing import Any, Callable, Iterator
+MODULE_OUTPUT_DIMENSIONS_ATTR = "_dqb_module_output_dimensions"
+_PAI_CONFIG_LIST_SETTERS: tuple[str, ...] = (
+    "set_modules_to_track",
+    "set_module_names_to_track",
+    "set_module_ids_to_track",
+    "set_modules_to_perforate",
+    "set_module_names_to_perforate",
+    "set_module_ids_to_perforate",
+    # Clear persisted processing config so stale runs don't affect new ones.
+    "set_modules_with_processing",
+    "set_modules_processing_classes",
+    "set_module_names_with_processing",
+    "set_module_by_name_processing_classes",
+)
 
 load_dotenv: Any
 try:  # pragma: no cover - optional dependency
@@ -105,6 +119,13 @@ class BackendStatus:
     perforatedai_available: bool
 
 
+@dataclass(frozen=True)
+class PAIModuleSelection:
+    modules_to_perforate: list[Any] | None = None
+    module_names_to_perforate: list[str] | None = None
+    track_only_module_ids: list[str] | None = None
+
+
 def backend_status() -> BackendStatus:
     return BackendStatus(
         torch_available=torch is not None,
@@ -113,48 +134,55 @@ def backend_status() -> BackendStatus:
     )
 
 
-def _configure_pai_trackers(
-    gpa: Any,
-    modules_to_track: list[Any] | None,
-    module_names_to_track: list[str] | None,
-    confirm_unwrapped_modules: bool,
-) -> None:
-    for setter_name in (
-        "set_modules_to_track",
-        "set_module_names_to_track",
-        "set_module_ids_to_track",
-        "set_modules_to_perforate",
-        "set_module_names_to_perforate",
-        "set_module_ids_to_perforate",
-        # Clear persisted processing config so stale runs don't affect new ones.
-        "set_modules_with_processing",
-        "set_modules_processing_classes",
-        "set_module_names_with_processing",
-        "set_module_by_name_processing_classes",
-    ):
-        setter = getattr(gpa.pc, setter_name, None)
-        if setter is not None:
-            setter([])
+def _call_if_available(target: Any, method_name: str, *args: Any) -> None:
+    method = getattr(target, method_name, None)
+    if method is not None:
+        method(*args)
+
+
+def _clear_pai_tracker_lists(pc: Any) -> None:
+    for setter_name in _PAI_CONFIG_LIST_SETTERS:
+        _call_if_available(pc, setter_name, [])
+
+
+def _append_if_configured(pc: Any, method_name: str, value: Any) -> None:
+    if value:
+        _call_if_available(pc, method_name, value)
+
+
+def _append_pai_module_selection(pc: Any, selection: PAIModuleSelection) -> None:
     # In PerforatedAI 3.2, entries in *_to_track become tracked-only wrappers.
     # Dendrite insertion requires PAINeuronModule wrappers, so benchmark-selected
     # modules must be registered only with the perforation lists.
-    if modules_to_track:
-        append_modules_to_perforate = getattr(gpa.pc, "append_modules_to_perforate", None)
-        if append_modules_to_perforate is not None:
-            append_modules_to_perforate(modules_to_track)
-    if module_names_to_track:
-        append_module_names_to_perforate = getattr(
-            gpa.pc, "append_module_names_to_perforate", None
-        )
-        if append_module_names_to_perforate is not None:
-            append_module_names_to_perforate(module_names_to_track)
-    set_device = getattr(gpa.pc, "set_device", None)
-    if set_device is not None:
-        set_device(choose_device())
-    if hasattr(gpa.pc, "set_testing_dendrite_capacity"):
-        gpa.pc.set_testing_dendrite_capacity(False)
+    _append_if_configured(
+        pc, "append_modules_to_perforate", selection.modules_to_perforate
+    )
+    _append_if_configured(
+        pc,
+        "append_module_names_to_perforate",
+        selection.module_names_to_perforate,
+    )
+    _append_if_configured(
+        pc, "append_module_ids_to_track", selection.track_only_module_ids
+    )
+
+
+def _configure_pai_trackers(
+    gpa: Any,
+    module_selection: PAIModuleSelection | None,
+    confirm_unwrapped_modules: bool,
+    no_backward_workaround: bool = False,
+) -> None:
+    selection = module_selection or PAIModuleSelection()
+    pc = gpa.pc
+    _clear_pai_tracker_lists(pc)
+    _append_pai_module_selection(pc, selection)
+    _call_if_available(pc, "set_device", choose_device())
+    _call_if_available(pc, "set_testing_dendrite_capacity", False)
     if confirm_unwrapped_modules:
-        gpa.pc.set_unwrapped_modules_confirmed(True)
+        _call_if_available(pc, "set_unwrapped_modules_confirmed", True)
+    if no_backward_workaround:
+        _call_if_available(pc, "set_no_backward_workaround", True)
 
 
 def _bounded_dendrite_schedule(
@@ -269,6 +297,19 @@ def set_module_output_dimensions(
         if device is not None and torch is not None:
             value = torch.tensor(dimensions, device=device)
         setter(value)
+
+
+def attach_module_output_dimensions(
+    model: Any,
+    module_dimensions: dict[str, list[int]] | None,
+) -> Any:
+    if module_dimensions:
+        setattr(
+            model,
+            MODULE_OUTPUT_DIMENSIONS_ATTR,
+            {name: list(dimensions) for name, dimensions in module_dimensions.items()},
+        )
+    return model
 
 
 def _consume_pai_config_message(text: str) -> bool:
@@ -447,8 +488,7 @@ def perforate_model(
     save_name: str,
     doing_pai: bool = True,
     maximizing_score: bool = True,
-    modules_to_track: list[Any] | None = None,
-    module_names_to_track: list[str] | None = None,
+    module_selection: PAIModuleSelection | None = None,
     confirm_unwrapped_modules: bool = True,
     config_snapshot_path: Path | str | None = None,
     use_runtime_guard: bool = False,
@@ -456,6 +496,7 @@ def perforate_model(
     dynamic_dendritic_training: bool = True,
     freeze_dendrite_updates_fraction: float = 0.20,
     batches_per_epoch: int | None = None,
+    no_backward_workaround: bool = False,
 ) -> Any:
     if not has_perforatedai():
         return model
@@ -471,7 +512,10 @@ def perforate_model(
 
         def _run_perforation() -> Any:
             _configure_pai_trackers(
-                GPA, modules_to_track, module_names_to_track, confirm_unwrapped_modules
+                GPA,
+                module_selection,
+                confirm_unwrapped_modules,
+                no_backward_workaround=no_backward_workaround,
             )
             if dendrite_training_max_epochs is not None:
                 _configure_pai_training_schedule(
@@ -592,7 +636,11 @@ def choose_device() -> Any:
     if torch is None:
         return "cpu"
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        return torch.device("mps")
+        try:
+            torch.empty(1, device="mps")
+            return torch.device("mps")
+        except Exception:
+            pass
     if torch.cuda.is_available():  # pragma: no cover - CUDA not expected on Mac
         return torch.device("cuda")
     return torch.device("cpu")
