@@ -113,34 +113,6 @@ def backend_status() -> BackendStatus:
     )
 
 
-def _configure_pai_rnn_processors(gpa: Any, modules_to_track: list[Any] | None) -> None:
-    if not modules_to_track or nn is None:
-        return
-    try:
-        lpa = importlib.import_module("perforatedai.library_perforatedai")
-    except Exception:
-        return
-    proc_modules: list[Any] = []
-    proc_classes: list[Any] = []
-    for mod_type in modules_to_track:
-        if mod_type is nn.LSTM:
-            cls = getattr(lpa, "LSTMProcessor", None)
-        elif mod_type is nn.GRU:
-            cls = getattr(lpa, "MultiOutputProcessor", None)
-        else:
-            continue
-        if cls is not None:
-            proc_modules.append(mod_type)
-            proc_classes.append(cls())
-    if not proc_modules:
-        return
-    set_mwp = getattr(gpa.pc, "set_modules_with_processing", None)
-    set_mpc = getattr(gpa.pc, "set_modules_processing_classes", None)
-    if set_mwp is not None and set_mpc is not None:
-        set_mwp(proc_modules)
-        set_mpc(proc_classes)
-
-
 def _configure_pai_trackers(
     gpa: Any,
     modules_to_track: list[Any] | None,
@@ -154,6 +126,11 @@ def _configure_pai_trackers(
         "set_modules_to_perforate",
         "set_module_names_to_perforate",
         "set_module_ids_to_perforate",
+        # Clear persisted processing config so stale runs don't affect new ones.
+        "set_modules_with_processing",
+        "set_modules_processing_classes",
+        "set_module_names_with_processing",
+        "set_module_by_name_processing_classes",
     ):
         setter = getattr(gpa.pc, setter_name, None)
         if setter is not None:
@@ -171,7 +148,6 @@ def _configure_pai_trackers(
         )
         if append_module_names_to_perforate is not None:
             append_module_names_to_perforate(module_names_to_track)
-    _configure_pai_rnn_processors(gpa, modules_to_track)
     set_device = getattr(gpa.pc, "set_device", None)
     if set_device is not None:
         set_device(choose_device())
@@ -214,7 +190,7 @@ def _apply_pai_schedule_values(pc: Any, values: dict[str, Any]) -> None:
         _call_pai_setter(pc, setter_name, value)
 
 
-def _configure_dynamic_pai_schedule(pc: Any) -> None:
+def _configure_dynamic_pai_schedule(pc: Any, batches_per_epoch: int | None = None) -> None:
     _set_pai_switch_mode(pc, "DOING_HISTORY")
     _apply_pai_schedule_values(
         pc,
@@ -224,6 +200,8 @@ def _configure_dynamic_pai_schedule(pc: Any) -> None:
             "set_max_dendrites": 100,
         },
     )
+    if batches_per_epoch is not None:
+        _call_pai_setter(pc, "set_initial_correlation_batches", max(1, batches_per_epoch - 1))
 
 
 def _configure_bounded_pai_schedule(
@@ -231,6 +209,7 @@ def _configure_bounded_pai_schedule(
     *,
     max_epochs: int,
     freeze_fraction: float,
+    batches_per_epoch: int | None = None,
 ) -> None:
     _, target_switches, switch_interval, p_epochs = _bounded_dendrite_schedule(
         max_epochs, freeze_fraction
@@ -246,6 +225,8 @@ def _configure_bounded_pai_schedule(
             "set_max_dendrites": target_switches,
         },
     )
+    if batches_per_epoch is not None:
+        _call_pai_setter(pc, "set_initial_correlation_batches", max(1, batches_per_epoch - 1))
 
 
 def _configure_pai_training_schedule(
@@ -254,14 +235,16 @@ def _configure_pai_training_schedule(
     max_epochs: int,
     dynamic_dendritic_training: bool,
     freeze_fraction: float,
+    batches_per_epoch: int | None = None,
 ) -> None:
     pc = gpa.pc
     if dynamic_dendritic_training:
-        _configure_dynamic_pai_schedule(pc)
+        _configure_dynamic_pai_schedule(pc, batches_per_epoch=batches_per_epoch)
         return
 
     _configure_bounded_pai_schedule(
-        pc, max_epochs=max_epochs, freeze_fraction=freeze_fraction
+        pc, max_epochs=max_epochs, freeze_fraction=freeze_fraction,
+        batches_per_epoch=batches_per_epoch,
     )
 
 
@@ -292,7 +275,6 @@ def _consume_pai_debugger_message(text: str) -> bool:
     if not stripped:
         return False
     if stripped.startswith("WARNING: Parameter does not have parameter_type attribute"):
-        _print_pai_debugger_notice(stripped)
         _PAI_DEBUGGER_SUPPRESS_REMAINING = 8
         return True
     if stripped.startswith(
@@ -315,8 +297,17 @@ def _consume_pai_debugger_message(text: str) -> bool:
     return False
 
 
+def _consume_pai_noise_message(text: str) -> bool:
+    stripped = text.strip()
+    return stripped.startswith("For PAI training it is recommended to not use weight decay")
+
+
 def _consume_pai_output_message(text: str) -> bool:
-    return _consume_pai_config_message(text) or _consume_pai_debugger_message(text)
+    return (
+        _consume_pai_config_message(text)
+        or _consume_pai_debugger_message(text)
+        or _consume_pai_noise_message(text)
+    )
 
 
 class _PaiConfigFilterStream:
@@ -441,6 +432,7 @@ def perforate_model(
     dendrite_training_max_epochs: int | None = None,
     dynamic_dendritic_training: bool = True,
     freeze_dendrite_updates_fraction: float = 0.20,
+    batches_per_epoch: int | None = None,
 ) -> Any:
     if not has_perforatedai():
         return model
@@ -450,6 +442,9 @@ def perforate_model(
         GPA = importlib.import_module("perforatedai.globals_perforatedai")
         UPA = importlib.import_module("perforatedai.utils_perforatedai")
         upa_perforate_model = getattr(UPA, "perforate_model")
+
+        modules_mod = importlib.import_module("perforatedai.modules_perforatedai")
+        _set_tracked_params = getattr(modules_mod, "set_tracked_params", None)
 
         def _run_perforation() -> Any:
             _configure_pai_trackers(
@@ -461,15 +456,19 @@ def perforate_model(
                     max_epochs=dendrite_training_max_epochs,
                     dynamic_dendritic_training=dynamic_dendritic_training,
                     freeze_fraction=freeze_dendrite_updates_fraction,
+                    batches_per_epoch=batches_per_epoch,
                 )
             pai_save_name = str(_pai_save_path(save_name))
-            return upa_perforate_model(
+            perforated = upa_perforate_model(
                 model,
                 doing_pai=doing_pai,
                 save_name=pai_save_name,
                 maximizing_score=maximizing_score,
                 making_graphs=False,
             )
+            if _set_tracked_params is not None:
+                _set_tracked_params(perforated)
+            return perforated
 
         if use_runtime_guard:
             with pai_runtime_guard():
@@ -538,14 +537,19 @@ def load_pai_system_checkpoint(
         return model
     try:  # pragma: no cover - optional dependency
         UPA = importlib.import_module("perforatedai.utils_perforatedai")
+        modules_mod = importlib.import_module("perforatedai.modules_perforatedai")
         load_system = getattr(UPA, "load_system")
+        _set_tracked_params = getattr(modules_mod, "set_tracked_params", None)
         with pai_runtime_guard():
-            return load_system(
+            loaded = load_system(
                 model,
                 str(_pai_save_path(save_name)),
                 checkpoint_name,
                 True,
             )
+        if _set_tracked_params is not None:
+            _set_tracked_params(loaded)
+        return loaded
     except SystemExit as exc:
         print(
             f"[state] PerforatedAI system load aborted from "

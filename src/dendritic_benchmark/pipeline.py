@@ -137,6 +137,7 @@ class BenchmarkRunner:
         dendrite_training_max_epochs: int | None = None,
         dynamic_dendritic_training: bool = False,
         freeze_dendrite_updates_fraction: float = 0.20,
+        batches_per_epoch: int | None = None,
     ) -> Any:
         source_condition = condition_by_key(source_key)
 
@@ -155,6 +156,7 @@ class BenchmarkRunner:
                 dendrite_training_max_epochs=dendrite_training_max_epochs,
                 dynamic_dendritic_training=dynamic_dendritic_training,
                 freeze_dendrite_updates_fraction=freeze_dendrite_updates_fraction,
+                batches_per_epoch=batches_per_epoch,
             )
             model = self._configure_perforated_model(model, model_key)
             source_save_name = f"{model_key}_{source_key}"
@@ -181,6 +183,7 @@ class BenchmarkRunner:
                 dendrite_training_max_epochs=dendrite_training_max_epochs,
                 dynamic_dendritic_training=dynamic_dendritic_training,
                 freeze_dendrite_updates_fraction=freeze_dendrite_updates_fraction,
+                batches_per_epoch=batches_per_epoch,
             )
             model = self._configure_perforated_model(model, model_key)
         return model
@@ -241,7 +244,7 @@ class BenchmarkRunner:
         if nn is None:
             return []
         if model_key in {"lstm_forecaster", "lstm_autoencoder"}:
-            return [nn.LSTM]
+            return [nn.Linear]
         if model_key in {"distilbert", "gru_forecaster"}:
             return [nn.GRU]
         if model_key == "attentivefp_freesolv":
@@ -466,6 +469,16 @@ class BenchmarkRunner:
         write_comparison_reports(all_records, self.comparison_root)
         return all_records
 
+    @staticmethod
+    def _batches_per_epoch(bundle: Any) -> int | None:
+        train_loader = getattr(bundle, "train_loader", None)
+        if train_loader is None:
+            return None
+        try:
+            return len(train_loader)
+        except TypeError:
+            return None
+
     def _run_condition(
         self,
         model_key: str,
@@ -493,6 +506,8 @@ class BenchmarkRunner:
         model = build_model(model_key, **self._model_kwargs(model_key))
         condition_dir = self.results_root / model_key / condition.key
         pai_config_snapshot = condition_dir / "PAI_config.json"
+        batches_per_epoch = self._batches_per_epoch(bundle)
+
         if condition.source_key in saved_dirs:
             checkpoint = self._artifact_path(
                 saved_dirs[condition.source_key],
@@ -512,6 +527,7 @@ class BenchmarkRunner:
                 ),
                 dynamic_dendritic_training=dynamic_dendritic_training,
                 freeze_dendrite_updates_fraction=0.20,
+                batches_per_epoch=batches_per_epoch,
             )
         elif condition.use_dendrites:
             model = perforate_model(
@@ -527,6 +543,7 @@ class BenchmarkRunner:
                 ),
                 dynamic_dendritic_training=dynamic_dendritic_training,
                 freeze_dendrite_updates_fraction=0.20,
+                batches_per_epoch=batches_per_epoch,
             )
             model = self._configure_perforated_model(model, model_key)
 
