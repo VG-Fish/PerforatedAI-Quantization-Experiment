@@ -13,6 +13,7 @@ authors = [{ name = "Codex" }]
 dependencies = [
     "argcomplete>=3.6.2",
     "datasets>=3.0.0",
+    "transformers>=4.40.0",
     "gymnasium[classic-control,box2d]>=1.0.0",
     "matplotlib>=3.10.9",
     "python-dotenv>=1.0.1",

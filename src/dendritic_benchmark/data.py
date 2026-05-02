@@ -493,22 +493,34 @@ def _build_ag_news(batch_size: int) -> TaskBundle:
 def _build_sst2(batch_size: int) -> TaskBundle:
     torch = require_torch()
     datasets = _require_dependency("datasets")
+    transformers = _require_dependency("transformers")
+    tokenizer = transformers.AutoTokenizer.from_pretrained("distilbert-base-uncased")
     loaded = datasets.load_dataset("glue", "sst2", cache_dir=_hf_dataset_cache())
-    vocab: dict[str, int] = _build_vocab(loaded["train"]["sentence"], 5_000)
-    x_train = _encode_texts(loaded["train"]["sentence"], vocab, 96)
+
+    def _tokenize(sentences: list[str]) -> tuple[Any, Any]:
+        encoding = tokenizer(
+            sentences,
+            padding="max_length",
+            truncation=True,
+            max_length=128,
+            return_tensors="pt",
+        )
+        return encoding["input_ids"], encoding["attention_mask"]
+
+    train_ids, train_mask = _tokenize(loaded["train"]["sentence"])
     y_train = torch.tensor(loaded["train"]["label"], dtype=torch.long)
-    train_full = _TensorRowsDataset(x_train, y_train)
+    train_full = _TensorRowsDataset(train_ids, train_mask, y_train)
     train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
-    x_test = _encode_texts(loaded["validation"]["sentence"], vocab, 96)
+    test_ids, test_mask = _tokenize(loaded["validation"]["sentence"])
     y_test = torch.tensor(loaded["validation"]["label"], dtype=torch.long)
     return _bundle_from_splits(
         train_ds,
         val_ds,
-        _TensorRowsDataset(x_test, y_test),
+        _TensorRowsDataset(test_ids, test_mask, y_test),
         batch_size,
         "Accuracy",
         "maximize",
-        "SST-2 tokenized sentiment sentences",
+        "SST-2 sentences tokenized with distilbert-base-uncased tokenizer",
     )
 
 
@@ -1208,7 +1220,7 @@ _BATCH_SIZES: dict[str, int] = {
     "mpnn": 32,  # ESOL molecular graphs — variable topology
     "actor_critic": 1024,  # CartPole 4-D observations — negligible per-sample cost
     "lstm_autoencoder": 256,  # MIT-BIH 128-sample ECG windows
-    "distilbert": 128,  # SST-2 token sequences
+    "distilbert": 32,  # DistilBERT 128-token sequences — larger model requires smaller batches
     "dqn_lunarlander": 128,  # Matches tuned SB3 RL Zoo DQN batch size.
     "ppo_bipedalwalker": 64,  # Matches tuned SB3 RL Zoo PPO minibatch size.
     "attentivefp_freesolv": 32,

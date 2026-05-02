@@ -662,6 +662,9 @@ def _forward(model_key: str, model: Any, batch: tuple[Any, ...]) -> tuple[Any, A
     if model_key == "actor_critic":
         x, targets = batch
         return model(x), targets, None
+    if model_key == "distilbert":
+        input_ids, attention_mask, targets = batch
+        return model(input_ids, attention_mask), targets, None
     x, targets = batch
     return model(x), targets, None
 

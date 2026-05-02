@@ -209,6 +209,7 @@ For each model below, this document captures:
 - Metric direction: maximize
 - Factory key: `distilbert`
 - Model kwargs: `num_classes=2`
+- Architecture: `distilbert-base-uncased` loaded via `transformers.AutoModelForSequenceClassification`. 6-layer Transformer encoder (66M parameters) fine-tuned for binary sentiment classification. Input batches are 3-tuples `(input_ids, attention_mask, label)` produced by the matching HuggingFace tokenizer with `max_length=128`.
 - Training recipe:
   - `batch_size=32`
   - `max_epochs=4`
@@ -216,7 +217,7 @@ For each model below, this document captures:
   - `optimizer_name=adamw`
   - `momentum=0.9`
   - `weight_decay=1.0e-2`
-- Perforation registration: `nn.GRU`
+- Perforation registration: default (`nn.Linear`) — targets the Q/K/V/output projections inside each attention block and the two feed-forward sublayer linears.
 - PQAT epoch budget: `1`
 
 ## 11. `dqn_lunarlander` — DQN (LunarLander)

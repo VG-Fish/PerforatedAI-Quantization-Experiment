@@ -165,18 +165,17 @@ if nn is not None:  # pragma: no branch - optional dependency gating
             return self.output(decoded)
 
 
-    class DistilBertFallback(nn.Module):
-        def __init__(self, vocab_size: int = 5000, embed_dim: int = 128, num_classes: int = 2):
+    class DistilBertClassifier(nn.Module):
+        def __init__(self, num_classes: int = 2):
             super().__init__()
-            self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-            self.encoder = nn.GRU(embed_dim, 128, batch_first=True, bidirectional=True)
-            self.head = nn.Linear(256, num_classes)
+            transformers = __import__("transformers")
+            self.model = transformers.AutoModelForSequenceClassification.from_pretrained(
+                "distilbert-base-uncased",
+                num_labels=num_classes,
+            )
 
-        def forward(self, x: Any) -> Any:
-            embedded = self.embedding(x.long())
-            encoded, _ = self.encoder(embedded)
-            pooled = encoded.mean(dim=1)
-            return self.head(pooled)
+        def forward(self, input_ids: Any, attention_mask: Any) -> Any:
+            return self.model(input_ids=input_ids, attention_mask=attention_mask).logits
 
 
     class DQN(nn.Module):
@@ -515,7 +514,7 @@ if nn is not None:  # pragma: no branch - optional dependency gating
 
 else:  # pragma: no cover - import-time fallback
 
-    LeNet5 = M5 = LSTMForecaster = TextCNN = GCN = TabNetLite = MPNN = ActorCritic = LSTMAutoencoder = DistilBertFallback = object
+    LeNet5 = M5 = LSTMForecaster = TextCNN = GCN = TabNetLite = MPNN = ActorCritic = LSTMAutoencoder = DistilBertClassifier = object
     DQN = PPOPolicy = AttentiveFPLite = GIN = TCNForecaster = GRUForecaster = PointNet = VAE = SNNLite = TinyUNet = SAINTLite = CapsNetLite = ConvLSTM = object
 
 
@@ -524,7 +523,7 @@ M5 = cast(Any, M5)
 TextCNN = cast(Any, TextCNN)
 GCN = cast(Any, GCN)
 TabNetLite = cast(Any, TabNetLite)
-DistilBertFallback = cast(Any, DistilBertFallback)
+DistilBertClassifier = cast(Any, DistilBertClassifier)
 GIN = cast(Any, GIN)
 TCNForecaster = cast(Any, TCNForecaster)
 GRUForecaster = cast(Any, GRUForecaster)
@@ -563,7 +562,7 @@ MODEL_FACTORIES: dict[str, Callable[..., Any]] = {
     "mpnn": lambda **_: MPNN(),
     "actor_critic": lambda **_: ActorCritic(),
     "lstm_autoencoder": lambda **_: LSTMAutoencoder(),
-    "distilbert": lambda num_classes=2, **_: _construct(DistilBertFallback, num_classes=num_classes),
+    "distilbert": lambda num_classes=2, **_: _construct(DistilBertClassifier, num_classes=num_classes),
     "dqn_lunarlander": lambda **_: DQN(),
     "ppo_bipedalwalker": lambda **_: PPOPolicy(),
     "attentivefp_freesolv": lambda **_: AttentiveFPLite(),
