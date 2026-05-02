@@ -539,6 +539,11 @@ def perforate_model(
     no_backward_workaround: bool = False,
 ) -> Any:
     if not has_perforatedai():
+        if doing_pai:
+            raise RuntimeError(
+                "PerforatedAI is required for dendritic benchmark conditions. "
+                "Install project dependencies before running dendritic models."
+            )
         return model
 
     try:  # pragma: no cover - optional dependency
@@ -584,7 +589,13 @@ def perforate_model(
             perforated_model = _run_perforation()
         _snapshot_pai_config(_snapshot_stem(save_name), config_snapshot_path)
         return perforated_model
-    except Exception:
+    except Exception as exc:
+        if doing_pai:
+            raise RuntimeError(
+                "PerforatedAI failed to perforate the model. The dendritic "
+                "condition is invalid, so the benchmark will not continue with "
+                "an unperforated fallback model."
+            ) from exc
         return model
 
 

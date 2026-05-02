@@ -4,26 +4,26 @@ This document consolidates all project documentation: the experiment plan, exten
 
 ---
 
-# Part 1: 10-Model, 10-Domain Experiment Plan
+# Part 1: Benchmark Experiment Plan
 
 ## Overview
-This experiment investigates whether quantized dendritic models (created via Perforated Backpropagation) outperform non-dendritic counterparts across diverse fields. Ten models are selected — one per domain — spanning complexities from ~50K to ~66M parameters. Each model is trained and evaluated under **12 experimental conditions**, yielding 120 total training runs.
+This experiment investigates whether quantized dendritic models (created via Perforated Backpropagation) outperform non-dendritic counterparts across diverse fields. The current runnable suite contains **25 models** spanning complexities from ~25K to ~66M parameters. Each model is trained and evaluated under **12 experimental conditions**, yielding 300 total training/evaluation runs for a full sweep.
 
 The hardware target is an **Apple M3 Pro** chip using PyTorch's MPS backend, with a total budget of 12–48 hours. All quantization uses `torchao` (PyTorch-native), and dendrites are added via the `PerforatedAI` library.
 
 ***
-## The 10 Benchmark Models
+## Original 10 Benchmark Models
 | # | Model | Domain | Dataset | Complexity | ~Params | Est. Base Hrs |
 |---|-------|--------|---------|------------|---------|---------------|
 | 1 | **LeNet-5** | Image Classification | MNIST | Tiny | 60K | 0.5h |
-| 2 | **M5 (1D-CNN)** | Audio Classification | SpeechCommands | Tiny | 300K | 1h |
-| 3 | **LSTM Univariate** | Time-Series Forecasting | ETTh1 | Tiny | 200K | 1h |
-| 4 | **TextCNN** | NLP / Text Classification | AG News | Tiny | 500K | 0.5h |
-| 5 | **GCN** | Graph / Node Classification | Cora | Tiny | 180K | 0.5h |
-| 6 | **TabNet** | Tabular Classification | Adult Income | Small | 1M | 1h |
-| 7 | **MPNN** | Drug Discovery / Molecular | ESOL (MoleculeNet) | Small | 400K | 1h |
-| 8 | **Actor-Critic** | Reinforcement Learning | CartPole-v1 | Tiny | 50K | 0.3h |
-| 9 | **LSTM Autoencoder** | Anomaly Detection (ECG) | MIT-BIH | Small | 800K | 1.5h |
+| 2 | **M5 (1D-CNN)** | Audio Classification | SpeechCommands | Tiny | 25K | 1h |
+| 3 | **LSTM Univariate** | Time-Series Forecasting | ETTh1 | Tiny | 52K | 1h |
+| 4 | **TextCNN** | NLP / Text Classification | AG News | Small | 873K | 0.5h |
+| 5 | **GCN** | Graph / Node Classification | Cora | Tiny | 92K | 0.5h |
+| 6 | **TabNet** | Tabular Classification | Adult Income | Tiny | 39K | 1h |
+| 7 | **MPNN** | Drug Discovery / Molecular | ESOL (MoleculeNet) | Small | 353K | 1h |
+| 8 | **Actor-Critic** | Reinforcement Learning | CartPole-v1 | Tiny | 18K | 0.3h |
+| 9 | **LSTM Autoencoder** | Anomaly Detection (ECG) | MIT-BIH | Tiny | 71K | 1.5h |
 | 10 | **DistilBERT (fine-tune)** | NLP / Seq Classification | SST-2 | Large | 66M | 10h |
 
 > Models 1–9 are intentionally lightweight to allow all 12 conditions to complete within the 12–48h budget. Model 10 (DistilBERT) serves as the large-model anchor.
@@ -52,7 +52,7 @@ fine-tuning after an initial PTQ snapshot is saved.
 
 ***
 ## Output Graphs (Per Model)
-For each of the 10 models, generate **3 comparison bar charts** — one for each metric — with all 12 conditions on the x-axis:
+For each of the 25 models, generate **3 comparison bar charts** — one for each metric — with all 12 conditions on the x-axis:
 
 ### Graph Set A: Accuracy (or Task Metric)
 - Y-axis: Accuracy % (classification), MAE/MSE (regression/forecasting), Reward (RL), AUC (anomaly), ELBO (VAE)
@@ -73,14 +73,14 @@ For each of the 10 models, generate **3 comparison bar charts** — one for each
 ## Cross-Model Comparison Graphs
 After all individual runs, produce the following **cross-domain comparison plots**:
 
-### Cross-Graph 1: Accuracy Retention Heatmap (10 × 13)
+### Cross-Graph 1: Accuracy Retention Heatmap (25 × 12)
 - Rows = models/domains, Columns = conditions
 - Cell value = accuracy as % of the Base FP32 baseline (retention ratio)
 
 ### Cross-Graph 2: Size Reduction vs. Accuracy Tradeoff (scatter)
 - X-axis: File size reduction ratio vs. Base FP32
 - Y-axis: Accuracy retention (%)
-- One point per (model × condition) combination — 130 points total
+- One point per (model × condition) combination — 300 points total
 
 ### Cross-Graph 3: "Dendrite Delta" Bar Chart (per domain)
 - For each domain: side-by-side bars of `Base FP32` vs `+Dendrites FP32` accuracy
@@ -145,16 +145,19 @@ model = UPA.perforate_model(
 )
 ```
 
-For non-standard layers (GRUs, Transformers, custom blocks):
+For custom integrations outside this benchmark, non-standard layers can be registered explicitly when their outputs are compatible with PerforatedAI:
 ```python
 GPA.pc.append_modules_to_perforate([nn.MultiheadAttention])
 GPA.pc.append_module_names_to_perforate(['encoder_block'])
 GPA.pc.append_module_ids_to_perforate(['.layer1.0.conv1'])
 ```
 
-The benchmark compatibility wrapper registers model-specific non-standard
-modules with PerforatedAI's perforation list when those APIs are available, and
-it forwards the selected runtime device into `GPA.pc.set_device(...)`.
+This benchmark keeps the runtime path on tensor-returning `nn.Linear`,
+`nn.Conv1d`, and `nn.Conv2d` modules. Recurrent and attention-style benchmark
+models are written with explicit Linear gate/projection layers so those
+parameters are still eligible for dendritic insertion without directly wrapping
+tuple-returning LSTM/GRU/MultiheadAttention modules. The compatibility wrapper
+also forwards the selected runtime device into `GPA.pc.set_device(...)`.
 
 #### Step 3 — Optimizer & Scheduler Setup
 ```python
@@ -322,7 +325,7 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 | **Dataset** | FreeSolv (642 molecules, hydration free energy regression) |
 | **Architecture** | Multi-layer graph attention with node/edge features + global readout |
 | **Metric** | RMSE (kcal/mol) |
-| **PAI Notes** | Must add `GPA.pc.append_modules_to_perforate([nn.GRUCell])` before `perforate_model` |
+| **PAI Notes** | GRU-style graph updates are implemented with explicit Linear gates, so the default Linear/Conv perforation registration applies. |
 
 #### Model 14 — GIN (IMDB-B, Graph Classification)
 | Field | Value |
@@ -351,9 +354,9 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 | **Key** | `gru_forecaster` |
 | **Domain** | Time-Series Forecasting — RNN variant |
 | **Dataset** | Weather (21 meteorological features) |
-| **Architecture** | 2-layer bidirectional GRU, FC projection to multi-step output |
+| **Architecture** | 2-layer GRU forecaster implemented with explicit Linear update/reset/new gates, FC projection to multi-step output |
 | **Metric** | MAE |
-| **PAI Notes** | Must declare `GPA.pc.append_modules_to_perforate([nn.GRU])` |
+| **PAI Notes** | Default Linear/Conv perforation registration applies to the gate projections. |
 
 ### Group D: Entirely New Domains
 
@@ -375,13 +378,13 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 | **Architecture** | FC encoder → (μ, logσ²), reparameterization trick, FC decoder; ELBO loss |
 | **Metric** | ELBO (higher = better) |
 
-#### Model 19 — Spiking Neural Network (SpikingJelly, N-MNIST)
+#### Model 19 — Spiking Neural Network (N-MNIST)
 | Field | Value |
 |---|---|
 | **Key** | `snn_nmnist` |
 | **Domain** | Neuromorphic Computing / Event-Driven Classification |
 | **Dataset** | N-MNIST (event-camera MNIST, 60K samples) |
-| **Architecture** | Conv-LIF → Conv-LIF → FC-LIF SNN, T=10 timesteps, surrogate gradient (ATan) |
+| **Architecture** | Conv-LIF → Conv-LIF → FC-LIF SNN, T=10 timesteps, PyTorch surrogate-gradient spike activation |
 | **Metric** | Accuracy (%) |
 | **Scientific Rationale** | Most biologically motivated experiment — biological dendrites and spiking neurons coexist |
 
@@ -422,7 +425,7 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 | **Dataset** | Adult Income |
 | **Architecture** | Feature embedding, column-wise self-attention, row-wise inter-sample attention |
 | **Metric** | Accuracy (%) |
-| **PAI Notes** | Use `GPA.pc.append_modules_to_perforate([nn.MultiheadAttention])` |
+| **PAI Notes** | Attention uses explicit Linear Q/K/V/output projections, so default Linear/Conv perforation registration applies. |
 
 #### Model 24 — Capsule Network (CapsNet, MNIST)
 | Field | Value |
@@ -448,28 +451,28 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 | # | Key | Domain | Dataset | ~Params |
 |---|---|---|---|---|
 | 1 | `lenet5` | Image (tiny CNN) | MNIST | 60K |
-| 2 | `m5` | Audio (1D-CNN) | SpeechCommands | 35K |
-| 3 | `lstm_forecaster` | Time-Series (RNN) | ETTh1 | 17K |
-| 4 | `textcnn` | NLP (Text CNN) | AG News | 739K |
+| 2 | `m5` | Audio (1D-CNN) | SpeechCommands | 25K |
+| 3 | `lstm_forecaster` | Time-Series (RNN) | ETTh1 | 52K |
+| 4 | `textcnn` | NLP (Text CNN) | AG News | 873K |
 | 5 | `gcn` | Graph (Conv) | Cora | 92K |
-| 6 | `tabnet` | Tabular (Seq Att) | Adult Income | 5K |
-| 7 | `mpnn` | Molecular (GNN) | ESOL | 34K |
-| 8 | `actor_critic` | RL (CartPole) | CartPole-v1 | 5K |
-| 9 | `lstm_autoencoder` | Anomaly Detect | MIT-BIH ECG | 34K |
-| 10 | `distilbert` | Large NLP (Xfmr) | SST-2 | 839K |
-| 11 | `dqn_lunarlander` | RL (CNN Q-net) | LunarLander-v2 | ~50K |
-| 12 | `ppo_bipedalwalker` | RL (continuous) | BipedalWalker-v3 | ~80K |
-| 13 | `attentivefp_freesolv` | Molecular (Att-GNN) | FreeSolv | ~120K |
-| 14 | `gin_imdbb` | Graph Classif. | IMDB-B | ~30K |
-| 15 | `tcn_forecaster` | Time-Series (TCN) | ETTm1 | ~200K |
-| 16 | `gru_forecaster` | Time-Series (GRU) | Weather | ~25K |
+| 6 | `tabnet` | Tabular (Seq Att) | Adult Income | 39K |
+| 7 | `mpnn` | Molecular (GNN) | ESOL | 353K |
+| 8 | `actor_critic` | RL (CartPole) | CartPole-v1 | 18K |
+| 9 | `lstm_autoencoder` | Anomaly Detect | MIT-BIH ECG | 71K |
+| 10 | `distilbert` | Large NLP (Xfmr) | SST-2 | 66M |
+| 11 | `dqn_lunarlander` | RL (Q-net) | LunarLander-v2 | 69K |
+| 12 | `ppo_bipedalwalker` | RL (continuous) | BipedalWalker-v3 | 20K |
+| 13 | `attentivefp_freesolv` | Molecular (Att-GNN) | FreeSolv | 611K |
+| 14 | `gin_imdbb` | Graph Classif. | IMDB-B | 39K |
+| 15 | `tcn_forecaster` | Time-Series (TCN) | ETTm1 | 99K |
+| 16 | `gru_forecaster` | Time-Series (GRU) | Weather | 74K |
 | 17 | `pointnet_modelnet40` | 3D Point Cloud | ModelNet40 | ~3.5M |
-| 18 | `vae_mnist` | Generative (VAE) | MNIST | ~400K |
-| 19 | `snn_nmnist` | Neuromorphic SNN | N-MNIST | ~100K |
-| 20 | `unet_isic` | Medical Seg. | ISIC 2018 | ~7M |
+| 18 | `vae_mnist` | Generative (VAE) | MNIST | ~1.1M |
+| 19 | `snn_nmnist` | Neuromorphic SNN | N-MNIST | 60K |
+| 20 | `unet_isic` | Medical Seg. | ISIC 2018 | ~1.9M |
 | 21 | `resnet18_cifar10` | Image (ResNet) | CIFAR-10 | ~11M |
 | 22 | `mobilenetv2_cifar10` | Image (Efficient) | CIFAR-10 | ~2.2M |
-| 23 | `saint_adult` | Tabular (Xfmr) | Adult Income | ~500K |
+| 23 | `saint_adult` | Tabular (Xfmr) | Adult Income | 205K |
 | 24 | `capsnet_mnist` | Image (CapsNet) | MNIST | ~8M |
 | 25 | `convlstm_movingmnist` | Spatiotemporal | Moving MNIST | ~500K |
 
@@ -492,7 +495,7 @@ For MPNN, Actor-Critic, and LSTM Forecaster, compare L1 unstructured global prun
 For the 5 best Q4 conditions per model, measure actual wall-clock inference latency on M3 Pro (batch size 1 and 32) using `torch.utils.benchmark.Timer`. Add `dqb benchmark_models` command to `cli.py`.
 
 ### Experiment F — Dataset Difficulty Scaling (LSTM Forecaster)
-Run the full 13-condition suite for LSTM Forecaster on ETTh1, ETTh2, ETTm1, ETTm2, and Weather to test whether the +51.4pp Q4 rescue magnitude scales with dataset complexity.
+Run the full 12-condition suite for LSTM Forecaster on ETTh1, ETTh2, ETTm1, ETTm2, and Weather to test whether the +51.4pp Q4 rescue magnitude scales with dataset complexity.
 
 ### Experiment G — Anomaly Detection Regularization Study
 For LSTM Autoencoder, add Gaussian noise injection at σ ∈ {0.01, 0.05, 0.10, 0.20} during training to validate whether the Q4 inversion (+123.5% AUC) is due to implicit noise injection.
@@ -546,6 +549,10 @@ Declares benchmark model and condition metadata.
 
 The run method also computes `max_epochs` from the model recipe. Baseline and default dendritic FP32 conditions use it as a hard epoch budget; dynamic dendritic runs use it as the canonical comparison budget and continue until PerforatedAI reports completion.
 
+Model architecture changes invalidate previous checkpoints for that model key.
+Use `--ignore-saved-models` or a fresh `--results-directory` when rerunning
+after implementation updates.
+
 ## Real Data
 
 ### `src/dendritic_benchmark/data.py`
@@ -554,7 +561,7 @@ Builds task bundles for each benchmark task and caches datasets under `data/` by
 ## Models
 
 ### `src/dendritic_benchmark/models.py`
-Defines compact PyTorch model implementations for all 25 benchmark models and exposes `build_model()` to construct each architecture by key. Includes all model classes inline and a `MODEL_FACTORIES` dict mapping keys to constructors. ResNet-18 and MobileNetV2 use `torchvision.models` with CIFAR-10 adaptations.
+Defines PyTorch implementations for all 25 benchmark models and exposes `build_model()` to construct each architecture by key. The recurrent models use explicit Linear-gated LSTM/GRU cells so PerforatedAI can operate on recurrent projections; TabNet, SAINT, AttentiveFP, PointNet, CapsNet, SNN, U-Net, ConvLSTM, ResNet-18, and MobileNetV2 are implemented as named architectures rather than placeholder fallbacks. ResNet-18 and MobileNetV2 use `torchvision.models` with CIFAR-10 adaptations.
 
 ## Compatibility Helpers
 
@@ -563,7 +570,7 @@ Isolates optional dependencies and PerforatedAI integration.
 - Safely imports PyTorch and optional `dotenv`.
 - Detects MPS, CUDA, or CPU at runtime.
 - Mirrors PerforatedAI token and email aliases from environment variables.
-- Wraps and configures models with PerforatedAI when available. Model-specific non-standard modules are registered for perforation, the selected runtime device is forwarded to PerforatedAI when supported, and bounded dendritic runs get a budget-aware switch schedule. Suppresses repeated `[PAI Config] Saved` messages by patching `builtins.print`.
+- Wraps and configures dendritic models with PerforatedAI. Dendritic conditions fail fast if PerforatedAI is missing or cannot perforate the model, so an unperforated fallback cannot be recorded as a dendritic result. The selected runtime device is forwarded to PerforatedAI when supported, and bounded dendritic runs get a budget-aware switch schedule. Suppresses repeated `[PAI Config] Saved` messages by patching `builtins.print`.
 - Provides simple symmetric, ternary, and binary quantization helpers.
 
 ## Training and Evaluation

@@ -179,8 +179,8 @@ flowchart TD
     H -->|No| F
     I --> F
     F -->|Done| J["results.py<br>write_comparison_reports<br>all records"]
-    J --> K["accuracy_retention_heatmap.svg<br>10x13 normalized scores"]
-    J --> L["size_tradeoff_scatter.svg<br>130 model×condition points"]
+    J --> K["accuracy_retention_heatmap.svg<br>25x12 normalized scores"]
+    J --> L["size_tradeoff_scatter.svg<br>300 model×condition points"]
     J --> M["dendrite_delta.svg<br>Base FP32 vs Dendrites FP32"]
     J --> N["best_quantization_heatmap.svg<br>best accuracy per bit level"]
     J --> O[summary.csv]

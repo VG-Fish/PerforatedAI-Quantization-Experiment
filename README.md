@@ -1,6 +1,6 @@
 # Dendritic Quantization Benchmark
 
-This repo now contains a `uv`-managed benchmark scaffold for the 10-model / 13-condition experiment described in `Dendritic Quantization Benchmark Plan.md`.
+This repo contains a `uv`-managed benchmark scaffold for a 25-model / 12-condition dendritic quantization experiment.
 
 ## How It Works
 
@@ -65,6 +65,11 @@ When `--allow-PQAT` is supplied, PQAT is applied to all quantized conditions
 after their source checkpoint has been trained. Each quantized run saves a PTQ
 evaluation under `before_pqat/`, fine-tunes for the model-aware PQAT budget, and
 saves the post-PQAT artifacts under `after_pqat/`.
+
+The model implementations are part of the experimental definition. After
+changing architectures, rerun affected models with `--ignore-saved-models` or a
+fresh `--results-directory` so old checkpoints and records do not mix with the
+new model definitions.
 
 ## Compare Existing Runs
 
@@ -136,7 +141,7 @@ an existing terminal does not pick up completion immediately, open a new shell.
 The repository includes extended documentation under the `information/` directory. Below are short summaries with links to the full markdown files.
 
 - `information/DOCUMENTATION.md` — Comprehensive project documentation (recommended start):
-	- Experiment plan for 10 models across the benchmark condition grid (per-model and cross-model graphs).
+	- Experiment plan for the full 25-model benchmark condition grid (per-model and cross-model graphs).
 	- Execution strategy targeting Apple M3 Pro (MPS) and PyTorch integration notes.
 	- Detailed PerforatedAI (PAI) integration steps, quantization (`torchao`) and pruning examples, and training loop hooks.
 	- Round-2 expansion with 15 additional models and research findings from a preliminary run.

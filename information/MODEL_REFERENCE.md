@@ -5,6 +5,7 @@ This file centralizes the current per-model configuration used by the benchmark 
 Sources of truth:
 - `src/dendritic_benchmark/specs.py`
 - `src/dendritic_benchmark/pipeline.py`
+- `src/dendritic_benchmark/models.py`
 
 For each model below, this document captures:
 - model key and display name
@@ -29,13 +30,16 @@ For each model below, this document captures:
 - Model kwargs:
   - Only listed when the pipeline passes non-empty kwargs to `build_model(...)`
 - Perforation registration:
-  - Most models register the default Conv/Linear module classes for PerforatedAI perforation.
-  - Model-specific non-standard modules below are registered with PerforatedAI perforation APIs when available.
+  - The benchmark registers tensor-returning `nn.Linear`, `nn.Conv1d`, and `nn.Conv2d` modules for PerforatedAI perforation.
+  - Recurrent, graph-attention, capsule, and tabular-attention models expose their gates/projections as explicit Linear/Conv modules, rather than handing tuple-returning `nn.LSTM`, `nn.GRU`, or `nn.MultiheadAttention` modules directly to PerforatedAI.
+  - Dendritic conditions fail fast if PerforatedAI is unavailable or cannot perforate the model; the runner does not silently record unperforated fallback models as dendritic results.
 - Dendritic epoch policy:
   - By default, dendritic FP32 runs use the listed `max_epochs` value as a hard budget matching Base FP32.
   - PerforatedAI insertion is active for the first 80% of that budget with fixed switch intervals, then frozen for the last 20%.
   - With `uv run dqb run --dynamic-dendritic-training`, training continues past that budget until PerforatedAI reports `training_complete=True`.
   - Dynamic epochs beyond `max_epochs` are saved under `continued_until_complete/`.
+- Reproducibility note:
+  - Model definitions are part of the experimental condition. After architecture changes, rerun affected keys with `--ignore-saved-models` or use a fresh `--results-directory` to avoid comparing old checkpoints against new implementations.
 
 ## 1. `lenet5` — LeNet-5
 
@@ -88,7 +92,8 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation registration: `nn.LSTM`
+- Architecture: two-layer LSTM forecaster implemented with explicit Linear input/hidden gates so recurrent gates are eligible for dendritic perforation.
+- Perforation registration: default
 - PQAT epoch budget: `4`
 
 ## 4. `textcnn` — TextCNN
@@ -137,6 +142,7 @@ For each model below, this document captures:
 - Metric direction: maximize
 - Factory key: `tabnet`
 - Model kwargs: `num_classes=2`
+- Architecture: TabNet-style sequential attentive tabular classifier with sparsemax feature masks, GLU feature transformers, and four decision steps.
 - Training recipe:
   - `batch_size=1024`
   - `max_epochs=100`
@@ -155,6 +161,7 @@ For each model below, this document captures:
 - Metric direction: minimize
 - Factory key: `mpnn`
 - Model kwargs: none
+- Architecture: multi-step dense molecular MPNN with edge message MLPs, dendritic Linear GRU-style updates, gated graph readout, and scalar regression head.
 - Training recipe:
   - `batch_size=32`
   - `max_epochs=100`
@@ -198,7 +205,8 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation registration: `nn.LSTM`
+- Architecture: sequence-to-sequence LSTM autoencoder implemented with explicit Linear gates and a compact latent bottleneck.
+- Perforation registration: default
 - PQAT epoch budget: `5`
 
 ## 10. `distilbert` — DistilBERT
@@ -228,6 +236,7 @@ For each model below, this document captures:
 - Metric direction: maximize
 - Factory key: `dqn_lunarlander`
 - Model kwargs: none
+- Architecture: 3-layer MLP Q-network with 256-unit hidden layers matching the observation/action dimensions of LunarLander.
 - Training recipe:
   - `batch_size=128`
   - `max_epochs=120`
@@ -246,6 +255,7 @@ For each model below, this document captures:
 - Metric direction: maximize
 - Factory key: `ppo_bipedalwalker`
 - Model kwargs: none
+- Architecture: PPO-style continuous-action policy MLP with tanh actor mean, learnable log standard deviation, and critic head. Supervised benchmark training uses the actor output against heuristic actions.
 - Training recipe:
   - `batch_size=64`
   - `max_epochs=120`
@@ -271,7 +281,8 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=1.0e-5`
-- Perforation registration: `nn.GRUCell`
+- Architecture: AttentiveFP-style graph attention/message-passing network with attention-weighted neighbor updates, gated graph readout, and scalar regression head. GRU-style updates are implemented from Linear gates.
+- Perforation registration: default
 - PQAT epoch budget: `10`
 
 ## 14. `gin_imdbb` — GIN
@@ -325,7 +336,8 @@ For each model below, this document captures:
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation registration: `nn.GRU`
+- Architecture: two-layer GRU forecaster implemented with explicit Linear update/reset/new gates so recurrent projections can be perforated.
+- Perforation registration: default
 - PQAT epoch budget: `5`
 
 ## 17. `pointnet_modelnet40` — PointNet
@@ -336,6 +348,7 @@ For each model below, this document captures:
 - Metric direction: maximize
 - Factory key: `pointnet_modelnet40`
 - Model kwargs: `num_classes=40`
+- Architecture: PointNet with input transform, feature transform, shared 1x1 convolutions, global max pooling, and MLP classifier.
 - Training recipe:
   - `batch_size=32`
   - `max_epochs=60`
@@ -353,7 +366,8 @@ For each model below, this document captures:
 - Primary metric: ELBO
 - Metric direction: maximize
 - Factory key: `vae_mnist`
-- Model kwargs: `num_classes=10`
+- Model kwargs: none
+- Architecture: fully connected MNIST VAE with 32-dimensional latent bottleneck and ELBO training objective.
 - Training recipe:
   - `batch_size=128`
   - `max_epochs=20`
@@ -372,6 +386,7 @@ For each model below, this document captures:
 - Metric direction: maximize
 - Factory key: `snn_nmnist`
 - Model kwargs: `num_classes=10`
+- Architecture: convolutional leaky-integrate-and-fire spiking network with 10 simulation steps and surrogate-gradient spike activation.
 - Training recipe:
   - `batch_size=16`
   - `max_epochs=50`
@@ -390,6 +405,7 @@ For each model below, this document captures:
 - Metric direction: maximize
 - Factory key: `unet_isic`
 - Model kwargs: none
+- Architecture: encoder-decoder U-Net with three downsampling blocks, bottleneck, transposed-convolution upsampling, skip connections, and binary mask head.
 - Training recipe:
   - `batch_size=8`
   - `max_epochs=100`
@@ -451,7 +467,8 @@ For each model below, this document captures:
   - `optimizer_name=adamw`
   - `momentum=0.9`
   - `weight_decay=1.0e-5`
-- Perforation registration: `nn.MultiheadAttention`
+- Architecture: SAINT-style tabular transformer with explicit Linear Q/K/V projections, column attention, row attention across the mini-batch, and pooled classification head.
+- Perforation registration: default
 - PQAT epoch budget: `10`
 
 ## 24. `capsnet_mnist` — CapsNet
@@ -462,6 +479,7 @@ For each model below, this document captures:
 - Metric direction: maximize
 - Factory key: `capsnet_mnist`
 - Model kwargs: `num_classes=10`
+- Architecture: Capsule Network with convolutional stem, primary capsules, digit capsules, three routing iterations, and class logits from capsule lengths.
 - Training recipe:
   - `batch_size=128`
   - `max_epochs=30`
@@ -480,6 +498,7 @@ For each model below, this document captures:
 - Metric direction: maximize
 - Factory key: `convlstm_movingmnist`
 - Model kwargs: none
+- Architecture: two-layer ConvLSTM with 64 hidden channels and convolutional frame decoder for 10-frame Moving MNIST prediction.
 - Training recipe:
   - `batch_size=16`
   - `max_epochs=50`

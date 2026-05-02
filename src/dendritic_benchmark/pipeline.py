@@ -264,7 +264,7 @@ class BenchmarkRunner:
         return [key for key in [spec.key for spec in CONDITION_SPECS] if key in ordered]
 
     def _model_kwargs(self, model_key: str) -> dict[str, Any]:
-        if model_key in {"lenet5", "vae_mnist", "snn_nmnist", "capsnet_mnist"}:
+        if model_key in {"lenet5", "snn_nmnist", "capsnet_mnist"}:
             return {"num_classes": 10}
         if model_key == "m5":
             return {"num_classes": 12}
@@ -283,11 +283,10 @@ class BenchmarkRunner:
     def _perforation_track_modules(self) -> list[Any]:
         if nn is None:
             return []
-        # The compat wrapper registers these with PAI's perforation list. If no
-        # default Conv/Linear classes are supplied, PAI initializes the tracker
-        # but leaves ordinary layers unwrapped for dynamic dendrite insertion.
-        # Tuple-returning modules such as GRU and MultiheadAttention require
-        # custom PAI processors; the benchmark stays on tensor-returning layers.
+        # PerforatedAI is configured on tensor-returning Conv/Linear modules.
+        # Recurrent and attention benchmark models expose their gates/projections
+        # as explicit Linear layers rather than handing tuple-returning LSTM/GRU
+        # or MultiheadAttention modules directly to PAI.
         return [nn.Linear, nn.Conv1d, nn.Conv2d]
 
     def _perforation_track_only_module_ids(self, model_key: str) -> list[str]:

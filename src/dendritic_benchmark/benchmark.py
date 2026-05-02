@@ -50,7 +50,7 @@ def get_model_input_shapes(model_key: str) -> tuple:
         "mpnn": ((24, 9), (24, 24)),
         "actor_critic": (4,),
         "lstm_autoencoder": (128, 1),
-        "distilbert": (96,),
+        "distilbert": (128,),
         "dqn_lunarlander": (8,),
         "ppo_bipedalwalker": (24,),
         "attentivefp_freesolv": ((24, 9), (24, 24)),
@@ -85,6 +85,11 @@ def generate_sample_inputs(model_key: str, batch_size: int) -> tuple[Any, Any]:
             torch.randn(batch_size, *adjacency_shape, device=device),
         )
 
+    if model_key == "distilbert":
+        input_ids = torch.randint(0, 30522, (batch_size, *shape), device=device)
+        attention_mask = torch.ones_like(input_ids)
+        return ((input_ids, attention_mask), None)
+
     if model_key in _TEXT_MODELS:
         vocab_size = 5000 if model_key == "textcnn" else 30522
         return (torch.randint(0, vocab_size, (batch_size, *shape), device=device), None)
@@ -114,6 +119,13 @@ def benchmark_model_latency(
                 stmt="model(x, adj)",
                 globals={"model": model, "x": primary, "adj": adjacency},
             )
+        elif isinstance(primary, tuple):
+            for _ in range(warmup_runs):
+                model(*primary)
+            timer = Timer(
+                stmt="model(*x)",
+                globals={"model": model, "x": primary},
+            )
         else:
             for _ in range(warmup_runs):
                 model(primary)
@@ -135,6 +147,15 @@ def benchmark_model_latency(
         "median_latency_ms": median_ms,
         "stdev_latency_ms": stdev_ms,
     }
+
+
+def _move_to_device(value: Any, device: Any) -> Any:
+    if isinstance(value, tuple):
+        return tuple(_move_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [_move_to_device(item, device) for item in value]
+    move = getattr(value, "to", None)
+    return move(device) if move is not None else value
 
 
 class BenchmarkOrchestrator:
@@ -196,7 +217,7 @@ class BenchmarkOrchestrator:
             try:
                 primary, adjacency = generate_sample_inputs(model_key, batch_size)
                 inputs: tuple[Any, Any] = (
-                    primary.to(device),
+                    _move_to_device(primary, device),
                     adjacency.to(device) if adjacency is not None else None,
                 )
                 results["batch_sizes"][batch_size] = benchmark_model_latency(

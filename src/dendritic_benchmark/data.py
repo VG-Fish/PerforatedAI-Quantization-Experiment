@@ -542,7 +542,13 @@ class _CoraEgoDataset:
 
     def __getitem__(self, index: int) -> tuple[Any, Any, Any]:
         torch = require_torch()
-        neighbors = self.adjacency[index].nonzero().flatten()[:50]
+        neighbors = self.adjacency[index].nonzero().flatten()
+        neighbors = torch.cat(
+            [
+                torch.tensor([index], dtype=neighbors.dtype, device=neighbors.device),
+                neighbors[neighbors != index],
+            ]
+        )[:50]
         if len(neighbors) < 50:
             pad = neighbors.new_full((50 - len(neighbors),), index)
             neighbors = torch.cat([neighbors, pad])
