@@ -257,6 +257,7 @@ class BenchmarkOrchestrator:
         benchmark_root: Path,
         total_benchmarks: int,
         counter: list[int],
+        re_run: bool = False,
     ) -> list[dict[str, Any]]:
         model_dir = benchmark_root / model_key
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -264,10 +265,15 @@ class BenchmarkOrchestrator:
 
         for condition_key in condition_keys:
             counter[0] += 1
+            result_file = model_dir / f"{condition_key}.json"
+            if not re_run and result_file.exists():
+                _log(f"[{counter[0]}/{total_benchmarks}] {model_key} / {condition_key} — already benchmarked, skipping.")
+                model_results.append(json.loads(result_file.read_text()))
+                continue
             _log(f"[{counter[0]}/{total_benchmarks}] {model_key} / {condition_key}…")
             result = self.benchmark_condition(model_key, condition_key, batch_sizes, num_runs)
             model_results.append(result)
-            (model_dir / f"{condition_key}.json").write_text(json.dumps(result, indent=2))
+            result_file.write_text(json.dumps(result, indent=2))
 
         self._write_latency_summary(model_dir, model_results)
         return model_results
@@ -280,6 +286,7 @@ class BenchmarkOrchestrator:
         num_runs: int = 5,
         benchmark_root: Path | str = "benchmarks",
         comparison_root: Path | str | None = None,
+        re_run: bool = False,
     ) -> None:
         if batch_sizes is None:
             batch_sizes = [1, 32]
@@ -298,7 +305,7 @@ class BenchmarkOrchestrator:
 
         for model_key in model_keys:
             model_results = self._benchmark_model(
-                model_key, condition_keys, batch_sizes, num_runs, benchmark_root, total_benchmarks, counter
+                model_key, condition_keys, batch_sizes, num_runs, benchmark_root, total_benchmarks, counter, re_run=re_run,
             )
             for result in model_results:
                 manifest_data.extend(self._collect_manifest_rows(result, model_key))

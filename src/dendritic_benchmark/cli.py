@@ -333,6 +333,15 @@ def build_parser() -> argparse.ArgumentParser:
             "are computed across these runs. (default: 5)"
         ),
     )
+    bench_parser.add_argument(
+        "--re-run",
+        action="store_true",
+        help=(
+            "Re-benchmark all selected model/condition pairs even if a result "
+            "JSON already exists on disk. By default, existing results are loaded "
+            "and that combination is skipped."
+        ),
+    )
 
     return parser
 
@@ -409,6 +418,7 @@ def _handle_bench(args: Any, results_root: Path, benchmark_root: Path, compariso
         num_runs=args.num_runs,
         benchmark_root=benchmark_root,
         comparison_root=comparison_root,
+        re_run=args.re_run,
     )
 
 

@@ -235,7 +235,7 @@ flowchart TD
 
 ## `uv run dqb benchmark_models`
 
-Measures wall-clock inference latency for all trained models using `torch.utils.benchmark.Timer`.
+Measures wall-clock inference latency for all trained models using `torch.utils.benchmark.Timer`. Already-benchmarked model/condition pairs are skipped by default (existing `{condition}.json` is reused). Pass `--re-run` to force re-measurement.
 
 ```bash
 uv run dqb benchmark_models
@@ -246,17 +246,20 @@ uv run dqb benchmark_models --batch-sizes 1 8 32
 uv run dqb benchmark_models --num-runs 10
 uv run dqb benchmark_models --benchmark-root my_benchmarks
 uv run dqb benchmark_models --comparison-root my_comparison
+uv run dqb benchmark_models --re-run
 ```
 
 ```mermaid
 flowchart TD
-    A([uv run dqb benchmark_models]) --> B["Parse args<br>--models, --conditions,<br>--batch-sizes, --num-runs,<br>--benchmark-root, --comparison-root"]
+    A([uv run dqb benchmark_models]) --> B["Parse args<br>--models, --conditions,<br>--batch-sizes, --num-runs,<br>--re-run,<br>--benchmark-root, --comparison-root"]
     B --> C["Create benchmark directory"]
     C --> D["Capture system info<br>CPU, device, PyTorch version"]
     D --> E["Write computer_info.json"]
     E --> F{"For each<br>selected model"}
     F --> G{"For each<br>selected condition"}
-    G --> H["Load trained model from<br>results/model/condition/model.pt"]
+    G --> GG{"condition.json exists<br>and --re-run not set?"}
+    GG -->|Yes| GH["Load existing result<br>log skip"]
+    GG -->|No| H["Load trained model from<br>results/model/condition/model.pt"]
     H --> I{"Model loaded<br>successfully?"}
     I -->|No| J["Log error skip condition"]
     I -->|Yes| K["Generate sample inputs<br>matching model shape"]
@@ -267,6 +270,7 @@ flowchart TD
     O --> P["Aggregate to<br>latency_summary.csv"]
     P --> L
     L -->|Done| G
+    GH --> G
     J --> G
     G -->|Done| Q["Write model<br>latency_summary.csv"]
     Q --> F
@@ -276,6 +280,7 @@ flowchart TD
 
     style A fill:#2d6a4f,color:#fff
     style ZZ fill:#2d6a4f,color:#fff
+    style GG fill:#457b9d,color:#fff
     style I fill:#457b9d,color:#fff
     style L fill:#457b9d,color:#fff
 ```

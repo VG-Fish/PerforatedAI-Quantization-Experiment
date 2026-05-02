@@ -714,7 +714,7 @@ uv run dqb generate_graphs --regenerate-graphs
 ```
 
 ### `dqb benchmark_models`
-Measures wall-clock inference latency for all trained models and writes per-model latency charts to the comparison directory.
+Measures wall-clock inference latency for all trained models and writes per-model latency charts to the comparison directory. Already-benchmarked model/condition pairs are skipped by default; pass `--re-run` to force re-measurement.
 
 ```bash
 uv run dqb benchmark_models
@@ -725,6 +725,7 @@ uv run dqb benchmark_models --batch-sizes 1 8 32
 uv run dqb benchmark_models --num-runs 20
 uv run dqb benchmark_models --benchmark-root my_benchmarks
 uv run dqb benchmark_models --comparison-root my_comparison
+uv run dqb benchmark_models --re-run
 ```
 
 ## Output Layout
@@ -821,6 +822,7 @@ uv run dqb benchmark_models --batch-sizes 1 8 32
 uv run dqb benchmark_models --num-runs 20
 uv run dqb benchmark_models --benchmark-root my_benchmarks
 uv run dqb benchmark_models --comparison-root my_comparison
+uv run dqb benchmark_models --re-run
 ```
 
 ## Options
@@ -833,6 +835,7 @@ uv run dqb benchmark_models --comparison-root my_comparison
 | `--conditions KEY [KEY ...]` | all 12 | Space-separated condition keys to benchmark |
 | `--batch-sizes SIZE [SIZE ...]` | `1 32` | Batch sizes to test |
 | `--num-runs N` | 5 | Number of independent timing runs per batch size; mean and median are computed across these runs |
+| `--re-run` | off | Re-benchmark all selected pairs even if a result JSON already exists; by default existing results are loaded and that pair is skipped |
 
 ## Output Structure
 
