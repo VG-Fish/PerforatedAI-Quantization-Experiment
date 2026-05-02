@@ -29,6 +29,7 @@ _PAI_CONFIG_LIST_SETTERS: tuple[str, ...] = (
     "set_modules_processing_classes",
     "set_module_names_with_processing",
     "set_module_by_name_processing_classes",
+    "set_module_names_to_not_save",
 )
 
 load_dotenv: Any
@@ -124,6 +125,7 @@ class PAIModuleSelection:
     modules_to_perforate: list[Any] | None = None
     module_names_to_perforate: list[str] | None = None
     track_only_module_ids: list[str] | None = None
+    module_names_to_not_save: list[str] | None = None
 
 
 def backend_status() -> BackendStatus:
@@ -164,6 +166,9 @@ def _append_pai_module_selection(pc: Any, selection: PAIModuleSelection) -> None
     )
     _append_if_configured(
         pc, "append_module_ids_to_track", selection.track_only_module_ids
+    )
+    _append_if_configured(
+        pc, "append_module_names_to_not_save", selection.module_names_to_not_save
     )
 
 

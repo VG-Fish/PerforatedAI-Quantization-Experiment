@@ -296,6 +296,14 @@ class BenchmarkRunner:
             "capsnet_mnist": [".decoder.0", ".decoder.2"],
         }.get(model_key, [])
 
+    def _perforation_module_names_to_not_save(self, model_key: str) -> list[str]:
+        # HuggingFace's DistilBertForSequenceClassification exposes both
+        # `.distilbert` and `.base_model` pointing at the same submodule;
+        # PAI requires one of the duplicate pointers be excluded from saving.
+        return {
+            "distilbert": [".model.base_model"],
+        }.get(model_key, [])
+
     def _use_pai_runtime_guard(self) -> bool:
         return True
 
@@ -348,6 +356,7 @@ class BenchmarkRunner:
         module_selection = PAIModuleSelection(
             modules_to_perforate=modules_to_perforate,
             track_only_module_ids=self._perforation_track_only_module_ids(model_key),
+            module_names_to_not_save=self._perforation_module_names_to_not_save(model_key),
         )
         module_output_dimensions = infer_module_output_dimensions(
             model, model_key, bundle, modules_to_perforate
