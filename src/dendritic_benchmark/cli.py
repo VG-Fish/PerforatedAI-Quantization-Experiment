@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +49,123 @@ _CONDITION_KEYS: str = (
     "dendrites_fp32, dendrites_q8, dendrites_q4, dendrites_q2, "
     "dendrites_q1_58, dendrites_q1"
 )
+
+_CLEAN_CONFIG_PATH = Path(".dqb") / "command_config.json"
+_CLEAN_CONFIG_VERSION = 1
+
+
+def _path_entry(path: Path | str, kind: str) -> dict[str, str]:
+    resolved = Path(path).expanduser().resolve()
+    return {"path": str(resolved), "kind": kind}
+
+
+def _load_clean_config() -> dict[str, Any]:
+    if not _CLEAN_CONFIG_PATH.exists():
+        return {"version": _CLEAN_CONFIG_VERSION, "invocations": []}
+    try:
+        with _CLEAN_CONFIG_PATH.open("r", encoding="utf-8") as fh:
+            config = json.load(fh)
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError(f"Could not read clean config at {_CLEAN_CONFIG_PATH}: {exc}") from exc
+    if not isinstance(config, dict):
+        return {"version": _CLEAN_CONFIG_VERSION, "invocations": []}
+    invocations = config.get("invocations")
+    if not isinstance(invocations, list):
+        config["invocations"] = []
+    config["version"] = _CLEAN_CONFIG_VERSION
+    return config
+
+
+def _write_clean_config(config: dict[str, Any]) -> None:
+    _CLEAN_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _CLEAN_CONFIG_PATH.open("w", encoding="utf-8") as fh:
+        json.dump(config, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def _record_clean_config(args: Any, results_root: Path, comparison_root: Path, benchmark_root: Path) -> None:
+    if args.command == "clean":
+        return
+    paths: list[dict[str, str]] = [_path_entry(args.logging_dir, "logs")]
+    if args.command == "run":
+        paths.extend(
+            [
+                _path_entry(results_root, "results"),
+                _path_entry(comparison_root, "comparison"),
+                _path_entry("PAI", "perforatedai"),
+                _path_entry(Path(os.environ.get(DATA_ROOT_ENV, DEFAULT_DATA_ROOT)), "data"),
+            ]
+        )
+    elif args.command == "download_data":
+        paths.append(_path_entry(Path(os.environ.get(DATA_ROOT_ENV, DEFAULT_DATA_ROOT)), "data"))
+    elif args.command == "compare":
+        paths.extend(
+            [
+                _path_entry(results_root, "results_reports"),
+                _path_entry(comparison_root, "comparison"),
+            ]
+        )
+    elif args.command == "generate_graphs":
+        paths.append(_path_entry(results_root, "results_graphs"))
+    elif args.command == "benchmark_models":
+        paths.extend(
+            [
+                _path_entry(benchmark_root, "benchmarks"),
+                _path_entry(comparison_root, "comparison"),
+            ]
+        )
+    config = _load_clean_config()
+    config["invocations"].append(
+        {
+            "command": args.command,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "results_root": str(results_root.expanduser().resolve()),
+            "results_directory": args.results_directory,
+            "logging_dir": str(Path(args.logging_dir).expanduser().resolve()),
+            "comparison_root": str(comparison_root.expanduser().resolve()),
+            "benchmark_root": str(benchmark_root.expanduser().resolve()),
+            "data_root": str(Path(os.environ.get(DATA_ROOT_ENV, DEFAULT_DATA_ROOT)).expanduser().resolve()),
+            "paths": paths,
+        }
+    )
+    _write_clean_config(config)
+
+
+def _iter_recorded_clean_paths(config: dict[str, Any]) -> list[dict[str, str]]:
+    by_path: dict[str, str] = {}
+    for invocation in config.get("invocations", []):
+        if not isinstance(invocation, dict):
+            continue
+        for entry in invocation.get("paths", []):
+            if not isinstance(entry, dict):
+                continue
+            raw_path = entry.get("path")
+            if not isinstance(raw_path, str):
+                continue
+            path = str(Path(raw_path).expanduser().resolve())
+            by_path[path] = str(entry.get("kind", "generated"))
+    return [{"path": path, "kind": kind} for path, kind in sorted(by_path.items())]
+
+
+def _is_dangerous_clean_target(path: Path) -> bool:
+    resolved = path.expanduser().resolve()
+    cwd = Path.cwd().resolve()
+    home = Path.home().resolve()
+    anchors = {resolved.anchor, str(cwd), str(home)}
+    return str(resolved) in anchors or resolved == _CLEAN_CONFIG_PATH.parent.resolve()
+
+
+def _remove_clean_target(path: Path) -> str:
+    if path.is_symlink():
+        path.unlink()
+        return "symlink"
+    if path.is_dir():
+        shutil.rmtree(path)
+        return "directory"
+    if path.exists():
+        path.unlink()
+        return "file"
+    return "missing"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -343,6 +462,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    clean_parser: argparse.ArgumentParser = subparsers.add_parser(
+        "clean",
+        help="Remove files generated by previous dqb commands.",
+        description=(
+            "Reads .dqb/command_config.json and removes the output directories "
+            "and files recorded by previous 'uv run dqb' commands. The registry "
+            "tracks user-supplied locations such as --results-root, "
+            "--results-directory, --comparison-root, --benchmark-root, "
+            "--logging-dir, and DQB_DATA_ROOT."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    clean_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the paths that would be removed without deleting anything.",
+    )
+
     return parser
 
 
@@ -422,6 +559,40 @@ def _handle_bench(args: Any, results_root: Path, benchmark_root: Path, compariso
     )
 
 
+def _handle_clean(args: Any) -> None:
+    config = _load_clean_config()
+    entries = _iter_recorded_clean_paths(config)
+    if not entries:
+        _log(f"[clean] No generated paths recorded in {_CLEAN_CONFIG_PATH}.")
+        return
+    removed = 0
+    skipped = 0
+    for entry in entries:
+        path = Path(entry["path"])
+        label = entry["kind"]
+        if _is_dangerous_clean_target(path):
+            _log(f"[clean] Skipping unsafe {label} target: {path}")
+            skipped += 1
+            continue
+        if args.dry_run:
+            status = "exists" if path.exists() else "missing"
+            _log(f"[clean] Would remove {label} target ({status}): {path}")
+            continue
+        status = _remove_clean_target(path)
+        if status == "missing":
+            _log(f"[clean] Already missing {label} target: {path}")
+            skipped += 1
+        else:
+            _log(f"[clean] Removed {status} {label} target: {path}")
+            removed += 1
+    if args.dry_run:
+        _log(f"[clean] Dry run complete. {len(entries)} recorded target(s) inspected.")
+        return
+    config["invocations"] = []
+    _write_clean_config(config)
+    _log(f"[clean] Complete. Removed {removed} target(s), skipped {skipped}.")
+
+
 def main() -> None:
     load_project_environment()
     parser = build_parser()
@@ -434,9 +605,11 @@ def main() -> None:
     comparison_root = Path(getattr(args, "comparison_root", "comparison"))
     benchmark_root = Path(getattr(args, "benchmark_root", "benchmarks"))
 
-    setup_logging(output_dir=args.logging_dir, script_name=args.command)
+    _record_clean_config(args, results_root, comparison_root, benchmark_root)
+    if args.command != "clean":
+        setup_logging(output_dir=args.logging_dir, script_name=args.command)
 
-    if perforatedai_credentials_present():
+    if args.command != "clean" and perforatedai_credentials_present():
         _log("PerforatedAI credentials detected in environment; beta-capable features can be used if installed.")
 
     if args.command == "run":
@@ -449,6 +622,8 @@ def main() -> None:
         generate_training_graphs(results_root, regenerate=args.regenerate_graphs)
     elif args.command == "benchmark_models":
         _handle_bench(args, results_root, benchmark_root, comparison_root)
+    elif args.command == "clean":
+        _handle_clean(args)
     else:
         parser.print_help()
 

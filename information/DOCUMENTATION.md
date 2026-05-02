@@ -518,9 +518,11 @@ The package exposes the `dqb` entry point via `pyproject.toml`.
 - `uv run dqb run` constructs a `BenchmarkRunner` and executes the selected models and conditions.
 - `uv run dqb compare` loads saved `best_model_stats.csv` files (falling back to `record.json`) and rebuilds per-model and cross-model comparison outputs.
 - `uv run dqb generate_graphs` regenerates training plots from existing `history.csv` files.
+- `uv run dqb clean` reads `.dqb/command_config.json` and removes generated outputs from previous commands.
 - `--results-root` controls where per-model results are read from or written to.
 - `--results-directory` optionally scopes results to a named subdirectory under `--results-root`.
 - `--comparison-root` controls where comparison outputs are written for `run`, `compare`, and `benchmark_models`.
+- `.dqb/command_config.json` records user-supplied output locations, including `--results-root`, `--results-directory`, `--comparison-root`, `--benchmark-root`, `--logging-dir`, and `DQB_DATA_ROOT`, so `clean` can remove the same locations later.
 - `--dynamic-dendritic-training` makes FP32 dendritic runs continue until PerforatedAI reports completion; without it, dendritic FP32 runs use the fixed base-model epoch budget.
 - `.env` credentials are loaded before running so PerforatedAI aliases and API variables are mirrored into the environment.
 
@@ -735,11 +737,24 @@ uv run dqb benchmark_models --comparison-root my_comparison
 uv run dqb benchmark_models --re-run
 ```
 
+### `dqb clean`
+Removes generated outputs recorded from previous CLI invocations.
+
+```bash
+uv run dqb clean --dry-run
+uv run dqb clean
+```
+
+Each generating command updates `.dqb/command_config.json` before it runs. The clean command reads that registry and removes recorded results, comparison, benchmark, data, PAI, and log targets while refusing unsafe roots such as `/`, the repository root, or the user's home directory. After a successful clean, the registry is kept but its invocation list is reset.
+
 ## Output Layout
 
 ```text
 logs/
   <command>_<timestamp>.txt
+
+.dqb/
+  command_config.json                  # Local registry read by dqb clean
 
 PAI/
   PAI_config.json
@@ -800,6 +815,10 @@ uv run dqb --results-directory smoke_test compare --manifest
 # Re-run specific models ignoring cached results
 uv run dqb run --models mpnn actor_critic --ignore-saved-models
 uv run dqb --results-directory experiment_b run --models mpnn actor_critic --ignore-saved-models
+
+# Inspect and remove generated outputs
+uv run dqb clean --dry-run
+uv run dqb clean
 ```
 
 ## Notes
@@ -809,6 +828,7 @@ uv run dqb --results-directory experiment_b run --models mpnn actor_critic --ign
 - If you add new models or conditions, update `src/dendritic_benchmark/specs.py` and rerun the CLI.
 - Conditions are executed in dependency order — omitting an upstream condition will cause its dependents to be skipped.
 - `generate_graphs` only rebuilds per-condition training plots. Use `compare` to create or refresh `comparison/`.
+- `clean` only removes paths recorded in `.dqb/command_config.json`; run `uv run dqb clean --dry-run` first when using custom output roots.
 
 ---
 

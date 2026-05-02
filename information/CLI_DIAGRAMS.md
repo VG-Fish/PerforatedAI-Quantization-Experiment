@@ -18,6 +18,8 @@ These flags are shared by all commands:
 
 `--benchmark-root DIR` is available only on `uv run dqb benchmark_models`.
 
+Generating commands update `.dqb/command_config.json` with the concrete user-supplied output paths they used. `uv run dqb clean` reads that registry later.
+
 ---
 
 ## `uv run dqb run`
@@ -297,10 +299,50 @@ Results are organized by model and condition:
 
 ---
 
+## `uv run dqb clean`
+
+Removes generated outputs recorded by previous `uv run dqb` commands.
+
+```bash
+uv run dqb clean --dry-run
+uv run dqb clean
+```
+
+```mermaid
+flowchart TD
+    A([uv run dqb clean]) --> B["Read .dqb/command_config.json"]
+    B --> C{"Any recorded<br>targets?"}
+    C -->|No| D["Print nothing to clean"]
+    C -->|Yes| E{"--dry-run?"}
+    E -->|Yes| F["Print each path<br>and existence status"]
+    E -->|No| G{"For each recorded<br>path"}
+    G --> H{"Unsafe root?<br>/, repo root, home,<br>or .dqb/"}
+    H -->|Yes| I["Skip target"]
+    H -->|No| J["Remove file,<br>symlink, or directory"]
+    J --> G
+    I --> G
+    G -->|Done| K["Reset invocation list<br>in command_config.json"]
+    D --> ZZ([End])
+    F --> ZZ
+    K --> ZZ
+
+    style A fill:#2d6a4f,color:#fff
+    style ZZ fill:#2d6a4f,color:#fff
+    style C fill:#457b9d,color:#fff
+    style E fill:#457b9d,color:#fff
+    style H fill:#457b9d,color:#fff
+```
+
+Recorded targets include results, comparison reports, benchmark outputs, logs, downloaded data caches, and PerforatedAI sidecars when the corresponding commands used them.
+
+---
+
 ## Output Directory Layout
 
 ```text
 .
+├── .dqb/
+│   └── command_config.json              # local registry used by dqb clean
 ├── benchmarks/                          # created by dqb benchmark_models
 │   ├── computer_info.json
 │   ├── manifest.csv
@@ -359,31 +401,45 @@ flowchart TD
     RUN["run<br>Train models and<br>save results"]
     DL["download_data<br>Pre-cache datasets"]
     BEN["benchmark_models<br>Measure inference<br>latency"]
+    CLN["clean<br>Remove recorded<br>generated outputs"]
 
     RES[("results/<br>records + plots")]
     COM[("comparison/<br>charts + summary")]
     DAT[("data/<br>dataset cache")]
     BEN_OUT[("benchmarks/<br>latency + system info")]
+    CFG[(".dqb/command_config.json<br>generated-path registry")]
 
     CLI --> GG
     CLI --> CMP
     CLI --> RUN
     CLI --> DL
     CLI --> BEN
+    CLI --> CLN
 
     GG <-->|reads & writes| RES
+    GG -->|records path| CFG
     CMP -->|reads| RES
     CMP -->|writes| COM
+    CMP -->|records paths| CFG
     RUN -->|writes| RES
     RUN -->|writes| COM
+    RUN -->|records paths| CFG
     DL -->|writes| DAT
+    DL -->|records path| CFG
     BEN -->|reads| RES
     BEN -->|writes| BEN_OUT
     BEN -->|writes| COM
+    BEN -->|records paths| CFG
+    CLN -->|reads| CFG
+    CLN -->|removes recorded paths| RES
+    CLN -->|removes recorded paths| COM
+    CLN -->|removes recorded paths| DAT
+    CLN -->|removes recorded paths| BEN_OUT
 
     style CLI fill:#1d3557,color:#fff
     style RES fill:#457b9d,color:#fff
     style COM fill:#457b9d,color:#fff
     style DAT fill:#457b9d,color:#fff
     style BEN_OUT fill:#457b9d,color:#fff
+    style CFG fill:#457b9d,color:#fff
 ```

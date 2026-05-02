@@ -13,6 +13,7 @@ The benchmark automates training neural networks under different quantization an
 5. **Compare**: Generate comparison charts and summary reports using `uv run dqb compare`
 6. **Visualize**: Render training curves and analysis plots with `uv run dqb generate_graphs`
 7. **Benchmark**: Measure inference latency on your hardware with `uv run dqb benchmark_models`
+8. **Clean**: Remove generated outputs recorded from previous commands with `uv run dqb clean`
 
 Each condition applies only two experimental factors to the same models: quantization level and whether the model is dendritic, allowing cleaner side-by-side comparison of efficiency vs. accuracy tradeoffs.
 
@@ -41,6 +42,7 @@ Results are written to:
 - `comparison/`
 - `data/` for downloaded datasets, unless `DQB_DATA_ROOT` is set
 - `logs/` for command logs
+- `.dqb/command_config.json`, a local registry of generated output paths used by `uv run dqb clean`
 
 To scope outputs for a specific experiment, use `--results-directory`:
 
@@ -89,6 +91,7 @@ uv run dqb download_data --help
 uv run dqb compare --help
 uv run dqb generate_graphs --help
 uv run dqb benchmark_models --help
+uv run dqb clean --help
 
 # Download datasets
 uv run dqb download_data
@@ -119,6 +122,10 @@ uv run dqb benchmark_models --batch-sizes 1 32 --num-runs 10
 uv run dqb benchmark_models --benchmark-root my_benchmarks
 uv run dqb benchmark_models --comparison-root comparison
 
+# Remove generated outputs recorded in .dqb/command_config.json
+uv run dqb clean --dry-run
+uv run dqb clean
+
 # Use an experiment namespace under results/
 uv run dqb --results-directory experiment_a run
 uv run dqb --results-directory experiment_a compare
@@ -147,7 +154,7 @@ The repository includes extended documentation under the `information/` director
 	- Round-2 expansion with 15 additional models and research findings from a preliminary run.
 
 - `information/CLI_DIAGRAMS.md` — CLI reference and diagrams:
-	- Command summaries and Mermaid flowcharts for `uv run dqb run`, `uv run dqb download_data`, `uv run dqb compare`, `uv run dqb generate_graphs`, and `uv run dqb benchmark_models`.
+	- Command summaries and Mermaid flowcharts for `uv run dqb run`, `uv run dqb download_data`, `uv run dqb compare`, `uv run dqb generate_graphs`, `uv run dqb benchmark_models`, and `uv run dqb clean`.
 	- Global CLI flags and the recommended output directory layout.
 
 Read the full documents for architecture details, hypotheses, and example commands:
@@ -221,6 +228,16 @@ The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` f
         uv run dqb benchmark_models --benchmark-root my_benchmarks
         uv run dqb benchmark_models --comparison-root my_comparison
         uv run dqb benchmark_models --re-run
+        ```
+
+- `uv run dqb clean`
+	- Removes generated outputs listed in `.dqb/command_config.json`. The registry is updated automatically by `run`, `download_data`, `compare`, `generate_graphs`, and `benchmark_models`.
+	- Recorded paths include user-supplied output locations such as `--results-root`, `--results-directory`, `--comparison-root`, `--benchmark-root`, `--logging-dir`, and `DQB_DATA_ROOT`.
+	- Use `--dry-run` to inspect what would be deleted before removing files.
+	- Examples:
+        ```bash
+        uv run dqb clean --dry-run
+        uv run dqb clean
         ```
 
 - `uv run dqb --help`

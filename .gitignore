@@ -20,3 +20,4 @@ sonar-project.properties
 .uv-tools/
 .github/
 benchmarks/
+.dqb/
