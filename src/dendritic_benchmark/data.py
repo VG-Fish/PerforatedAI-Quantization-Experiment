@@ -499,7 +499,7 @@ def _build_sst2(batch_size: int) -> TaskBundle:
 
     def _tokenize(sentences: list[str]) -> tuple[Any, Any]:
         encoding = tokenizer(
-            sentences,
+            list(sentences),
             padding="max_length",
             truncation=True,
             max_length=128,
@@ -508,11 +508,11 @@ def _build_sst2(batch_size: int) -> TaskBundle:
         return encoding["input_ids"], encoding["attention_mask"]
 
     train_ids, train_mask = _tokenize(loaded["train"]["sentence"])
-    y_train = torch.tensor(loaded["train"]["label"], dtype=torch.long)
+    y_train = torch.tensor(list(loaded["train"]["label"]), dtype=torch.long)
     train_full = _TensorRowsDataset(train_ids, train_mask, y_train)
     train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
     test_ids, test_mask = _tokenize(loaded["validation"]["sentence"])
-    y_test = torch.tensor(loaded["validation"]["label"], dtype=torch.long)
+    y_test = torch.tensor(list(loaded["validation"]["label"]), dtype=torch.long)
     return _bundle_from_splits(
         train_ds,
         val_ds,
