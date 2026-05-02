@@ -716,10 +716,9 @@ def ternary_quantize_tensor(tensor: Any) -> Any:
     if torch is None:
         return tensor
     threshold = tensor.std(unbiased=False) * 0.5
-    out = torch.zeros_like(tensor)
-    out[tensor > threshold] = 1
-    out[tensor < -threshold] = -1
-    return out
+    pos = (tensor > threshold).to(tensor.dtype)
+    neg = (tensor < -threshold).to(tensor.dtype)
+    return pos - neg
 
 
 def binary_quantize_tensor(tensor: Any) -> Any:
