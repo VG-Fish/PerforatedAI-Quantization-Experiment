@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import math
 from dataclasses import dataclass
@@ -78,6 +79,18 @@ def _log(msg: str, *, before: bool = False, after: bool = False) -> None:
     print(f"[{ts}] {msg}")
     if after:
         print()
+
+
+def _release_accelerator_memory() -> None:
+    gc.collect()
+    torch = require_torch()
+    mps = getattr(torch, "mps", None)
+    if mps is not None and torch.backends.mps.is_available():
+        empty = getattr(mps, "empty_cache", None)
+        if empty is not None:
+            empty()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _is_ignorable_state_key(key: str) -> bool:
@@ -574,6 +587,7 @@ class BenchmarkRunner:
                     dynamic_dendritic_training,
                 ):
                     newly_trained = True
+                _release_accelerator_memory()
 
         write_model_reports(
             model_spec.display_name,
