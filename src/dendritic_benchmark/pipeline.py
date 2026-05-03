@@ -10,8 +10,10 @@ from typing import Any, cast
 
 from .compat import (
     PAIModuleSelection,
+    PAIRuntimeOptions,
     attach_module_output_dimensions,
     choose_device,
+    configure_pai_candidate_graph,
     latest_pai_switch_checkpoint,
     load_pai_system_checkpoint,
     nn,
@@ -39,6 +41,19 @@ from .training import (
 EPOCH_MULTIPLIER = 10
 _RECORD_JSON = "record.json"
 _MODEL_PT = "model.pt"
+_DEFAULT_PAI_INITIAL_CORRELATION_BATCH_LIMIT = 32
+_MODEL_PAI_INITIAL_CORRELATION_BATCH_LIMITS = {
+    "distilbert": 4,
+}
+_MODEL_DENDRITIC_BATCH_SIZES = {
+    "distilbert": 4,
+}
+# Full-transformer PAI wrapping makes DistilBERT's candidate forward exceed
+# Apple Silicon MPS memory. Keep dendrite search on the task-specific head.
+_DISTILBERT_PAI_CLASSIFICATION_HEAD = [
+    ".model.pre_classifier",
+    ".model.classifier",
+]
 
 
 @dataclass(frozen=True)
@@ -70,6 +85,8 @@ class SourceCheckpointLoadConfig:
     freeze_dendrite_updates_fraction: float = 0.20
     batches_per_epoch: int | None = None
     module_output_dimensions: dict[str, list[int]] | None = None
+    candidate_graph_enabled: bool = True
+    initial_correlation_batches_limit: int | None = None
 
 
 def _log(msg: str, *, before: bool = False, after: bool = False) -> None:
@@ -167,6 +184,11 @@ class BenchmarkRunner:
                 self._load_compatible_state(model, cast(dict[str, Any], state))
         return model
 
+    def _pai_save_name(self, model_key: str, condition_key: str) -> str:
+        if model_key == "distilbert" and "dendrites" in condition_key:
+            return f"{model_key}_{condition_key}_head_only"
+        return f"{model_key}_{condition_key}"
+
     def _load_source_checkpoint(
         self,
         model: Any,
@@ -189,7 +211,6 @@ class BenchmarkRunner:
                 maximizing_score=load_config.maximizing_score,
                 module_selection=load_config.module_selection,
                 config_snapshot_path=load_config.config_snapshot_path,
-                use_runtime_guard=self._use_pai_runtime_guard(),
                 dendrite_training_max_epochs=(
                     load_config.dendrite_training_max_epochs
                 ),
@@ -198,12 +219,18 @@ class BenchmarkRunner:
                     load_config.freeze_dendrite_updates_fraction
                 ),
                 batches_per_epoch=load_config.batches_per_epoch,
-                no_backward_workaround=False,
+                runtime_options=PAIRuntimeOptions(
+                    use_runtime_guard=self._use_pai_runtime_guard(),
+                    candidate_graph_enabled=load_config.candidate_graph_enabled,
+                    initial_correlation_batches_limit=(
+                        load_config.initial_correlation_batches_limit
+                    ),
+                ),
             )
             model = self._configure_perforated_model(
                 model, load_config.module_output_dimensions
             )
-            source_save_name = f"{model_key}_{source_key}"
+            source_save_name = self._pai_save_name(model_key, source_key)
             pai_checkpoint_name = latest_pai_switch_checkpoint(source_save_name)
             if pai_checkpoint_name is not None:
                 model = load_pai_system_checkpoint(
@@ -214,7 +241,10 @@ class BenchmarkRunner:
                 model = self._configure_perforated_model(
                     model, load_config.module_output_dimensions
                 )
-            return self._load_state(model, checkpoint_path, strict=False)
+                configure_pai_candidate_graph(load_config.candidate_graph_enabled)
+            model = self._load_state(model, checkpoint_path, strict=False)
+            configure_pai_candidate_graph(load_config.candidate_graph_enabled)
+            return model
 
         model = self._load_state(model, checkpoint_path)
         if target_uses_dendrites:
@@ -225,7 +255,6 @@ class BenchmarkRunner:
                 maximizing_score=load_config.maximizing_score,
                 module_selection=load_config.module_selection,
                 config_snapshot_path=load_config.config_snapshot_path,
-                use_runtime_guard=self._use_pai_runtime_guard(),
                 dendrite_training_max_epochs=(
                     load_config.dendrite_training_max_epochs
                 ),
@@ -234,11 +263,18 @@ class BenchmarkRunner:
                     load_config.freeze_dendrite_updates_fraction
                 ),
                 batches_per_epoch=load_config.batches_per_epoch,
-                no_backward_workaround=False,
+                runtime_options=PAIRuntimeOptions(
+                    use_runtime_guard=self._use_pai_runtime_guard(),
+                    candidate_graph_enabled=load_config.candidate_graph_enabled,
+                    initial_correlation_batches_limit=(
+                        load_config.initial_correlation_batches_limit
+                    ),
+                ),
             )
             model = self._configure_perforated_model(
                 model, load_config.module_output_dimensions
             )
+            configure_pai_candidate_graph(load_config.candidate_graph_enabled)
         return model
 
     def _artifact_path(
@@ -302,6 +338,16 @@ class BenchmarkRunner:
         # or MultiheadAttention modules directly to PAI.
         return [nn.Linear, nn.Conv1d, nn.Conv2d]
 
+    def _perforation_modules_to_perforate(self, model_key: str) -> list[Any]:
+        if model_key == "distilbert":
+            return []
+        return self._perforation_track_modules()
+
+    def _perforation_module_names_to_perforate(self, model_key: str) -> list[str]:
+        if model_key == "distilbert":
+            return list(_DISTILBERT_PAI_CLASSIFICATION_HEAD)
+        return []
+
     def _perforation_track_only_module_ids(self, model_key: str) -> list[str]:
         return {
             "actor_critic": [".value"],
@@ -319,6 +365,11 @@ class BenchmarkRunner:
 
     def _use_pai_runtime_guard(self) -> bool:
         return True
+
+    def _pai_initial_correlation_batches_limit(self, model_key: str) -> int:
+        return _MODEL_PAI_INITIAL_CORRELATION_BATCH_LIMITS.get(
+            model_key, _DEFAULT_PAI_INITIAL_CORRELATION_BATCH_LIMIT
+        )
 
     def _configure_perforated_model(
         self,
@@ -365,14 +416,22 @@ class BenchmarkRunner:
     ) -> tuple[PAIModuleSelection, dict[str, list[int]] | None]:
         if not condition.use_dendrites:
             return PAIModuleSelection(), None
-        modules_to_perforate = self._perforation_track_modules()
+        modules_to_perforate = self._perforation_modules_to_perforate(model_key)
+        module_names_to_perforate = self._perforation_module_names_to_perforate(
+            model_key
+        )
         module_selection = PAIModuleSelection(
             modules_to_perforate=modules_to_perforate,
+            module_names_to_perforate=module_names_to_perforate,
             track_only_module_ids=self._perforation_track_only_module_ids(model_key),
             module_names_to_not_save=self._perforation_module_names_to_not_save(model_key),
         )
         module_output_dimensions = infer_module_output_dimensions(
-            model, model_key, bundle, modules_to_perforate
+            model,
+            model_key,
+            bundle,
+            modules_to_perforate,
+            module_names=module_names_to_perforate,
         )
         return module_selection, module_output_dimensions
 
@@ -396,6 +455,11 @@ class BenchmarkRunner:
             if training_plan.update_dendrites_during_training
             else None
         )
+        initial_correlation_batches_limit = (
+            self._pai_initial_correlation_batches_limit(model_key)
+            if training_plan.update_dendrites_during_training
+            else None
+        )
         if condition.source_key in saved_dirs:
             checkpoint = self._artifact_path(
                 saved_dirs[condition.source_key],
@@ -408,7 +472,7 @@ class BenchmarkRunner:
                 checkpoint,
                 condition.use_dendrites,
                 SourceCheckpointLoadConfig(
-                    save_name=f"{model_key}_{condition.key}",
+                    save_name=self._pai_save_name(model_key, condition.key),
                     maximizing_score=metric_direction == "maximize",
                     module_selection=module_selection,
                     config_snapshot_path=pai_config_snapshot,
@@ -417,28 +481,36 @@ class BenchmarkRunner:
                     freeze_dendrite_updates_fraction=0.20,
                     batches_per_epoch=batches_per_epoch,
                     module_output_dimensions=module_output_dimensions,
+                    candidate_graph_enabled=training_plan.update_dendrites_during_training,
+                    initial_correlation_batches_limit=(
+                        initial_correlation_batches_limit
+                    ),
                 ),
             )
         if not condition.use_dendrites:
             return model
         model = perforate_model(
             model,
-            save_name=f"{model_key}_{condition.key}",
+            save_name=self._pai_save_name(model_key, condition.key),
             doing_pai=True,
             maximizing_score=metric_direction == "maximize",
             module_selection=module_selection,
             config_snapshot_path=pai_config_snapshot,
-            use_runtime_guard=self._use_pai_runtime_guard(),
             dendrite_training_max_epochs=dendrite_training_max_epochs,
             dynamic_dendritic_training=dynamic_dendritic_training,
             freeze_dendrite_updates_fraction=0.20,
             batches_per_epoch=batches_per_epoch,
-            no_backward_workaround=False,
+            runtime_options=PAIRuntimeOptions(
+                use_runtime_guard=self._use_pai_runtime_guard(),
+                candidate_graph_enabled=training_plan.update_dendrites_during_training,
+                initial_correlation_batches_limit=initial_correlation_batches_limit,
+            ),
         )
+        configure_pai_candidate_graph(training_plan.update_dendrites_during_training)
         return self._configure_perforated_model(model, module_output_dimensions)
 
     def _training_hyperparameters(
-        self, model_key: str, _condition: ConditionSpec
+        self, model_key: str, condition: ConditionSpec
     ) -> ModelTrainingRecipe:
         """Return model-specific training knobs adapted from canonical recipes."""
         recipes: dict[str, ModelTrainingRecipe] = {
@@ -468,10 +540,21 @@ class BenchmarkRunner:
             "capsnet_mnist": ModelTrainingRecipe(128, 30, 3.0e-3, "adam", 0.9, 0.0),
             "convlstm_movingmnist": ModelTrainingRecipe(16, 50, 1.0e-3),
         }
-        return recipes.get(
+        recipe = recipes.get(
             model_key,
             ModelTrainingRecipe(64, 4 * EPOCH_MULTIPLIER, 1.0e-3),
         )
+        dendritic_batch_size = _MODEL_DENDRITIC_BATCH_SIZES.get(model_key)
+        if condition.use_dendrites and dendritic_batch_size is not None:
+            return ModelTrainingRecipe(
+                dendritic_batch_size,
+                recipe.max_epochs,
+                recipe.learning_rate,
+                recipe.optimizer_name,
+                recipe.momentum,
+                recipe.weight_decay,
+            )
+        return recipe
 
     def _pqat_epoch_budget(self, model_key: str) -> int:
         """Allocate a short PQAT phase from the model's canonical epoch recipe."""
@@ -495,6 +578,51 @@ class BenchmarkRunner:
         model_records.append(record.to_dict())
         all_records.append(record.to_dict())
         saved_dirs[condition.key] = condition_dir
+
+    def _distilbert_dendritic_config_current(self, condition_dir: Path) -> bool:
+        config_path = condition_dir / "PAI_config.json"
+        if not config_path.exists():
+            return False
+        try:
+            config = json.loads(config_path.read_text())
+        except json.JSONDecodeError:
+            return False
+        expected_names = set(_DISTILBERT_PAI_CLASSIFICATION_HEAD)
+        module_names = set(config.get("module_names_to_perforate") or [])
+        modules_to_perforate = config.get("modules_to_perforate") or []
+        correlation_batches = config.get("initial_correlation_batches")
+        return (
+            module_names == expected_names
+            and not modules_to_perforate
+            and isinstance(correlation_batches, int)
+            and correlation_batches <= self._pai_initial_correlation_batches_limit(
+                "distilbert"
+            )
+        )
+
+    def _condition_record_usable(
+        self,
+        model_key: str,
+        condition: ConditionSpec,
+        *,
+        ignore_saved: bool,
+    ) -> bool:
+        if ignore_saved:
+            return False
+        condition_dir = self.results_root / model_key / condition.key
+        if not (condition_dir / _RECORD_JSON).exists():
+            return False
+        if (
+            model_key == "distilbert"
+            and condition.use_dendrites
+            and not self._distilbert_dendritic_config_current(condition_dir)
+        ):
+            _log(
+                f"[stale] {model_key} / {condition.key} — old full-transformer "
+                "PAI config found; retraining with memory-safe head-only PAI."
+            )
+            return False
+        return True
 
     def _train_pending_condition(
         self,
@@ -549,9 +677,9 @@ class BenchmarkRunner:
     ) -> bool:
         pending = [
             cond for cond in selected_conditions
-            if ignore_saved or not (
-                self.results_root / model_spec.key / cond.key / _RECORD_JSON
-            ).exists()
+            if not self._condition_record_usable(
+                model_spec.key, cond, ignore_saved=ignore_saved
+            )
         ]
         already_done = [cond for cond in selected_conditions if cond not in pending]
 
@@ -578,9 +706,15 @@ class BenchmarkRunner:
 
         newly_trained = False
         if pending:
-            recipe = self._training_hyperparameters(model_spec.key, selected_conditions[0])
-            bundle = build_task_bundle(model_spec.key, batch_size=recipe.batch_size)
+            bundles_by_batch_size: dict[int, Any] = {}
             for condition in pending:
+                recipe = self._training_hyperparameters(model_spec.key, condition)
+                bundle = bundles_by_batch_size.get(recipe.batch_size)
+                if bundle is None:
+                    bundle = build_task_bundle(
+                        model_spec.key, batch_size=recipe.batch_size
+                    )
+                    bundles_by_batch_size[recipe.batch_size] = bundle
                 if self._train_pending_condition(
                     model_spec, condition, bundle, ignore_saved,
                     model_records, all_records, saved_dirs, allow_pqat,

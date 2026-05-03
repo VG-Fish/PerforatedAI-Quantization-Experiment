@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterator
 # Module-level flag to ensure the PAI config-saved message is emitted only once
 _PAI_CONFIG_SAVED_PRINTED: bool = False
 _PAI_DEBUGGER_SUPPRESS_REMAINING: int = 0
+_PAI_GLOBALS_MODULE = "perforatedai.globals_perforatedai"
 MODULE_OUTPUT_DIMENSIONS_ATTR = "_dqb_module_output_dimensions"
 _PAI_CONFIG_LIST_SETTERS: tuple[str, ...] = (
     "set_modules_to_track",
@@ -128,6 +129,14 @@ class PAIModuleSelection:
     module_names_to_not_save: list[str] | None = None
 
 
+@dataclass(frozen=True)
+class PAIRuntimeOptions:
+    use_runtime_guard: bool = False
+    no_backward_workaround: bool = False
+    candidate_graph_enabled: bool = True
+    initial_correlation_batches_limit: int | None = None
+
+
 def backend_status() -> BackendStatus:
     return BackendStatus(
         torch_available=torch is not None,
@@ -172,11 +181,24 @@ def _append_pai_module_selection(pc: Any, selection: PAIModuleSelection) -> None
     )
 
 
+def configure_pai_candidate_graph(candidate_graph_enabled: bool) -> None:
+    try:
+        gpa = importlib.import_module(_PAI_GLOBALS_MODULE)
+    except Exception:
+        return
+    _call_if_available(
+        getattr(gpa, "pc", None),
+        "set_candidate_graph_mode",
+        candidate_graph_enabled,
+    )
+
+
 def _configure_pai_trackers(
     gpa: Any,
     module_selection: PAIModuleSelection | None,
     confirm_unwrapped_modules: bool,
     no_backward_workaround: bool = False,
+    candidate_graph_enabled: bool = True,
 ) -> None:
     selection = module_selection or PAIModuleSelection()
     pc = gpa.pc
@@ -185,6 +207,7 @@ def _configure_pai_trackers(
     _call_if_available(pc, "set_device", choose_device())
     _call_if_available(pc, "set_testing_dendrite_capacity", False)
     _call_if_available(pc, "set_debugging_memory_leak", False)
+    _call_if_available(pc, "set_candidate_graph_mode", candidate_graph_enabled)
     if confirm_unwrapped_modules:
         _call_if_available(pc, "set_unwrapped_modules_confirmed", True)
     _call_if_available(pc, "set_no_backward_workaround", no_backward_workaround)
@@ -223,7 +246,25 @@ def _apply_pai_schedule_values(pc: Any, values: dict[str, Any]) -> None:
         _call_pai_setter(pc, setter_name, value)
 
 
-def _configure_dynamic_pai_schedule(pc: Any, batches_per_epoch: int | None = None) -> None:
+def _initial_correlation_batches(
+    batches_per_epoch: int | None,
+    initial_correlation_batches_limit: int | None,
+) -> int | None:
+    if batches_per_epoch is None:
+        return None
+    correlation_batches = max(1, batches_per_epoch - 1)
+    if initial_correlation_batches_limit is not None:
+        correlation_batches = min(
+            correlation_batches, max(1, initial_correlation_batches_limit)
+        )
+    return correlation_batches
+
+
+def _configure_dynamic_pai_schedule(
+    pc: Any,
+    batches_per_epoch: int | None = None,
+    initial_correlation_batches_limit: int | None = None,
+) -> None:
     _set_pai_switch_mode(pc, "DOING_HISTORY")
     _apply_pai_schedule_values(
         pc,
@@ -233,8 +274,11 @@ def _configure_dynamic_pai_schedule(pc: Any, batches_per_epoch: int | None = Non
             "set_max_dendrites": 100,
         },
     )
-    if batches_per_epoch is not None:
-        _call_pai_setter(pc, "set_initial_correlation_batches", max(1, batches_per_epoch - 1))
+    correlation_batches = _initial_correlation_batches(
+        batches_per_epoch, initial_correlation_batches_limit
+    )
+    if correlation_batches is not None:
+        _call_pai_setter(pc, "set_initial_correlation_batches", correlation_batches)
 
 
 def _configure_bounded_pai_schedule(
@@ -243,6 +287,7 @@ def _configure_bounded_pai_schedule(
     max_epochs: int,
     freeze_fraction: float,
     batches_per_epoch: int | None = None,
+    initial_correlation_batches_limit: int | None = None,
 ) -> None:
     _, target_switches, switch_interval, p_epochs = _bounded_dendrite_schedule(
         max_epochs, freeze_fraction
@@ -258,8 +303,11 @@ def _configure_bounded_pai_schedule(
             "set_max_dendrites": target_switches,
         },
     )
-    if batches_per_epoch is not None:
-        _call_pai_setter(pc, "set_initial_correlation_batches", max(1, batches_per_epoch - 1))
+    correlation_batches = _initial_correlation_batches(
+        batches_per_epoch, initial_correlation_batches_limit
+    )
+    if correlation_batches is not None:
+        _call_pai_setter(pc, "set_initial_correlation_batches", correlation_batches)
 
 
 def _configure_pai_training_schedule(
@@ -269,15 +317,23 @@ def _configure_pai_training_schedule(
     dynamic_dendritic_training: bool,
     freeze_fraction: float,
     batches_per_epoch: int | None = None,
+    initial_correlation_batches_limit: int | None = None,
 ) -> None:
     pc = gpa.pc
     if dynamic_dendritic_training:
-        _configure_dynamic_pai_schedule(pc, batches_per_epoch=batches_per_epoch)
+        _configure_dynamic_pai_schedule(
+            pc,
+            batches_per_epoch=batches_per_epoch,
+            initial_correlation_batches_limit=initial_correlation_batches_limit,
+        )
         return
 
     _configure_bounded_pai_schedule(
-        pc, max_epochs=max_epochs, freeze_fraction=freeze_fraction,
+        pc,
+        max_epochs=max_epochs,
+        freeze_fraction=freeze_fraction,
         batches_per_epoch=batches_per_epoch,
+        initial_correlation_batches_limit=initial_correlation_batches_limit,
     )
 
 
@@ -329,7 +385,7 @@ def _zero_grad_if_available(target: Any) -> None:
 
 def clear_pai_processor_buffers(model: Any) -> None:
     try:
-        gpa = importlib.import_module("perforatedai.globals_perforatedai")
+        gpa = importlib.import_module(_PAI_GLOBALS_MODULE)
         clear_all_processors = getattr(
             getattr(gpa, "pai_tracker", None),
             "clear_all_processors",
@@ -536,12 +592,11 @@ def perforate_model(
     module_selection: PAIModuleSelection | None = None,
     confirm_unwrapped_modules: bool = True,
     config_snapshot_path: Path | str | None = None,
-    use_runtime_guard: bool = False,
     dendrite_training_max_epochs: int | None = None,
     dynamic_dendritic_training: bool = True,
     freeze_dendrite_updates_fraction: float = 0.20,
     batches_per_epoch: int | None = None,
-    no_backward_workaround: bool = False,
+    runtime_options: PAIRuntimeOptions | None = None,
 ) -> Any:
     if not has_perforatedai():
         if doing_pai:
@@ -553,7 +608,8 @@ def perforate_model(
 
     try:  # pragma: no cover - optional dependency
         _mirror_env_aliases()
-        GPA = importlib.import_module("perforatedai.globals_perforatedai")
+        runtime_options = runtime_options or PAIRuntimeOptions()
+        GPA = importlib.import_module(_PAI_GLOBALS_MODULE)
         UPA = importlib.import_module("perforatedai.utils_perforatedai")
         upa_perforate_model = getattr(UPA, "perforate_model")
 
@@ -565,7 +621,8 @@ def perforate_model(
                 GPA,
                 module_selection,
                 confirm_unwrapped_modules,
-                no_backward_workaround=no_backward_workaround,
+                no_backward_workaround=runtime_options.no_backward_workaround,
+                candidate_graph_enabled=runtime_options.candidate_graph_enabled,
             )
             if dendrite_training_max_epochs is not None:
                 _configure_pai_training_schedule(
@@ -574,6 +631,9 @@ def perforate_model(
                     dynamic_dendritic_training=dynamic_dendritic_training,
                     freeze_fraction=freeze_dendrite_updates_fraction,
                     batches_per_epoch=batches_per_epoch,
+                    initial_correlation_batches_limit=(
+                        runtime_options.initial_correlation_batches_limit
+                    ),
                 )
             pai_save_name = str(_pai_save_path(save_name))
             perforated = upa_perforate_model(
@@ -587,7 +647,7 @@ def perforate_model(
                 _set_tracked_params(perforated)
             return perforated
 
-        if use_runtime_guard:
+        if runtime_options.use_runtime_guard:
             with pai_runtime_guard():
                 perforated_model = _run_perforation()
         else:

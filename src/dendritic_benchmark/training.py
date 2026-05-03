@@ -19,6 +19,7 @@ from .compat import (
     binary_quantize_tensor,
     choose_device,
     clear_pai_processor_buffers,
+    configure_pai_candidate_graph,
     pai_runtime_guard,
     require_torch,
     set_module_output_dimensions,
@@ -138,6 +139,12 @@ class EpochTrainingState:
     best_metric: float
     best_epoch: int
     best_state: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class PAIUpdateStatus:
+    frozen: bool
+    active: bool
 
 
 @dataclass(frozen=True)
@@ -726,11 +733,15 @@ def infer_module_output_dimensions(
     model_key: str,
     bundle: Any,
     module_classes: list[Any],
+    module_names: list[str] | None = None,
 ) -> dict[str, list[int]]:
     valid_classes = tuple(
         module_class for module_class in module_classes if isinstance(module_class, type)
     )
-    if not valid_classes:
+    selected_module_names = {
+        module_name.lstrip(".") for module_name in (module_names or [])
+    }
+    if not valid_classes and not selected_module_names:
         return {}
 
     torch = require_torch()
@@ -750,7 +761,12 @@ def infer_module_output_dimensions(
         return hook
 
     for module_name, module in model.named_modules():
-        if module_name and _module_matches_any(module, valid_classes):
+        if not module_name:
+            continue
+        if (
+            module_name in selected_module_names
+            or _module_matches_any(module, valid_classes)
+        ):
             handles.append(module.register_forward_hook(make_hook(module_name)))
 
     was_training = bool(getattr(model, "training", False))
@@ -1485,6 +1501,158 @@ def _set_epoch_progress(
     )
 
 
+def _epoch_progress(context: EpochTrainingContext, run_until_pai_complete: bool) -> Any:
+    epoch_iterable = (
+        itertools.count() if run_until_pai_complete else range(context.max_epochs)
+    )
+    return tqdm(
+        epoch_iterable,
+        total=None if run_until_pai_complete else context.max_epochs,
+        desc=context.run_label,
+        unit="epoch",
+        leave=True,
+        dynamic_ncols=True,
+    )
+
+
+def _pai_update_status(
+    context: EpochTrainingContext,
+    epoch: int,
+    pai_tracker: Any | None,
+    run_until_pai_complete: bool,
+) -> PAIUpdateStatus:
+    frozen = _pai_updates_frozen(
+        context, epoch, run_until_pai_complete=run_until_pai_complete
+    )
+    return PAIUpdateStatus(frozen=frozen, active=bool(pai_tracker and not frozen))
+
+
+def _set_pai_candidate_graph_for_context(
+    context: EpochTrainingContext, enabled: bool
+) -> None:
+    if context.config.use_dendrites:
+        configure_pai_candidate_graph(enabled)
+
+
+def _clear_pai_buffers_when_inactive(
+    context: EpochTrainingContext, pai_updates_active: bool
+) -> None:
+    if context.config.use_dendrites and not pai_updates_active:
+        clear_pai_processor_buffers(context.model)
+
+
+def _run_training_pass(
+    context: EpochTrainingContext,
+    optimizer: Any,
+    epoch: int,
+    pai_status: PAIUpdateStatus,
+) -> tuple[float, dict[str, Any]]:
+    _set_pai_candidate_graph_for_context(context, pai_status.active)
+    try:
+        return _run_epoch_batches(
+            context.model, context.model_key, context.bundle, context.device,
+            context.criterion, optimizer, context.torch, epoch, context.max_epochs,
+            context.run_label, context.config, context.metric_name,
+            clear_pai_buffers=context.config.use_dendrites and not pai_status.active,
+        )
+    finally:
+        _set_pai_candidate_graph_for_context(context, False)
+        _clear_pai_buffers_when_inactive(context, pai_status.active)
+
+
+def _run_validation_pass(
+    context: EpochTrainingContext,
+) -> tuple[float, dict[str, Any]]:
+    context.model.eval()
+    return _eval_on_loader(
+        context.model, context.model_key, context.bundle.val_loader,
+        context.device, context.criterion, context.metric_name, context.torch
+    )
+
+
+def _record_epoch_result(
+    *,
+    state: EpochTrainingState,
+    context: EpochTrainingContext,
+    optimizer: Any,
+    epoch: int,
+    epoch_start: float,
+    train_loss: float,
+    train_metrics: dict[str, Any],
+    val_loss: float,
+    val_metrics: dict[str, Any],
+    pai_status: PAIUpdateStatus,
+) -> tuple[dict[str, Any], float]:
+    history_row = _build_history_row(
+        epoch=epoch, epoch_start=epoch_start, optimizer=optimizer,
+        train_loss=train_loss, train_metrics=train_metrics,
+        val_loss=val_loss, val_metrics=val_metrics, context=context,
+    )
+    state.history.append(history_row)
+    val_metric = float(history_row["val_metric"])
+    _record_best_epoch(
+        state, context.model, epoch, val_metric, context.metric_direction
+    )
+    history_row["pai_dynamic_insertion_active"] = pai_status.active
+    history_row["pai_dendrite_updates_frozen"] = pai_status.frozen
+    history_row["pai_restructured"] = False
+    history_row["pai_training_complete"] = False
+    return history_row, val_metric
+
+
+def _run_active_pai_update(
+    *,
+    context: EpochTrainingContext,
+    optimizer: Any,
+    pai_tracker: Any,
+    val_metric: float,
+) -> tuple[Any, Any | None, bool, bool]:
+    _set_pai_candidate_graph_for_context(context, True)
+    try:
+        return _run_dynamic_dendrite_update(
+            context=context, optimizer=optimizer, pai_tracker=pai_tracker,
+            val_metric=val_metric,
+        )
+    finally:
+        _set_pai_candidate_graph_for_context(context, False)
+
+
+def _apply_pai_epoch_update(
+    *,
+    context: EpochTrainingContext,
+    optimizer: Any,
+    pai_tracker: Any | None,
+    history_row: dict[str, Any],
+    val_metric: float,
+    pai_status: PAIUpdateStatus,
+) -> tuple[Any, Any | None, bool]:
+    if not pai_status.active:
+        return optimizer, pai_tracker, False
+    optimizer, pai_tracker, restructured, training_complete = _run_active_pai_update(
+        context=context, optimizer=optimizer, pai_tracker=pai_tracker,
+        val_metric=val_metric,
+    )
+    history_row["pai_restructured"] = restructured
+    history_row["pai_training_complete"] = training_complete
+    if training_complete:
+        _set_pai_candidate_graph_for_context(context, False)
+        clear_pai_processor_buffers(context.model)
+        return optimizer, None, True
+    return optimizer, pai_tracker, False
+
+
+def _update_epoch_progress(
+    epoch_progress: Any,
+    context: EpochTrainingContext,
+    state: EpochTrainingState,
+    val_metric: float,
+) -> None:
+    _set_epoch_progress(
+        epoch_progress, context.metric_name, val_metric,
+        state.best_metric, state.best_epoch,
+    )
+
+
 def _run_training_epochs(
     context: EpochTrainingContext,
     optimizer: Any,
@@ -1494,71 +1662,31 @@ def _run_training_epochs(
     run_until_pai_complete = bool(
         context.config.train_dendrites_until_complete and pai_tracker is not None
     )
-    epoch_iterable = itertools.count() if run_until_pai_complete else range(context.max_epochs)
-    epoch_progress = tqdm(
-        epoch_iterable,
-        total=None if run_until_pai_complete else context.max_epochs,
-        desc=context.run_label,
-        unit="epoch",
-        leave=True,
-        dynamic_ncols=True,
-    )
+    epoch_progress = _epoch_progress(context, run_until_pai_complete)
     for epoch in epoch_progress:
         epoch_start = time.perf_counter()
-        train_loss, train_metrics = _run_epoch_batches(
-            context.model, context.model_key, context.bundle, context.device,
-            context.criterion, optimizer, context.torch, epoch, context.max_epochs,
-            context.run_label, context.config, context.metric_name,
-            clear_pai_buffers=context.config.use_dendrites and pai_tracker is None,
+        pai_status = _pai_update_status(
+            context, epoch, pai_tracker, run_until_pai_complete
         )
-        context.model.eval()
-        val_loss, val_metrics = _eval_on_loader(
-            context.model, context.model_key, context.bundle.val_loader,
-            context.device, context.criterion, context.metric_name, context.torch
+        train_loss, train_metrics = _run_training_pass(
+            context, optimizer, epoch, pai_status
         )
-        history_row = _build_history_row(
-            epoch=epoch, epoch_start=epoch_start, optimizer=optimizer,
-            train_loss=train_loss, train_metrics=train_metrics,
-            val_loss=val_loss, val_metrics=val_metrics, context=context,
+        val_loss, val_metrics = _run_validation_pass(context)
+        history_row, val_metric = _record_epoch_result(
+            state=state, context=context, optimizer=optimizer, epoch=epoch,
+            epoch_start=epoch_start, train_loss=train_loss,
+            train_metrics=train_metrics, val_loss=val_loss,
+            val_metrics=val_metrics, pai_status=pai_status,
         )
-        state.history.append(history_row)
-        val_metric = float(history_row["val_metric"])
-        _record_best_epoch(
-            state, context.model, epoch, val_metric, context.metric_direction
+        optimizer, pai_tracker, pai_training_complete = _apply_pai_epoch_update(
+            context=context, optimizer=optimizer, pai_tracker=pai_tracker,
+            history_row=history_row, val_metric=val_metric, pai_status=pai_status,
         )
-        pai_updates_frozen = _pai_updates_frozen(
-            context, epoch, run_until_pai_complete=run_until_pai_complete
-        )
-        pai_updates_active = bool(pai_tracker is not None and not pai_updates_frozen)
-        history_row["pai_dynamic_insertion_active"] = pai_updates_active
-        history_row["pai_dendrite_updates_frozen"] = pai_updates_frozen
-        history_row["pai_restructured"] = False
-        history_row["pai_training_complete"] = False
-        if pai_updates_active:
-            (
-                optimizer,
-                pai_tracker,
-                restructured,
-                training_complete,
-            ) = _run_dynamic_dendrite_update(
-                context=context, optimizer=optimizer, pai_tracker=pai_tracker,
-                val_metric=val_metric,
-            )
-            history_row["pai_restructured"] = restructured
-            history_row["pai_training_complete"] = training_complete
-            if training_complete:
-                pai_tracker = None
-                if run_until_pai_complete:
-                    _set_epoch_progress(
-                        epoch_progress, context.metric_name, val_metric,
-                        state.best_metric, state.best_epoch,
-                    )
-                    break
-        _set_epoch_progress(
-            epoch_progress, context.metric_name, val_metric,
-            state.best_metric, state.best_epoch,
-        )
+        _update_epoch_progress(epoch_progress, context, state, val_metric)
+        if pai_training_complete and run_until_pai_complete:
+            break
     epoch_progress.close()
+    _set_pai_candidate_graph_for_context(context, False)
     return state.history, state.best_metric, state.best_epoch, state.best_state
 
 
