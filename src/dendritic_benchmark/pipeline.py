@@ -353,6 +353,9 @@ class BenchmarkRunner:
             "actor_critic": [".value"],
             "ppo_bipedalwalker": [".critic"],
             "capsnet_mnist": [".decoder.0", ".decoder.2"],
+            # Recurrent gates run per-timestep; perforating them dominates wallclock
+            # on long sequences. Restrict gru_forecaster to the readout Linear only.
+            "gru_forecaster": [".cells"],
         }.get(model_key, [])
 
     def _perforation_module_names_to_not_save(self, model_key: str) -> list[str]:
