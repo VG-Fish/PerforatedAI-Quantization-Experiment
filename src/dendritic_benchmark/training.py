@@ -1253,6 +1253,23 @@ def _print_skip_banner(
     )
 
 
+def _optimizer_step_requires_retained_graph(optimizer: Any) -> bool:
+    step = getattr(optimizer, "step", None)
+    step_func = getattr(step, "__func__", None)
+    step_module = (
+        getattr(step, "__module__", "")
+        or getattr(step_func, "__module__", "")
+    )
+    step_name = (
+        getattr(step, "__name__", "")
+        or getattr(step_func, "__name__", "")
+    )
+    return (
+        step_module.startswith("perforatedbp.")
+        and step_name in {"closure_pai_step", "pai_step"}
+    )
+
+
 def _run_epoch_batches(
     model: Any,
     model_key: str,
@@ -1289,6 +1306,9 @@ def _run_epoch_batches(
         dynamic_ncols=True,
         miniters=max(1, len(bundle.train_loader) // 10),
     )
+    retain_graph_for_optimizer_step = _optimizer_step_requires_retained_graph(
+        optimizer
+    )
     for batch in batch_progress:
         batch = tuple(item.to(device, non_blocking=True) for item in batch)
         optimizer.zero_grad(set_to_none=True)
@@ -1296,7 +1316,14 @@ def _run_epoch_batches(
             clear_pai_processor_buffers(model)
         outputs, targets, metric_targets = _forward(model_key, model, batch)
         loss = _compute_loss(model_key, criterion, outputs, targets)
-        loss.backward(retain_graph=not clear_pai_buffers)
+        # PerforatedAI's optimizer step may run its own backward pass after the
+        # benchmark's loss backward, including during frozen dendrite epochs.
+        loss.backward(
+            retain_graph=(
+                not clear_pai_buffers
+                or retain_graph_for_optimizer_step
+            )
+        )
         optimizer.step()
         if clear_pai_buffers:
             clear_pai_processor_buffers(model)
