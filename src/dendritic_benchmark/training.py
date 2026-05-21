@@ -1511,6 +1511,37 @@ def _pai_updates_frozen(
     return freeze_start is not None and epoch >= freeze_start
 
 
+def _copy_optimizer_learning_rates(source: Any, target: Any) -> None:
+    source_groups = getattr(source, "param_groups", None)
+    target_groups = getattr(target, "param_groups", None)
+    if not source_groups or not target_groups:
+        return
+    if len(source_groups) == len(target_groups):
+        for source_group, target_group in zip(source_groups, target_groups):
+            if "lr" in source_group:
+                target_group["lr"] = source_group["lr"]
+        return
+    source_lr = source_groups[0].get("lr")
+    if source_lr is None:
+        return
+    for target_group in target_groups:
+        target_group["lr"] = source_lr
+
+
+def _freeze_pai_live_updates(
+    context: EpochTrainingContext,
+    optimizer: Any,
+) -> Any:
+    _set_pai_candidate_graph_for_context(context, False)
+    clear_pai_processor_buffers(context.model)
+    standard_optimizer = _build_optimizer(context.model, context.torch, context.config)
+    _copy_optimizer_learning_rates(optimizer, standard_optimizer)
+    print(
+        "[pai] live dendrite updates frozen; continuing with a standard optimizer."
+    )
+    return standard_optimizer
+
+
 def _set_epoch_progress(
     epoch_progress: Any,
     metric_name: str,
@@ -1698,6 +1729,10 @@ def _run_training_epochs(
         pai_status = _pai_update_status(
             context, epoch, pai_tracker, run_until_pai_complete
         )
+        if pai_status.frozen and pai_tracker is not None:
+            optimizer = _freeze_pai_live_updates(context, optimizer)
+            pai_tracker = None
+            pai_status = PAIUpdateStatus(frozen=True, active=False)
         train_loss, train_metrics = _run_training_pass(
             context, optimizer, epoch, pai_status
         )
