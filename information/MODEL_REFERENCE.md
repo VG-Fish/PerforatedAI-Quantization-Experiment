@@ -57,7 +57,7 @@ For each model below, this document captures:
   - `momentum=0.9`
   - `weight_decay=0.0`
 - Perforation registration: default
-- PQAT epoch budget: `2`
+- PQAT epoch budget: `6`
 - Architecture diagram:
 
 ```mermaid
@@ -84,7 +84,7 @@ flowchart TD
   - `momentum=0.9`
   - `weight_decay=1.0e-4`
 - Perforation registration: default
-- PQAT epoch budget: `3`
+- PQAT epoch budget: `9`
 - Architecture diagram:
 
 ```mermaid
@@ -113,7 +113,7 @@ flowchart TD
   - `weight_decay=0.0`
 - Architecture: two-layer LSTM forecaster implemented with explicit Linear input/hidden gates so recurrent gates are eligible for dendritic perforation.
 - Perforation registration: default
-- PQAT epoch budget: `4`
+- PQAT epoch budget: `10`
 - Architecture diagram:
 
 ```mermaid
@@ -147,7 +147,7 @@ flowchart TD
   - `momentum=0.9`
   - `weight_decay=1.0e-4`
 - Perforation registration: default
-- PQAT epoch budget: `1`
+- PQAT epoch budget: `3`
 - Architecture diagram:
 
 ```mermaid
@@ -276,8 +276,8 @@ flowchart TD
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation registration: default
-- PQAT epoch budget: `4`
+- Perforation registration: default (`nn.Linear`, `nn.Conv1d`, `nn.Conv2d`). The `.value` head is registered as track-only (PAI wraps it for observation but does not insert dendrites into it); dendrite insertion applies to the shared backbone and policy head only.
+- PQAT epoch budget: `10`
 - Architecture diagram:
 
 ```mermaid
@@ -305,7 +305,7 @@ flowchart TD
   - `weight_decay=0.0`
 - Architecture: sequence-to-sequence LSTM autoencoder implemented with explicit Linear gates and a compact latent bottleneck.
 - Perforation registration: default
-- PQAT epoch budget: `5`
+- PQAT epoch budget: `10`
 - Architecture diagram:
 
 ```mermaid
@@ -334,7 +334,7 @@ flowchart TD
   - `momentum=0.9`
   - `weight_decay=1.0e-2`
 - Perforation registration: default (`nn.Linear`) — targets the Q/K/V/output projections inside each attention block and the two feed-forward sublayer linears.
-- PQAT epoch budget: `1`
+- PQAT epoch budget: `2`
 - Architecture diagram:
 
 ```mermaid
@@ -399,7 +399,7 @@ flowchart TD
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation registration: default
+- Perforation registration: default (`nn.Linear`, `nn.Conv1d`, `nn.Conv2d`). The `.critic` head is registered as track-only; dendrite insertion applies to the shared backbone and actor head only.
 - PQAT epoch budget: `10`
 
 ## 13. `attentivefp_freesolv` — AttentiveFP
@@ -480,7 +480,7 @@ flowchart TD
   - `momentum=0.9`
   - `weight_decay=1.0e-4`
 - Perforation registration: default
-- PQAT epoch budget: `6`
+- PQAT epoch budget: `10`
 - Architecture diagram:
 
 ```mermaid
@@ -514,8 +514,8 @@ flowchart TD
   - `momentum=0.9`
   - `weight_decay=0.0`
 - Architecture: two-layer GRU forecaster implemented with explicit Linear update/reset/new gates so recurrent projections can be perforated.
-- Perforation registration: default
-- PQAT epoch budget: `5`
+- Perforation registration: default (`nn.Linear`, `nn.Conv1d`, `nn.Conv2d`). The recurrent `.cells` modules are registered as track-only (PAI wraps them for observation but does not insert dendrites into them); dendrite insertion is confined to the readout `Linear` in `.head` only. This avoids per-timestep perforation overhead on long sequences.
+- PQAT epoch budget: `10`
 - Architecture diagram:
 
 ```mermaid
@@ -568,7 +568,7 @@ flowchart TD
   - `momentum=0.9`
   - `weight_decay=1.0e-4`
 - Perforation registration: default
-- PQAT epoch budget: `6`
+- PQAT epoch budget: `10`
 
 ## 18. `vae_mnist` — VAE
 
@@ -598,7 +598,7 @@ flowchart TD
   - `momentum=0.9`
   - `weight_decay=0.0`
 - Perforation registration: default
-- PQAT epoch budget: `2`
+- PQAT epoch budget: `6`
 
 ## 19. `snn_nmnist` — Spiking Neural Network
 
@@ -628,7 +628,7 @@ flowchart TD
   - `momentum=0.9`
   - `weight_decay=0.0`
 - Perforation registration: default
-- PQAT epoch budget: `5`
+- PQAT epoch budget: `10`
 
 ## 20. `unet_isic` — Tiny U-Net
 
@@ -681,7 +681,7 @@ flowchart TD
   - `momentum=0.9`
   - `weight_decay=5.0e-4`
 - Perforation registration: default
-- PQAT epoch budget: `9`
+- PQAT epoch budget: `10`
 - Architecture diagram:
 
 ```mermaid
@@ -779,8 +779,8 @@ flowchart TD
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
-- Perforation registration: default
-- PQAT epoch budget: `3`
+- Perforation registration: default (`nn.Linear`, `nn.Conv1d`, `nn.Conv2d`). The decoder reconstruction head linears (`.decoder.0` and `.decoder.2`) are registered as track-only; dendrite insertion applies to the convolutional stem, primary capsules, and routing weights only.
+- PQAT epoch budget: `9`
 
 ## 25. `convlstm_movingmnist` — ConvLSTM
 
@@ -811,4 +811,4 @@ flowchart TD
   - `momentum=0.9`
   - `weight_decay=0.0`
 - Perforation registration: default
-- PQAT epoch budget: `5`
+- PQAT epoch budget: `10`

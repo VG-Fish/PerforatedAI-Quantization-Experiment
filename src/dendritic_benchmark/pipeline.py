@@ -344,6 +344,9 @@ class BenchmarkRunner:
         return self._perforation_track_modules()
 
     def _perforation_module_names_to_perforate(self, model_key: str) -> list[str]:
+        return []
+
+    def _perforation_module_ids_to_perforate(self, model_key: str) -> list[str]:
         if model_key == "distilbert":
             return list(_DISTILBERT_PAI_CLASSIFICATION_HEAD)
         return []
@@ -354,7 +357,8 @@ class BenchmarkRunner:
             "ppo_bipedalwalker": [".critic"],
             "capsnet_mnist": [".decoder.0", ".decoder.2"],
             # Recurrent gates run per-timestep; perforating them dominates wallclock
-            # on long sequences. Restrict gru_forecaster to the readout Linear only.
+            # on long sequences. Marking .cells as track-only (not perforated)
+            # confines dendrite insertion to the readout Linear in .head only.
             "gru_forecaster": [".cells"],
         }.get(model_key, [])
 
@@ -423,9 +427,11 @@ class BenchmarkRunner:
         module_names_to_perforate = self._perforation_module_names_to_perforate(
             model_key
         )
+        module_ids_to_perforate = self._perforation_module_ids_to_perforate(model_key)
         module_selection = PAIModuleSelection(
             modules_to_perforate=modules_to_perforate,
             module_names_to_perforate=module_names_to_perforate,
+            module_ids_to_perforate=module_ids_to_perforate,
             track_only_module_ids=self._perforation_track_only_module_ids(model_key),
             module_names_to_not_save=self._perforation_module_names_to_not_save(model_key),
         )
@@ -434,7 +440,7 @@ class BenchmarkRunner:
             model_key,
             bundle,
             modules_to_perforate,
-            module_names=module_names_to_perforate,
+            module_names=[*module_names_to_perforate, *module_ids_to_perforate],
         )
         return module_selection, module_output_dimensions
 
@@ -590,12 +596,12 @@ class BenchmarkRunner:
             config = json.loads(config_path.read_text())
         except json.JSONDecodeError:
             return False
-        expected_names = set(_DISTILBERT_PAI_CLASSIFICATION_HEAD)
-        module_names = set(config.get("module_names_to_perforate") or [])
+        expected_ids = set(_DISTILBERT_PAI_CLASSIFICATION_HEAD)
+        module_ids = set(config.get("module_ids_to_perforate") or [])
         modules_to_perforate = config.get("modules_to_perforate") or []
         correlation_batches = config.get("initial_correlation_batches")
         return (
-            module_names == expected_names
+            module_ids == expected_ids
             and not modules_to_perforate
             and isinstance(correlation_batches, int)
             and correlation_batches <= self._pai_initial_correlation_batches_limit(

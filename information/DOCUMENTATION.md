@@ -333,7 +333,7 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 | **Key** | `gin_imdbb` |
 | **Domain** | Graph Classification (Social Networks) |
 | **Dataset** | IMDB-Binary — 1000 graphs, binary classification |
-| **Architecture** | 3-layer Graph Isomorphism Network with MLP aggregators, global mean pooling |
+| **Architecture** | 4-layer Graph Isomorphism Network with MLP aggregators, global mean pooling |
 | **Metric** | Accuracy (10-fold CV) |
 
 ### Group C: Time-Series Depth (Probe the Q4 Rescue)

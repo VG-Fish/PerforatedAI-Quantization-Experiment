@@ -125,6 +125,7 @@ class BackendStatus:
 class PAIModuleSelection:
     modules_to_perforate: list[Any] | None = None
     module_names_to_perforate: list[str] | None = None
+    module_ids_to_perforate: list[str] | None = None
     track_only_module_ids: list[str] | None = None
     module_names_to_not_save: list[str] | None = None
 
@@ -172,6 +173,11 @@ def _append_pai_module_selection(pc: Any, selection: PAIModuleSelection) -> None
         pc,
         "append_module_names_to_perforate",
         selection.module_names_to_perforate,
+    )
+    _append_if_configured(
+        pc,
+        "append_module_ids_to_perforate",
+        selection.module_ids_to_perforate,
     )
     _append_if_configured(
         pc, "append_module_ids_to_track", selection.track_only_module_ids
