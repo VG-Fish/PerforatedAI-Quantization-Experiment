@@ -343,9 +343,6 @@ class BenchmarkRunner:
             return []
         return self._perforation_track_modules()
 
-    def _perforation_module_names_to_perforate(self, model_key: str) -> list[str]:
-        return []
-
     def _perforation_module_ids_to_perforate(self, model_key: str) -> list[str]:
         if model_key == "distilbert":
             return list(_DISTILBERT_PAI_CLASSIFICATION_HEAD)
@@ -424,13 +421,9 @@ class BenchmarkRunner:
         if not condition.use_dendrites:
             return PAIModuleSelection(), None
         modules_to_perforate = self._perforation_modules_to_perforate(model_key)
-        module_names_to_perforate = self._perforation_module_names_to_perforate(
-            model_key
-        )
         module_ids_to_perforate = self._perforation_module_ids_to_perforate(model_key)
         module_selection = PAIModuleSelection(
             modules_to_perforate=modules_to_perforate,
-            module_names_to_perforate=module_names_to_perforate,
             module_ids_to_perforate=module_ids_to_perforate,
             track_only_module_ids=self._perforation_track_only_module_ids(model_key),
             module_names_to_not_save=self._perforation_module_names_to_not_save(model_key),
@@ -440,7 +433,7 @@ class BenchmarkRunner:
             model_key,
             bundle,
             modules_to_perforate,
-            module_names=[*module_names_to_perforate, *module_ids_to_perforate],
+            module_names=[*module_ids_to_perforate],
         )
         return module_selection, module_output_dimensions
 

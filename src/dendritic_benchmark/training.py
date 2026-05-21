@@ -1296,7 +1296,7 @@ def _run_epoch_batches(
             clear_pai_processor_buffers(model)
         outputs, targets, metric_targets = _forward(model_key, model, batch)
         loss = _compute_loss(model_key, criterion, outputs, targets)
-        loss.backward()
+        loss.backward(retain_graph=not clear_pai_buffers)
         optimizer.step()
         if clear_pai_buffers:
             clear_pai_processor_buffers(model)
@@ -1634,9 +1634,12 @@ def _apply_pai_epoch_update(
     )
     history_row["pai_restructured"] = restructured
     history_row["pai_training_complete"] = training_complete
+    # The model may have been replaced (e.g. best-model import on PAI switch) or
+    # restructured, so any buffered tensors referencing the old computation graphs
+    # are now stale.  Clear them so the next training epoch starts fresh.
+    clear_pai_processor_buffers(context.model)
     if training_complete:
         _set_pai_candidate_graph_for_context(context, False)
-        clear_pai_processor_buffers(context.model)
         return optimizer, None, True
     return optimizer, pai_tracker, False
 
