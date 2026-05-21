@@ -144,6 +144,15 @@ class EpochTrainingState:
     best_state: dict[str, Any] | None
 
 
+@dataclass
+class TrainingBatchAccumulator:
+    running_loss_t: Any
+    examples: int
+    outputs: list[Any]
+    targets: list[Any]
+    metric_targets: list[Any]
+
+
 @dataclass(frozen=True)
 class PAIUpdateStatus:
     frozen: bool
@@ -1273,6 +1282,167 @@ def _optimizer_step_requires_retained_graph(optimizer: Any) -> bool:
     )
 
 
+def _new_training_batch_accumulator(torch: Any, device: Any) -> TrainingBatchAccumulator:
+    return TrainingBatchAccumulator(
+        running_loss_t=torch.zeros(1, device=device),
+        examples=0,
+        outputs=[],
+        targets=[],
+        metric_targets=[],
+    )
+
+
+def _epoch_limit_label(config: "TrainingConfig", max_epochs: int) -> str:
+    if config.train_dendrites_until_complete:
+        return "until PAI complete"
+    return str(max_epochs)
+
+
+def _training_batch_progress(
+    bundle: Any,
+    *,
+    run_label: str,
+    epoch: int,
+    epoch_limit_label: str,
+) -> Any:
+    return tqdm(
+        bundle.train_loader,
+        desc=f"{run_label} | epoch {epoch + 1}/{epoch_limit_label}",
+        unit="batch",
+        leave=False,
+        dynamic_ncols=True,
+        miniters=max(1, len(bundle.train_loader) // 10),
+    )
+
+
+def _candidate_graph_batch_limit(
+    config: "TrainingConfig",
+    *,
+    clear_pai_buffers: bool,
+) -> int | None:
+    candidate_graph_batch_limit = config.pai_candidate_graph_batch_limit
+    if (
+        config.use_dendrites
+        and not clear_pai_buffers
+        and candidate_graph_batch_limit is not None
+        and candidate_graph_batch_limit > 0
+    ):
+        return candidate_graph_batch_limit
+    return None
+
+
+def _maybe_disable_candidate_graph_for_batch(
+    batch_index: int,
+    candidate_graph_batch_limit: int | None,
+) -> None:
+    if batch_index == candidate_graph_batch_limit:
+        configure_pai_candidate_graph(False)
+
+
+def _move_batch_to_device(batch: Any, device: Any) -> tuple[Any, ...]:
+    return tuple(item.to(device, non_blocking=True) for item in batch)
+
+
+def _backward_and_step(
+    loss: Any,
+    optimizer: Any,
+    *,
+    clear_pai_buffers: bool,
+    retain_graph_for_optimizer_step: bool,
+) -> None:
+    # PerforatedAI's optimizer step may run its own backward pass after the
+    # benchmark's loss backward, including during frozen dendrite epochs.
+    loss.backward(
+        retain_graph=(
+            not clear_pai_buffers
+            or retain_graph_for_optimizer_step
+        )
+    )
+    optimizer.step()
+
+
+def _record_training_batch_metrics(
+    accumulator: TrainingBatchAccumulator,
+    *,
+    model_key: str,
+    outputs: Any,
+    targets: Any,
+    metric_targets: Any | None,
+    loss: Any,
+) -> None:
+    batch_examples = _batch_size(targets)
+    accumulator.running_loss_t = (
+        accumulator.running_loss_t + loss.detach() * batch_examples
+    )
+    accumulator.examples += batch_examples
+    det_out, det_tgt, det_mt = _detach_metric_payload(
+        model_key, outputs, targets, metric_targets
+    )
+    accumulator.outputs.append(det_out)
+    accumulator.targets.append(det_tgt)
+    if det_mt is not None:
+        accumulator.metric_targets.append(det_mt)
+
+
+def _maybe_apply_qat_projection(model: Any, config: "TrainingConfig") -> None:
+    if config.bit_width is not None and config.bit_width < 32 and config.use_qat:
+        _make_quantized_copy(model, config.bit_width, config.quantization_mode)
+
+
+def _run_training_batch(
+    *,
+    model: Any,
+    model_key: str,
+    batch: Any,
+    device: Any,
+    criterion: Any,
+    optimizer: Any,
+    config: "TrainingConfig",
+    clear_pai_buffers: bool,
+    retain_graph_for_optimizer_step: bool,
+) -> tuple[Any, Any, Any, Any | None]:
+    batch = _move_batch_to_device(batch, device)
+    optimizer.zero_grad(set_to_none=True)
+    if clear_pai_buffers:
+        clear_pai_processor_buffers(model)
+    outputs, targets, metric_targets = _forward(model_key, model, batch)
+    loss = _compute_loss(model_key, criterion, outputs, targets)
+    _backward_and_step(
+        loss,
+        optimizer,
+        clear_pai_buffers=clear_pai_buffers,
+        retain_graph_for_optimizer_step=retain_graph_for_optimizer_step,
+    )
+    if clear_pai_buffers:
+        clear_pai_processor_buffers(model)
+    _maybe_apply_qat_projection(model, config)
+    return outputs, targets, metric_targets, loss
+
+
+def _finalize_training_batch_metrics(
+    accumulator: TrainingBatchAccumulator,
+    *,
+    model_key: str,
+    torch: Any,
+    metric_name: str,
+) -> tuple[float, dict[str, Any]]:
+    train_loss = (
+        accumulator.running_loss_t / max(1, accumulator.examples)
+    ).item()
+    if not accumulator.outputs:
+        return train_loss, {}
+    train_metrics = _compute_all_metrics(
+        model_key,
+        _cat_payload(accumulator.outputs),
+        torch.cat(accumulator.targets, dim=0),
+        torch.cat(accumulator.metric_targets, dim=0)
+        if accumulator.metric_targets
+        else None,
+        metric_name=metric_name,
+    )
+    return train_loss, train_metrics
+
+
 def _run_epoch_batches(
     model: Any,
     model_key: str,
@@ -1291,76 +1461,49 @@ def _run_epoch_batches(
     model.train()
     if clear_pai_buffers:
         clear_pai_processor_buffers(model)
-    running_loss_t = torch.zeros(1, device=device)
-    train_examples = 0
-    train_outputs: list[Any] = []
-    train_targets: list[Any] = []
-    train_metric_targets: list[Any] = []
-    epoch_limit_label = (
-        "until PAI complete"
-        if config.train_dendrites_until_complete
-        else str(max_epochs)
-    )
-    batch_progress = tqdm(
-        bundle.train_loader,
-        desc=f"{run_label} | epoch {epoch + 1}/{epoch_limit_label}",
-        unit="batch",
-        leave=False,
-        dynamic_ncols=True,
-        miniters=max(1, len(bundle.train_loader) // 10),
+    accumulator = _new_training_batch_accumulator(torch, device)
+    batch_progress = _training_batch_progress(
+        bundle,
+        run_label=run_label,
+        epoch=epoch,
+        epoch_limit_label=_epoch_limit_label(config, max_epochs),
     )
     retain_graph_for_optimizer_step = _optimizer_step_requires_retained_graph(
         optimizer
     )
-    candidate_graph_batch_limit = config.pai_candidate_graph_batch_limit
-    candidate_graph_limited = (
-        config.use_dendrites
-        and not clear_pai_buffers
-        and candidate_graph_batch_limit is not None
-        and candidate_graph_batch_limit > 0
+    candidate_graph_batch_limit = _candidate_graph_batch_limit(
+        config, clear_pai_buffers=clear_pai_buffers
     )
     for batch_index, batch in enumerate(batch_progress):
-        if candidate_graph_limited and batch_index == candidate_graph_batch_limit:
-            configure_pai_candidate_graph(False)
-        batch = tuple(item.to(device, non_blocking=True) for item in batch)
-        optimizer.zero_grad(set_to_none=True)
-        if clear_pai_buffers:
-            clear_pai_processor_buffers(model)
-        outputs, targets, metric_targets = _forward(model_key, model, batch)
-        loss = _compute_loss(model_key, criterion, outputs, targets)
-        # PerforatedAI's optimizer step may run its own backward pass after the
-        # benchmark's loss backward, including during frozen dendrite epochs.
-        loss.backward(
-            retain_graph=(
-                not clear_pai_buffers
-                or retain_graph_for_optimizer_step
-            )
+        _maybe_disable_candidate_graph_for_batch(
+            batch_index, candidate_graph_batch_limit
         )
-        optimizer.step()
-        if clear_pai_buffers:
-            clear_pai_processor_buffers(model)
-        batch_examples = _batch_size(targets)
-        running_loss_t = running_loss_t + loss.detach() * batch_examples
-        train_examples += batch_examples
-        det_out, det_tgt, det_mt = _detach_metric_payload(model_key, outputs, targets, metric_targets)
-        train_outputs.append(det_out)
-        train_targets.append(det_tgt)
-        if det_mt is not None:
-            train_metric_targets.append(det_mt)
-        if config.bit_width is not None and config.bit_width < 32 and config.use_qat:
-            _make_quantized_copy(model, config.bit_width, config.quantization_mode)
+        outputs, targets, metric_targets, loss = _run_training_batch(
+            model=model,
+            model_key=model_key,
+            batch=batch,
+            device=device,
+            criterion=criterion,
+            optimizer=optimizer,
+            config=config,
+            clear_pai_buffers=clear_pai_buffers,
+            retain_graph_for_optimizer_step=retain_graph_for_optimizer_step,
+        )
+        _record_training_batch_metrics(
+            accumulator,
+            model_key=model_key,
+            outputs=outputs,
+            targets=targets,
+            metric_targets=metric_targets,
+            loss=loss,
+        )
     batch_progress.close()
-    train_loss = (running_loss_t / max(1, train_examples)).item()
-    train_metrics: dict[str, Any] = {}
-    if train_outputs:
-        train_metrics = _compute_all_metrics(
-            model_key,
-            _cat_payload(train_outputs),
-            torch.cat(train_targets, dim=0),
-            torch.cat(train_metric_targets, dim=0) if train_metric_targets else None,
-            metric_name=metric_name,
-        )
-    return train_loss, train_metrics
+    return _finalize_training_batch_metrics(
+        accumulator,
+        model_key=model_key,
+        torch=torch,
+        metric_name=metric_name,
+    )
 
 
 def _release_accelerator_cache(torch: Any) -> None:

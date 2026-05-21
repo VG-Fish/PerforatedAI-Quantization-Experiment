@@ -821,6 +821,12 @@ class BenchmarkRunner:
         )
 
         weight_decay = 0.0 if condition.use_dendrites else training_hyperparameters.weight_decay
+        pai_candidate_graph_batch_limit = (
+            self._pai_initial_correlation_batches_limit(model_key)
+            if model_key == "distilbert"
+            and training_plan.update_dendrites_during_training
+            else None
+        )
         training_config = TrainingConfig(
             bit_width=condition.bit_width,
             quantization_mode=condition.quantization_mode,
@@ -841,12 +847,7 @@ class BenchmarkRunner:
                 and dynamic_dendritic_training
             ),
             freeze_dendrite_updates_fraction=0.20,
-            pai_candidate_graph_batch_limit=(
-                initial_correlation_batches_limit
-                if model_key == "distilbert"
-                and training_plan.update_dendrites_during_training
-                else None
-            ),
+            pai_candidate_graph_batch_limit=pai_candidate_graph_batch_limit,
         )
         return train_and_evaluate(
             model_key=model_key,
