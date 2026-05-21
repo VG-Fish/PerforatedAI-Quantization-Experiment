@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gc
 import importlib
 import itertools
 import json
@@ -60,6 +61,7 @@ class TrainingConfig:
     enable_pai_dendrite_updates: bool = False
     train_dendrites_until_complete: bool = False
     freeze_dendrite_updates_fraction: float = 0.20
+    pai_candidate_graph_batch_limit: int | None = None
 
 
 @dataclass
@@ -102,6 +104,7 @@ class ArtifactMetadata:
     enable_pai_dendrite_updates: bool
     train_dendrites_until_complete: bool
     freeze_dendrite_updates_fraction: float
+    pai_candidate_graph_batch_limit: int | None
 
 
 @dataclass(frozen=True)
@@ -1309,7 +1312,16 @@ def _run_epoch_batches(
     retain_graph_for_optimizer_step = _optimizer_step_requires_retained_graph(
         optimizer
     )
-    for batch in batch_progress:
+    candidate_graph_batch_limit = config.pai_candidate_graph_batch_limit
+    candidate_graph_limited = (
+        config.use_dendrites
+        and not clear_pai_buffers
+        and candidate_graph_batch_limit is not None
+        and candidate_graph_batch_limit > 0
+    )
+    for batch_index, batch in enumerate(batch_progress):
+        if candidate_graph_limited and batch_index == candidate_graph_batch_limit:
+            configure_pai_candidate_graph(False)
         batch = tuple(item.to(device, non_blocking=True) for item in batch)
         optimizer.zero_grad(set_to_none=True)
         if clear_pai_buffers:
@@ -1349,6 +1361,17 @@ def _run_epoch_batches(
             metric_name=metric_name,
         )
     return train_loss, train_metrics
+
+
+def _release_accelerator_cache(torch: Any) -> None:
+    gc.collect()
+    mps = getattr(torch, "mps", None)
+    if mps is not None and torch.backends.mps.is_available():
+        empty_cache = getattr(mps, "empty_cache", None)
+        if empty_cache is not None:
+            empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _initial_epoch_state(metric_direction: str) -> EpochTrainingState:
@@ -1534,6 +1557,7 @@ def _freeze_pai_live_updates(
 ) -> Any:
     _set_pai_candidate_graph_for_context(context, False)
     clear_pai_processor_buffers(context.model)
+    _release_accelerator_cache(context.torch)
     standard_optimizer = _build_optimizer(context.model, context.torch, context.config)
     _copy_optimizer_learning_rates(optimizer, standard_optimizer)
     print(
@@ -1696,6 +1720,7 @@ def _apply_pai_epoch_update(
     # restructured, so any buffered tensors referencing the old computation graphs
     # are now stale.  Clear them so the next training epoch starts fresh.
     clear_pai_processor_buffers(context.model)
+    _release_accelerator_cache(context.torch)
     if training_complete:
         _set_pai_candidate_graph_for_context(context, False)
         return optimizer, None, True
@@ -1732,6 +1757,7 @@ def _run_training_epochs(
         if pai_status.frozen and pai_tracker is not None:
             optimizer = _freeze_pai_live_updates(context, optimizer)
             pai_tracker = None
+            _release_accelerator_cache(context.torch)
             pai_status = PAIUpdateStatus(frozen=True, active=False)
         train_loss, train_metrics = _run_training_pass(
             context, optimizer, epoch, pai_status
@@ -1780,6 +1806,7 @@ def _build_artifact_metadata(
         enable_pai_dendrite_updates=config.enable_pai_dendrite_updates,
         train_dendrites_until_complete=config.train_dendrites_until_complete,
         freeze_dendrite_updates_fraction=config.freeze_dendrite_updates_fraction,
+        pai_candidate_graph_batch_limit=config.pai_candidate_graph_batch_limit,
     )
 
 
@@ -1808,6 +1835,7 @@ def _metadata_for_stage(
         enable_pai_dendrite_updates=metadata.enable_pai_dendrite_updates,
         train_dendrites_until_complete=metadata.train_dendrites_until_complete,
         freeze_dendrite_updates_fraction=metadata.freeze_dendrite_updates_fraction,
+        pai_candidate_graph_batch_limit=metadata.pai_candidate_graph_batch_limit,
     )
 
 

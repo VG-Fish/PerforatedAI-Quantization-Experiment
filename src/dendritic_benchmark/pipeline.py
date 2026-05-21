@@ -841,6 +841,12 @@ class BenchmarkRunner:
                 and dynamic_dendritic_training
             ),
             freeze_dendrite_updates_fraction=0.20,
+            pai_candidate_graph_batch_limit=(
+                initial_correlation_batches_limit
+                if model_key == "distilbert"
+                and training_plan.update_dendrites_during_training
+                else None
+            ),
         )
         return train_and_evaluate(
             model_key=model_key,
