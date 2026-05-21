@@ -202,22 +202,13 @@ def write_model_reports(
     )
 
 
-def _process_model_comparison(
-    model_key: str,
-    records: list[dict[str, Any]],
-    baselines: dict[str, dict[str, Any]],
-    condition_order: list[str],
+def _compute_quant_rows(
     quantization_groups: list[list[str]],
-) -> tuple[list[float], list[float], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Return (retention_row, quant_row, winner_row, summary_rows, tradeoff_points) for one model."""
-    model_records = [r for r in records if r["model_key"] == model_key]
-    by_condition = {r["condition_key"]: r for r in model_records}
-    baseline = baselines.get(model_key, {})
-    retention_row = [
-        _normalization_score(by_condition[key], baseline) if key in by_condition else 0.0
-        for key in condition_order
-    ]
+    by_condition: dict[str, Any],
+    baseline: dict[str, Any],
+) -> tuple[list[float], list[float], list[int]]:
     quant_row: list[float] = []
+    other_quant_row: list[float] = []
     winner_row: list[int] = []
     for group in quantization_groups:
         scores = [
@@ -229,14 +220,25 @@ def _process_model_comparison(
             best_i, best_score = max(scores, key=lambda t: t[1])
             quant_row.append(best_score)
             winner_row.append(0 if best_i == 0 else 1)
+            other_scores = [s for i, s in scores if i != best_i]
+            other_quant_row.append(other_scores[0] if other_scores else best_score)
         else:
             quant_row.append(0.0)
+            other_quant_row.append(0.0)
             winner_row.append(0)
+    return quant_row, other_quant_row, winner_row
+
+
+def _build_model_records(
+    model_key: str,
+    by_condition: dict[str, Any],
+    baseline: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     summary_rows: list[dict[str, Any]] = []
     tradeoff_points: list[dict[str, Any]] = []
+    if not baseline:
+        return summary_rows, tradeoff_points
     for condition_key, record in by_condition.items():
-        if not baseline:
-            continue
         retention = _normalization_score(record, baseline)
         size_reduction = _size_reduction(baseline, record)
         summary_rows.append({
@@ -257,7 +259,29 @@ def _process_model_comparison(
             "color": "#2b6cb0" if "dendrites" not in condition_key else "#2f855a",
             "shape": "square" if "dendrites" in condition_key else "circle",
         })
-    return retention_row, quant_row, winner_row, summary_rows, tradeoff_points
+    return summary_rows, tradeoff_points
+
+
+def _process_model_comparison(
+    model_key: str,
+    records: list[dict[str, Any]],
+    baselines: dict[str, dict[str, Any]],
+    condition_order: list[str],
+    quantization_groups: list[list[str]],
+) -> tuple[list[float], list[float], list[float], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return (retention_row, quant_row, other_quant_row, winner_row, summary_rows, tradeoff_points) for one model."""
+    model_records = [r for r in records if r["model_key"] == model_key]
+    by_condition = {r["condition_key"]: r for r in model_records}
+    baseline = baselines.get(model_key, {})
+    retention_row = [
+        _normalization_score(by_condition[key], baseline) if key in by_condition else 0.0
+        for key in condition_order
+    ]
+    quant_row, other_quant_row, winner_row = _compute_quant_rows(
+        quantization_groups, by_condition, baseline
+    )
+    summary_rows, tradeoff_points = _build_model_records(model_key, by_condition, baseline)
+    return retention_row, quant_row, other_quant_row, winner_row, summary_rows, tradeoff_points
 
 
 def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) -> None:
@@ -275,15 +299,17 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
     ]
     retention_rows: list[list[float]] = []
     best_quant_rows: list[list[float]] = []
+    other_quant_rows: list[list[float]] = []
     best_quant_winners: list[list[int]] = []
     tradeoff_points: list[dict[str, Any]] = []
     summary_rows: list[dict[str, Any]] = []
     for model_key in model_order:
-        ret_row, quant_row, winner_row, s_rows, t_points = _process_model_comparison(
+        ret_row, quant_row, other_quant_row, winner_row, s_rows, t_points = _process_model_comparison(
             model_key, records, baselines, condition_order, quantization_groups
         )
         retention_rows.append(ret_row)
         best_quant_rows.append(quant_row)
+        other_quant_rows.append(other_quant_row)
         best_quant_winners.append(winner_row)
         summary_rows.extend(s_rows)
         tradeoff_points.extend(t_points)
@@ -340,6 +366,7 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
         best_quant_rows,
         subtitle="Which variant achieves the best retention per quantization level (%)",
         metric_labels=[spec.metric_name for spec in MODEL_SPECS],
+        other_score_matrix=other_quant_rows,
     )
     with (output_dir / "summary.csv").open("w", newline="") as fh:
         if summary_rows:

@@ -364,6 +364,70 @@ def heatmap(
     _save(fig, path)
 
 
+_WINNER_OTHER_COLOR = "#FFD580"
+
+
+def _draw_winner_metric_labels(ax: Axes, cols: int, metric_labels: list[str]) -> None:
+    ax.set_xlim(-0.5, cols + 2.35)
+    for row_index, metric_label in enumerate(metric_labels):
+        ax.text(
+            cols + 0.08,
+            row_index,
+            f"Metric: {metric_label}\nBest model: winner retention vs Base FP32\nOther model: other variant retention vs Base FP32",
+            ha="left",
+            va="center",
+            fontsize=7.2,
+            color=TEXT,
+            bbox={
+                "boxstyle": "round,pad=0.28",
+                "facecolor": "#fffdfa",
+                "edgecolor": GRID,
+                "linewidth": 0.8,
+            },
+        )
+
+
+def _annotate_winner_cell(
+    ax: Axes,
+    col_index: int,
+    row_index: int,
+    winner: int,
+    score: float,
+    other_row: list[float] | None,
+) -> None:
+    best_label = "Base" if winner == 0 else "Dendrites"
+    if other_row is not None:
+        other_label = "Dendrites" if winner == 0 else "Base"
+        ax.text(
+            col_index, row_index - 0.18,
+            f"Best ({best_label}): {score:.1f}%",
+            ha="center", va="center", fontsize=6.5, color="white", fontweight="bold",
+        )
+        ax.text(
+            col_index, row_index + 0.22,
+            f"Other ({other_label}): {other_row[col_index]:.1f}%",
+            ha="center", va="center", fontsize=6.0, color=_WINNER_OTHER_COLOR,
+        )
+    else:
+        ax.text(
+            col_index, row_index,
+            f"{best_label}\n{score:.1f}%",
+            ha="center", va="center", fontsize=7.5, color="white", fontweight="bold",
+        )
+
+
+def _annotate_winner_cells(
+    ax: Axes,
+    winner_matrix: list[list[int]],
+    score_matrix: list[list[float]],
+    other_score_matrix: list[list[float]] | None,
+) -> None:
+    for row_index, (winner_row, score_row) in enumerate(zip(winner_matrix, score_matrix)):
+        other_row = other_score_matrix[row_index] if other_score_matrix else None
+        for col_index, (winner, score) in enumerate(zip(winner_row, score_row)):
+            _annotate_winner_cell(ax, col_index, row_index, winner, score, other_row)
+
+
 def winner_heatmap(
     path: Path,
     title: str,
@@ -373,16 +437,17 @@ def winner_heatmap(
     score_matrix: list[list[float]],
     subtitle: str | None = None,
     metric_labels: list[str] | None = None,
+    other_score_matrix: list[list[float]] | None = None,
 ) -> None:
     """Categorical heatmap: 0 = base wins (blue), 1 = dendrites wins (green)."""
+    import numpy as np
+    from matplotlib.colors import ListedColormap
+
     rows = len(row_labels)
     cols = len(col_labels)
     fig_width = max(14.0, 1.02 * cols + 7.2)
     fig_height = max(6.6, 0.52 * rows + 3.2)
     fig, ax = _setup_figure(fig_width, fig_height)
-
-    import numpy as np
-    from matplotlib.colors import ListedColormap
 
     data = np.array(winner_matrix, dtype=float)
     cmap = ListedColormap([BASE_BLUE, DENDRITE_GREEN])
@@ -397,23 +462,7 @@ def winner_heatmap(
     ax.set_xticks(range(cols), [_wrap_label(label, width=10) for label in col_labels])
     ax.set_yticks(range(rows), row_labels)
     if metric_labels:
-        ax.set_xlim(-0.5, cols + 2.35)
-        for row_index, metric_label in enumerate(metric_labels):
-            ax.text(
-                cols + 0.08,
-                row_index,
-                f"Metric: {metric_label}\nCell: best retention vs Base FP32",
-                ha="left",
-                va="center",
-                fontsize=7.2,
-                color=TEXT,
-                bbox={
-                    "boxstyle": "round,pad=0.28",
-                    "facecolor": "#fffdfa",
-                    "edgecolor": GRID,
-                    "linewidth": 0.8,
-                },
-            )
+        _draw_winner_metric_labels(ax, cols, metric_labels)
     ax.tick_params(axis="x", labeltop=True, labelbottom=False, colors=TEXT, pad=4)
     ax.tick_params(axis="y", colors=TEXT)
     ax.set_xticks([index - 0.5 for index in range(1, cols)], minor=True)
@@ -421,19 +470,7 @@ def winner_heatmap(
     ax.grid(which="minor", color=BACKGROUND, linestyle="-", linewidth=2)
     ax.tick_params(which="minor", bottom=False, left=False)
 
-    for row_index, (winner_row, score_row) in enumerate(zip(winner_matrix, score_matrix)):
-        for col_index, (winner, score) in enumerate(zip(winner_row, score_row)):
-            label = "Base" if winner == 0 else "Dendrites"
-            ax.text(
-                col_index,
-                row_index,
-                f"{label}\n{score:.1f}%",
-                ha="center",
-                va="center",
-                fontsize=7.5,
-                color="white",
-                fontweight="bold",
-            )
+    _annotate_winner_cells(ax, winner_matrix, score_matrix, other_score_matrix)
 
     legend_patches = [
         Patch(facecolor=BASE_BLUE, label="Base"),
