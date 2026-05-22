@@ -6,6 +6,8 @@ import importlib
 import itertools
 import json
 import math
+import os
+import subprocess
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
@@ -30,6 +32,8 @@ from .compat import (
 
 _MODEL_PT: str = "model.pt"
 _BEST_MODEL_STATS_CSV: str = "best_model_stats.csv"
+_MEMORY_GUARD_THRESHOLD_BYTES = 10 * 1024**3
+_MEMORY_GUARD_CHECK_INTERVAL_BATCHES = 16
 _FALLBACK_MODULE_OUTPUT_DIMENSIONS: dict[str, dict[str, list[int]]] = {
     "gcn": {
         ".conv1.linear": [-1, -1, 0],
@@ -1482,6 +1486,12 @@ def _run_epoch_batches(
     model.train()
     if clear_pai_buffers:
         clear_pai_processor_buffers(model)
+    _run_memory_guard_cleanup_if_needed(
+        model=model,
+        torch=torch,
+        config=config,
+        location=f"{run_label} epoch {epoch + 1} start",
+    )
     accumulator = _new_training_batch_accumulator(torch, device)
     batch_progress = _training_batch_progress(
         bundle,
@@ -1519,7 +1529,18 @@ def _run_epoch_batches(
             loss=loss,
         )
         del outputs, targets, metric_targets, loss
-        if _memory_cleanup_due(batch_index, config):
+        guard_cleaned = False
+        if _memory_guard_check_due(batch_index):
+            guard_cleaned = _run_memory_guard_cleanup_if_needed(
+                model=model,
+                torch=torch,
+                config=config,
+                location=(
+                    f"{run_label} epoch {epoch + 1} "
+                    f"batch {batch_index + 1}"
+                ),
+            )
+        if _memory_cleanup_due(batch_index, config) and not guard_cleaned:
             _run_periodic_training_memory_cleanup(
                 model=model,
                 torch=torch,
@@ -1544,6 +1565,148 @@ def _release_accelerator_cache(torch: Any, *, collect_python: bool = True) -> No
             empty_cache()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _process_rss_bytes_from_proc() -> int | None:
+    statm_path = Path("/proc/self/statm")
+    if not statm_path.exists():
+        return None
+    try:
+        fields = statm_path.read_text().split()
+        resident_pages = int(fields[1])
+        return resident_pages * int(os.sysconf("SC_PAGE_SIZE"))
+    except (IndexError, OSError, ValueError):
+        return None
+
+
+def _process_rss_bytes_from_ps() -> int | None:
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = result.stdout.strip().splitlines()
+    if not lines:
+        return None
+    try:
+        return int(lines[0].strip()) * 1024
+    except ValueError:
+        return None
+
+
+def _process_resident_memory_bytes() -> int | None:
+    return _process_rss_bytes_from_proc() or _process_rss_bytes_from_ps()
+
+
+def _safe_backend_available(backend: Any) -> bool:
+    try:
+        return bool(backend is not None and backend.is_available())
+    except Exception:
+        return False
+
+
+def _safe_memory_method_reading(target: Any, method_name: str) -> int | None:
+    method = getattr(target, method_name, None)
+    if method is None:
+        return None
+    try:
+        return int(method())
+    except Exception:
+        return None
+
+
+def _memory_readings_from_methods(
+    target: Any, method_names: tuple[str, ...]
+) -> list[int]:
+    return [
+        reading
+        for method_name in method_names
+        if (reading := _safe_memory_method_reading(target, method_name)) is not None
+    ]
+
+
+def _cuda_memory_readings(torch: Any) -> list[int]:
+    cuda = getattr(torch, "cuda", None)
+    if not _safe_backend_available(cuda):
+        return []
+    return _memory_readings_from_methods(
+        cuda, ("memory_reserved", "memory_allocated")
+    )
+
+
+def _mps_memory_readings(torch: Any) -> list[int]:
+    mps = getattr(torch, "mps", None)
+    mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+    if mps is None or not _safe_backend_available(mps_backend):
+        return []
+    return _memory_readings_from_methods(
+        mps, ("driver_allocated_memory", "current_allocated_memory")
+    )
+
+
+def _max_memory_reading(readings: list[int]) -> int | None:
+    return max(readings) if readings else None
+
+
+def _torch_accelerator_memory_bytes(torch: Any) -> int | None:
+    return _max_memory_reading([
+        *_cuda_memory_readings(torch),
+        *_mps_memory_readings(torch),
+    ])
+
+
+def _current_memory_usage_bytes(torch: Any) -> int | None:
+    readings = [
+        value
+        for value in (
+            _process_resident_memory_bytes(),
+            _torch_accelerator_memory_bytes(torch),
+        )
+        if value is not None
+    ]
+    if not readings:
+        return None
+    # MPS uses unified memory, so use the highest observed source instead of
+    # adding process RSS and driver allocation together.
+    return max(readings)
+
+
+def _format_memory_usage(memory_bytes: int) -> str:
+    return f"{memory_bytes / (1024**3):.2f} GB"
+
+
+def _memory_guard_check_due(batch_index: int) -> bool:
+    return (batch_index + 1) % _MEMORY_GUARD_CHECK_INTERVAL_BATCHES == 0
+
+
+def _run_memory_guard_cleanup_if_needed(
+    *,
+    model: Any,
+    torch: Any,
+    config: TrainingConfig,
+    location: str,
+) -> bool:
+    usage_bytes = _current_memory_usage_bytes(torch)
+    if usage_bytes is None or usage_bytes <= _MEMORY_GUARD_THRESHOLD_BYTES:
+        return False
+    if config.use_dendrites:
+        clear_pai_processor_buffers(model)
+    _release_accelerator_cache(torch)
+    after_bytes = _current_memory_usage_bytes(torch)
+    message = (
+        f"[memory] {location}: usage reached "
+        f"{_format_memory_usage(usage_bytes)}; cleared caches after crossing "
+        f"{_format_memory_usage(_MEMORY_GUARD_THRESHOLD_BYTES)}."
+    )
+    if after_bytes is not None:
+        message += f" Current usage: {_format_memory_usage(after_bytes)}."
+    print(message)
+    return True
 
 
 def _initial_epoch_state(metric_direction: str) -> EpochTrainingState:
@@ -1944,6 +2107,12 @@ def _run_training_epochs(
         optimizer, pai_tracker, pai_training_complete = _apply_pai_epoch_update(
             context=context, optimizer=optimizer, pai_tracker=pai_tracker,
             history_row=history_row, val_metric=val_metric, pai_status=pai_status,
+        )
+        _run_memory_guard_cleanup_if_needed(
+            model=context.model,
+            torch=context.torch,
+            config=context.config,
+            location=f"{context.run_label} epoch {epoch + 1} end",
         )
         _update_epoch_progress(epoch_progress, context, state, val_metric)
         if pai_training_complete and run_until_pai_complete:
