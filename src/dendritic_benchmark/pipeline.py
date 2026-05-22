@@ -48,6 +48,10 @@ _MODEL_PAI_INITIAL_CORRELATION_BATCH_LIMITS = {
 _MODEL_DENDRITIC_BATCH_SIZES = {
     "distilbert": 4,
 }
+_DEFAULT_DENDRITIC_MEMORY_CLEANUP_INTERVAL = 512
+_MODEL_DENDRITIC_MEMORY_CLEANUP_INTERVALS = {
+    "distilbert": 128,
+}
 # Full-transformer PAI wrapping makes DistilBERT's candidate forward exceed
 # Apple Silicon MPS memory. Keep dendrite search on the task-specific head.
 _DISTILBERT_PAI_CLASSIFICATION_HEAD = [
@@ -565,6 +569,23 @@ class BenchmarkRunner:
         )
         return max(1, min(10, math.ceil(recipe.max_epochs * 0.30)))
 
+    def _memory_cleanup_interval_batches(
+        self,
+        model_key: str,
+        condition: ConditionSpec,
+        batches_per_epoch: int | None,
+    ) -> int | None:
+        if not condition.use_dendrites:
+            return None
+        configured = _MODEL_DENDRITIC_MEMORY_CLEANUP_INTERVALS.get(
+            model_key, _DEFAULT_DENDRITIC_MEMORY_CLEANUP_INTERVAL
+        )
+        if batches_per_epoch is None:
+            return configured
+        if batches_per_epoch <= configured:
+            return None
+        return configured
+
     def _load_saved_condition(
         self,
         model_key: str,
@@ -827,6 +848,9 @@ class BenchmarkRunner:
             and training_plan.update_dendrites_during_training
             else None
         )
+        memory_cleanup_interval_batches = self._memory_cleanup_interval_batches(
+            model_key, condition, batches_per_epoch
+        )
         training_config = TrainingConfig(
             bit_width=condition.bit_width,
             quantization_mode=condition.quantization_mode,
@@ -848,6 +872,7 @@ class BenchmarkRunner:
             ),
             freeze_dendrite_updates_fraction=0.20,
             pai_candidate_graph_batch_limit=pai_candidate_graph_batch_limit,
+            memory_cleanup_interval_batches=memory_cleanup_interval_batches,
         )
         return train_and_evaluate(
             model_key=model_key,

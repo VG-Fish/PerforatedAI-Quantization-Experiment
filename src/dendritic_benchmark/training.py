@@ -62,6 +62,7 @@ class TrainingConfig:
     train_dendrites_until_complete: bool = False
     freeze_dendrite_updates_fraction: float = 0.20
     pai_candidate_graph_batch_limit: int | None = None
+    memory_cleanup_interval_batches: int | None = None
 
 
 @dataclass
@@ -105,6 +106,7 @@ class ArtifactMetadata:
     train_dendrites_until_complete: bool
     freeze_dendrite_updates_fraction: float
     pai_candidate_graph_batch_limit: int | None
+    memory_cleanup_interval_batches: int | None
 
 
 @dataclass(frozen=True)
@@ -902,6 +904,9 @@ def _write_metrics_and_history(
                 "freeze_dendrite_updates_fraction": (
                     metadata.freeze_dendrite_updates_fraction
                 ),
+                "memory_cleanup_interval_batches": (
+                    metadata.memory_cleanup_interval_batches
+                ),
                 "artifact_path": str(stats.artifact_path),
                 "training_skipped": payload.training_skipped,
                 "skip_reason": payload.skip_reason,
@@ -1389,6 +1394,22 @@ def _maybe_apply_qat_projection(model: Any, config: "TrainingConfig") -> None:
         _make_quantized_copy(model, config.bit_width, config.quantization_mode)
 
 
+def _memory_cleanup_due(batch_index: int, config: "TrainingConfig") -> bool:
+    interval = config.memory_cleanup_interval_batches
+    return interval is not None and interval > 0 and (batch_index + 1) % interval == 0
+
+
+def _run_periodic_training_memory_cleanup(
+    *,
+    model: Any,
+    torch: Any,
+    config: "TrainingConfig",
+) -> None:
+    if config.use_dendrites:
+        clear_pai_processor_buffers(model)
+    _release_accelerator_cache(torch)
+
+
 def _run_training_batch(
     *,
     model: Any,
@@ -1497,6 +1518,13 @@ def _run_epoch_batches(
             metric_targets=metric_targets,
             loss=loss,
         )
+        del outputs, targets, metric_targets, loss
+        if _memory_cleanup_due(batch_index, config):
+            _run_periodic_training_memory_cleanup(
+                model=model,
+                torch=torch,
+                config=config,
+            )
     batch_progress.close()
     return _finalize_training_batch_metrics(
         accumulator,
@@ -1506,8 +1534,9 @@ def _run_epoch_batches(
     )
 
 
-def _release_accelerator_cache(torch: Any) -> None:
-    gc.collect()
+def _release_accelerator_cache(torch: Any, *, collect_python: bool = True) -> None:
+    if collect_python:
+        gc.collect()
     mps = getattr(torch, "mps", None)
     if mps is not None and torch.backends.mps.is_available():
         empty_cache = getattr(mps, "empty_cache", None)
@@ -1950,6 +1979,7 @@ def _build_artifact_metadata(
         train_dendrites_until_complete=config.train_dendrites_until_complete,
         freeze_dendrite_updates_fraction=config.freeze_dendrite_updates_fraction,
         pai_candidate_graph_batch_limit=config.pai_candidate_graph_batch_limit,
+        memory_cleanup_interval_batches=config.memory_cleanup_interval_batches,
     )
 
 
@@ -1979,6 +2009,7 @@ def _metadata_for_stage(
         train_dendrites_until_complete=metadata.train_dendrites_until_complete,
         freeze_dendrite_updates_fraction=metadata.freeze_dendrite_updates_fraction,
         pai_candidate_graph_batch_limit=metadata.pai_candidate_graph_batch_limit,
+        memory_cleanup_interval_batches=metadata.memory_cleanup_interval_batches,
     )
 
 

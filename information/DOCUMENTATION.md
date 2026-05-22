@@ -218,6 +218,9 @@ persistent DataLoader workers, uses larger per-model batch sizes to amortize
 Python dispatch, and applies `torch.compile(..., backend='aot_eager')` for
 non-dendritic MPS models when PyTorch supports it. Dendritic models are not
 compiled because PerforatedAI may restructure modules during the live phase.
+Long dendritic runs periodically clear PerforatedAI processor buffers and the
+accelerator cache after completed batches to prevent late-epoch MPS memory
+pressure.
 
 ### Quantization via torchao
 ```python

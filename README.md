@@ -19,7 +19,7 @@ Each condition applies only two experimental factors to the same models: quantiz
 
 Dendritic FP32 training defaults to the same fixed epoch budget as the matching non-dendritic model. PerforatedAI dendrite insertion is active during the first 80% of those epochs with a fixed switch cadence tuned to the budget, then dendrite insertion is frozen for the final 20% so the selected architecture can settle. Pass `--dynamic-dendritic-training` to restore the open-ended PerforatedAI mode that keeps training until `training_complete=True`; any epochs beyond the canonical budget are written under `results/<model>/<condition>/continued_until_complete/`.
 
-For Apple Silicon runs, the training path selects MPS automatically, disables CUDA-only pinned memory, keeps DataLoader workers persistent, uses larger per-model batch sizes, sets high float32 matmul precision where supported, and compiles non-dendritic MPS models with `torch.compile(..., backend="aot_eager")` when available.
+For Apple Silicon runs, the training path selects MPS automatically, disables CUDA-only pinned memory, keeps DataLoader workers persistent, uses larger per-model batch sizes, sets high float32 matmul precision where supported, and compiles non-dendritic MPS models with `torch.compile(..., backend="aot_eager")` when available. Long dendritic runs periodically clear PerforatedAI processor buffers and the accelerator cache to avoid MPS memory pressure during late epochs.
 
 ## Setup
 

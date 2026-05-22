@@ -33,6 +33,9 @@ For each model below, this document captures:
   - The benchmark registers tensor-returning `nn.Linear`, `nn.Conv1d`, and `nn.Conv2d` modules for PerforatedAI perforation.
   - Recurrent, graph-attention, capsule, and tabular-attention models expose their gates/projections as explicit Linear/Conv modules, rather than handing tuple-returning `nn.LSTM`, `nn.GRU`, or `nn.MultiheadAttention` modules directly to PerforatedAI.
   - Dendritic conditions fail fast if PerforatedAI is unavailable or cannot perforate the model; the runner does not silently record unperforated fallback models as dendritic results.
+- Dendritic memory cleanup:
+  - Long dendritic runs periodically clear PerforatedAI processor buffers and the accelerator cache after completed batches.
+  - DistilBERT dendritic runs use a 128-batch cleanup interval to avoid late-epoch MPS memory pressure.
 - Dendritic epoch policy:
   - By default, dendritic FP32 runs use the listed `max_epochs` value as a hard budget matching Base FP32.
   - PerforatedAI insertion is active for the first 80% of that budget with fixed switch intervals, then frozen for the last 20%.
@@ -333,7 +336,8 @@ flowchart TD
   - `optimizer_name=adamw`
   - `momentum=0.9`
   - `weight_decay=1.0e-2`
-- Perforation registration: default (`nn.Linear`) — targets the Q/K/V/output projections inside each attention block and the two feed-forward sublayer linears.
+- Perforation registration: head-only (`.model.pre_classifier`, `.model.classifier`) to keep DistilBERT dendritic runs within Apple Silicon MPS memory. The base transformer is excluded from PerforatedAI saving through `.model.base_model`.
+- Dendritic runtime note: dendritic DistilBERT uses `batch_size=4`, caps initial PAI correlation to 4 batches, and clears memory every 128 completed batches.
 - PQAT epoch budget: `2`
 - Architecture diagram:
 
