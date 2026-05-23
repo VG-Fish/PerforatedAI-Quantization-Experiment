@@ -447,7 +447,13 @@ def _classification_metrics(logits: Any, targets: Any) -> dict[str, float]:
         )
 
     confusion = torch.zeros((num_classes, num_classes), dtype=torch.float64)
-    indices = (targets * num_classes + predictions).cpu()
+    cm_targets = targets.cpu()
+    cm_predictions = predictions.cpu()
+    valid_mask = (cm_targets >= 0) & (cm_targets < num_classes)
+    if not valid_mask.all():
+        cm_targets = cm_targets[valid_mask]
+        cm_predictions = cm_predictions[valid_mask]
+    indices = cm_targets * num_classes + cm_predictions
     confusion += (
         torch.bincount(indices, minlength=num_classes * num_classes)
         .reshape(num_classes, num_classes)
