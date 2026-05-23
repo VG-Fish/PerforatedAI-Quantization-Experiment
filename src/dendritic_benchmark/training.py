@@ -22,6 +22,7 @@ from .compat import (
     binary_quantize_tensor,
     choose_device,
     clear_pai_processor_buffers,
+    clear_pai_tracker_state,
     configure_pai_candidate_graph,
     pai_runtime_guard,
     require_torch,
@@ -32,6 +33,7 @@ from .compat import (
 
 _MODEL_PT: str = "model.pt"
 _BEST_MODEL_STATS_CSV: str = "best_model_stats.csv"
+_EPOCH_CHECKPOINT_PT: str = "epoch_checkpoint.pt"
 _MEMORY_GUARD_THRESHOLD_BYTES = 10 * 1024**3
 _MEMORY_GUARD_CHECK_INTERVAL_BATCHES = 16
 _FALLBACK_MODULE_OUTPUT_DIMENSIONS: dict[str, dict[str, list[int]]] = {
@@ -140,6 +142,7 @@ class EpochTrainingContext:
     metric_name: str
     primary_metric_key: str
     metric_direction: str
+    output_dir: "Path | None" = None
 
 
 @dataclass
@@ -444,7 +447,7 @@ def _classification_metrics(logits: Any, targets: Any) -> dict[str, float]:
         )
 
     confusion = torch.zeros((num_classes, num_classes), dtype=torch.float64)
-    indices = targets * num_classes + predictions
+    indices = (targets * num_classes + predictions).cpu()
     confusion += (
         torch.bincount(indices, minlength=num_classes * num_classes)
         .reshape(num_classes, num_classes)
@@ -1356,17 +1359,12 @@ def _backward_and_step(
     loss: Any,
     optimizer: Any,
     *,
-    clear_pai_buffers: bool,
     retain_graph_for_optimizer_step: bool,
 ) -> None:
     # PerforatedAI's optimizer step may run its own backward pass after the
-    # benchmark's loss backward, including during frozen dendrite epochs.
-    loss.backward(
-        retain_graph=(
-            not clear_pai_buffers
-            or retain_graph_for_optimizer_step
-        )
-    )
+    # benchmark's loss backward. Standard torch optimizers do not need the
+    # graph retained; keeping it on long MPS runs causes per-batch memory growth.
+    loss.backward(retain_graph=retain_graph_for_optimizer_step)
     optimizer.step()
 
 
@@ -1435,7 +1433,6 @@ def _run_training_batch(
     _backward_and_step(
         loss,
         optimizer,
-        clear_pai_buffers=clear_pai_buffers,
         retain_graph_for_optimizer_step=retain_graph_for_optimizer_step,
     )
     if clear_pai_buffers:
@@ -1714,6 +1711,68 @@ def _initial_epoch_state(metric_direction: str) -> EpochTrainingState:
     return EpochTrainingState([], best_metric, 0, None)
 
 
+def _save_epoch_checkpoint(
+    output_dir: "Path",
+    epoch: int,
+    state: "EpochTrainingState",
+    optimizer: Any,
+    model: Any,
+    torch: Any,
+) -> None:
+    ckpt = {
+        "epoch": epoch,
+        "model_state_dict": {
+            k: v.detach().cpu().clone()
+            for k, v in _unwrap_compiled(model).state_dict().items()
+        },
+        "optimizer_state_dict": optimizer.state_dict(),
+        "history": state.history,
+        "best_metric": state.best_metric,
+        "best_epoch": state.best_epoch,
+        "best_state": state.best_state,
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(ckpt, output_dir / _EPOCH_CHECKPOINT_PT)
+
+
+def _load_epoch_checkpoint(
+    output_dir: "Path",
+    torch: Any,
+) -> "dict | None":
+    path = output_dir / _EPOCH_CHECKPOINT_PT
+    if not path.exists():
+        return None
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        print(f"[checkpoint] failed to load epoch checkpoint ({exc}); starting from scratch.")
+        return None
+
+
+def _apply_epoch_checkpoint(
+    ckpt: dict,
+    state: "EpochTrainingState",
+    model: Any,
+    optimizer: Any,
+) -> int:
+    resume_epoch = int(ckpt["epoch"]) + 1
+    _load_compatible_best_state(model, ckpt["model_state_dict"])
+    try:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    except Exception as exc:
+        print(f"[checkpoint] could not restore optimizer state ({exc}); optimizer reset.")
+    state.history = list(ckpt.get("history", []))
+    state.best_metric = ckpt["best_metric"]
+    state.best_epoch = int(ckpt["best_epoch"])
+    state.best_state = ckpt.get("best_state")
+    print(
+        f"[checkpoint] resuming from epoch {resume_epoch} "
+        f"(last completed: {ckpt['epoch'] + 1}, "
+        f"best so far: epoch {state.best_epoch}, metric {state.best_metric:.4f})"
+    )
+    return resume_epoch
+
+
 def _build_history_row(
     *,
     epoch: int,
@@ -1892,6 +1951,7 @@ def _freeze_pai_live_updates(
 ) -> Any:
     _set_pai_candidate_graph_for_context(context, False)
     clear_pai_processor_buffers(context.model)
+    clear_pai_tracker_state()
     _release_accelerator_cache(context.torch)
     standard_optimizer = _build_optimizer(context.model, context.torch, context.config)
     _copy_optimizer_learning_rates(optimizer, standard_optimizer)
@@ -1918,13 +1978,20 @@ def _set_epoch_progress(
     )
 
 
-def _epoch_progress(context: EpochTrainingContext, run_until_pai_complete: bool) -> Any:
+def _epoch_progress(
+    context: EpochTrainingContext,
+    run_until_pai_complete: bool,
+    start_epoch: int = 0,
+) -> Any:
     epoch_iterable = (
-        itertools.count() if run_until_pai_complete else range(context.max_epochs)
+        itertools.count(start_epoch)
+        if run_until_pai_complete
+        else range(start_epoch, context.max_epochs)
     )
+    remaining = None if run_until_pai_complete else context.max_epochs - start_epoch
     return tqdm(
         epoch_iterable,
-        total=None if run_until_pai_complete else context.max_epochs,
+        total=remaining,
         desc=context.run_label,
         unit="epoch",
         leave=True,
@@ -2074,6 +2141,25 @@ def _update_epoch_progress(
     )
 
 
+def _run_training_pass_oom_guarded(
+    context: EpochTrainingContext,
+    optimizer: Any,
+    epoch: int,
+    pai_status: "PAIUpdateStatus",
+) -> tuple[float, dict[str, Any]]:
+    try:
+        return _run_training_pass(context, optimizer, epoch, pai_status)
+    except RuntimeError as exc:
+        if "out of memory" in str(exc).lower():
+            _release_accelerator_cache(context.torch)
+            print(
+                f"[oom] {context.run_label} epoch {epoch + 1}: out of memory — "
+                "releasing caches. Resume training to continue from the last "
+                "completed epoch checkpoint."
+            )
+        raise
+
+
 def _run_training_epochs(
     context: EpochTrainingContext,
     optimizer: Any,
@@ -2083,7 +2169,12 @@ def _run_training_epochs(
     run_until_pai_complete = bool(
         context.config.train_dendrites_until_complete and pai_tracker is not None
     )
-    epoch_progress = _epoch_progress(context, run_until_pai_complete)
+    start_epoch = 0
+    if context.output_dir is not None:
+        ckpt = _load_epoch_checkpoint(context.output_dir, context.torch)
+        if ckpt is not None:
+            start_epoch = _apply_epoch_checkpoint(ckpt, state, context.model, optimizer)
+    epoch_progress = _epoch_progress(context, run_until_pai_complete, start_epoch)
     for epoch in epoch_progress:
         epoch_start = time.perf_counter()
         pai_status = _pai_update_status(
@@ -2094,7 +2185,7 @@ def _run_training_epochs(
             pai_tracker = None
             _release_accelerator_cache(context.torch)
             pai_status = PAIUpdateStatus(frozen=True, active=False)
-        train_loss, train_metrics = _run_training_pass(
+        train_loss, train_metrics = _run_training_pass_oom_guarded(
             context, optimizer, epoch, pai_status
         )
         val_loss, val_metrics = _run_validation_pass(context)
@@ -2114,6 +2205,10 @@ def _run_training_epochs(
             config=context.config,
             location=f"{context.run_label} epoch {epoch + 1} end",
         )
+        if context.output_dir is not None:
+            _save_epoch_checkpoint(
+                context.output_dir, epoch, state, optimizer, context.model, context.torch
+            )
         _update_epoch_progress(epoch_progress, context, state, val_metric)
         if pai_training_complete and run_until_pai_complete:
             break
@@ -2492,6 +2587,7 @@ def train_and_evaluate(
             metric_name=metric_name,
             primary_metric_key=primary_metric_key,
             metric_direction=metric_direction,
+            output_dir=output_dir,
         )
         history, best_metric, best_epoch, best_state = _run_or_skip_training(
             context=epoch_context,

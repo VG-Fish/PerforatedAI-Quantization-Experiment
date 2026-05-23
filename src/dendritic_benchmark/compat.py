@@ -389,16 +389,45 @@ def _zero_grad_if_available(target: Any) -> None:
         zero_grad()
 
 
+def _call_noarg_if_available(target: Any, method_name: str) -> bool:
+    method = getattr(target, method_name, None)
+    if method is None:
+        return False
+    try:
+        method()
+        return True
+    except Exception:
+        return False
+
+
+def _clear_pai_tracker_buffers(tracker: Any) -> None:
+    if tracker is None:
+        return
+    if isinstance(tracker, (list, tuple, set)):
+        for item in tracker:
+            _clear_pai_tracker_buffers(item)
+        return
+    if _call_noarg_if_available(tracker, "clear_all_processors"):
+        return
+    _call_noarg_if_available(tracker, "clear_processors")
+
+
+def _clear_pai_tracker_state(tracker: Any) -> None:
+    if tracker is None:
+        return
+    if isinstance(tracker, (list, tuple, set)):
+        for item in tracker:
+            _clear_pai_tracker_state(item)
+        return
+    _clear_pai_tracker_buffers(tracker)
+    if hasattr(tracker, "add_validation_score"):
+        _call_noarg_if_available(tracker, "clear")
+
+
 def clear_pai_processor_buffers(model: Any) -> None:
     try:
         gpa = importlib.import_module(_PAI_GLOBALS_MODULE)
-        clear_all_processors = getattr(
-            getattr(gpa, "pai_tracker", None),
-            "clear_all_processors",
-            None,
-        )
-        if clear_all_processors is not None:
-            clear_all_processors()
+        _clear_pai_tracker_buffers(getattr(gpa, "pai_tracker", None))
     except Exception:
         pass
     _zero_grad_if_available(model)
@@ -417,6 +446,14 @@ def clear_pai_processor_buffers(model: Any) -> None:
             clear_processors()
         except Exception:
             continue
+
+
+def clear_pai_tracker_state() -> None:
+    try:
+        gpa = importlib.import_module(_PAI_GLOBALS_MODULE)
+        _clear_pai_tracker_state(getattr(gpa, "pai_tracker", None))
+    except Exception:
+        pass
 
 
 def _consume_pai_config_message(text: str) -> bool:
