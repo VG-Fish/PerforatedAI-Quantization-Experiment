@@ -122,9 +122,7 @@ def _make_loader(
         "pin_memory": False,
     }
     if num_workers > 0:
-        loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 2
-        loader_kwargs["multiprocessing_context"] = "forkserver"
     return torch.utils.data.DataLoader(dataset, **loader_kwargs)
 
 
