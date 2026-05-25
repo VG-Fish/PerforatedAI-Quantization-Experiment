@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .benchmark import BenchmarkOrchestrator
-from .compat import load_project_environment, perforatedai_credentials_present
+from .compat import load_project_environment, perforatedai_credentials_present, torch as _torch
 from .data import DATA_ROOT_ENV, DEFAULT_DATA_ROOT, build_task_bundle, dataset_exists
 from .log_utils import setup_logging
 from .pipeline import BenchmarkRunner
@@ -40,7 +40,7 @@ _MODEL_KEYS: str = (
     "lenet5, m5, lstm_forecaster, textcnn, gcn, tabnet, mpnn, actor_critic, "
     "lstm_autoencoder, distilbert, dqn_lunarlander, ppo_bipedalwalker, "
     "attentivefp_freesolv, gin_imdbb, tcn_forecaster, gru_forecaster, "
-    "pointnet_modelnet40, vae_mnist, snn_nmnist, unet_isic, resnet18_cifar10, "
+    "pointnet_modelnet40, vae_mnist, snn_nmnist, resnet18_cifar10, "
     "mobilenetv2_cifar10, saint_adult, capsnet_mnist, convlstm_movingmnist"
 )
 
@@ -595,6 +595,8 @@ def _handle_clean(args: Any) -> None:
 
 def main() -> None:
     load_project_environment()
+    if _torch is not None:
+        _torch.multiprocessing.set_sharing_strategy("file_system")
     parser = build_parser()
     if argcomplete is not None:
         argcomplete.autocomplete(parser)

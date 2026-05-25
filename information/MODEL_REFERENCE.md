@@ -634,6 +634,7 @@ flowchart TD
 - Perforation registration: default
 - PQAT epoch budget: `10`
 
+<!--
 ## 20. `unet_isic` — Tiny U-Net
 
 - Domain: Medical Image Segmentation
@@ -668,6 +669,7 @@ flowchart TD
   - `weight_decay=1.0e-5`
 - Perforation registration: default
 - PQAT epoch budget: `10`
+-->
 
 ## 21. `resnet18_cifar10` — ResNet-18
 

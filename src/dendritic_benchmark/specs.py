@@ -60,7 +60,6 @@ MODEL_SPECS: list[ModelSpec] = [
     ModelSpec("pointnet_modelnet40", "PointNet", "3D Point Cloud Classification", "ModelNet40", "Accuracy", "maximize", "pointnet_modelnet40"),
     ModelSpec("vae_mnist", "VAE", "Generative Modeling", "MNIST", "ELBO", "maximize", "vae_mnist"),
     ModelSpec("snn_nmnist", "Spiking Neural Network", "Neuromorphic Computing", "N-MNIST", "Accuracy", "maximize", "snn_nmnist"),
-    ModelSpec("unet_isic", "Tiny U-Net", "Medical Image Segmentation", "ISIC 2018 Task 1", "Dice", "maximize", "unet_isic"),
     ModelSpec("resnet18_cifar10", "ResNet-18", _IMAGE_CLASSIFICATION, "CIFAR-10", "Accuracy", "maximize", "resnet18_cifar10"),
     ModelSpec("mobilenetv2_cifar10", "MobileNetV2", _IMAGE_CLASSIFICATION, "CIFAR-10", "Accuracy", "maximize", "mobilenetv2_cifar10"),
     ModelSpec("saint_adult", "SAINT", "Tabular Classification", "Adult Income", "Accuracy", "maximize", "saint_adult"),

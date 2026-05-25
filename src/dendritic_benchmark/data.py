@@ -77,9 +77,35 @@ def _data_root() -> Path:
 
 def _download(url: str, destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if not destination.exists():
-        print(f"Downloading {url} -> {destination}")
-        urllib.request.urlretrieve(url, destination)
+    if destination.exists():
+        return destination
+    print(f"Downloading {url} -> {destination}")
+    tmp_path: Path = destination.with_suffix(destination.suffix + ".part")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    try:
+        with urllib.request.urlopen(url) as response:
+            expected_size: int | None = None
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None:
+                expected_size = int(content_length)
+            with open(tmp_path, "wb") as out:
+                while True:
+                    chunk = response.read(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+        actual_size: int = tmp_path.stat().st_size
+        if expected_size is not None and actual_size != expected_size:
+            raise IOError(
+                f"Download size mismatch for {url}: got {actual_size} bytes, "
+                f"expected {expected_size} bytes (likely interrupted; check disk space)."
+            )
+        tmp_path.rename(destination)
+    except BaseException:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
     return destination
 
 
@@ -123,6 +149,7 @@ def _make_loader(
     }
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = 2
+        loader_kwargs["persistent_workers"] = True
     return torch.utils.data.DataLoader(dataset, **loader_kwargs)
 
 

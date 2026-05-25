@@ -699,6 +699,9 @@ def _forward(model_key: str, model: Any, batch: tuple[Any, ...]) -> tuple[Any, A
     if model_key == "distilbert":
         input_ids, attention_mask, targets = batch
         return model(input_ids, attention_mask), targets, None
+    if model_key == "vae_mnist":
+        x, _ = batch
+        return model(x), x, None
     x, targets = batch
     return model(x), targets, None
 
@@ -851,14 +854,21 @@ def _make_quantized_copy(
     torch = require_torch()
     if bit_width is None or bit_width >= 32:
         return model
+    # Quantize on CPU and stream results back to each parameter.  Running the
+    # quantization kernels on MPS triggered a malloc double-free for PointNet
+    # post-training ternary quantization, so we keep the math off-device.
     with torch.no_grad():
         for param in model.parameters():
+            if param.numel() == 0:
+                continue
+            cpu_param = param.detach().cpu()
             if mode == "binary" or bit_width == 1:
-                param.copy_(binary_quantize_tensor(param))
+                quantized = binary_quantize_tensor(cpu_param)
             elif mode == "ternary":
-                param.copy_(ternary_quantize_tensor(param))
+                quantized = ternary_quantize_tensor(cpu_param)
             else:
-                param.copy_(symmetric_quantize_tensor(param, bit_width))
+                quantized = symmetric_quantize_tensor(cpu_param, bit_width)
+            param.copy_(quantized.to(param.device))
     return model
 
 
@@ -1051,10 +1061,43 @@ def _apply_pruning(model: Any, torch: Any, prune_amount: float) -> None:
         pass
 
 
+# Models where torch.compile(aot_eager) triggers MPS allocator faults
+# (malloc "pointer being freed was not allocated").  PointNet's TransformNet
+# uses torch.bmm with [B,3,3]/[B,64,64] matrices against [B,*,1024] inputs;
+# AOT-eager tracing of that pattern double-frees an MPS buffer during the
+# first eval-mode forward, so we keep it in eager mode.
+_TORCH_COMPILE_MPS_BLOCKLIST: frozenset[str] = frozenset({"pointnet_modelnet40", "snn_nmnist"})
+
+# Models that crash with an MPS allocator double-free regardless of
+# torch.compile.  SpikingConvNet runs a 10-step BPTT loop through a custom
+# autograd Function (SurrogateSpike), and the MPS backend double-frees an
+# intermediate buffer near the end of the second epoch.  Forcing CPU
+# evaluation/training avoids the fault; the model is small enough (32+64
+# conv channels + FC) that CPU is viable.
+_MPS_TO_CPU_FALLBACK: frozenset[str] = frozenset({"snn_nmnist"})
+
+
+def _resolve_device(model_key: str, torch: Any) -> Any:
+    device = choose_device()
+    if (
+        getattr(device, "type", "") == "mps"
+        and model_key in _MPS_TO_CPU_FALLBACK
+    ):
+        print(
+            f"[device] {model_key}: forcing CPU (MPS allocator double-free "
+            f"observed during training)"
+        )
+        return torch.device("cpu")
+    return device
+
+
 def _apply_torch_compile(
     model: Any, torch: Any, model_key: str, condition_key: str, device: Any, use_dendrites: bool
 ) -> Any:
     if use_dendrites or not hasattr(torch, "compile") or getattr(device, "type", "") != "mps":
+        return model
+    if model_key in _TORCH_COMPILE_MPS_BLOCKLIST:
+        print(f"[compile] torch.compile skipped for {model_key}/{condition_key}: known MPS allocator issue")
         return model
     try:
         model = torch.compile(model, backend="aot_eager", fullgraph=False)
@@ -2477,6 +2520,8 @@ def _prepare_model_for_training(
         _apply_pruning(model, torch, config.prune_amount)
     if _should_quantize_for_training(config):
         model = _make_quantized_copy(model, config.bit_width, config.quantization_mode)
+    if config.max_epochs <= 0:
+        return model
     return _apply_torch_compile(
         model, torch, model_key, condition_key, device, config.use_dendrites
     )
@@ -2526,7 +2571,7 @@ def train_and_evaluate(
     source_condition_key = config.source_condition_key
 
     torch = require_torch()
-    device = choose_device()
+    device = _resolve_device(model_key, torch)
     _configure_mps_matmul_precision(torch, device)
     output_dir.mkdir(parents=True, exist_ok=True)
     primary_metric_key = _PRIMARY_METRIC_KEY.get(model_key, "accuracy")
@@ -2613,9 +2658,20 @@ def train_and_evaluate(
     if _should_quantize_for_eval(config):
         model = _make_quantized_copy(model, bit_width, quantization_mode)
 
+    eval_device = device
+    if (
+        _should_quantize_for_eval(config)
+        and model_key in _TORCH_COMPILE_MPS_BLOCKLIST
+        and getattr(device, "type", "") == "mps"
+    ):
+        # PointNet's bmm-heavy forward double-frees an MPS buffer when run on
+        # post-training-quantized weights; evaluate the quantized copy on CPU.
+        eval_device = torch.device("cpu")
+        model = model.to(eval_device)
+
     model.eval()
     test_loss, test_metrics = _eval_on_loader(
-        model, model_key, bundle.test_loader, device, criterion,
+        model, model_key, bundle.test_loader, eval_device, criterion,
         metric_name, torch
     )
     final_metric = float(test_metrics.get(primary_metric_key, 0.0))

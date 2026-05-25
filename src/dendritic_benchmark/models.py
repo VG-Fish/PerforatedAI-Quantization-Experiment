@@ -943,41 +943,30 @@ if nn is not None:  # pragma: no branch - optional dependency gating
         return norm_sq / (1.0 + norm_sq) * x / torch.sqrt(norm_sq + 1e-8)
 
 
-    class PrimaryCapsules(nn.Module):
-        def __init__(self, in_channels: int, capsule_dim: int, capsule_channels: int):
-            super().__init__()
-            self.capsule_dim = capsule_dim
-            self.capsules = nn.Conv2d(
-                in_channels,
-                capsule_dim * capsule_channels,
-                kernel_size=9,
-                stride=2,
-            )
-
-        def forward(self, x: Any) -> Any:
-            batch = x.shape[0]
-            x = self.capsules(x)
-            x = x.view(batch, self.capsule_dim, -1).transpose(1, 2)
-            return _squash_capsules(x)
-
-
     class CapsNet(nn.Module):
+        # Conv2d layers are direct attributes (not nested in nn.Sequential or a
+        # custom submodule) so PerforatedAI's DendriteValueTracker can register
+        # their output shapes at the PA switch.
         def __init__(
             self,
             num_classes: int = 10,
             primary_dim: int = 8,
             digit_dim: int = 16,
             routing_iters: int = 3,
+            capsule_channels: int = 32,
         ):
             super().__init__()
             self.num_classes = num_classes
             self.routing_iters = routing_iters
-            self.conv = nn.Sequential(
-                nn.Conv2d(1, 256, kernel_size=9),
-                nn.ReLU(),
+            self.primary_dim = primary_dim
+            self.conv = nn.Conv2d(1, 256, kernel_size=9)
+            self.primary_caps = nn.Conv2d(
+                256,
+                primary_dim * capsule_channels,
+                kernel_size=9,
+                stride=2,
             )
-            self.primary = PrimaryCapsules(256, primary_dim, capsule_channels=32)
-            self.num_primary_caps = 32 * 6 * 6
+            self.num_primary_caps = capsule_channels * 6 * 6
             self.route_weights = nn.Parameter(
                 0.01
                 * torch.randn(
@@ -988,14 +977,6 @@ if nn is not None:  # pragma: no branch - optional dependency gating
                     primary_dim,
                 )
             )
-            self.decoder = nn.Sequential(
-                nn.Linear(num_classes * digit_dim, 512),
-                nn.ReLU(),
-                nn.Linear(512, 1024),
-                nn.ReLU(),
-                nn.Linear(1024, 784),
-                nn.Sigmoid(),
-            )
 
         @staticmethod
         def squash(x: Any) -> Any:
@@ -1003,7 +984,10 @@ if nn is not None:  # pragma: no branch - optional dependency gating
 
         def forward(self, x: Any) -> Any:
             batch = x.shape[0]
-            primary = self.primary(self.conv(x))
+            features = F.relu(self.conv(x))
+            primary = self.primary_caps(features)
+            primary = primary.view(batch, self.primary_dim, -1).transpose(1, 2)
+            primary = _squash_capsules(primary)
             votes = torch.einsum(
                 "bip,bicdp->bicd",
                 primary,

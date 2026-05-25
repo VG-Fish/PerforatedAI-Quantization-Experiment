@@ -391,6 +391,7 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 | **Metric** | Accuracy (%) |
 | **Scientific Rationale** | Most biologically motivated experiment — biological dendrites and spiking neurons coexist |
 
+<!--
 #### Model 20 — Tiny U-Net (ISIC Skin Lesion Segmentation)
 | Field | Value |
 |---|---|
@@ -399,6 +400,7 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 | **Dataset** | ISIC 2018 Task 1 (2,594 dermoscopy images, binary lesion mask) |
 | **Architecture** | 4-level encoder-decoder with skip connections (16→32→64→128 channels) |
 | **Metric** | Dice coefficient |
+-->
 
 ### Group E: Architecture Interaction Studies
 
@@ -472,7 +474,7 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 | 17 | `pointnet_modelnet40` | 3D Point Cloud | ModelNet40 | ~3.5M |
 | 18 | `vae_mnist` | Generative (VAE) | MNIST | ~1.1M |
 | 19 | `snn_nmnist` | Neuromorphic SNN | N-MNIST | 60K |
-| 20 | `unet_isic` | Medical Seg. | ISIC 2018 | ~1.9M |
+<!-- | 20 | `unet_isic` | Medical Seg. | ISIC 2018 | ~1.9M | -->
 | 21 | `resnet18_cifar10` | Image (ResNet) | CIFAR-10 | ~11M |
 | 22 | `mobilenetv2_cifar10` | Image (Efficient) | CIFAR-10 | ~2.2M |
 | 23 | `saint_adult` | Tabular (Xfmr) | Adult Income | 205K |
@@ -796,7 +798,7 @@ comparison/
 ```
 
 ## Model Keys
-`lenet5`, `m5`, `lstm_forecaster`, `textcnn`, `gcn`, `tabnet`, `mpnn`, `actor_critic`, `lstm_autoencoder`, `distilbert`, `dqn_lunarlander`, `ppo_bipedalwalker`, `attentivefp_freesolv`, `gin_imdbb`, `tcn_forecaster`, `gru_forecaster`, `pointnet_modelnet40`, `vae_mnist`, `snn_nmnist`, `unet_isic`, `resnet18_cifar10`, `mobilenetv2_cifar10`, `saint_adult`, `capsnet_mnist`, `convlstm_movingmnist`
+`lenet5`, `m5`, `lstm_forecaster`, `textcnn`, `gcn`, `tabnet`, `mpnn`, `actor_critic`, `lstm_autoencoder`, `distilbert`, `dqn_lunarlander`, `ppo_bipedalwalker`, `attentivefp_freesolv`, `gin_imdbb`, `tcn_forecaster`, `gru_forecaster`, `pointnet_modelnet40`, `vae_mnist`, `snn_nmnist`, <!-- `unet_isic`, --> `resnet18_cifar10`, `mobilenetv2_cifar10`, `saint_adult`, `capsnet_mnist`, `convlstm_movingmnist`
 
 ## Condition Keys
 `base_fp32`, `base_q8`, `base_q4`, `base_q2`, `base_q1_58`, `base_q1`, `dendrites_fp32`, `dendrites_q8`, `dendrites_q4`, `dendrites_q2`, `dendrites_q1_58`, `dendrites_q1`

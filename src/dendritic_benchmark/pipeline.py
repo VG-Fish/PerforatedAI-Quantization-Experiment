@@ -356,11 +356,14 @@ class BenchmarkRunner:
         return {
             "actor_critic": [".value"],
             "ppo_bipedalwalker": [".critic"],
-            "capsnet_mnist": [".decoder.0", ".decoder.2"],
             # Recurrent gates run per-timestep; perforating them dominates wallclock
             # on long sequences. Marking .cells as track-only (not perforated)
             # confines dendrite insertion to the readout Linear in .head only.
             "gru_forecaster": [".cells"],
+            # MobileNetV2's final classifier Linear sits inside nn.Sequential(Dropout, Linear),
+            # and the initial Conv2d sits inside Conv2dNormActivation (also an nn.Sequential);
+            # perforating either leaves DendriteValueTracker.shape uninitialized at the PA switch.
+            "mobilenetv2_cifar10": [".classifier.1", ".features.0.0"],
         }.get(model_key, [])
 
     def _perforation_module_names_to_not_save(self, model_key: str) -> list[str]:
