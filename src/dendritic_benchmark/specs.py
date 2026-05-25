@@ -11,11 +11,9 @@ MetricDirection = Literal["maximize", "minimize"]
 class ModelSpec:
     key: str
     display_name: str
-    domain: str
     dataset: str
     metric_name: str
     metric_direction: MetricDirection
-    factory: str
 
 
 @dataclass(frozen=True)
@@ -36,35 +34,31 @@ class ConditionSpec:
         return self.bit_width is not None and self.bit_width < 32
 
 
-_IMAGE_CLASSIFICATION = "Image Classification"
-_TIME_SERIES_FORECASTING = "Time-Series Forecasting"
-_REINFORCEMENT_LEARNING = "Reinforcement Learning"
-
 MODEL_SPECS: list[ModelSpec] = [
-    ModelSpec("lenet5", "LeNet-5", _IMAGE_CLASSIFICATION, "MNIST", "Accuracy", "maximize", "lenet5"),
-    ModelSpec("m5", "M5 (1D-CNN)", "Audio Classification", "SpeechCommands", "Accuracy", "maximize", "m5"),
-    ModelSpec("lstm_forecaster", "LSTM Univariate", _TIME_SERIES_FORECASTING, "ETTh1", "MAE", "minimize", "lstm_forecaster"),
-    ModelSpec("textcnn", "TextCNN", "NLP / Text Classification", "AG News", "Accuracy", "maximize", "textcnn"),
-    ModelSpec("gcn", "GCN", "Graph / Node Classification", "Cora", "Accuracy", "maximize", "gcn"),
-    ModelSpec("tabnet", "TabNet", "Tabular Classification", "Adult Income", "Accuracy", "maximize", "tabnet"),
-    ModelSpec("mpnn", "MPNN", "Drug Discovery / Molecular", "ESOL", "RMSE", "minimize", "mpnn"),
-    ModelSpec("actor_critic", "Actor-Critic", _REINFORCEMENT_LEARNING, "CartPole-v1", "Reward", "maximize", "actor_critic"),
-    ModelSpec("lstm_autoencoder", "LSTM Autoencoder", "Anomaly Detection", "MIT-BIH", "AUC", "maximize", "lstm_autoencoder"),
-    ModelSpec("distilbert", "DistilBERT", "NLP / Seq Classification", "SST-2", "Accuracy", "maximize", "distilbert"),
-    ModelSpec("dqn_lunarlander", "DQN (LunarLander)", _REINFORCEMENT_LEARNING, "LunarLander-v2", "Reward", "maximize", "dqn_lunarlander"),
-    ModelSpec("ppo_bipedalwalker", "PPO Policy Network", _REINFORCEMENT_LEARNING, "BipedalWalker-v3", "Reward", "maximize", "ppo_bipedalwalker"),
-    ModelSpec("attentivefp_freesolv", "AttentiveFP", "Drug Discovery / Molecular", "FreeSolv", "RMSE", "minimize", "attentivefp_freesolv"),
-    ModelSpec("gin_imdbb", "GIN", "Graph Classification", "IMDB-Binary", "Accuracy", "maximize", "gin_imdbb"),
-    ModelSpec("tcn_forecaster", "TCN Forecaster", _TIME_SERIES_FORECASTING, "ETTm1", "MAE", "minimize", "tcn_forecaster"),
-    ModelSpec("gru_forecaster", "GRU Forecaster", _TIME_SERIES_FORECASTING, "Weather", "MAE", "minimize", "gru_forecaster"),
-    ModelSpec("pointnet_modelnet40", "PointNet", "3D Point Cloud Classification", "ModelNet40", "Accuracy", "maximize", "pointnet_modelnet40"),
-    ModelSpec("vae_mnist", "VAE", "Generative Modeling", "MNIST", "ELBO", "maximize", "vae_mnist"),
-    ModelSpec("snn_nmnist", "Spiking Neural Network", "Neuromorphic Computing", "N-MNIST", "Accuracy", "maximize", "snn_nmnist"),
-    ModelSpec("resnet18_cifar10", "ResNet-18", _IMAGE_CLASSIFICATION, "CIFAR-10", "Accuracy", "maximize", "resnet18_cifar10"),
-    ModelSpec("mobilenetv2_cifar10", "MobileNetV2", _IMAGE_CLASSIFICATION, "CIFAR-10", "Accuracy", "maximize", "mobilenetv2_cifar10"),
-    ModelSpec("saint_adult", "SAINT", "Tabular Classification", "Adult Income", "Accuracy", "maximize", "saint_adult"),
-    ModelSpec("capsnet_mnist", "CapsNet", _IMAGE_CLASSIFICATION, "MNIST", "Accuracy", "maximize", "capsnet_mnist"),
-    ModelSpec("convlstm_movingmnist", "ConvLSTM", "Spatiotemporal Prediction", "Moving MNIST", "SSIM", "maximize", "convlstm_movingmnist"),
+    ModelSpec("lenet5", "LeNet-5", "MNIST", "Accuracy", "maximize"),
+    ModelSpec("m5", "M5 (1D-CNN)", "SpeechCommands", "Accuracy", "maximize"),
+    ModelSpec("lstm_forecaster", "LSTM Univariate", "ETTh1", "MAE", "minimize"),
+    ModelSpec("textcnn", "TextCNN", "AG News", "Accuracy", "maximize"),
+    ModelSpec("gcn", "GCN", "Cora", "Accuracy", "maximize"),
+    ModelSpec("tabnet", "TabNet", "Adult Income", "Accuracy", "maximize"),
+    ModelSpec("mpnn", "MPNN", "ESOL", "RMSE", "minimize"),
+    ModelSpec("actor_critic", "Actor-Critic", "CartPole-v1", "Reward", "maximize"),
+    ModelSpec("lstm_autoencoder", "LSTM Autoencoder", "MIT-BIH", "AUC", "maximize"),
+    ModelSpec("distilbert", "DistilBERT", "SST-2", "Accuracy", "maximize"),
+    ModelSpec("dqn_lunarlander", "DQN (LunarLander)", "LunarLander-v2", "Reward", "maximize"),
+    ModelSpec("ppo_bipedalwalker", "PPO Policy Network", "BipedalWalker-v3", "Reward", "maximize"),
+    ModelSpec("attentivefp_freesolv", "AttentiveFP", "FreeSolv", "RMSE", "minimize"),
+    ModelSpec("gin_imdbb", "GIN", "IMDB-Binary", "Accuracy", "maximize"),
+    ModelSpec("tcn_forecaster", "TCN Forecaster", "ETTm1", "MAE", "minimize"),
+    ModelSpec("gru_forecaster", "GRU Forecaster", "Weather", "MAE", "minimize"),
+    ModelSpec("pointnet_modelnet40", "PointNet", "ModelNet40", "Accuracy", "maximize"),
+    ModelSpec("vae_mnist", "VAE", "MNIST", "ELBO", "maximize"),
+    ModelSpec("snn_nmnist", "Spiking Neural Network", "N-MNIST", "Accuracy", "maximize"),
+    ModelSpec("resnet18_cifar10", "ResNet-18", "CIFAR-10", "Accuracy", "maximize"),
+    ModelSpec("mobilenetv2_cifar10", "MobileNetV2", "CIFAR-10", "Accuracy", "maximize"),
+    ModelSpec("saint_adult", "SAINT", "Adult Income", "Accuracy", "maximize"),
+    ModelSpec("capsnet_mnist", "CapsNet", "MNIST", "Accuracy", "maximize"),
+    ModelSpec("convlstm_movingmnist", "ConvLSTM", "Moving MNIST", "SSIM", "maximize"),
 ]
 
 

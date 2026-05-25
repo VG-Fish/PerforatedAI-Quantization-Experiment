@@ -29,6 +29,8 @@ dependencies = [
     "tonic>=1.5.0",
     "torch-geometric>=2.6.0",
     "perforatedbp>=3.2.0",
+    "vulture>=2.16",
+    "bandit>=1.9.4",
 ]
 
 [project.scripts]

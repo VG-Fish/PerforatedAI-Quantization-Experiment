@@ -72,10 +72,6 @@ def require_torch() -> Any:
     return torch
 
 
-def has_torchao() -> bool:
-    return module_available("torchao")
-
-
 def has_perforatedai() -> bool:
     return module_available("perforatedai")
 
@@ -114,13 +110,6 @@ def perforatedai_credentials_present() -> bool:
     return bool(_mirror_env_aliases())
 
 
-@dataclass
-class BackendStatus:
-    torch_available: bool
-    torchao_available: bool
-    perforatedai_available: bool
-
-
 @dataclass(frozen=True)
 class PAIModuleSelection:
     modules_to_perforate: list[Any] | None = None
@@ -136,14 +125,6 @@ class PAIRuntimeOptions:
     no_backward_workaround: bool = False
     candidate_graph_enabled: bool = True
     initial_correlation_batches_limit: int | None = None
-
-
-def backend_status() -> BackendStatus:
-    return BackendStatus(
-        torch_available=torch is not None,
-        torchao_available=has_torchao(),
-        perforatedai_available=has_perforatedai(),
-    )
 
 
 def _call_if_available(target: Any, method_name: str, *args: Any) -> None:
@@ -464,17 +445,6 @@ def _consume_pai_config_message(text: str) -> bool:
         return True
     _PAI_CONFIG_SAVED_PRINTED = True
     return False
-
-
-def _print_pai_debugger_notice(text: str) -> None:
-    stream = sys.__stderr__ or sys.stderr
-    if stream is None:
-        return
-    stream.write(
-        "\033[31m[PAI debugger suppressed] PerforatedAI attempted to print a "
-        f"debugger warning: {text.strip()}\033[0m\n"
-    )
-    stream.flush()
 
 
 def _consume_pai_debugger_message(text: str) -> bool:
@@ -833,11 +803,3 @@ def binary_quantize_tensor(tensor: Any) -> Any:
     if torch is None:
         return tensor
     return torch.where(tensor >= 0, torch.ones_like(tensor), -torch.ones_like(tensor))
-
-
-def round_robin(value: int, modulo: int) -> int:
-    return value % modulo if modulo else value
-
-
-def clamp_float(value: float, lower: float, upper: float) -> float:
-    return max(lower, min(value, upper))

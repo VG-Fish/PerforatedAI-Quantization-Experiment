@@ -24,9 +24,6 @@ ETTH1_URL: str = (
 ETTM1_URL: str = (
     "https://raw.githubusercontent.com/zhouhaoyi/ETDataset/main/ETT-small/ETTm1.csv"
 )
-WEATHER_URL: str = (
-    "https://huggingface.co/datasets/dunzane/time-series-dataset/raw/main/weather/weather.csv"
-)
 ADULT_URLS: dict[str, str] = {
     ADULT_DATA_FILENAME: "https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.data",
     "adult.test": "https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.test",

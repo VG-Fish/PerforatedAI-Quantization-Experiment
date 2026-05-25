@@ -189,18 +189,6 @@ def _metric_is_better(new: float, old: float, direction: str) -> bool:
     return new > old if direction == "maximize" else new < old
 
 
-def _accuracy(logits: Any, targets: Any) -> float:
-    return (logits.argmax(dim=-1) == targets).float().mean().item()
-
-
-def _mae(preds: Any, targets: Any) -> float:
-    return (preds - targets).abs().mean().item()
-
-
-def _rmse(preds: Any, targets: Any) -> float:
-    return math.sqrt(((preds - targets) ** 2).mean().item())
-
-
 def _auc(scores: Any, targets: Any) -> float:
     scores = scores.detach().flatten()
     targets = targets.detach().flatten().long()
@@ -249,12 +237,6 @@ def _vae_metrics(outputs: Any, targets: Any) -> dict[str, float]:
     }
 
 
-def _reward_proxy(preds: Any, targets: Any) -> float:
-    if preds.shape == targets.shape and preds.dtype.is_floating_point:
-        return 1.0 / (1.0 + _mae(preds, targets))
-    return _accuracy(preds, targets)
-
-
 _PRIMARY_METRIC_KEY: dict[str, str] = {
     "lenet5": "accuracy",
     "m5": "accuracy",
@@ -297,32 +279,6 @@ def _binary_or_multi_loss(model_key: str) -> Any:
     if model_key == "actor_critic":
         return torch.nn.CrossEntropyLoss()
     return torch.nn.CrossEntropyLoss()
-
-
-def _collapse_metric(
-    model_key: str, outputs: Any, targets: Any, metric_targets: Any | None = None
-) -> float:
-    if model_key in {"actor_critic"}:
-        outputs = outputs[0]
-    if model_key in {"lstm_forecaster", "tcn_forecaster", "gru_forecaster"}:
-        return _mae(outputs, targets)
-    if model_key in {"mpnn", "attentivefp_freesolv"}:
-        return _rmse(outputs, targets)
-    if model_key == "ppo_bipedalwalker":
-        return _reward_proxy(outputs, targets)
-    if model_key == "unet_isic":
-        return _dice_from_logits(outputs, targets)
-    if model_key == "convlstm_movingmnist":
-        return _ssim_proxy(outputs, targets)
-    if model_key == "vae_mnist":
-        return _vae_metrics(outputs, targets)["elbo"]
-    if model_key == "lstm_autoencoder":
-        torch = require_torch()
-        if metric_targets is None:
-            metric_targets = torch.zeros(outputs.shape[0], device=outputs.device)
-        reconstruction_error = ((outputs - targets) ** 2).mean(dim=(1, 2))
-        return _auc(-reconstruction_error, metric_targets)
-    return _accuracy(outputs, targets)
 
 
 def _safe_ratio(numerator: float, denominator: float, default: float = 0.0) -> float:
