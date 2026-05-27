@@ -22,7 +22,7 @@ from .compat import (
     set_module_output_dimensions,
 )
 from .data import build_task_bundle
-from .models import build_model
+from .models import UnsharedConv2d, build_model
 from .results import (
     save_training_record,
     write_comparison_reports,
@@ -345,7 +345,13 @@ class BenchmarkRunner:
     def _perforation_modules_to_perforate(self, model_key: str) -> list[Any]:
         if model_key == "distilbert":
             return []
-        return self._perforation_track_modules()
+        modules = list(self._perforation_track_modules())
+        if model_key == "convlstm_movingmnist" and nn is not None:
+            # ConvLSTM uses the UnsharedConv2d subclass so per-timestep calls
+            # save distinct weight tensors; PAI matches by class identity, so
+            # the subclass must be registered explicitly to be perforated.
+            modules.append(UnsharedConv2d)
+        return modules
 
     def _perforation_module_ids_to_perforate(self, model_key: str) -> list[str]:
         if model_key == "distilbert":

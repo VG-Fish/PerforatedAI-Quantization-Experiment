@@ -1003,11 +1003,27 @@ if nn is not None:  # pragma: no branch - optional dependency gating
             return outputs.norm(dim=-1)
 
 
+    class UnsharedConv2d(nn.Conv2d):
+        # ConvLSTM reuses each Conv2d across a 20-step unroll, so the same
+        # weight/bias tensor is saved many times in the retained autograd graph.
+        # PerforatedAI's dendrite-mode optimizer.step() updates that weight
+        # in-place before apply_pb_grads replays the graph, tripping an inplace
+        # version check. Cloning weight and bias per forward gives each saved
+        # tensor a fresh identity (still differentiable back to the parameter),
+        # so the version check sees version 0 on every replay.
+        def forward(self, x: Any) -> Any:
+            weight = self.weight.clone()
+            bias = self.bias.clone() if self.bias is not None else None
+            return F.conv2d(
+                x, weight, bias, self.stride, self.padding, self.dilation, self.groups
+            )
+
+
     class ConvLSTMCell(nn.Module):
         def __init__(self, in_channels: int, hidden_channels: int):
             super().__init__()
             self.hidden_channels = hidden_channels
-            self.gates = nn.Conv2d(in_channels + hidden_channels, 4 * hidden_channels, 3, padding=1)
+            self.gates = UnsharedConv2d(in_channels + hidden_channels, 4 * hidden_channels, 3, padding=1)
 
         def forward(self, x: Any, state: tuple[Any, Any]) -> tuple[Any, Any]:
             h, c = state
@@ -1025,7 +1041,7 @@ if nn is not None:  # pragma: no branch - optional dependency gating
             self.horizon = horizon
             self.cell1 = ConvLSTMCell(1, hidden_channels)
             self.cell2 = ConvLSTMCell(hidden_channels, hidden_channels)
-            self.decoder = nn.Conv2d(hidden_channels, 1, 3, padding=1)
+            self.decoder = UnsharedConv2d(hidden_channels, 1, 3, padding=1)
 
         def forward(self, x: Any) -> Any:
             batch, seq, _, height, width = x.shape
@@ -1050,7 +1066,7 @@ else:  # pragma: no cover - import-time fallback
     LeNet5 = M5 = LSTMForecaster = TextCNN = GCN = TabNet = MPNN = ActorCritic = object
     LSTMAutoencoder = DistilBertClassifier = DQN = PPOPolicy = AttentiveFP = GIN = object
     TCNForecaster = GRUForecaster = PointNet = VAE = SpikingConvNet = TinyUNet = object
-    SAINT = CapsNet = ConvLSTM = object
+    SAINT = CapsNet = ConvLSTM = UnsharedConv2d = object
 
 
 LeNet5 = cast(Any, LeNet5)
@@ -1076,6 +1092,7 @@ TinyUNet = cast(Any, TinyUNet)
 SAINT = cast(Any, SAINT)
 CapsNet = cast(Any, CapsNet)
 ConvLSTM = cast(Any, ConvLSTM)
+UnsharedConv2d = cast(Any, UnsharedConv2d)
 
 
 def _build_resnet18_cifar10(**_: Any) -> Any:
