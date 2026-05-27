@@ -44,6 +44,10 @@ _MODEL_PT = "model.pt"
 _DEFAULT_PAI_INITIAL_CORRELATION_BATCH_LIMIT = 32
 _MODEL_PAI_INITIAL_CORRELATION_BATCH_LIMITS = {
     "distilbert": 4,
+    # ConvLSTM's 20-step unroll with cloned weights (see UnsharedConv2d) saves
+    # ~190 MB of activations per batch in dendrite mode; cap candidate-graph
+    # tracking to the first few batches so it doesn't accumulate all epoch.
+    "convlstm_movingmnist": 4,
 }
 _MODEL_DENDRITIC_BATCH_SIZES = {
     "distilbert": 4,
@@ -51,6 +55,10 @@ _MODEL_DENDRITIC_BATCH_SIZES = {
 _DEFAULT_DENDRITIC_MEMORY_CLEANUP_INTERVAL = 512
 _MODEL_DENDRITIC_MEMORY_CLEANUP_INTERVALS = {
     "distilbert": 128,
+    # convlstm has 438 batches/epoch, which would skip cleanup at the default
+    # of 512. Pick an interval well below the epoch length so caches don't
+    # accumulate across the long unrolled timesteps.
+    "convlstm_movingmnist": 32,
 }
 # Full-transformer PAI wrapping makes DistilBERT's candidate forward exceed
 # Apple Silicon MPS memory. Keep dendrite search on the task-specific head.
@@ -853,7 +861,7 @@ class BenchmarkRunner:
         weight_decay = 0.0 if condition.use_dendrites else training_hyperparameters.weight_decay
         pai_candidate_graph_batch_limit = (
             self._pai_initial_correlation_batches_limit(model_key)
-            if model_key == "distilbert"
+            if model_key in _MODEL_PAI_INITIAL_CORRELATION_BATCH_LIMITS
             and training_plan.update_dendrites_during_training
             else None
         )
