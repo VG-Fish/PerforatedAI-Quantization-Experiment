@@ -211,11 +211,6 @@ def _dice_from_logits(logits: Any, targets: Any) -> float:
     return float(((2.0 * intersection + 1e-6) / (union + 1e-6)).mean().item())
 
 
-def _ssim_proxy(preds: Any, targets: Any) -> float:
-    mse = ((preds - targets) ** 2).mean()
-    return float((1.0 / (1.0 + mse)).item())
-
-
 def _vae_loss(outputs: Any, targets: Any) -> Any:
     torch = require_torch()
     recon, mu, logvar = outputs
@@ -262,13 +257,12 @@ _PRIMARY_METRIC_KEY: dict[str, str] = {
     "mobilenetv2_cifar10": "accuracy",
     "saint_adult": "accuracy",
     "capsnet_mnist": "accuracy",
-    "convlstm_movingmnist": "ssim",
 }
 
 
 def _binary_or_multi_loss(model_key: str) -> Any:
     torch = require_torch()
-    if model_key in {"lstm_forecaster", "mpnn", "attentivefp_freesolv", "tcn_forecaster", "gru_forecaster", "ppo_bipedalwalker", "convlstm_movingmnist"}:
+    if model_key in {"lstm_forecaster", "mpnn", "attentivefp_freesolv", "tcn_forecaster", "gru_forecaster", "ppo_bipedalwalker"}:
         return torch.nn.MSELoss()
     if model_key in {"lstm_autoencoder"}:
         return torch.nn.MSELoss()
@@ -585,10 +579,6 @@ def _compute_all_metrics(
         return _vae_metrics(outputs, targets)
     if model_key == "unet_isic":
         return {"dice": _dice_from_logits(outputs, targets)}
-    if model_key == "convlstm_movingmnist":
-        metrics = _regression_metrics(outputs, targets)
-        metrics["ssim"] = _ssim_proxy(outputs, targets)
-        return metrics
     if model_key == "lstm_autoencoder":
         return _anomaly_metrics(outputs, targets, metric_targets)
     metrics = _classification_metrics(outputs, targets)
@@ -1332,10 +1322,22 @@ def _training_batch_progress(
     )
 
 
+def _pai_model_has_dendrites(model: Any) -> bool:
+    modules = getattr(model, "modules", None)
+    if modules is None:
+        return False
+    for module in modules():
+        added = getattr(module, "dendrite_modules_added", None)
+        if isinstance(added, int) and added > 0:
+            return True
+    return False
+
+
 def _candidate_graph_batch_limit(
     config: "TrainingConfig",
     *,
     clear_pai_buffers: bool,
+    model: Any,
 ) -> int | None:
     candidate_graph_batch_limit = config.pai_candidate_graph_batch_limit
     if (
@@ -1343,6 +1345,12 @@ def _candidate_graph_batch_limit(
         and not clear_pai_buffers
         and candidate_graph_batch_limit is not None
         and candidate_graph_batch_limit > 0
+        # Once any dendrites exist, PAI's optimizer.step (closure_pai_step) does
+        # an internal backward through the candidate graph in p-phase. Disabling
+        # that graph mid-epoch frees the saved tensors and the next p-step
+        # raises "Trying to backward through the graph a second time", so the
+        # limit is only safe during the initial all-neuron correlation phase.
+        and not _pai_model_has_dendrites(model)
     ):
         return candidate_graph_batch_limit
     return None
@@ -1505,7 +1513,7 @@ def _run_epoch_batches(
         optimizer
     )
     candidate_graph_batch_limit = _candidate_graph_batch_limit(
-        config, clear_pai_buffers=clear_pai_buffers
+        config, clear_pai_buffers=clear_pai_buffers, model=model
     )
     for batch_index, batch in enumerate(batch_progress):
         _maybe_disable_candidate_graph_for_batch(
@@ -1829,8 +1837,65 @@ def _record_best_epoch(
     }
 
 
+def _navigate_to_module_attr(model: Any, key: str) -> tuple[Any, str] | None:
+    parts = key.split(".")
+    target = model
+    for part in parts[:-1]:
+        try:
+            target = getattr(target, part)
+        except AttributeError:
+            if not part.isdigit():
+                return None
+            try:
+                target = target[int(part)]
+            except (IndexError, KeyError, TypeError):
+                return None
+    return target, parts[-1]
+
+
+def _is_pai_lazy_dendrite_buffer_key(key: str) -> bool:
+    return ".dendrite_module." in key or ".dendrite_values." in key
+
+
+def _adopt_missing_pai_dendrite_buffers(
+    model: Any, best_state: dict[str, Any]
+) -> list[str]:
+    # PAI registers some DendriteValueTracker buffers (`shape`, score history,
+    # etc.) lazily inside create_new_dendrite_module rather than at perforation.
+    # A checkpoint saved after the n→p switch carries them, but the freshly
+    # perforated model on resume does not, so a plain load_state_dict silently
+    # drops the values. The `initialized` flag IS present in both and gets
+    # set to True, which makes PAI skip its first-forward re-init and later
+    # AttributeError on `.shape`. Register the missing buffers on the parent
+    # modules so the imminent load_state_dict can populate them.
+    plain_model = _unwrap_compiled(model)
+    current_keys = set(plain_model.state_dict().keys())
+    adopted: list[str] = []
+    for key, value in best_state.items():
+        if key in current_keys:
+            continue
+        if not _is_pai_lazy_dendrite_buffer_key(key):
+            continue
+        if not hasattr(value, "clone"):
+            continue
+        nav = _navigate_to_module_attr(plain_model, key)
+        if nav is None:
+            continue
+        parent, leaf = nav
+        register_buffer = getattr(parent, "register_buffer", None)
+        if register_buffer is None:
+            continue
+        try:
+            register_buffer(leaf, value.detach().clone())
+            adopted.append(key)
+        except Exception:
+            continue
+    return adopted
+
+
 def _load_compatible_best_state(model: Any, best_state: dict[str, Any]) -> None:
     plain_model = _unwrap_compiled(model)
+    adopted = _adopt_missing_pai_dendrite_buffers(plain_model, best_state)
     current_state = plain_model.state_dict()
     compatible_state: dict[str, Any] = {}
     skipped: list[str] = []
@@ -1845,6 +1910,12 @@ def _load_compatible_best_state(model: Any, best_state: dict[str, Any]) -> None:
             continue
         compatible_state[key] = value
     missing, unexpected = plain_model.load_state_dict(compatible_state, strict=False)
+    if adopted:
+        print(
+            "[state] adopted lazy PAI dendrite buffers: "
+            + ", ".join(adopted[:5])
+            + ("..." if len(adopted) > 5 else "")
+        )
     if skipped:
         print(
             "[state] skipped incompatible best-state tensors: "

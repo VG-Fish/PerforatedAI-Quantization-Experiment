@@ -41,7 +41,7 @@ _MODEL_KEYS: str = (
     "lstm_autoencoder, distilbert, dqn_lunarlander, ppo_bipedalwalker, "
     "attentivefp_freesolv, gin_imdbb, tcn_forecaster, gru_forecaster, "
     "pointnet_modelnet40, vae_mnist, snn_nmnist, resnet18_cifar10, "
-    "mobilenetv2_cifar10, saint_adult, capsnet_mnist, convlstm_movingmnist"
+    "mobilenetv2_cifar10, saint_adult, capsnet_mnist"
 )
 
 _CONDITION_KEYS: str = (

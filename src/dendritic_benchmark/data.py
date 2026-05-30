@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import gzip
 import os
 import tarfile
 import urllib.request
@@ -34,7 +33,6 @@ ESOL_URL: str = (
 )
 FREESOLV_URL: str = "https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/SAMPL.csv"
 IMDBB_URL: str = "https://www.chrsmrrs.com/graphkerneldatasets/IMDB-BINARY.zip"
-MOVING_MNIST_URL: str = "https://github.com/tychovdo/MovingMNIST/raw/master/mnist_test_seq.npy.gz"
 ISIC_SAMPLE_URL: str = (
     "https://isic-archive.s3.amazonaws.com/challenges/2018/ISIC2018_Task1-2_Training_Input.zip"
 )
@@ -1211,29 +1209,6 @@ def _build_isic(batch_size: int) -> TaskBundle:
     )
 
 
-def _build_moving_mnist(batch_size: int) -> TaskBundle:
-    torch = require_torch()
-    numpy = _require_dependency("numpy")
-    root: Path = _data_root() / "moving_mnist"
-    gz_path: Path = _download(MOVING_MNIST_URL, root / "mnist_test_seq.npy.gz")
-    npy_path: Path = root / "mnist_test_seq.npy"
-    if not npy_path.exists():
-        with gzip.open(gz_path, "rb") as src, npy_path.open("wb") as dst:
-            dst.write(src.read())
-    arr = numpy.load(npy_path)  # (20, 10000, 64, 64)
-    arr = torch.tensor(arr, dtype=torch.float32).permute(1, 0, 2, 3).unsqueeze(2) / 255.0
-    x = arr[:, :10]
-    y = arr[:, 10:20]
-    return _bundle_from_dataset(
-        _TensorRowsDataset(x, y),
-        batch_size,
-        "SSIM",
-        "maximize",
-        "Moving MNIST two-digit video prediction sequences",
-        num_workers=0,
-    )
-
-
 # Per-model batch sizes tuned for Apple Silicon MPS throughput.
 # Larger batches amortise Python-loop and host-to-device transfer overhead,
 # keeping the GPU busy for longer between CPU round-trips.  Each value was
@@ -1264,7 +1239,6 @@ _BATCH_SIZES: dict[str, int] = {
     "mobilenetv2_cifar10": 64,  # CIFAR SGD recipe batch size.
     "saint_adult": 256,  # Official SAINT implementation default.
     "capsnet_mnist": 64,  # Efficient-CapsNet MNIST recipe.
-    "convlstm_movingmnist": 16,
 }
 
 
@@ -1301,7 +1275,6 @@ def dataset_exists(model_key: str) -> bool:
         "pointnet_modelnet40":  [root / "modelnet40" / "raw"],
         "snn_nmnist":           [root / "nmnist"],
         "unet_isic":            [root / "isic2018" / "images" / EXTRACTED_MARKER],
-        "convlstm_movingmnist": [root / "moving_mnist" / "mnist_test_seq.npy"],
     }
     paths: list[Path] | None = sentinels.get(model_key)
     if paths is None:
@@ -1341,7 +1314,6 @@ def build_task_bundle(model_key: str, batch_size: int | None = None) -> TaskBund
         "mobilenetv2_cifar10": _build_cifar10,
         "saint_adult": _build_adult,
         "capsnet_mnist": _build_mnist,
-        "convlstm_movingmnist": _build_moving_mnist,
     }
     if model_key not in builders:
         raise KeyError(f"Unknown model key: {model_key}")

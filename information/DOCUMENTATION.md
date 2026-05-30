@@ -442,15 +442,6 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 | **Metric** | Accuracy (%) |
 | **Scientific Rationale** | Unique combination of routing-by-agreement and PAI's cascade-correlation dendrite addition |
 
-#### Model 25 — ConvLSTM (Moving MNIST, Spatiotemporal)
-| Field | Value |
-|---|---|
-| **Key** | `convlstm_movingmnist` |
-| **Domain** | Spatiotemporal Sequence Prediction |
-| **Dataset** | Moving MNIST (10K sequences, predict next 10 frames from 10 input frames) |
-| **Architecture** | 2-layer ConvLSTM (64 filters, 3×3 kernel), frame decoder, MSE reconstruction loss |
-| **Metric** | SSIM |
-
 ***
 ## Complete 25-Model Roster
 | # | Key | Domain | Dataset | ~Params |
@@ -479,7 +470,6 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 | 22 | `mobilenetv2_cifar10` | Image (Efficient) | CIFAR-10 | ~2.2M |
 | 23 | `saint_adult` | Tabular (Xfmr) | Adult Income | 205K |
 | 24 | `capsnet_mnist` | Image (CapsNet) | MNIST | ~8M |
-| 25 | `convlstm_movingmnist` | Spatiotemporal | Moving MNIST | ~500K |
 
 ***
 ## Additional Experiments Beyond New Models
@@ -568,7 +558,7 @@ Builds task bundles for each benchmark task and caches datasets under `data/` by
 ## Models
 
 ### `src/dendritic_benchmark/models.py`
-Defines PyTorch implementations for all 25 benchmark models and exposes `build_model()` to construct each architecture by key. The recurrent models use explicit Linear-gated LSTM/GRU cells so PerforatedAI can operate on recurrent projections; TabNet, SAINT, AttentiveFP, PointNet, CapsNet, SNN, U-Net, ConvLSTM, ResNet-18, and MobileNetV2 are implemented as named architectures rather than placeholder fallbacks. ResNet-18 and MobileNetV2 use `torchvision.models` with CIFAR-10 adaptations.
+Defines PyTorch implementations for all benchmark models and exposes `build_model()` to construct each architecture by key. The recurrent models use explicit Linear-gated LSTM/GRU cells so PerforatedAI can operate on recurrent projections; TabNet, SAINT, AttentiveFP, PointNet, CapsNet, SNN, U-Net, ResNet-18, and MobileNetV2 are implemented as named architectures rather than placeholder fallbacks. ResNet-18 and MobileNetV2 use `torchvision.models` with CIFAR-10 adaptations.
 
 ## Compatibility Helpers
 
@@ -798,7 +788,7 @@ comparison/
 ```
 
 ## Model Keys
-`lenet5`, `m5`, `lstm_forecaster`, `textcnn`, `gcn`, `tabnet`, `mpnn`, `actor_critic`, `lstm_autoencoder`, `distilbert`, `dqn_lunarlander`, `ppo_bipedalwalker`, `attentivefp_freesolv`, `gin_imdbb`, `tcn_forecaster`, `gru_forecaster`, `pointnet_modelnet40`, `vae_mnist`, `snn_nmnist`, <!-- `unet_isic`, --> `resnet18_cifar10`, `mobilenetv2_cifar10`, `saint_adult`, `capsnet_mnist`, `convlstm_movingmnist`
+`lenet5`, `m5`, `lstm_forecaster`, `textcnn`, `gcn`, `tabnet`, `mpnn`, `actor_critic`, `lstm_autoencoder`, `distilbert`, `dqn_lunarlander`, `ppo_bipedalwalker`, `attentivefp_freesolv`, `gin_imdbb`, `tcn_forecaster`, `gru_forecaster`, `pointnet_modelnet40`, `vae_mnist`, `snn_nmnist`, <!-- `unet_isic`, --> `resnet18_cifar10`, `mobilenetv2_cifar10`, `saint_adult`, `capsnet_mnist`
 
 ## Condition Keys
 `base_fp32`, `base_q8`, `base_q4`, `base_q2`, `base_q1_58`, `base_q1`, `dendrites_fp32`, `dendrites_q8`, `dendrites_q4`, `dendrites_q2`, `dendrites_q1_58`, `dendrites_q1`

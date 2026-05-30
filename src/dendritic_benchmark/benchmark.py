@@ -65,7 +65,6 @@ def get_model_input_shapes(model_key: str) -> tuple:
         "mobilenetv2_cifar10": (3, 32, 32),
         "saint_adult": (14,),
         "capsnet_mnist": (1, 28, 28),
-        "convlstm_movingmnist": (10, 1, 64, 64),
     }
     if model_key not in shapes_map:
         raise KeyError(f"Unknown model key: {model_key}")

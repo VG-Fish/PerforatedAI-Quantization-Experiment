@@ -58,7 +58,6 @@ MODEL_SPECS: list[ModelSpec] = [
     ModelSpec("mobilenetv2_cifar10", "MobileNetV2", "CIFAR-10", "Accuracy", "maximize"),
     ModelSpec("saint_adult", "SAINT", "Adult Income", "Accuracy", "maximize"),
     ModelSpec("capsnet_mnist", "CapsNet", "MNIST", "Accuracy", "maximize"),
-    ModelSpec("convlstm_movingmnist", "ConvLSTM", "Moving MNIST", "SSIM", "maximize"),
 ]
 
 

@@ -22,7 +22,7 @@ from .compat import (
     set_module_output_dimensions,
 )
 from .data import build_task_bundle
-from .models import UnsharedConv2d, build_model
+from .models import build_model
 from .results import (
     save_training_record,
     write_comparison_reports,
@@ -44,10 +44,6 @@ _MODEL_PT = "model.pt"
 _DEFAULT_PAI_INITIAL_CORRELATION_BATCH_LIMIT = 32
 _MODEL_PAI_INITIAL_CORRELATION_BATCH_LIMITS = {
     "distilbert": 4,
-    # ConvLSTM's 20-step unroll with cloned weights (see UnsharedConv2d) saves
-    # ~190 MB of activations per batch in dendrite mode; cap candidate-graph
-    # tracking to the first few batches so it doesn't accumulate all epoch.
-    "convlstm_movingmnist": 4,
 }
 _MODEL_DENDRITIC_BATCH_SIZES = {
     "distilbert": 4,
@@ -55,10 +51,6 @@ _MODEL_DENDRITIC_BATCH_SIZES = {
 _DEFAULT_DENDRITIC_MEMORY_CLEANUP_INTERVAL = 512
 _MODEL_DENDRITIC_MEMORY_CLEANUP_INTERVALS = {
     "distilbert": 128,
-    # convlstm has 438 batches/epoch, which would skip cleanup at the default
-    # of 512. Pick an interval well below the epoch length so caches don't
-    # accumulate across the long unrolled timesteps.
-    "convlstm_movingmnist": 32,
 }
 # Full-transformer PAI wrapping makes DistilBERT's candidate forward exceed
 # Apple Silicon MPS memory. Keep dendrite search on the task-specific head.
@@ -353,13 +345,7 @@ class BenchmarkRunner:
     def _perforation_modules_to_perforate(self, model_key: str) -> list[Any]:
         if model_key == "distilbert":
             return []
-        modules = list(self._perforation_track_modules())
-        if model_key == "convlstm_movingmnist" and nn is not None:
-            # ConvLSTM uses the UnsharedConv2d subclass so per-timestep calls
-            # save distinct weight tensors; PAI matches by class identity, so
-            # the subclass must be registered explicitly to be perforated.
-            modules.append(UnsharedConv2d)
-        return modules
+        return list(self._perforation_track_modules())
 
     def _perforation_module_ids_to_perforate(self, model_key: str) -> list[str]:
         if model_key == "distilbert":
@@ -561,7 +547,6 @@ class BenchmarkRunner:
             "mobilenetv2_cifar10": ModelTrainingRecipe(128, 150, 5.0e-2, "sgd", 0.9, 4.0e-5),
             "saint_adult": ModelTrainingRecipe(256, 100, 1.0e-4, "adamw", 0.9, 1.0e-5),
             "capsnet_mnist": ModelTrainingRecipe(128, 30, 3.0e-3, "adam", 0.9, 0.0),
-            "convlstm_movingmnist": ModelTrainingRecipe(16, 50, 1.0e-3),
         }
         recipe = recipes.get(
             model_key,
