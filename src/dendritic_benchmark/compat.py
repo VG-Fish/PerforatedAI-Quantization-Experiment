@@ -36,25 +36,19 @@ _PAI_CONFIG_LIST_SETTERS: tuple[str, ...] = (
 
 
 def load_project_environment() -> dict[str, str]:
-    """Find the nearest ``.env`` file and return its contents as a dict.
+    """Return the ``.env`` file in the current working directory as a dict.
 
-    Walks upward from this file's directory toward the current working
-    directory (where ``uv run dqb ...`` was invoked) and stops there. If no
-    ``.env`` is found within that range, returns an empty dict.
+    The current working directory is where ``uv run dqb ...`` was invoked.
+    Returns an empty dict if no ``.env`` is present.
     """
-    cwd = Path.cwd().resolve()
-    start = Path(__file__).resolve().parent
-    for directory in (start, *start.parents):
-        dotenv_path = directory / ".env"
-        if dotenv_path.exists():
-            return {
-                key: value
-                for key, value in dotenv_values(dotenv_path).items()
-                if value is not None
-            }
-        if directory == cwd:
-            break
-    return {}
+    dotenv_path = Path.cwd() / ".env"
+    if not dotenv_path.exists():
+        return {}
+    return {
+        key: value
+        for key, value in dotenv_values(dotenv_path).items()
+        if value is not None
+    }
 
 
 def _mirror_env_aliases() -> dict[str, str]:
