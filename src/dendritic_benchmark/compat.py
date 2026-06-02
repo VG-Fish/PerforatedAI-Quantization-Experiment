@@ -1,17 +1,18 @@
-from __future__ import annotations
-
-import importlib.util
+import builtins
+import importlib
 import math
 import os
 import pdb
 import re
 import shutil
 import sys
-import builtins
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
+
+import torch
+from dotenv import dotenv_values
 
 # Module-level flag to ensure the PAI config-saved message is emitted only once
 _PAI_CONFIG_SAVED_PRINTED: bool = False
@@ -33,55 +34,27 @@ _PAI_CONFIG_LIST_SETTERS: tuple[str, ...] = (
     "set_module_names_to_not_save",
 )
 
-load_dotenv: Any
-try:  # pragma: no cover - optional dependency
-    from dotenv import load_dotenv as _load_dotenv
 
-    load_dotenv = _load_dotenv
-except Exception:  # pragma: no cover - allow import before deps are installed
-    load_dotenv = None
+def load_project_environment() -> dict[str, str]:
+    """Find the nearest ``.env`` file and return its contents as a dict.
 
-
-def module_available(name: str) -> bool:
-    return importlib.util.find_spec(name) is not None
-
-
-torch: Any
-nn: Any
-F: Any
-try:  # pragma: no cover - optional dependency
-    import torch as _torch
-    import torch.nn as _nn
-    import torch.nn.functional as _F
-
-    torch = _torch
-    nn = _nn
-    F = _F
-except Exception:  # pragma: no cover - allow import on machines without torch
-    torch = None
-    nn = None
-    F = None
-
-
-def require_torch() -> Any:
-    if torch is None:
-        raise RuntimeError(
-            "PyTorch is required for training. Install it in the uv-managed environment "
-            "before running the benchmark."
-        )
-    return torch
-
-
-def has_perforatedai() -> bool:
-    return module_available("perforatedai")
-
-
-def load_project_environment() -> None:
-    if load_dotenv is None:
-        return
-    dotenv_path = Path(__file__).resolve().parents[2] / ".env"
-    if dotenv_path.exists():
-        load_dotenv(dotenv_path, override=False)
+    Walks upward from this file's directory toward the current working
+    directory (where ``uv run dqb ...`` was invoked) and stops there. If no
+    ``.env`` is found within that range, returns an empty dict.
+    """
+    cwd = Path.cwd().resolve()
+    start = Path(__file__).resolve().parent
+    for directory in (start, *start.parents):
+        dotenv_path = directory / ".env"
+        if dotenv_path.exists():
+            return {
+                key: value
+                for key, value in dotenv_values(dotenv_path).items()
+                if value is not None
+            }
+        if directory == cwd:
+            break
+    return {}
 
 
 def _mirror_env_aliases() -> dict[str, str]:
@@ -342,7 +315,7 @@ def set_module_output_dimensions(
         if setter is None:
             continue
         value: Any = dimensions
-        if device is not None and torch is not None:
+        if device is not None:
             value = torch.tensor(dimensions, device=device)
         setter(value)
 
@@ -477,7 +450,9 @@ def _consume_pai_debugger_message(text: str) -> bool:
 
 def _consume_pai_noise_message(text: str) -> bool:
     stripped = text.strip()
-    return stripped.startswith("For PAI training it is recommended to not use weight decay")
+    return stripped.startswith(
+        "For PAI training it is recommended to not use weight decay"
+    )
 
 
 def _consume_pai_output_message(text: str) -> bool:
@@ -611,15 +586,7 @@ def perforate_model(
     batches_per_epoch: int | None = None,
     runtime_options: PAIRuntimeOptions | None = None,
 ) -> Any:
-    if not has_perforatedai():
-        if doing_pai:
-            raise RuntimeError(
-                "PerforatedAI is required for dendritic benchmark conditions. "
-                "Install project dependencies before running dendritic models."
-            )
-        return model
-
-    try:  # pragma: no cover - optional dependency
+    try:
         _mirror_env_aliases()
         runtime_options = runtime_options or PAIRuntimeOptions()
         GPA = importlib.import_module(_PAI_GLOBALS_MODULE)
@@ -690,7 +657,9 @@ def _snapshot_stem(save_name: str) -> str:
     return "_".join(Path(save_name).parts)
 
 
-def _snapshot_pai_config(save_name: str, config_snapshot_path: Path | str | None) -> None:
+def _snapshot_pai_config(
+    save_name: str, config_snapshot_path: Path | str | None
+) -> None:
     config_path = Path("PAI") / "PAI_config.json"
     if not config_path.exists():
         return
@@ -729,9 +698,7 @@ def load_pai_system_checkpoint(
     checkpoint_name: str,
 ) -> Any:
     """Rebuild a PerforatedAI model architecture from a saved PAI switch."""
-    if not has_perforatedai():
-        return model
-    try:  # pragma: no cover - optional dependency
+    try:
         UPA = importlib.import_module("perforatedai.utils_perforatedai")
         modules_mod = importlib.import_module("perforatedai.modules_perforatedai")
         load_system = getattr(UPA, "load_system")
@@ -762,8 +729,6 @@ def load_pai_system_checkpoint(
 
 
 def choose_device() -> Any:
-    if torch is None:
-        return "cpu"
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         try:
             torch.empty(1, device="mps")
@@ -776,13 +741,11 @@ def choose_device() -> Any:
 
 
 def symmetric_quantize_tensor(tensor: Any, bit_width: int) -> Any:
-    if torch is None:
-        return tensor
     if bit_width >= 16:
         return tensor.clone()
     if bit_width <= 1:
         return tensor.sign().clamp(min=-1, max=1)
-    levels = 2 ** bit_width - 1
+    levels = 2**bit_width - 1
     max_abs = tensor.abs().max()
     if max_abs == 0:
         return tensor.clone()
@@ -791,8 +754,6 @@ def symmetric_quantize_tensor(tensor: Any, bit_width: int) -> Any:
 
 
 def ternary_quantize_tensor(tensor: Any) -> Any:
-    if torch is None:
-        return tensor
     threshold = tensor.std(unbiased=False) * 0.5
     pos = (tensor > threshold).to(tensor.dtype)
     neg = (tensor < -threshold).to(tensor.dtype)
@@ -800,6 +761,4 @@ def ternary_quantize_tensor(tensor: Any) -> Any:
 
 
 def binary_quantize_tensor(tensor: Any) -> Any:
-    if torch is None:
-        return tensor
     return torch.where(tensor >= 0, torch.ones_like(tensor), -torch.ones_like(tensor))

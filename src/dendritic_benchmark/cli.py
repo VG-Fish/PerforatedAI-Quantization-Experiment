@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 import json
 import os
@@ -9,8 +7,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+import torch
+
 from .benchmark import BenchmarkOrchestrator
-from .compat import load_project_environment, perforatedai_credentials_present, torch as _torch
+from .compat import load_project_environment, perforatedai_credentials_present
 from .data import DATA_ROOT_ENV, DEFAULT_DATA_ROOT, build_task_bundle, dataset_exists
 from .log_utils import setup_logging
 from .pipeline import BenchmarkRunner
@@ -594,9 +594,8 @@ def _handle_clean(args: Any) -> None:
 
 
 def main() -> None:
-    load_project_environment()
-    if _torch is not None:
-        _torch.multiprocessing.set_sharing_strategy("file_system")
+    os.environ.update(load_project_environment())
+    torch.multiprocessing.set_sharing_strategy("file_system")
     parser = build_parser()
     if argcomplete is not None:
         argcomplete.autocomplete(parser)

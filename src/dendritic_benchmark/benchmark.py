@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import csv
 import json
 import os
@@ -8,14 +6,27 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .compat import choose_device, require_torch
+import torch
+
+from .compat import choose_device
 from .models import build_model
-from .specs import CONDITION_SPECS, MODEL_SPECS, condition_by_key, model_by_key
+from .specs import CONDITION_SPECS, MODEL_SPECS, condition_by_key
 
 _GRAPH_MODELS = {"gcn", "gin_imdbb", "mpnn", "attentivefp_freesolv"}
 _TEXT_MODELS = {"textcnn", "distilbert"}
-_LATENCY_CSV_FIELDS = ["condition_key", "batch_size", "mean_latency_ms", "median_latency_ms"]
-_MANIFEST_CSV_FIELDS = ["model_key", "condition_key", "batch_size", "mean_latency_ms", "median_latency_ms"]
+_LATENCY_CSV_FIELDS = [
+    "condition_key",
+    "batch_size",
+    "mean_latency_ms",
+    "median_latency_ms",
+]
+_MANIFEST_CSV_FIELDS = [
+    "model_key",
+    "condition_key",
+    "batch_size",
+    "mean_latency_ms",
+    "median_latency_ms",
+]
 
 
 def _log(msg: str) -> None:
@@ -24,7 +35,6 @@ def _log(msg: str) -> None:
 
 
 def get_system_info() -> dict[str, Any]:
-    torch = require_torch()
     return {
         "timestamp": datetime.now().isoformat(),
         "platform": platform.system(),
@@ -34,13 +44,13 @@ def get_system_info() -> dict[str, Any]:
         "python_version": platform.python_version(),
         "pytorch_version": torch.__version__,
         "cuda_available": torch.cuda.is_available(),
-        "mps_available": torch.backends.mps.is_available(),
+        "mps_available": torch.mps.is_available(),
         "cpu_count": os.cpu_count(),
     }
 
 
-def get_model_input_shapes(model_key: str) -> tuple:
-    shapes_map = {
+def get_model_input_shapes(model_key: str) -> tuple[str, tuple]:
+    shapes_map: dict[str, tuple] = {
         "lenet5": (1, 28, 28),
         "m5": (1, 16000),
         "lstm_forecaster": (24, 1),
@@ -66,14 +76,11 @@ def get_model_input_shapes(model_key: str) -> tuple:
         "saint_adult": (14,),
         "capsnet_mnist": (1, 28, 28),
     }
-    if model_key not in shapes_map:
-        raise KeyError(f"Unknown model key: {model_key}")
     return shapes_map[model_key]
 
 
 def generate_sample_inputs(model_key: str, batch_size: int) -> tuple[Any, Any]:
     """Return a 2-tuple (primary_input, adjacency). adjacency is None for non-graph models."""
-    torch = require_torch()
     device = choose_device()
     shape = get_model_input_shapes(model_key)
 
@@ -104,7 +111,6 @@ def benchmark_model_latency(
 ) -> dict[str, Any]:
     import statistics
 
-    torch = require_torch()
     from torch.utils.benchmark import Timer
 
     primary, adjacency = inputs
@@ -198,11 +204,19 @@ class BenchmarkOrchestrator:
         condition_dir = self.results_root / model_key / condition_key
 
         if not condition_dir.exists():
-            return {"model_key": model_key, "condition_key": condition_key, "error": "condition directory not found"}
+            return {
+                "model_key": model_key,
+                "condition_key": condition_key,
+                "error": "condition directory not found",
+            }
 
         model = build_model(model_key).to(device)
         if not self._load_model_state(model, condition_dir):
-            return {"model_key": model_key, "condition_key": condition_key, "error": "failed to load model state"}
+            return {
+                "model_key": model_key,
+                "condition_key": condition_key,
+                "error": "failed to load model state",
+            }
 
         results: dict[str, Any] = {
             "model_key": model_key,
@@ -227,22 +241,28 @@ class BenchmarkOrchestrator:
 
         return results
 
-    def _collect_manifest_rows(self, result: dict[str, Any], model_key: str) -> list[dict[str, Any]]:
+    def _collect_manifest_rows(
+        self, result: dict[str, Any], model_key: str
+    ) -> list[dict[str, Any]]:
         if "error" in result:
             return []
         rows = []
         for batch_size, stats in result["batch_sizes"].items():
             if "error" not in stats:
-                rows.append({
-                    "model_key": model_key,
-                    "condition_key": result["condition_key"],
-                    "batch_size": batch_size,
-                    "mean_latency_ms": stats["mean_latency_ms"],
-                    "median_latency_ms": stats["median_latency_ms"],
-                })
+                rows.append(
+                    {
+                        "model_key": model_key,
+                        "condition_key": result["condition_key"],
+                        "batch_size": batch_size,
+                        "mean_latency_ms": stats["mean_latency_ms"],
+                        "median_latency_ms": stats["median_latency_ms"],
+                    }
+                )
         return rows
 
-    def _write_latency_summary(self, model_dir: Path, model_results: list[dict[str, Any]]) -> None:
+    def _write_latency_summary(
+        self, model_dir: Path, model_results: list[dict[str, Any]]
+    ) -> None:
         latency_summary_file = model_dir / "latency_summary.csv"
         with latency_summary_file.open("w", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=_LATENCY_CSV_FIELDS)
@@ -252,14 +272,18 @@ class BenchmarkOrchestrator:
                     continue
                 for batch_size, stats in result["batch_sizes"].items():
                     if "error" not in stats:
-                        writer.writerow({
-                            "condition_key": result["condition_key"],
-                            "batch_size": batch_size,
-                            "mean_latency_ms": stats["mean_latency_ms"],
-                            "median_latency_ms": stats["median_latency_ms"],
-                        })
+                        writer.writerow(
+                            {
+                                "condition_key": result["condition_key"],
+                                "batch_size": batch_size,
+                                "mean_latency_ms": stats["mean_latency_ms"],
+                                "median_latency_ms": stats["median_latency_ms"],
+                            }
+                        )
 
-    def _write_manifest(self, benchmark_root: Path, manifest_data: list[dict[str, Any]]) -> None:
+    def _write_manifest(
+        self, benchmark_root: Path, manifest_data: list[dict[str, Any]]
+    ) -> None:
         if not manifest_data:
             return
         manifest_file = benchmark_root / "manifest.csv"
@@ -287,11 +311,15 @@ class BenchmarkOrchestrator:
             counter[0] += 1
             result_file = model_dir / f"{condition_key}.json"
             if not re_run and result_file.exists():
-                _log(f"[{counter[0]}/{total_benchmarks}] {model_key} / {condition_key} — already benchmarked, skipping.")
+                _log(
+                    f"[{counter[0]}/{total_benchmarks}] {model_key} / {condition_key} — already benchmarked, skipping."
+                )
                 model_results.append(json.loads(result_file.read_text()))
                 continue
             _log(f"[{counter[0]}/{total_benchmarks}] {model_key} / {condition_key}…")
-            result = self.benchmark_condition(model_key, condition_key, batch_sizes, num_runs)
+            result = self.benchmark_condition(
+                model_key, condition_key, batch_sizes, num_runs
+            )
             model_results.append(result)
             result_file.write_text(json.dumps(result, indent=2))
 
@@ -317,7 +345,9 @@ class BenchmarkOrchestrator:
 
         benchmark_root = Path(benchmark_root)
         benchmark_root.mkdir(parents=True, exist_ok=True)
-        (benchmark_root / "computer_info.json").write_text(json.dumps(get_system_info(), indent=2))
+        (benchmark_root / "computer_info.json").write_text(
+            json.dumps(get_system_info(), indent=2)
+        )
 
         total_benchmarks = len(model_keys) * len(condition_keys)
         counter = [0]
@@ -325,7 +355,14 @@ class BenchmarkOrchestrator:
 
         for model_key in model_keys:
             model_results = self._benchmark_model(
-                model_key, condition_keys, batch_sizes, num_runs, benchmark_root, total_benchmarks, counter, re_run=re_run,
+                model_key,
+                condition_keys,
+                batch_sizes,
+                num_runs,
+                benchmark_root,
+                total_benchmarks,
+                counter,
+                re_run=re_run,
             )
             for result in model_results:
                 manifest_data.extend(self._collect_manifest_rows(result, model_key))
@@ -333,5 +370,6 @@ class BenchmarkOrchestrator:
         self._write_manifest(benchmark_root, manifest_data)
         if comparison_root is not None:
             from .results import write_per_model_benchmark_plots
+
             write_per_model_benchmark_plots(benchmark_root, Path(comparison_root))
         _log(f"Benchmarking complete. Results written to {benchmark_root}")

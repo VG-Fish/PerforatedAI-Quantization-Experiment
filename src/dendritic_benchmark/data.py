@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import csv
 import os
 import tarfile
@@ -10,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Callable
 
-from .compat import require_torch
+import torch
 
 DATA_ROOT_ENV: str = "DQB_DATA_ROOT"
 DEFAULT_DATA_ROOT: str = "data"
@@ -135,7 +133,6 @@ def _make_loader(
     ``persistent_workers`` keeps worker processes alive between epochs so the
     spawn cost is paid only once per training run.
     """
-    torch = require_torch()
     loader_kwargs: dict[str, Any] = {
         "batch_size": batch_size,
         "shuffle": shuffle,
@@ -151,7 +148,6 @@ def _make_loader(
 def _split_dataset(
     dataset: Any, train_ratio: float = 0.7, val_ratio: float = 0.15
 ) -> tuple[Any, Any, Any]:
-    torch = require_torch()
     total: int = len(dataset)
     if total < 3:
         raise ValueError(
@@ -222,10 +218,10 @@ def _build_mnist(batch_size: int) -> TaskBundle:
     test_ds = torchvision.datasets.MNIST(
         root=str(root), train=False, download=True, transform=transform
     )
-    train_ds, val_ds = require_torch().utils.data.random_split(
+    train_ds, val_ds = torch.utils.data.random_split(
         train_full,
         [55_000, 5_000],
-        generator=require_torch().Generator().manual_seed(42),
+        generator=torch.Generator().manual_seed(42),
     )
     return _bundle_from_splits(
         train_ds,
@@ -296,7 +292,7 @@ class _SpeechCommands12:
 
     def __getitem__(self, index: int) -> tuple[Any, Any]:
         _torch = (
-            require_torch()
+            torch
         )  # lightweight: just returns the already-imported module
         waveform, sample_rate, label, *_ = self.base[self.indices[index]]
         waveform = waveform.mean(dim=0, keepdim=True)
@@ -342,7 +338,6 @@ class _TensorRowsDataset:
 
 
 def _build_etth1(batch_size: int) -> TaskBundle:
-    torch = require_torch()
     path: Path = _download(ETTH1_URL, _data_root() / "etth1" / "ETTh1.csv")
     rows: list[float] = []
     with path.open(newline="") as fh:
@@ -377,7 +372,6 @@ def _build_multivariate_forecast(
     horizon: int,
     input_description: str,
 ) -> TaskBundle:
-    torch = require_torch()
     path: Path = _download(url, _data_root() / subdir / filename)
     rows: list[list[float]] = []
     with path.open(newline="") as fh:
@@ -426,7 +420,6 @@ def _build_ettm1(batch_size: int) -> TaskBundle:
 
 
 def _build_weather(batch_size: int) -> TaskBundle:
-    torch = require_torch()
     datasets = _require_dependency("datasets")
     loaded = datasets.load_dataset(
         "dunzane/time-series-dataset", "Weather", cache_dir=_hf_dataset_cache()
@@ -473,7 +466,6 @@ def _build_vocab(texts: Iterable[str], vocab_size: int) -> dict[str, int]:
 
 
 def _encode_texts(texts: Iterable[str], vocab: dict[str, int], seq_len: int) -> Any:
-    torch = require_torch()
     encoded: list[list[int]] = []
     for text in texts:
         ids: list[int] = [vocab.get(token, 0) for token in _tokenize(text)[:seq_len]]
@@ -489,7 +481,6 @@ def _hf_dataset_cache() -> str:
 
 
 def _build_ag_news(batch_size: int) -> TaskBundle:
-    torch = require_torch()
     datasets = _require_dependency("datasets")
     loaded = datasets.load_dataset("ag_news", cache_dir=_hf_dataset_cache())
     vocab: dict[str, int] = _build_vocab(loaded["train"]["text"], 5_000)
@@ -512,7 +503,6 @@ def _build_ag_news(batch_size: int) -> TaskBundle:
 
 
 def _build_sst2(batch_size: int) -> TaskBundle:
-    torch = require_torch()
     datasets = _require_dependency("datasets")
     transformers = _require_dependency("transformers")
     tokenizer = transformers.AutoTokenizer.from_pretrained("distilbert-base-uncased")
@@ -562,7 +552,6 @@ class _CoraEgoDataset:
         return int(self.y_all.shape[0])
 
     def __getitem__(self, index: int) -> tuple[Any, Any, Any]:
-        torch = require_torch()
         neighbors = self.adjacency[index].nonzero().flatten()
         neighbors = torch.cat(
             [
@@ -579,7 +568,6 @@ class _CoraEgoDataset:
 
 
 def _build_cora(batch_size: int) -> TaskBundle:
-    torch = require_torch()
     root: Path = _data_root() / "cora"
     archive: Path = _download(CORA_URL, root / "cora.tgz")
     content: Path = root / "cora" / "cora.content"
@@ -664,7 +652,6 @@ def _encode_adult_rows(
 
 
 def _build_adult(batch_size: int) -> TaskBundle:
-    torch = require_torch()
     root: Path = _data_root() / "adult"
     for filename, url in ADULT_URLS.items():
         _download(url, root / filename)
@@ -730,7 +717,6 @@ def _build_graph_tensors(
 
 
 def _smiles_to_graph(smiles: str) -> tuple[Any, Any]:
-    torch = require_torch()
     atoms: list[str] = []
     edges: list[tuple[int, int]] = []
     last_atom: int | None = None
@@ -759,7 +745,6 @@ def _smiles_to_graph(smiles: str) -> tuple[Any, Any]:
 
 
 def _build_esol(batch_size: int) -> TaskBundle:
-    torch = require_torch()
     path: Path = _download(ESOL_URL, _data_root() / "esol" / "delaney-processed.csv")
     node_features = []
     adjacencies = []
@@ -791,7 +776,6 @@ def _build_esol(batch_size: int) -> TaskBundle:
 
 
 def _build_freesolv(batch_size: int) -> TaskBundle:
-    torch = require_torch()
     path: Path = _download(FREESOLV_URL, _data_root() / "freesolv" / "SAMPL.csv")
     node_features = []
     adjacencies = []
@@ -829,7 +813,6 @@ def _read_tu_indicator(path: Path) -> list[int]:
 
 
 def _build_imdbb(batch_size: int) -> TaskBundle:
-    torch = require_torch()
     root: Path = _data_root() / "imdb_binary"
     archive: Path = _download(IMDBB_URL, root / "IMDB-BINARY.zip")
     _extract_zip(archive, root)
@@ -879,7 +862,6 @@ def _build_imdbb(batch_size: int) -> TaskBundle:
 
 
 def _build_cartpole(batch_size: int) -> TaskBundle:
-    torch = require_torch()
     gymnasium = _require_dependency("gymnasium", "gymnasium[classic-control]")
     numpy = _require_dependency("numpy")
     cache: Path = _data_root() / "cartpole" / HEURISTIC_ROLLOUTS_FILENAME
@@ -935,7 +917,6 @@ def _lunarlander_heuristic_action(
 
 
 def _build_lunarlander(batch_size: int) -> TaskBundle:
-    torch = require_torch()
     gymnasium = _require_dependency("gymnasium", "gymnasium[box2d]")
     numpy = _require_dependency("numpy")
     cache: Path = _data_root() / "lunarlander" / HEURISTIC_ROLLOUTS_FILENAME
@@ -975,7 +956,6 @@ def _build_lunarlander(batch_size: int) -> TaskBundle:
 
 
 def _build_bipedalwalker(batch_size: int) -> TaskBundle:
-    torch = require_torch()
     gymnasium = _require_dependency("gymnasium", "gymnasium[box2d]")
     numpy = _require_dependency("numpy")
     cache: Path = _data_root() / "bipedalwalker" / HEURISTIC_ROLLOUTS_FILENAME
@@ -1020,7 +1000,6 @@ def _build_bipedalwalker(batch_size: int) -> TaskBundle:
 
 
 def _build_mitbih(batch_size: int) -> TaskBundle:
-    torch = require_torch()
     wfdb = _require_dependency("wfdb")
     root: Path = _data_root() / "mit-bih"
     if not all((root / f"{record}.dat").exists() for record in MITBIH_RECORDS):
@@ -1076,7 +1055,6 @@ class _ModelNet40Dataset:
         return len(self.samples)
 
     def __getitem__(self, index: int) -> tuple[Any, Any]:
-        torch = require_torch()
         path, label = self.samples[index]
         with path.open() as fh:
             header: str = fh.readline().strip()
@@ -1117,7 +1095,6 @@ def _build_modelnet40(batch_size: int) -> TaskBundle:
 
 
 def _build_nmnist(batch_size: int) -> TaskBundle:
-    torch = require_torch()
     tonic = _require_dependency("tonic")
     transforms = __import__("tonic.transforms", fromlist=["transforms"])
     transform = transforms.Compose(
@@ -1179,7 +1156,6 @@ class _ISICDataset:
         return len(self.samples)
 
     def __getitem__(self, index: int) -> tuple[Any, Any]:
-        torch = require_torch()
         pil_image = __import__("PIL.Image", fromlist=["Image"])
         image_path, mask_path = self.samples[index]
         image = pil_image.open(image_path).convert("RGB").resize((self.image_size, self.image_size))
@@ -1288,7 +1264,6 @@ def build_task_bundle(model_key: str, batch_size: int | None = None) -> TaskBund
     Pass an explicit ``batch_size`` to override the MPS-tuned default in
     ``_BATCH_SIZES`` (useful for smoke tests or ablation studies).
     """
-    require_torch()
     builders: dict[str, Callable[..., TaskBundle]] = {
         "lenet5": _build_mnist,
         "m5": _build_speechcommands,

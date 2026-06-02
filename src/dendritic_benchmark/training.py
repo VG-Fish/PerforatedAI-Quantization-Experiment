@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import csv
 import gc
 import importlib
@@ -14,6 +12,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+import torch
 from tqdm.auto import tqdm
 
 from .compat import (
@@ -25,7 +24,6 @@ from .compat import (
     clear_pai_tracker_state,
     configure_pai_candidate_graph,
     pai_runtime_guard,
-    require_torch,
     set_module_output_dimensions,
     symmetric_quantize_tensor,
     ternary_quantize_tensor,
@@ -212,7 +210,6 @@ def _dice_from_logits(logits: Any, targets: Any) -> float:
 
 
 def _vae_loss(outputs: Any, targets: Any) -> Any:
-    torch = require_torch()
     recon, mu, logvar = outputs
     bce = torch.nn.functional.binary_cross_entropy(recon, targets, reduction="sum")
     kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
@@ -220,7 +217,6 @@ def _vae_loss(outputs: Any, targets: Any) -> Any:
 
 
 def _vae_metrics(outputs: Any, targets: Any) -> dict[str, float]:
-    torch = require_torch()
     recon, mu, logvar = outputs
     bce = torch.nn.functional.binary_cross_entropy(recon, targets, reduction="sum")
     kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
@@ -261,7 +257,6 @@ _PRIMARY_METRIC_KEY: dict[str, str] = {
 
 
 def _binary_or_multi_loss(model_key: str) -> Any:
-    torch = require_torch()
     if model_key in {"lstm_forecaster", "mpnn", "attentivefp_freesolv", "tcn_forecaster", "gru_forecaster", "ppo_bipedalwalker"}:
         return torch.nn.MSELoss()
     if model_key in {"lstm_autoencoder"}:
@@ -303,7 +298,6 @@ def _detach_metric_payload(
 
 
 def _average_precision(scores: Any, targets: Any) -> float:
-    torch = require_torch()
     scores = scores.flatten().float()
     targets = targets.flatten().long()
     positives = int((targets == 1).sum().item())
@@ -322,7 +316,6 @@ def _average_precision(scores: Any, targets: Any) -> float:
 def _best_f1_threshold(
     scores: Any, targets: Any
 ) -> tuple[float, float, float, float, float]:
-    torch = require_torch()
     scores = scores.flatten().float()
     targets = targets.flatten().long()
     positives = int((targets == 1).sum().item())
@@ -358,7 +351,6 @@ def _best_f1_threshold(
 
 
 def _classification_metrics(logits: Any, targets: Any) -> dict[str, float]:
-    torch = require_torch()
     logits = logits.float()
     targets = targets.long().flatten()
     predictions = logits.argmax(dim=-1)
@@ -488,7 +480,6 @@ def _classification_metrics(logits: Any, targets: Any) -> dict[str, float]:
 
 
 def _regression_metrics(preds: Any, targets: Any) -> dict[str, float]:
-    torch = require_torch()
     preds = preds.float().flatten()
     targets = targets.float().flatten()
     errors = preds - targets
@@ -527,7 +518,6 @@ def _regression_metrics(preds: Any, targets: Any) -> dict[str, float]:
 def _anomaly_metrics(
     reconstructions: Any, targets: Any, labels: Any | None
 ) -> dict[str, float]:
-    torch = require_torch()
     reductions = tuple(range(1, reconstructions.dim()))
     reconstruction_error = ((reconstructions.float() - targets.float()) ** 2).mean(
         dim=reductions
@@ -594,7 +584,6 @@ def _prefix_metrics(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
 
 
 def _cat_payload(items: list[Any]) -> Any:
-    torch = require_torch()
     if not items:
         return items
     first = items[0]
@@ -653,7 +642,6 @@ def _forward(model_key: str, model: Any, batch: tuple[Any, ...]) -> tuple[Any, A
 
 
 def _first_tensor(value: Any) -> Any | None:
-    torch = require_torch()
     if isinstance(value, torch.Tensor):
         return value
     if isinstance(value, (tuple, list)):
@@ -720,7 +708,6 @@ def infer_module_output_dimensions(
     if not valid_classes and not selected_module_names:
         return {}
 
-    torch = require_torch()
     device = next(
         (parameter.device for parameter in model.parameters()),
         torch.device("cpu"),
@@ -797,7 +784,6 @@ def _tensor_shape(value: Any) -> tuple[int, ...] | None:
 def _make_quantized_copy(
     model: Any, bit_width: int | None, mode: str | None = None
 ) -> Any:
-    torch = require_torch()
     if bit_width is None or bit_width >= 32:
         return model
     # Quantize on CPU and stream results back to each parameter.  Running the
@@ -900,7 +886,6 @@ def _persist_stage_artifacts(
 ) -> tuple[Path, float, int, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / _MODEL_PT
-    torch = require_torch()
     torch.save(plain_model.state_dict(), checkpoint_path)
     artifact_path = _artifact_path(output_dir, metadata.use_dendrites)
     file_size_mb = artifact_path.stat().st_size / (1024 * 1024)
@@ -2597,7 +2582,6 @@ def train_and_evaluate(
     max_epochs = config.max_epochs
     source_condition_key = config.source_condition_key
 
-    torch = require_torch()
     device = _resolve_device(model_key, torch)
     _configure_mps_matmul_precision(torch, device)
     output_dir.mkdir(parents=True, exist_ok=True)

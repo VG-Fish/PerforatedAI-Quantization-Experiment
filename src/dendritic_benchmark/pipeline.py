@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import gc
 import json
 import math
@@ -7,6 +5,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
+
+import torch
+import torch.nn as nn
 
 from .compat import (
     PAIModuleSelection,
@@ -16,9 +17,7 @@ from .compat import (
     configure_pai_candidate_graph,
     latest_pai_switch_checkpoint,
     load_pai_system_checkpoint,
-    nn,
     perforate_model,
-    require_torch,
     set_module_output_dimensions,
 )
 from .data import build_task_bundle
@@ -104,7 +103,6 @@ def _log(msg: str, *, before: bool = False, after: bool = False) -> None:
 
 def _release_accelerator_memory() -> None:
     gc.collect()
-    torch = require_torch()
     mps = getattr(torch, "mps", None)
     if mps is not None and torch.backends.mps.is_available():
         empty = getattr(mps, "empty_cache", None)
@@ -179,7 +177,6 @@ class BenchmarkRunner:
     def _load_state(
         self, model: Any, checkpoint_path: Path, *, strict: bool = True
     ) -> Any:
-        torch = require_torch()
         if checkpoint_path.exists():
             state = torch.load(checkpoint_path, map_location=choose_device())
             if strict:
@@ -817,7 +814,6 @@ class BenchmarkRunner:
         allow_pqat: bool,
         dynamic_dendritic_training: bool,
     ) -> TrainingRecord:
-        require_torch()
         training_hyperparameters = self._training_hyperparameters(model_key, condition)
         training_plan = self._condition_training_plan(
             model_key, condition, training_hyperparameters, allow_pqat
