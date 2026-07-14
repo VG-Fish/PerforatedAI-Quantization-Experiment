@@ -77,13 +77,10 @@ class TrainingRecord:
     metric_name: str
     metric_value: float
     metric_direction: str
-    : float
     best_epoch: int
     param_count: int
     nonzero_params: int
     file_size_mb: float
-    : float
-    : str
     # Set to True when max_epochs==0 (post-training quantization — no gradient updates).
     training_skipped: bool = False
     # Human-readable explanation of why training was skipped (empty string when training ran).
