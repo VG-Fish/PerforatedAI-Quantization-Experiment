@@ -5,6 +5,7 @@ import itertools
 import json
 import math
 import os
+import shutil
 import subprocess
 import time
 from contextlib import nullcontext
@@ -67,6 +68,7 @@ class TrainingConfig:
     freeze_dendrite_updates_fraction: float = 0.20
     pai_candidate_graph_batch_limit: int | None = None
     memory_cleanup_interval_batches: int | None = None
+    pai_save_name: str | None = None
 
 
 @dataclass
@@ -1111,6 +1113,35 @@ def _pai_updates_enabled(config: TrainingConfig) -> bool:
     return bool(
         config.enable_pai_dendrite_updates or config.train_dendrites_until_complete
     )
+
+
+def _copy_pai_graphs_to_output(pai_save_name: str, output_dir: Path) -> None:
+    src = Path("PAI") / pai_save_name
+    if not src.exists():
+        return
+    dst = output_dir / "pai_plots"
+    dst.mkdir(parents=True, exist_ok=True)
+    for ext in ("*.png", "*.svg", "*.pdf"):
+        for f in src.glob(ext):
+            shutil.copy2(f, dst / f.name)
+
+
+def _post_pai_run_config_event(config: TrainingConfig) -> None:
+    try:
+        gpa = importlib.import_module("perforatedai.globals_perforatedai")
+        events_url = getattr(gpa.pc, "events_url", None)
+        if not events_url:
+            return
+        import requests
+
+        total = None if config.train_dendrites_until_complete else config.max_epochs
+        requests.post(
+            events_url,
+            json={"type": "run_config", "total_epochs": total},
+            timeout=1.0,
+        )
+    except Exception:
+        pass
 
 
 def _setup_pai_optimizer(
@@ -2582,6 +2613,8 @@ def train_and_evaluate(
     device = _resolve_device(model_key, torch)
     _configure_mps_matmul_precision(torch, device)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if use_dendrites and _pai_updates_enabled(config):
+        _post_pai_run_config_event(config)
     primary_metric_key = _PRIMARY_METRIC_KEY.get(model_key, "accuracy")
     metadata = _build_artifact_metadata(
         model_key=model_key,
@@ -2748,4 +2781,6 @@ def train_and_evaluate(
         skip_reason=skip_reason,
     )
     _write_best_model_stats_csv(output_dir, record)
+    if use_dendrites and config.pai_save_name:
+        _copy_pai_graphs_to_output(config.pai_save_name, output_dir)
     return record

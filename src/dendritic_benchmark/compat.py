@@ -162,6 +162,7 @@ def _configure_pai_trackers(
     _call_if_available(pc, "set_testing_dendrite_capacity", False)
     _call_if_available(pc, "set_debugging_memory_leak", False)
     _call_if_available(pc, "set_candidate_graph_mode", candidate_graph_enabled)
+    _call_if_available(pc, "set_dashboard_events_enabled", True)
     if confirm_unwrapped_modules:
         _call_if_available(pc, "set_unwrapped_modules_confirmed", True)
     _call_if_available(pc, "set_no_backward_workaround", no_backward_workaround)
@@ -225,7 +226,11 @@ def _configure_dynamic_pai_schedule(
         {
             "set_n_epochs_to_switch": 10,
             "set_p_epochs_to_switch": 2,
-            "set_max_dendrites": 100,
+            "set_max_dendrites": 6,
+            "set_n_epochs_for_switch_history": 8,
+            "set_improvement_threshold": [0.005, 0.001, 0.0001, 0],
+            "set_reset_best_score_on_switch": True,
+            "set_candidate_weight_initialization_multiplier": 0.005,
         },
     )
     correlation_batches = _initial_correlation_batches(
@@ -615,7 +620,7 @@ def perforate_model(
                 doing_pai=doing_pai,
                 save_name=pai_save_name,
                 maximizing_score=maximizing_score,
-                making_graphs=False,
+                making_graphs=True,
             )
             if _set_tracked_params is not None:
                 _set_tracked_params(perforated)
