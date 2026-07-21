@@ -160,11 +160,12 @@ def _split_dataset(
     overflow: int = train_size + val_size + test_size - total
     if overflow > 0:
         train_size: int = max(1, train_size - overflow)
-    return torch.utils.data.random_split(
+    train_ds, val_ds, test_ds = torch.utils.data.random_split(
         dataset,
         [train_size, val_size, test_size],
         generator=torch.Generator().manual_seed(42),
     )
+    return train_ds, val_ds, test_ds
 
 
 def _bundle_from_splits(
@@ -384,7 +385,7 @@ class TimeSeriesDatasets:
         horizon: int,
         input_description: str,
     ) -> TaskBundle:
-            path: Path = _download(url, _data_root() / subdir / filename)
+        path: Path = _download(url, _data_root() / subdir / filename)
         rows: list[list[float]] = []
         with path.open(newline="") as fh:
             reader: csv.DictReader[str] = csv.DictReader(fh)
@@ -419,7 +420,7 @@ class TimeSeriesDatasets:
         )
     @staticmethod
     def ettm1(batch_size: int) -> TaskBundle:
-        return _build_multivariate_forecast(
+        return TimeSeriesDatasets.multivariate_forecast(
             batch_size,
             url=ETTM1_URL,
             subdir="ettm1",
@@ -469,7 +470,7 @@ class TextDataSets:
     def _build_vocab(texts: Iterable[str], vocab_size: int) -> dict[str, int]:
         counts: Counter[str] = Counter()
         for text in texts:
-            counts.update(_tokenize(text))
+            counts.update(TextDataSets._tokenize(text))
         return {
             token: index + 1
             for index, (token, _) in enumerate(counts.most_common(vocab_size - 1))
@@ -479,7 +480,7 @@ class TextDataSets:
     def _encode_texts(texts: Iterable[str], vocab: dict[str, int], seq_len: int) -> Any:
         encoded: list[list[int]] = []
         for text in texts:
-            ids: list[int] = [vocab.get(token, 0) for token in _tokenize(text)[:seq_len]]
+            ids: list[int] = [vocab.get(token, 0) for token in TextDataSets._tokenize(text)[:seq_len]]
             ids.extend([0] * (seq_len - len(ids)))
             encoded.append(ids)
         return torch.tensor(encoded, dtype=torch.long)
@@ -488,13 +489,13 @@ class TextDataSets:
     def ag_news(batch_size: int) -> TaskBundle:
         datasets = _require_dependency("datasets")
         loaded = datasets.load_dataset("ag_news", cache_dir=_hf_dataset_cache())
-        vocab: dict[str, int] = _build_vocab(loaded["train"]["text"], 5_000)
+        vocab: dict[str, int] = TextDataSets._build_vocab(loaded["train"]["text"], 5_000)
         train_texts = loaded["train"]["text"]
         train_labels = torch.tensor(loaded["train"]["label"], dtype=torch.long)
-        x_train = _encode_texts(train_texts, vocab, 64)
+        x_train = TextDataSets._encode_texts(train_texts, vocab, 64)
         train_full = _TensorRowsDataset(x_train, train_labels)
         train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
-        x_test = _encode_texts(loaded["test"]["text"], vocab, 64)
+        x_test = TextDataSets._encode_texts(loaded["test"]["text"], vocab, 64)
         y_test = torch.tensor(loaded["test"]["label"], dtype=torch.long)
         return _bundle_from_splits(
             train_ds,
@@ -504,7 +505,7 @@ class TextDataSets:
             "Accuracy",
             "maximize",
             "AG News tokenized article titles and descriptions",
-    )
+        )
 
     @staticmethod
     def sst2(batch_size: int) -> TaskBundle:
@@ -652,7 +653,6 @@ def _build_adult(batch_size: int) -> TaskBundle:
 
 class GraphDatasets:
     @staticmethod
-
     def cora(batch_size: int) -> TaskBundle:
         root: Path = _data_root() / "cora"
         archive: Path = _download(CORA_URL, root / "cora.tgz")
@@ -736,7 +736,7 @@ class GraphDatasets:
                     ring_open[char] = last_atom
                 index += 1
                 continue
-            token, index = _parse_smiles_token(smiles, index)
+            token, index = GraphDatasets._parse_smiles_token(smiles, index)
             if token is None:
                 continue
             atom_index: int = len(atoms)
@@ -746,7 +746,7 @@ class GraphDatasets:
             last_atom = atom_index
         if not atoms:
             atoms = ["C"]
-        return _build_graph_tensors(atoms, edges, torch)
+        return GraphDatasets._build_graph_tensors(atoms, edges, torch)
 
     @staticmethod
     def esol(batch_size: int) -> TaskBundle:
@@ -763,7 +763,7 @@ class GraphDatasets:
                 )
                 if smiles is None or target is None:
                     continue
-                x, adjacency = _smiles_to_graph(smiles)
+                x, adjacency = GraphDatasets._smiles_to_graph(smiles)
                 node_features.append(x)
                 adjacencies.append(adjacency)
                 labels.append(float(target))
@@ -796,7 +796,7 @@ class GraphDatasets:
                 )
                 if smiles is None or target is None:
                     continue
-                x, adjacency = _smiles_to_graph(smiles)
+                x, adjacency = GraphDatasets._smiles_to_graph(smiles)
                 node_features.append(x)
                 adjacencies.append(adjacency)
                 labels.append(float(target))
@@ -822,15 +822,15 @@ class GraphDatasets:
         archive: Path = _download(IMDBB_URL, root / "IMDB-BINARY.zip")
         _extract_zip(archive, root)
         dataset_dir: Path = root / "IMDB-BINARY"
-        graph_indicator: list[int] = _read_tu_indicator(dataset_dir / "IMDB-BINARY_graph_indicator.txt")
-        labels_raw: list[int] = _read_tu_indicator(dataset_dir / "IMDB-BINARY_graph_labels.txt")
+        graph_indicator: list[int] = GraphDatasets._read_tu_indicator(dataset_dir / "IMDB-BINARY_graph_indicator.txt")
+        labels_raw: list[int] = GraphDatasets._read_tu_indicator(dataset_dir / "IMDB-BINARY_graph_labels.txt")
         edges: list[tuple[int, int]] = []
         with (dataset_dir / "IMDB-BINARY_A.txt").open() as fh:
             for line in fh:
                 left, right = line.replace(" ", "").strip().split(",")
                 edges.append((int(left) - 1, int(right) - 1))
         graph_nodes: dict[int, list[int]] = {}
-            for node_index, graph_id in enumerate(graph_indicator):
+        for node_index, graph_id in enumerate(graph_indicator):
             graph_nodes.setdefault(graph_id, []).append(node_index)
         max_nodes = 96
         features = []
@@ -854,16 +854,16 @@ class GraphDatasets:
             adjacencies.append(adjacency)
             labels.append(1 if labels_raw[graph_id - 1] > 0 else 0)
         return _bundle_from_dataset(
-        _TensorRowsDataset(
-            torch.stack(features),
-            torch.stack(adjacencies),
-            torch.tensor(labels, dtype=torch.long),
-        ),
-        batch_size,
-        "Accuracy",
-        "maximize",
-        "IMDB-Binary social-network graph classification",
-    )
+            _TensorRowsDataset(
+                torch.stack(features),
+                torch.stack(adjacencies),
+                torch.tensor(labels, dtype=torch.long),
+            ),
+            batch_size,
+            "Accuracy",
+            "maximize",
+            "IMDB-Binary social-network graph classification",
+        )
 
 
 def _build_cartpole(batch_size: int) -> TaskBundle:
@@ -1156,6 +1156,7 @@ class MedicalDatasets:
             num_workers=0,
         )
 
+    @staticmethod
     def mitbih(batch_size: int) -> TaskBundle:
         wfdb = _require_dependency("wfdb")
         root: Path = _data_root() / "mit-bih"
@@ -1271,30 +1272,30 @@ def build_task_bundle(model_key: str, batch_size: int | None = None) -> TaskBund
     ``_BATCH_SIZES`` (useful for smoke tests or ablation studies).
     """
     builders: dict[str, Callable[..., TaskBundle]] = {
-        "lenet5": _build_mnist,
-        "m5": _build_speechcommands,
-        "lstm_forecaster": _build_etth1,
-        "textcnn": _build_ag_news,
-        "gcn": _build_cora,
+        "lenet5": VisionDatasets.mnist,
+        "m5": AudioDatasets.speechcommands,
+        "lstm_forecaster": TimeSeriesDatasets.etth1,
+        "textcnn": TextDataSets.ag_news,
+        "gcn": GraphDatasets.cora,
         "tabnet": _build_adult,
-        "mpnn": _build_esol,
+        "mpnn": GraphDatasets.esol,
         "actor_critic": _build_cartpole,
-        "lstm_autoencoder": _build_mitbih,
-        "distilbert": _build_sst2,
+        "lstm_autoencoder": MedicalDatasets.mitbih,
+        "distilbert": TextDataSets.sst2,
         "dqn_lunarlander": _build_lunarlander,
         "ppo_bipedalwalker": _build_bipedalwalker,
-        "attentivefp_freesolv": _build_freesolv,
-        "gin_imdbb": _build_imdbb,
-        "tcn_forecaster": _build_ettm1,
-        "gru_forecaster": _build_weather,
+        "attentivefp_freesolv": GraphDatasets.freesolv,
+        "gin_imdbb": GraphDatasets.imdbb,
+        "tcn_forecaster": TimeSeriesDatasets.ettm1,
+        "gru_forecaster": TimeSeriesDatasets.weather,
         "pointnet_modelnet40": _build_modelnet40,
-        "vae_mnist": _build_mnist,
+        "vae_mnist": VisionDatasets.mnist,
         "snn_nmnist": _build_nmnist,
-        "unet_isic": _build_isic,
-        "resnet18_cifar10": _build_cifar10,
-        "mobilenetv2_cifar10": _build_cifar10,
+        "unet_isic": MedicalDatasets.isic,
+        "resnet18_cifar10": VisionDatasets.cifar10,
+        "mobilenetv2_cifar10": VisionDatasets.cifar10,
         "saint_adult": _build_adult,
-        "capsnet_mnist": _build_mnist,
+        "capsnet_mnist": VisionDatasets.mnist,
     }
     if model_key not in builders:
         raise KeyError(f"Unknown model key: {model_key}")

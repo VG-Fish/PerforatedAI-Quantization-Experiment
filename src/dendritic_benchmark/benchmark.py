@@ -49,7 +49,7 @@ def get_system_info() -> dict[str, Any]:
     }
 
 
-def get_model_input_shapes(model_key: str) -> tuple[str, tuple]:
+def get_model_input_shapes(model_key: str) -> tuple:
     shapes_map: dict[str, tuple] = {
         "lenet5": (1, 28, 28),
         "m5": (1, 16000),
@@ -82,25 +82,25 @@ def get_model_input_shapes(model_key: str) -> tuple[str, tuple]:
 def generate_sample_inputs(model_key: str, batch_size: int) -> tuple[Any, Any]:
     """Return a 2-tuple (primary_input, adjacency). adjacency is None for non-graph models."""
     device = choose_device()
-    shape = get_model_input_shapes(model_key)
+    shape: Any = get_model_input_shapes(model_key)
 
     if model_key in _GRAPH_MODELS:
         node_features_shape, adjacency_shape = shape
         return (
-            torch.randn(batch_size, *node_features_shape, device=device),
-            torch.randn(batch_size, *adjacency_shape, device=device),
+            torch.randn([batch_size, *node_features_shape], device=device),
+            torch.randn([batch_size, *adjacency_shape], device=device),
         )
 
     if model_key == "distilbert":
-        input_ids = torch.randint(0, 30522, (batch_size, *shape), device=device)
+        input_ids = torch.randint(0, 30522, [batch_size, *shape], device=device)
         attention_mask = torch.ones_like(input_ids)
         return ((input_ids, attention_mask), None)
 
     if model_key in _TEXT_MODELS:
         vocab_size = 5000 if model_key == "textcnn" else 30522
-        return (torch.randint(0, vocab_size, (batch_size, *shape), device=device), None)
+        return (torch.randint(0, vocab_size, [batch_size, *shape], device=device), None)
 
-    return (torch.randn(batch_size, *shape, device=device), None)
+    return (torch.randn([batch_size, *shape], device=device), None)
 
 
 def benchmark_model_latency(
