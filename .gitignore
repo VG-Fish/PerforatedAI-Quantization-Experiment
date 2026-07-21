@@ -22,3 +22,5 @@ sonar-project.properties
 benchmarks/
 .dqb/
 PAI Skills/
+.mcp.json
+.perforated_tools/
