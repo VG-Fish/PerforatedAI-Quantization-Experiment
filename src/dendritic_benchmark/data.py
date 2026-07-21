@@ -63,7 +63,8 @@ class TaskBundle:
     metric_direction: str
     input_description: str
 
-
+# Making the following into static methods is not necessary since every domain class 
+# after calls them. Adding inheritance by making some shared base class is pointless.
 def _data_root() -> Path:
     return Path(os.environ.get(DATA_ROOT_ENV, DEFAULT_DATA_ROOT)).expanduser()
 
@@ -205,70 +206,79 @@ def _bundle_from_dataset(
         num_workers=num_workers,
     )
 
-
-def _build_mnist(batch_size: int) -> TaskBundle:
-    torchvision = _require_dependency("torchvision")
-    transforms = __import__("torchvision.transforms", fromlist=["transforms"])
-    root: Path = _data_root() / "mnist"
-    root.mkdir(parents=True, exist_ok=True)
-    transform = transforms.Compose([transforms.ToTensor()])
-    train_full = torchvision.datasets.MNIST(
-        root=str(root), train=True, download=True, transform=transform
-    )
-    test_ds = torchvision.datasets.MNIST(
-        root=str(root), train=False, download=True, transform=transform
-    )
-    train_ds, val_ds = torch.utils.data.random_split(
-        train_full,
-        [55_000, 5_000],
-        generator=torch.Generator().manual_seed(42),
-    )
-    return _bundle_from_splits(
-        train_ds,
-        val_ds,
-        test_ds,
-        batch_size,
-        "Accuracy",
-        "maximize",
-        "MNIST handwritten digit images",
-    )
+def _hf_dataset_cache() -> str:
+    cache: Path = _data_root() / "huggingface"
+    cache.mkdir(parents=True, exist_ok=True)
+    return str(cache)
 
 
-def _build_cifar10(batch_size: int) -> TaskBundle:
-    torchvision = _require_dependency("torchvision")
-    transforms = __import__("torchvision.transforms", fromlist=["transforms"])
-    root: Path = _data_root() / "cifar10"
-    root.mkdir(parents=True, exist_ok=True)
-    transform = transforms.Compose(
-        [
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
-        ]
-    )
-    test_transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
-        ]
-    )
-    train_full = torchvision.datasets.CIFAR10(
-        root=str(root), train=True, download=True, transform=transform
-    )
-    test_ds = torchvision.datasets.CIFAR10(
-        root=str(root), train=False, download=True, transform=test_transform
-    )
-    train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
-    return _bundle_from_splits(
-        train_ds,
-        val_ds,
-        test_ds,
-        batch_size,
-        "Accuracy",
-        "maximize",
-        "CIFAR-10 32x32 natural images",
-    )
+# Each following class groups build functions for a single data type/domain as a static
+# method. As mentioned above, helpers reused across domains stay outside.
+
+class VisionDatasets:
+    @staticmethod
+    def mnist(batch_size: int) -> TaskBundle:
+        torchvision = _require_dependency("torchvision")
+        transforms = __import__("torchvision.transforms", fromlist=["transforms"])
+        root: Path = _data_root() / "mnist"
+        root.mkdir(parents=True, exist_ok=True)
+        transform = transforms.Compose([transforms.ToTensor()])
+        train_full = torchvision.datasets.MNIST(
+            root=str(root), train=True, download=True, transform=transform
+        )
+        test_ds = torchvision.datasets.MNIST(
+            root=str(root), train=False, download=True, transform=transform
+        )
+        train_ds, val_ds = torch.utils.data.random_split(
+            train_full,
+            [55_000, 5_000],
+            generator=torch.Generator().manual_seed(42),
+        )
+        return _bundle_from_splits(
+            train_ds,
+            val_ds,
+            test_ds,
+            batch_size,
+            "Accuracy",
+            "maximize",
+            "MNIST handwritten digit images",
+        )
+    @staticmethod
+    def cifar10(batch_size: int) -> TaskBundle:
+        torchvision = _require_dependency("torchvision")
+        transforms = __import__("torchvision.transforms", fromlist=["transforms"])
+        root: Path = _data_root() / "cifar10"
+        root.mkdir(parents=True, exist_ok=True)
+        transform = transforms.Compose(
+            [
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+            ]
+        )
+        test_transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+            ]
+        )
+        train_full = torchvision.datasets.CIFAR10(
+            root=str(root), train=True, download=True, transform=transform
+        )
+        test_ds = torchvision.datasets.CIFAR10(
+            root=str(root), train=False, download=True, transform=test_transform
+        )
+        train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
+        return _bundle_from_splits(
+            train_ds,
+            val_ds,
+            test_ds,
+            batch_size,
+            "Accuracy",
+            "maximize",
+            "CIFAR-10 32x32 natural images",
+        )
 
 
 class _SpeechCommands12:
@@ -310,20 +320,21 @@ class _SpeechCommands12:
         waveform = waveform[:, : self.target_len]
         return waveform, _torch.tensor(self.labels[label], dtype=_torch.long)
 
-
-def _build_speechcommands(batch_size: int) -> TaskBundle:
-    train_ds = _SpeechCommands12("training")
-    val_ds = _SpeechCommands12("validation")
-    test_ds = _SpeechCommands12("testing")
-    return _bundle_from_splits(
-        train_ds,
-        val_ds,
-        test_ds,
-        batch_size,
-        "Accuracy",
-        "maximize",
-        "SpeechCommands 12-class keyword audio",
-    )
+class AudioDatasets:
+    @staticmethod
+    def speechcommands(batch_size: int) -> TaskBundle:
+        train_ds = _SpeechCommands12("training")
+        val_ds = _SpeechCommands12("validation")
+        test_ds = _SpeechCommands12("testing")
+        return _bundle_from_splits(
+            train_ds,
+            val_ds,
+            test_ds,
+            batch_size,
+            "Accuracy",
+            "maximize",
+            "SpeechCommands 12-class keyword audio",
+        )
 
 
 class _TensorRowsDataset:
@@ -336,204 +347,197 @@ class _TensorRowsDataset:
     def __getitem__(self, index: int) -> tuple[Any, ...]:
         return tuple(tensor[index] for tensor in self.tensors)
 
-
-def _build_etth1(batch_size: int) -> TaskBundle:
-    path: Path = _download(ETTH1_URL, _data_root() / "etth1" / "ETTh1.csv")
-    rows: list[float] = []
-    with path.open(newline="") as fh:
-        reader: csv.DictReader[str] = csv.DictReader(fh)
-        for row in reader:
-            rows.append(float(row["OT"]))
-    values = torch.tensor(rows, dtype=torch.float32)
-    mean = values.mean()
-    std = values.std().clamp_min(1e-6)
-    values = (values - mean) / std
-    seq_len = 24
-    x = torch.stack(
-        [values[index : index + seq_len] for index in range(len(values) - seq_len)]
-    ).unsqueeze(-1)
-    y = torch.stack([values[index + seq_len] for index in range(len(values) - seq_len)])
-    return _bundle_from_dataset(
-        _TensorRowsDataset(x, y),
-        batch_size,
-        "MAE",
-        "minimize",
-        "ETTh1 hourly oil temperature forecasting windows",
-    )
-
-
-def _build_multivariate_forecast(
-    batch_size: int,
-    *,
-    url: str,
-    subdir: str,
-    filename: str,
-    seq_len: int,
-    horizon: int,
-    input_description: str,
-) -> TaskBundle:
-    path: Path = _download(url, _data_root() / subdir / filename)
-    rows: list[list[float]] = []
-    with path.open(newline="") as fh:
-        reader: csv.DictReader[str] = csv.DictReader(fh)
-        for row in reader:
-            values: list[float] = []
-            for key, value in row.items():
-                if key.lower() == "date":
-                    continue
-                try:
-                    values.append(float(value))
-                except ValueError:
-                    # skip non-numeric columns
-                    pass
-            if values:
-                rows.append(values)
-    values_t = torch.tensor(rows, dtype=torch.float32)
-    mean = values_t.mean(dim=0, keepdim=True)
-    std = values_t.std(dim=0, keepdim=True).clamp_min(1e-6)
-    values_t = (values_t - mean) / std
-    xs = []
-    ys = []
-    limit: int = len(values_t) - seq_len - horizon + 1
-    for index in range(limit):
-        xs.append(values_t[index : index + seq_len])
-        ys.append(values_t[index + seq_len : index + seq_len + horizon])
-    return _bundle_from_dataset(
-        _TensorRowsDataset(torch.stack(xs), torch.stack(ys)),
-        batch_size,
-        "MAE",
-        "minimize",
-        input_description,
-    )
-
-
-def _build_ettm1(batch_size: int) -> TaskBundle:
-    return _build_multivariate_forecast(
-        batch_size,
-        url=ETTM1_URL,
-        subdir="ettm1",
-        filename="ETTm1.csv",
-        seq_len=96,
-        horizon=24,
-        input_description="ETTm1 15-minute multivariate transformer-temperature windows",
-    )
-
-
-def _build_weather(batch_size: int) -> TaskBundle:
-    datasets = _require_dependency("datasets")
-    loaded = datasets.load_dataset(
-        "dunzane/time-series-dataset", "Weather", cache_dir=_hf_dataset_cache()
-    )
-    split = loaded["train"]
-    columns: list[Any] = [
-        name
-        for name in split.column_names
-        if name.lower() != "date" and split.features[name].dtype in {"float32", "float64", "int32", "int64"}
-    ]
-    rows: list[list[float]] = [[float(row[name]) for name in columns] for row in split]
-    values_t = torch.tensor(rows, dtype=torch.float32)
-    mean = values_t.mean(dim=0, keepdim=True)
-    std = values_t.std(dim=0, keepdim=True).clamp_min(1e-6)
-    values_t = (values_t - mean) / std
-    seq_len = 96
-    horizon = 24
-    xs = []
-    ys = []
-    for index in range(len(values_t) - seq_len - horizon + 1):
-        xs.append(values_t[index : index + seq_len])
-        ys.append(values_t[index + seq_len : index + seq_len + horizon])
-    return _bundle_from_dataset(
-        _TensorRowsDataset(torch.stack(xs), torch.stack(ys)),
-        batch_size,
-        "MAE",
-        "minimize",
-        "Weather multivariate meteorological forecasting windows",
-    )
-
-
-def _tokenize(text: str) -> list[str]:
-    return "".join(char.lower() if char.isalnum() else " " for char in text).split()
-
-
-def _build_vocab(texts: Iterable[str], vocab_size: int) -> dict[str, int]:
-    counts: Counter[str] = Counter()
-    for text in texts:
-        counts.update(_tokenize(text))
-    return {
-        token: index + 1
-        for index, (token, _) in enumerate(counts.most_common(vocab_size - 1))
-    }
-
-
-def _encode_texts(texts: Iterable[str], vocab: dict[str, int], seq_len: int) -> Any:
-    encoded: list[list[int]] = []
-    for text in texts:
-        ids: list[int] = [vocab.get(token, 0) for token in _tokenize(text)[:seq_len]]
-        ids.extend([0] * (seq_len - len(ids)))
-        encoded.append(ids)
-    return torch.tensor(encoded, dtype=torch.long)
-
-
-def _hf_dataset_cache() -> str:
-    cache: Path = _data_root() / "huggingface"
-    cache.mkdir(parents=True, exist_ok=True)
-    return str(cache)
-
-
-def _build_ag_news(batch_size: int) -> TaskBundle:
-    datasets = _require_dependency("datasets")
-    loaded = datasets.load_dataset("ag_news", cache_dir=_hf_dataset_cache())
-    vocab: dict[str, int] = _build_vocab(loaded["train"]["text"], 5_000)
-    train_texts = loaded["train"]["text"]
-    train_labels = torch.tensor(loaded["train"]["label"], dtype=torch.long)
-    x_train = _encode_texts(train_texts, vocab, 64)
-    train_full = _TensorRowsDataset(x_train, train_labels)
-    train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
-    x_test = _encode_texts(loaded["test"]["text"], vocab, 64)
-    y_test = torch.tensor(loaded["test"]["label"], dtype=torch.long)
-    return _bundle_from_splits(
-        train_ds,
-        val_ds,
-        _TensorRowsDataset(x_test, y_test),
-        batch_size,
-        "Accuracy",
-        "maximize",
-        "AG News tokenized article titles and descriptions",
-    )
-
-
-def _build_sst2(batch_size: int) -> TaskBundle:
-    datasets = _require_dependency("datasets")
-    transformers = _require_dependency("transformers")
-    tokenizer = transformers.AutoTokenizer.from_pretrained("distilbert-base-uncased")
-    loaded = datasets.load_dataset("glue", "sst2", cache_dir=_hf_dataset_cache())
-
-    def _tokenize(sentences: list[str]) -> tuple[Any, Any]:
-        encoding = tokenizer(
-            list(sentences),
-            padding="max_length",
-            truncation=True,
-            max_length=128,
-            return_tensors="pt",
+class TimeSeriesDatasets:
+    @staticmethod
+    def etth1(batch_size: int) -> TaskBundle:
+        path: Path = _download(ETTH1_URL, _data_root() / "etth1" / "ETTh1.csv")
+        rows: list[float] = []
+        with path.open(newline="") as fh:
+            reader: csv.DictReader[str] = csv.DictReader(fh)
+            for row in reader:
+                rows.append(float(row["OT"]))
+        values = torch.tensor(rows, dtype=torch.float32)
+        mean = values.mean()
+        std = values.std().clamp_min(1e-6)
+        values = (values - mean) / std
+        seq_len = 24
+        x = torch.stack(
+            [values[index : index + seq_len] for index in range(len(values) - seq_len)]
+        ).unsqueeze(-1)
+        y = torch.stack([values[index + seq_len] for index in range(len(values) - seq_len)])
+        return _bundle_from_dataset(
+            _TensorRowsDataset(x, y),
+            batch_size,
+            "MAE",
+            "minimize",
+            "ETTh1 hourly oil temperature forecasting windows",
         )
-        return encoding["input_ids"], encoding["attention_mask"]
 
-    train_ids, train_mask = _tokenize(loaded["train"]["sentence"])
-    y_train = torch.tensor(list(loaded["train"]["label"]), dtype=torch.long)
-    train_full = _TensorRowsDataset(train_ids, train_mask, y_train)
-    train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
-    test_ids, test_mask = _tokenize(loaded["validation"]["sentence"])
-    y_test = torch.tensor(list(loaded["validation"]["label"]), dtype=torch.long)
-    return _bundle_from_splits(
-        train_ds,
-        val_ds,
-        _TensorRowsDataset(test_ids, test_mask, y_test),
-        batch_size,
-        "Accuracy",
-        "maximize",
-        "SST-2 sentences tokenized with distilbert-base-uncased tokenizer",
+    @staticmethod
+    def multivariate_forecast(
+        batch_size: int,
+        *,
+        url: str,
+        subdir: str,
+        filename: str,
+        seq_len: int,
+        horizon: int,
+        input_description: str,
+    ) -> TaskBundle:
+            path: Path = _download(url, _data_root() / subdir / filename)
+        rows: list[list[float]] = []
+        with path.open(newline="") as fh:
+            reader: csv.DictReader[str] = csv.DictReader(fh)
+            for row in reader:
+                values: list[float] = []
+                for key, value in row.items():
+                    if key.lower() == "date":
+                        continue
+                    try:
+                        values.append(float(value))
+                    except ValueError:
+                        # skip non-numeric columns
+                        pass
+                if values:
+                    rows.append(values)
+        values_t = torch.tensor(rows, dtype=torch.float32)
+        mean = values_t.mean(dim=0, keepdim=True)
+        std = values_t.std(dim=0, keepdim=True).clamp_min(1e-6)
+        values_t = (values_t - mean) / std
+        xs = []
+        ys = []
+        limit: int = len(values_t) - seq_len - horizon + 1
+        for index in range(limit):
+            xs.append(values_t[index : index + seq_len])
+            ys.append(values_t[index + seq_len : index + seq_len + horizon])
+        return _bundle_from_dataset(
+            _TensorRowsDataset(torch.stack(xs), torch.stack(ys)),
+            batch_size,
+            "MAE",
+            "minimize",
+            input_description,
+        )
+    @staticmethod
+    def ettm1(batch_size: int) -> TaskBundle:
+        return _build_multivariate_forecast(
+            batch_size,
+            url=ETTM1_URL,
+            subdir="ettm1",
+            filename="ETTm1.csv",
+            seq_len=96,
+            horizon=24,
+            input_description="ETTm1 15-minute multivariate transformer-temperature windows",
+        )
+    @staticmethod
+    def weather(batch_size: int) ->TaskBundle:
+        datasets = _require_dependency("datasets")
+        loaded = datasets.load_dataset(
+            "dunzane/time-series-dataset", "Weather", cache_dir=_hf_dataset_cache()
+        )
+        split = loaded["train"]
+        columns: list[Any] = [
+            name
+            for name in split.column_names
+            if name.lower() != "date" and split.features[name].dtype in {"float32", "float64", "int32", "int64"}
+        ]
+        rows: list[list[float]] = [[float(row[name]) for name in columns] for row in split]
+        values_t = torch.tensor(rows, dtype=torch.float32)
+        mean = values_t.mean(dim=0, keepdim=True)
+        std = values_t.std(dim=0, keepdim=True).clamp_min(1e-6)
+        values_t = (values_t - mean) / std
+        seq_len = 96
+        horizon = 24
+        xs = []
+        ys = []
+        for index in range(len(values_t) - seq_len - horizon + 1):
+            xs.append(values_t[index : index + seq_len])
+            ys.append(values_t[index + seq_len : index + seq_len + horizon])
+        return _bundle_from_dataset(
+            _TensorRowsDataset(torch.stack(xs), torch.stack(ys)),
+            batch_size,
+            "MAE",
+            "minimize",
+            "Weather multivariate meteorological forecasting windows",
+        )
+
+class TextDataSets:
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        return "".join(char.lower() if char.isalnum() else " " for char in text).split()
+
+    @staticmethod
+    def _build_vocab(texts: Iterable[str], vocab_size: int) -> dict[str, int]:
+        counts: Counter[str] = Counter()
+        for text in texts:
+            counts.update(_tokenize(text))
+        return {
+            token: index + 1
+            for index, (token, _) in enumerate(counts.most_common(vocab_size - 1))
+        }
+
+    @staticmethod
+    def _encode_texts(texts: Iterable[str], vocab: dict[str, int], seq_len: int) -> Any:
+        encoded: list[list[int]] = []
+        for text in texts:
+            ids: list[int] = [vocab.get(token, 0) for token in _tokenize(text)[:seq_len]]
+            ids.extend([0] * (seq_len - len(ids)))
+            encoded.append(ids)
+        return torch.tensor(encoded, dtype=torch.long)
+
+    @staticmethod
+    def ag_news(batch_size: int) -> TaskBundle:
+        datasets = _require_dependency("datasets")
+        loaded = datasets.load_dataset("ag_news", cache_dir=_hf_dataset_cache())
+        vocab: dict[str, int] = _build_vocab(loaded["train"]["text"], 5_000)
+        train_texts = loaded["train"]["text"]
+        train_labels = torch.tensor(loaded["train"]["label"], dtype=torch.long)
+        x_train = _encode_texts(train_texts, vocab, 64)
+        train_full = _TensorRowsDataset(x_train, train_labels)
+        train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
+        x_test = _encode_texts(loaded["test"]["text"], vocab, 64)
+        y_test = torch.tensor(loaded["test"]["label"], dtype=torch.long)
+        return _bundle_from_splits(
+            train_ds,
+            val_ds,
+            _TensorRowsDataset(x_test, y_test),
+            batch_size,
+            "Accuracy",
+            "maximize",
+            "AG News tokenized article titles and descriptions",
     )
 
+    @staticmethod
+    def sst2(batch_size: int) -> TaskBundle:
+        datasets = _require_dependency("datasets")
+        transformers = _require_dependency("transformers")
+        tokenizer = transformers.AutoTokenizer.from_pretrained("distilbert-base-uncased")
+        loaded = datasets.load_dataset("glue", "sst2", cache_dir=_hf_dataset_cache())
+
+        def _tokenize(sentences: list[str]) -> tuple[Any, Any]:
+            encoding = tokenizer(
+                list(sentences),
+                padding="max_length",
+                truncation=True,
+                max_length=128,
+                return_tensors="pt",
+            )
+            return encoding["input_ids"], encoding["attention_mask"]
+
+        train_ids, train_mask = _tokenize(loaded["train"]["sentence"])
+        y_train = torch.tensor(list(loaded["train"]["label"]), dtype=torch.long)
+        train_full = _TensorRowsDataset(train_ids, train_mask, y_train)
+        train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
+        test_ids, test_mask = _tokenize(loaded["validation"]["sentence"])
+        y_test = torch.tensor(list(loaded["validation"]["label"]), dtype=torch.long)
+        return _bundle_from_splits(
+            train_ds,
+            val_ds,
+            _TensorRowsDataset(test_ids, test_mask, y_test),
+            batch_size,
+            "Accuracy",
+            "maximize",
+            "SST-2 sentences tokenized with distilbert-base-uncased tokenizer",
+        )
 
 class _CoraEgoDataset:
     """Module-level ego-graph dataset for Cora node classification.
@@ -566,47 +570,6 @@ class _CoraEgoDataset:
         sub_adj = self.adjacency[neighbors][:, neighbors]
         return sub_x, sub_adj, self.y_all[index]
 
-
-def _build_cora(batch_size: int) -> TaskBundle:
-    root: Path = _data_root() / "cora"
-    archive: Path = _download(CORA_URL, root / "cora.tgz")
-    content: Path = root / "cora" / "cora.content"
-    cites: Path = root / "cora" / "cora.cites"
-    if not content.exists() or not cites.exists():
-        with tarfile.open(archive) as tar:
-            tar.extractall(root)
-
-    paper_ids: list[str] = []
-    features: list[list[float]] = []
-    labels_raw: list[str] = []
-    with content.open() as fh:
-        for line in fh:
-            parts: list[str] = line.strip().split()
-            paper_ids.append(parts[0])
-            features.append([float(value) for value in parts[1:-1]])
-            labels_raw.append(parts[-1])
-    id_to_idx: dict[str, int] = {paper_id: index for index, paper_id in enumerate(paper_ids)}
-    label_to_idx: dict[str, int] = {label: index for index, label in enumerate(sorted(set(labels_raw)))}
-    x_all = torch.tensor(features, dtype=torch.float32)
-    y_all = torch.tensor([label_to_idx[label] for label in labels_raw], dtype=torch.long)
-    adjacency = torch.eye(len(paper_ids), dtype=torch.float32)
-    with cites.open() as fh:
-        for line in fh:
-            src, dst = line.strip().split()
-            if src in id_to_idx and dst in id_to_idx:
-                i, j = id_to_idx[src], id_to_idx[dst]
-                adjacency[i, j] = 1.0
-                adjacency[j, i] = 1.0
-
-    return _bundle_from_dataset(
-        _CoraEgoDataset(adjacency, x_all, y_all),
-        batch_size,
-        "Accuracy",
-        "maximize",
-        "Cora citation-network ego graphs for node labels",
-    )
-
-
 def _parse_adult_file(path: Path) -> list[list[str]]:
     rows = []
     with path.open(newline="") as fh:
@@ -636,7 +599,6 @@ def _encode_adult_row(
             encoded.append(float(mapping[value]))
     return encoded
 
-
 def _encode_adult_rows(
     rows: list[list[str]],
     encoders: list[dict[str, int]],
@@ -649,7 +611,6 @@ def _encode_adult_rows(
         values.append(_encode_adult_row(row, encoders, numeric_columns, feature_count))
         labels.append(1 if row[-1] == ">50K" else 0)
     return values, labels
-
 
 def _build_adult(batch_size: int) -> TaskBundle:
     root: Path = _data_root() / "adult"
@@ -688,167 +649,211 @@ def _build_adult(batch_size: int) -> TaskBundle:
     )
 
 
-def _parse_smiles_token(
-    smiles: str, index: int
-) -> tuple[str | None, int]:
-    """Return (token, new_index). token is None for non-atom characters."""
-    char = smiles[index]
-    if index + 1 < len(smiles) and smiles[index : index + 2] in {"Cl", "Br"}:
-        return smiles[index : index + 2], index + 2
-    if char.isalpha():
-        return char.upper(), index + 1
-    return None, index + 1
 
+class GraphDatasets:
+    @staticmethod
 
-def _build_graph_tensors(
-    atoms: list[str], edges: list[tuple[int, int]], torch: Any
-) -> tuple[Any, Any]:
-    atom_types: list[str] = ["C", "N", "O", "S", "F", "CL", "BR", "I"]
-    x = torch.zeros((24, 9), dtype=torch.float32)
-    for atom_index, atom in enumerate(atoms[:24]):
-        feature_index: int = atom_types.index(atom) if atom in atom_types else 8
-        x[atom_index, feature_index] = 1.0
-    adjacency = torch.eye(24, dtype=torch.float32)
-    for src, dst in edges:
-        if src < 24 and dst < 24:
-            adjacency[src, dst] = 1.0
-            adjacency[dst, src] = 1.0
-    return x, adjacency
+    def cora(batch_size: int) -> TaskBundle:
+        root: Path = _data_root() / "cora"
+        archive: Path = _download(CORA_URL, root / "cora.tgz")
+        content: Path = root / "cora" / "cora.content"
+        cites: Path = root / "cora" / "cora.cites"
+        if not content.exists() or not cites.exists():
+            with tarfile.open(archive) as tar:
+                tar.extractall(root)
 
+        paper_ids: list[str] = []
+        features: list[list[float]] = []
+        labels_raw: list[str] = []
+        with content.open() as fh:
+            for line in fh:
+                parts: list[str] = line.strip().split()
+                paper_ids.append(parts[0])
+                features.append([float(value) for value in parts[1:-1]])
+                labels_raw.append(parts[-1])
+        id_to_idx: dict[str, int] = {paper_id: index for index, paper_id in enumerate(paper_ids)}
+        label_to_idx: dict[str, int] = {label: index for index, label in enumerate(sorted(set(labels_raw)))}
+        x_all = torch.tensor(features, dtype=torch.float32)
+        y_all = torch.tensor([label_to_idx[label] for label in labels_raw], dtype=torch.long)
+        adjacency = torch.eye(len(paper_ids), dtype=torch.float32)
+        with cites.open() as fh:
+            for line in fh:
+                src, dst = line.strip().split()
+                if src in id_to_idx and dst in id_to_idx:
+                    i, j = id_to_idx[src], id_to_idx[dst]
+                    adjacency[i, j] = 1.0
+                    adjacency[j, i] = 1.0
 
-def _smiles_to_graph(smiles: str) -> tuple[Any, Any]:
-    atoms: list[str] = []
-    edges: list[tuple[int, int]] = []
-    last_atom: int | None = None
-    ring_open: dict[str, int] = {}
-    index = 0
-    while index < len(smiles):
-        char: str = smiles[index]
-        if char.isdigit() and last_atom is not None:
-            if char in ring_open:
-                edges.append((ring_open.pop(char), last_atom))
-            else:
-                ring_open[char] = last_atom
-            index += 1
-            continue
-        token, index = _parse_smiles_token(smiles, index)
-        if token is None:
-            continue
-        atom_index: int = len(atoms)
-        atoms.append(token)
-        if last_atom is not None:
-            edges.append((last_atom, atom_index))
-        last_atom = atom_index
-    if not atoms:
-        atoms = ["C"]
-    return _build_graph_tensors(atoms, edges, torch)
+        return _bundle_from_dataset(
+            _CoraEgoDataset(adjacency, x_all, y_all),
+            batch_size,
+            "Accuracy",
+            "maximize",
+            "Cora citation-network ego graphs for node labels",
+        )
 
+    @staticmethod
+    def _parse_smiles_token(
+        smiles: str, index: int
+    ) -> tuple[str | None, int]:
+        """Return (token, new_index). token is None for non-atom characters."""
+        char = smiles[index]
+        if index + 1 < len(smiles) and smiles[index : index + 2] in {"Cl", "Br"}:
+            return smiles[index : index + 2], index + 2
+        if char.isalpha():
+            return char.upper(), index + 1
+        return None, index + 1
 
-def _build_esol(batch_size: int) -> TaskBundle:
-    path: Path = _download(ESOL_URL, _data_root() / "esol" / "delaney-processed.csv")
-    node_features = []
-    adjacencies = []
-    labels = []
-    with path.open(newline="") as fh:
-        reader: csv.DictReader[str] = csv.DictReader(fh)
-        for row in reader:
-            smiles: str | Any | None = row.get("smiles") or row.get("smile") or row.get("SMILES")
-            target: str | Any | None = row.get("measured log solubility in mols per litre") or row.get(
-                "ESOL predicted log solubility in mols per litre"
-            )
-            if smiles is None or target is None:
+    @staticmethod
+    def _build_graph_tensors(
+        atoms: list[str], edges: list[tuple[int, int]], torch: Any
+    ) -> tuple[Any, Any]:
+        atom_types: list[str] = ["C", "N", "O", "S", "F", "CL", "BR", "I"]
+        x = torch.zeros((24, 9), dtype=torch.float32)
+        for atom_index, atom in enumerate(atoms[:24]):
+            feature_index: int = atom_types.index(atom) if atom in atom_types else 8
+            x[atom_index, feature_index] = 1.0
+        adjacency = torch.eye(24, dtype=torch.float32)
+        for src, dst in edges:
+            if src < 24 and dst < 24:
+                adjacency[src, dst] = 1.0
+                adjacency[dst, src] = 1.0
+        return x, adjacency
+
+    @staticmethod
+    def _smiles_to_graph(smiles: str) -> tuple[Any, Any]:
+        atoms: list[str] = []
+        edges: list[tuple[int, int]] = []
+        last_atom: int | None = None
+        ring_open: dict[str, int] = {}
+        index = 0
+        while index < len(smiles):
+            char: str = smiles[index]
+            if char.isdigit() and last_atom is not None:
+                if char in ring_open:
+                    edges.append((ring_open.pop(char), last_atom))
+                else:
+                    ring_open[char] = last_atom
+                index += 1
                 continue
-            x, adjacency = _smiles_to_graph(smiles)
-            node_features.append(x)
-            adjacencies.append(adjacency)
-            labels.append(float(target))
-    return _bundle_from_dataset(
-        _TensorRowsDataset(
-            torch.stack(node_features),
-            torch.stack(adjacencies),
-            torch.tensor(labels, dtype=torch.float32),
-        ),
-        batch_size,
-        "RMSE",
-        "minimize",
-        "ESOL MoleculeNet molecular graphs from SMILES",
-    )
-
-
-def _build_freesolv(batch_size: int) -> TaskBundle:
-    path: Path = _download(FREESOLV_URL, _data_root() / "freesolv" / "SAMPL.csv")
-    node_features = []
-    adjacencies = []
-    labels = []
-    with path.open(newline="") as fh:
-        reader: csv.DictReader[str] = csv.DictReader(fh)
-        for row in reader:
-            smiles: str | Any | None = row.get("smiles") or row.get("SMILES")
-            target: str | Any | None = (
-                row.get("expt")
-                or row.get("measured log solubility in mols per litre")
-                or row.get("y")
-            )
-            if smiles is None or target is None:
+            token, index = _parse_smiles_token(smiles, index)
+            if token is None:
                 continue
-            x, adjacency = _smiles_to_graph(smiles)
-            node_features.append(x)
+            atom_index: int = len(atoms)
+            atoms.append(token)
+            if last_atom is not None:
+                edges.append((last_atom, atom_index))
+            last_atom = atom_index
+        if not atoms:
+            atoms = ["C"]
+        return _build_graph_tensors(atoms, edges, torch)
+
+    @staticmethod
+    def esol(batch_size: int) -> TaskBundle:
+        path: Path = _download(ESOL_URL, _data_root() / "esol" / "delaney-processed.csv")
+        node_features = []
+        adjacencies = []
+        labels = []
+        with path.open(newline="") as fh:
+            reader: csv.DictReader[str] = csv.DictReader(fh)
+            for row in reader:
+                smiles: str | Any | None = row.get("smiles") or row.get("smile") or row.get("SMILES")
+                target: str | Any | None = row.get("measured log solubility in mols per litre") or row.get(
+                    "ESOL predicted log solubility in mols per litre"
+                )
+                if smiles is None or target is None:
+                    continue
+                x, adjacency = _smiles_to_graph(smiles)
+                node_features.append(x)
+                adjacencies.append(adjacency)
+                labels.append(float(target))
+        return _bundle_from_dataset(
+            _TensorRowsDataset(
+                torch.stack(node_features),
+                torch.stack(adjacencies),
+                torch.tensor(labels, dtype=torch.float32),
+            ),
+            batch_size,
+            "RMSE",
+            "minimize",
+            "ESOL MoleculeNet molecular graphs from SMILES",
+        )
+
+    @staticmethod
+    def freesolv(batch_size: int) -> TaskBundle:
+        path: Path = _download(FREESOLV_URL, _data_root() / "freesolv" / "SAMPL.csv")
+        node_features = []
+        adjacencies = []
+        labels = []
+        with path.open(newline="") as fh:
+            reader: csv.DictReader[str] = csv.DictReader(fh)
+            for row in reader:
+                smiles: str | Any | None = row.get("smiles") or row.get("SMILES")
+                target: str | Any | None = (
+                    row.get("expt")
+                    or row.get("measured log solubility in mols per litre")
+                    or row.get("y")
+                )
+                if smiles is None or target is None:
+                    continue
+                x, adjacency = _smiles_to_graph(smiles)
+                node_features.append(x)
+                adjacencies.append(adjacency)
+                labels.append(float(target))
+        return _bundle_from_dataset(
+            _TensorRowsDataset(
+                torch.stack(node_features),
+                torch.stack(adjacencies),
+                torch.tensor(labels, dtype=torch.float32),
+            ),
+            batch_size,
+            "RMSE",
+            "minimize",
+            "FreeSolv molecular hydration free-energy graphs from SMILES",
+        )
+
+    @staticmethod
+    def _read_tu_indicator(path: Path) -> list[int]:
+        return [int(line.strip()) for line in path.read_text().splitlines() if line.strip()]
+
+    @staticmethod
+    def imdbb(batch_size: int) -> TaskBundle:
+        root: Path = _data_root() / "imdb_binary"
+        archive: Path = _download(IMDBB_URL, root / "IMDB-BINARY.zip")
+        _extract_zip(archive, root)
+        dataset_dir: Path = root / "IMDB-BINARY"
+        graph_indicator: list[int] = _read_tu_indicator(dataset_dir / "IMDB-BINARY_graph_indicator.txt")
+        labels_raw: list[int] = _read_tu_indicator(dataset_dir / "IMDB-BINARY_graph_labels.txt")
+        edges: list[tuple[int, int]] = []
+        with (dataset_dir / "IMDB-BINARY_A.txt").open() as fh:
+            for line in fh:
+                left, right = line.replace(" ", "").strip().split(",")
+                edges.append((int(left) - 1, int(right) - 1))
+        graph_nodes: dict[int, list[int]] = {}
+            for node_index, graph_id in enumerate(graph_indicator):
+            graph_nodes.setdefault(graph_id, []).append(node_index)
+        max_nodes = 96
+        features = []
+        adjacencies = []
+        labels = []
+        edge_set: set[tuple[int, int]] = set(edges) | {(b, a) for a, b in edges}
+        for graph_id, nodes in sorted(graph_nodes.items()):
+            nodes = nodes[:max_nodes]
+            node_map: dict[int, int] = {node: i for i, node in enumerate(nodes)}
+            adjacency = torch.eye(max_nodes, dtype=torch.float32)
+            degree = torch.zeros(max_nodes, dtype=torch.float32)
+            for src, dst in edge_set:
+                if src in node_map and dst in node_map:
+                    i, j = node_map[src], node_map[dst]
+                    adjacency[i, j] = 1.0
+                    degree[i] += 1.0
+            x = torch.zeros((max_nodes, 8), dtype=torch.float32)
+            x[: len(nodes), 0] = 1.0
+            x[:, 1] = degree / degree.clamp_min(1.0).max().clamp_min(1.0)
+            features.append(x)
             adjacencies.append(adjacency)
-            labels.append(float(target))
-    return _bundle_from_dataset(
-        _TensorRowsDataset(
-            torch.stack(node_features),
-            torch.stack(adjacencies),
-            torch.tensor(labels, dtype=torch.float32),
-        ),
-        batch_size,
-        "RMSE",
-        "minimize",
-        "FreeSolv molecular hydration free-energy graphs from SMILES",
-    )
-
-
-def _read_tu_indicator(path: Path) -> list[int]:
-    return [int(line.strip()) for line in path.read_text().splitlines() if line.strip()]
-
-
-def _build_imdbb(batch_size: int) -> TaskBundle:
-    root: Path = _data_root() / "imdb_binary"
-    archive: Path = _download(IMDBB_URL, root / "IMDB-BINARY.zip")
-    _extract_zip(archive, root)
-    dataset_dir: Path = root / "IMDB-BINARY"
-    graph_indicator: list[int] = _read_tu_indicator(dataset_dir / "IMDB-BINARY_graph_indicator.txt")
-    labels_raw: list[int] = _read_tu_indicator(dataset_dir / "IMDB-BINARY_graph_labels.txt")
-    edges: list[tuple[int, int]] = []
-    with (dataset_dir / "IMDB-BINARY_A.txt").open() as fh:
-        for line in fh:
-            left, right = line.replace(" ", "").strip().split(",")
-            edges.append((int(left) - 1, int(right) - 1))
-    graph_nodes: dict[int, list[int]] = {}
-    for node_index, graph_id in enumerate(graph_indicator):
-        graph_nodes.setdefault(graph_id, []).append(node_index)
-    max_nodes = 96
-    features = []
-    adjacencies = []
-    labels = []
-    edge_set: set[tuple[int, int]] = set(edges) | {(b, a) for a, b in edges}
-    for graph_id, nodes in sorted(graph_nodes.items()):
-        nodes = nodes[:max_nodes]
-        node_map: dict[int, int] = {node: i for i, node in enumerate(nodes)}
-        adjacency = torch.eye(max_nodes, dtype=torch.float32)
-        degree = torch.zeros(max_nodes, dtype=torch.float32)
-        for src, dst in edge_set:
-            if src in node_map and dst in node_map:
-                i, j = node_map[src], node_map[dst]
-                adjacency[i, j] = 1.0
-                degree[i] += 1.0
-        x = torch.zeros((max_nodes, 8), dtype=torch.float32)
-        x[: len(nodes), 0] = 1.0
-        x[:, 1] = degree / degree.clamp_min(1.0).max().clamp_min(1.0)
-        features.append(x)
-        adjacencies.append(adjacency)
-        labels.append(1 if labels_raw[graph_id - 1] > 0 else 0)
-    return _bundle_from_dataset(
+            labels.append(1 if labels_raw[graph_id - 1] > 0 else 0)
+        return _bundle_from_dataset(
         _TensorRowsDataset(
             torch.stack(features),
             torch.stack(adjacencies),
@@ -999,40 +1004,6 @@ def _build_bipedalwalker(batch_size: int) -> TaskBundle:
     )
 
 
-def _build_mitbih(batch_size: int) -> TaskBundle:
-    wfdb = _require_dependency("wfdb")
-    root: Path = _data_root() / "mit-bih"
-    if not all((root / f"{record}.dat").exists() for record in MITBIH_RECORDS):
-        root.mkdir(parents=True, exist_ok=True)
-        wfdb.dl_database("mitdb", dl_dir=str(root), records=MITBIH_RECORDS)
-    windows = []
-    labels = []
-    half_width = 64
-    for record in MITBIH_RECORDS:
-        signal = wfdb.rdrecord(str(root / record)).p_signal[:, 0]
-        annotations = wfdb.rdann(str(root / record), "atr")
-        for sample, symbol in zip(annotations.sample, annotations.symbol):
-            start = sample - half_width
-            end = sample + half_width
-            if start < 0 or end > len(signal):
-                continue
-            window = torch.tensor(signal[start:end], dtype=torch.float32)
-            window = (window - window.mean()) / window.std().clamp_min(1e-6)
-            windows.append(window.unsqueeze(-1))
-            labels.append(0 if symbol == "N" else 1)
-    return _bundle_from_dataset(
-        _TensorRowsDataset(
-            torch.stack(windows),
-            torch.stack(windows),
-            torch.tensor(labels, dtype=torch.long),
-        ),
-        batch_size,
-        "AUC",
-        "maximize",
-        "MIT-BIH Arrhythmia ECG beat windows",
-    )
-
-
 class _ModelNet40Dataset:
     def __init__(self, train: bool) -> None:
         self.root: Path = _data_root() / "modelnet40"
@@ -1168,21 +1139,56 @@ class _ISICDataset:
         ) / 255.0
         return image_t, (mask_t > 0.5).float()
 
+class MedicalDatasets:
+    @staticmethod
+    def isic(batch_size: int) -> TaskBundle:
+        root: Path = _data_root() / "isic2018"
+        image_archive: Path = _download(ISIC_SAMPLE_URL, root / "images.zip")
+        mask_archive: Path = _download(ISIC_MASK_SAMPLE_URL, root / "masks.zip")
+        _extract_zip(image_archive, root / "images")
+        _extract_zip(mask_archive, root / "masks")
+        return _bundle_from_dataset(
+            _ISICDataset(root),
+            batch_size,
+            "Dice",
+            "maximize",
+            "ISIC 2018 Task 1 dermoscopy images and lesion masks",
+            num_workers=0,
+        )
 
-def _build_isic(batch_size: int) -> TaskBundle:
-    root: Path = _data_root() / "isic2018"
-    image_archive: Path = _download(ISIC_SAMPLE_URL, root / "images.zip")
-    mask_archive: Path = _download(ISIC_MASK_SAMPLE_URL, root / "masks.zip")
-    _extract_zip(image_archive, root / "images")
-    _extract_zip(mask_archive, root / "masks")
-    return _bundle_from_dataset(
-        _ISICDataset(root),
-        batch_size,
-        "Dice",
-        "maximize",
-        "ISIC 2018 Task 1 dermoscopy images and lesion masks",
-        num_workers=0,
-    )
+    def mitbih(batch_size: int) -> TaskBundle:
+        wfdb = _require_dependency("wfdb")
+        root: Path = _data_root() / "mit-bih"
+        if not all((root / f"{record}.dat").exists() for record in MITBIH_RECORDS):
+            root.mkdir(parents=True, exist_ok=True)
+            wfdb.dl_database("mitdb", dl_dir=str(root), records=MITBIH_RECORDS)
+        windows = []
+        labels = []
+        half_width = 64
+        for record in MITBIH_RECORDS:
+            signal = wfdb.rdrecord(str(root / record)).p_signal[:, 0]
+            annotations = wfdb.rdann(str(root / record), "atr")
+            for sample, symbol in zip(annotations.sample, annotations.symbol):
+                start = sample - half_width
+                end = sample + half_width
+                if start < 0 or end > len(signal):
+                    continue
+                window = torch.tensor(signal[start:end], dtype=torch.float32)
+                window = (window - window.mean()) / window.std().clamp_min(1e-6)
+                windows.append(window.unsqueeze(-1))
+                labels.append(0 if symbol == "N" else 1)
+        return _bundle_from_dataset(
+            _TensorRowsDataset(
+                torch.stack(windows),
+                torch.stack(windows),
+                torch.tensor(labels, dtype=torch.long),
+            ),
+            batch_size,
+            "AUC",
+            "maximize",
+            "MIT-BIH Arrhythmia ECG beat windows",
+        )
+
 
 
 # Per-model batch sizes tuned for Apple Silicon MPS throughput.
@@ -1223,7 +1229,7 @@ def dataset_exists(model_key: str) -> bool:
 
     Uses a per-model sentinel path — a file or directory whose presence indicates
     that the download and extraction steps have already completed.  A False result
-    is always safe: ``build_task_bundle`` will then run and fill any gaps.
+    is a:lways safe: ``build_task_bundle`` will then run and fill any gaps.
     """
     root: Path = _data_root()
     sentinels: dict[str, list[Path]] = {
