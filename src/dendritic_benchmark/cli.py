@@ -168,6 +168,49 @@ def _remove_clean_target(path: Path) -> str:
     return "missing"
 
 
+def _add_common_options(parser: argparse.ArgumentParser, *, is_subcommand: bool) -> None:
+    """Register the options that every command accepts.
+
+    These are added twice: once on the top-level parser (owning the real
+    defaults) and once on every subparser, so they may be given either before
+    or after the subcommand. The subcommand copies use ``SUPPRESS`` defaults so
+    that an absent flag leaves the top-level value alone; when given in both
+    positions the one after the subcommand wins.
+    """
+    position_note = " May be given before or after the subcommand."
+
+    parser.add_argument(
+        "--results-root",
+        default=argparse.SUPPRESS if is_subcommand else "results",
+        metavar="DIR",
+        help=(
+            "Root directory where per-model result folders are written. "
+            "Each model gets a subdirectory named by its key containing JSON "
+            "training records and PNG plots. (default: results)" + position_note
+        ),
+    )
+    parser.add_argument(
+        "--results-directory",
+        default=argparse.SUPPRESS if is_subcommand else None,
+        metavar="NAME",
+        help=(
+            "Optional directory name under --results-root to scope a training run "
+            "or analysis set. When provided, commands read/write results under "
+            "<results-root>/<results-directory>." + position_note
+        ),
+    )
+    parser.add_argument(
+        "--logging-dir",
+        default=argparse.SUPPRESS if is_subcommand else "logs",
+        metavar="DIR",
+        help=(
+            "Directory where timestamped log files are written. Each invocation "
+            "creates a new file named <command>_YYYYMMDD_HHMMSS.txt. "
+            "All stdout and stderr are teed to this file. (default: logs)" + position_note
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
         description=(
@@ -175,44 +218,22 @@ def build_parser() -> argparse.ArgumentParser:
             "Trains 25 models across 12 conditions that isolate two factors: "
             "PerforatedAI dendritic augmentation and post-training quantization "
             "(INT8 down to binary). Results are saved under --results-root "
-            "and cross-model comparisons under --comparison-root."
+            "and cross-model comparisons under --comparison-root.\n\n"
+            "--results-root, --results-directory and --logging-dir are accepted "
+            "either before or after the subcommand."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--results-root",
-        default="results",
-        metavar="DIR",
-        help=(
-            "Root directory where per-model result folders are written. "
-            "Each model gets a subdirectory named by its key containing JSON "
-            "training records and PNG plots. (default: results)"
-        ),
-    )
-    parser.add_argument(
-        "--results-directory",
-        default=None,
-        metavar="NAME",
-        help=(
-            "Optional directory name under --results-root to scope a training run "
-            "or analysis set. When provided, commands read/write results under "
-            "<results-root>/<results-directory>."
-        ),
-    )
-    parser.add_argument(
-        "--logging-dir",
-        default="logs",
-        metavar="DIR",
-        help=(
-            "Directory where timestamped log files are written. Each invocation "
-            "creates a new file named <command>_YYYYMMDD_HHMMSS.txt. "
-            "All stdout and stderr are teed to this file. (default: logs)"
-        ),
-    )
+    _add_common_options(parser, is_subcommand=False)
+
+    common_options: argparse.ArgumentParser = argparse.ArgumentParser(add_help=False)
+    _add_common_options(common_options, is_subcommand=True)
+
     subparsers: argparse._SubParsersAction = parser.add_subparsers(dest="command", required=True)
 
     run_parser: argparse.ArgumentParser = subparsers.add_parser(
         "run",
+        parents=[common_options],
         help="Train models across all (or a subset of) conditions and save results.",
         description=(
             "Runs the full benchmark pipeline: trains each selected model under each "
@@ -288,6 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     download_parser: argparse.ArgumentParser = subparsers.add_parser(
         "download_data",
+        parents=[common_options],
         help="Pre-download and cache datasets so that 'run' works offline.",
         description=(
             "Downloads and caches all datasets required by the selected models. "
@@ -321,6 +343,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     compare_parser: argparse.ArgumentParser = subparsers.add_parser(
         "compare",
+        parents=[common_options],
         help="Generate cross-model comparison reports and plots from saved training records.",
         description=(
             "Reads all JSON training records from --results-root and produces:\n"
@@ -361,6 +384,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     generate_graphs_parser: argparse.ArgumentParser = subparsers.add_parser(
         "generate_graphs",
+        parents=[common_options],
         help="Render per-epoch training-curve plots from saved results.",
         description=(
             "Walks --results-root and renders a training-curve PNG for every saved "
@@ -381,6 +405,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     bench_parser: argparse.ArgumentParser = subparsers.add_parser(
         "benchmark_models",
+        parents=[common_options],
         help="Benchmark inference latency of trained models using torch.utils.benchmark.Timer.",
         description=(
             "Measures wall-clock inference latency for all trained models and conditions. "
@@ -464,6 +489,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     clean_parser: argparse.ArgumentParser = subparsers.add_parser(
         "clean",
+        parents=[common_options],
         help="Remove files generated by previous dqb commands.",
         description=(
             "Reads .dqb/command_config.json and removes the output directories "

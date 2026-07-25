@@ -55,6 +55,17 @@ uv run dqb --results-directory experiment_a benchmark_models
 
 When set, results are read/written under `results/<results-directory>/...`.
 
+`--results-root`, `--results-directory` and `--logging-dir` apply to every
+subcommand and may be given either before or after it, so both of these are
+equivalent:
+
+```bash
+uv run dqb --results-root results_dynamic compare
+uv run dqb compare --results-root results_dynamic
+```
+
+If a flag is given in both positions, the one after the subcommand wins.
+
 Dendritic runs pass PerforatedAI save names under `PAI/`, so library-created
 checkpoints and sidecars stay in the `PAI/` tree. They also snapshot the
 active PerforatedAI config to
