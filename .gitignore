@@ -13,7 +13,6 @@ build/
 PAI/
 .claude
 uv.lock
-logs/
 sonar-project.properties
 .scannerwork/
 .uv-cache/
@@ -24,3 +23,4 @@ benchmarks/
 PAI Skills/
 .mcp.json
 .perforated_tools/
+logs*/
