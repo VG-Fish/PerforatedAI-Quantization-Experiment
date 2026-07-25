@@ -24,7 +24,12 @@ from .compat import (
     clear_pai_processor_buffers,
     clear_pai_tracker_state,
     configure_pai_candidate_graph,
+    load_pai_system,
+    pai_resume_state_exists,
     pai_runtime_guard,
+    pai_save_path,
+    pai_working_directory,
+    save_pai_system,
     set_module_output_dimensions,
     symmetric_quantize_tensor,
     ternary_quantize_tensor,
@@ -1119,7 +1124,7 @@ def _pai_updates_enabled(config: TrainingConfig) -> bool:
 
 
 def _copy_pai_graphs_to_output(pai_save_name: str, output_dir: Path) -> None:
-    src = Path("PAI") / pai_save_name
+    src = pai_save_path(pai_save_name)
     if not src.exists():
         return
     dst = output_dir / "pai_plots"
@@ -1164,15 +1169,17 @@ def _setup_pai_optimizer(
         return optimizer, None
     _validate_pai_training_model(model)
     try:
-        tracker.set_optimizer(_optimizer_class(torch, config))
-        setup_result = tracker.setup_optimizer(
-            model, _optimizer_args(model, config), {}
-        )
+        with pai_working_directory():
+            tracker.set_optimizer(_optimizer_class(torch, config))
+            setup_result = tracker.setup_optimizer(
+                model, _optimizer_args(model, config), {}
+            )
     except TypeError:
         try:
-            setup_result = tracker.setup_optimizer(
-                model, _optimizer_args(model, config)
-            )
+            with pai_working_directory():
+                setup_result = tracker.setup_optimizer(
+                    model, _optimizer_args(model, config)
+                )
         except Exception:
             return optimizer, tracker
     except Exception:
@@ -1802,6 +1809,64 @@ def _apply_epoch_checkpoint(
     return resume_epoch
 
 
+def _pai_state_is_persistable(context: "EpochTrainingContext") -> bool:
+    """Whether this run owns PAI tracker state worth snapshotting."""
+    return bool(
+        context.config.use_dendrites
+        and context.config.pai_save_name
+        and _pai_updates_enabled(context.config)
+        and _pai_tracker() is not None
+    )
+
+
+def _save_pai_resume_state(context: "EpochTrainingContext") -> None:
+    """Snapshot PAI's dendrite structure and schedule beside the epoch checkpoint."""
+    if not _pai_state_is_persistable(context):
+        return
+    save_pai_system(_unwrap_compiled(context.model), context.config.pai_save_name)
+
+
+def _restore_pai_resume_state(
+    context: "EpochTrainingContext",
+    optimizer: Any,
+) -> Any:
+    """Rebuild the saved dendrite structure and schedule before resuming.
+
+    Returns an optimizer matching the restored model.  The one handed in was
+    built against the freshly perforated (dendrite-free) network, so its
+    parameter groups stop lining up as soon as dendrites come back — that
+    mismatch is what silently reset the optimizer on every earlier resume.
+    """
+    if not _pai_state_is_persistable(context):
+        return optimizer
+    save_name = context.config.pai_save_name
+    if not pai_resume_state_exists(save_name):
+        return optimizer
+    module_dimensions = getattr(context.model, MODULE_OUTPUT_DIMENSIONS_ATTR, None)
+    restored = load_pai_system(_unwrap_compiled(context.model), save_name)
+    if restored is None:
+        return optimizer
+    attach_module_output_dimensions(restored, module_dimensions)
+    context.model = restored.to(context.device)
+    _configure_dendrite_output_dimensions(
+        context.model,
+        context.model_key,
+        context.config.use_dendrites,
+        context.device,
+    )
+    clear_pai_processor_buffers(context.model)
+    optimizer, _ = _setup_pai_optimizer(context.model, context.torch, context.config)
+    member_vars = getattr(_pai_tracker(), "member_vars", None) or {}
+    print(
+        "[pai-state] restored PAI schedule: "
+        f"{member_vars.get('num_dendrites_added', '?')} dendrite(s), "
+        f"cycle {member_vars.get('num_cycles', '?')}, "
+        f"mode {member_vars.get('mode', '?')}, "
+        f"PAI epoch {member_vars.get('num_epochs_run', '?')}."
+    )
+    return optimizer
+
+
 def _build_history_row(
     *,
     epoch: int,
@@ -1965,9 +2030,10 @@ def _run_dynamic_dendrite_update(
         module_dimensions = getattr(
             context.model, MODULE_OUTPUT_DIMENSIONS_ATTR, None
         )
-        model, restructured, training_complete = pai_tracker.add_validation_score(
-            val_metric, context.model
-        )
+        with pai_working_directory():
+            model, restructured, training_complete = pai_tracker.add_validation_score(
+                val_metric, context.model
+            )
         attach_module_output_dimensions(model, module_dimensions)
         context.model = model.to(context.device)
         _configure_dendrite_output_dimensions(
@@ -2265,6 +2331,9 @@ def _run_training_epochs(
     if context.output_dir is not None:
         ckpt = _load_epoch_checkpoint(context.output_dir, context.torch)
         if ckpt is not None:
+            # Restore the dendrite structure first so the checkpoint's tensors
+            # and optimizer groups have something shaped like them to land in.
+            optimizer = _restore_pai_resume_state(context, optimizer)
             start_epoch = _apply_epoch_checkpoint(ckpt, state, context.model, optimizer)
     epoch_progress = _epoch_progress(context, run_until_pai_complete, start_epoch)
     for epoch in epoch_progress:
@@ -2298,6 +2367,10 @@ def _run_training_epochs(
             location=f"{context.run_label} epoch {epoch + 1} end",
         )
         if context.output_dir is not None:
+            # Written before the epoch checkpoint so the PAI snapshot's
+            # tracker_string buffer is already on the model when its
+            # state_dict is captured, keeping the two files consistent.
+            _save_pai_resume_state(context)
             _save_epoch_checkpoint(
                 context.output_dir, epoch, state, optimizer, context.model, context.torch
             )

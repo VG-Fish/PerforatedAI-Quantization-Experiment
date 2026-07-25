@@ -83,7 +83,7 @@ def _configure_dynamic_pai_schedule(
             "set_n_epochs_to_switch": 10,
             "set_p_epochs_to_switch": 2,
             "set_max_dendrites": 6,
-            "set_n_epochs_for_switch_history": 8,
+            "set_history_lookback": 8,
             "set_improvement_threshold": [0.005, 0.001, 0.0001, 0],
             "set_reset_best_score_on_switch": True,
             "set_candidate_weight_initialization_multiplier": 0.005,
@@ -99,7 +99,7 @@ def _configure_dynamic_pai_schedule(
 Why each knob:
 
 - **`max_dendrites=6`** — the empirical win curve plateaus at 2-4 dendrites in almost every model. 100 leaves runaway room with no upside; 6 is a soft cap that still exceeds every historic best-arch count.
-- **`n_epochs_for_switch_history=8`** — matches PAI's guidance that history should be long enough to detect a real plateau. Default `history_lookback=1` triggers on transient noise.
+- **`history_lookback=8`** — matches PAI's guidance that history should be long enough to detect a real plateau. The default of 1 triggers on transient noise. (The setter is `set_history_lookback`; there is no `set_n_epochs_for_switch_history` — PAI prints `Variable 'n_epochs_for_switch_history' does not exist. Ignoring set attempt.` and silently keeps the default of 1.)
 - **`improvement_threshold=[0.005, 0.001, 0.0001, 0]`** — a decaying ladder. Early dendrites only fire when improvement stalls hard (>0.5% relative). Later dendrites fire on smaller gains as the model saturates.
 - **`reset_best_score_on_switch=True`** — dendrite additions restructure the model; comparing to the pre-restructure best anchors PAI to a metric it may no longer be able to match on the new architecture.
 - **`candidate_weight_initialization_multiplier=0.005`** — currently 0.01 in captured configs. Halving it should reduce the post-switch metric spike that caused several models to peak before the first switch.
@@ -181,6 +181,33 @@ def _copy_pai_graphs_to_output(pai_save_name: str, output_dir: Path) -> None:
 
 Call it once, gated by `config.use_dendrites`, after the training loop exits normally. Copying (not moving) preserves the checkpoint dir layout PAI expects on resume.
 
+Use `pai_save_path(save_name)` from [compat.py](../src/dendritic_benchmark/compat.py) rather than hardcoding `Path("PAI") / save_name` — see the next section for why the two are no longer trivially the same thing.
+
+---
+
+## 6b. PerforatedAI 3.2.3 — `save_name` may not contain `/`
+
+PerforatedAI ≥ 3.2.3 validates `save_name` and calls `sys.exit(1)` when it contains a path separator:
+
+```
+Warning: save_name 'PAI/lenet5_dendrites_fp32' contains '/'. Relative paths are not implemented yet.
+```
+
+`SystemExit` is not an `Exception`, so it slipped through `perforate_model`'s `except Exception` handler and killed the run with no traceback — the log simply stopped after that warning.
+
+PAI resolves `save_name` against the process working directory, so `PAI/{save_name}/` is now reached by changing directory rather than by nesting the name:
+
+- `_pai_flat_save_name()` collapses the save name to a single separator-free segment.
+- `pai_working_directory()` is a re-entrant context manager that `chdir`s into `PAI/` for the duration of each PAI library call, and restores the previous directory on the way out.
+- Every call that touches PAI's filesystem — `perforate_model`, `load_system`, `setup_optimizer`, `add_validation_score` — runs inside that context manager.
+
+The resulting on-disk layout is byte-for-byte the pre-3.2.3 one, so existing `PAI/{save_name}/switch_*.pt` checkpoints stay loadable.
+
+Two related 3.2.3 changes fall out of this:
+
+- The perforation config moved from a single `PAI/PAI_config.json` to a per-run `PAI/{save_name}/{save_name}_config.json`. `_snapshot_pai_config` reads the new path; without that fix it found nothing and the per-condition `*_PAI_config.json` snapshots stopped being written.
+- `perforate_model` now converts a PAI `SystemExit` into a `RuntimeError`, so any future library-level abort surfaces as a real failure instead of a silent process death.
+
 ---
 
 ## 7. Change 4 — restore recipe `weight_decay` for dendrite runs
@@ -208,7 +235,7 @@ If a specific model regresses on the dynamic run because of this, isolate it via
 Two models cannot benefit from dynamic dendrites in their current form:
 
 - **`pointnet_modelnet40`** — baseline accuracy is **13.4%** on ModelNet40 (10-class random ≈ 10%, 40-class random ≈ 2.5%). The base model is broken. Dendrites made it worse (−66%) because they're amplifying a non-signal. Fix the baseline first — investigate `models.py`'s pointnet definition and the modelnet40 dataloader — before including it in a dendritic sweep.
-- **`distilbert`** — the recipe is 4 epochs. Dynamic mode needs many more to detect a real plateau (`n_epochs_for_switch_history=8` already exceeds it). Either bump `distilbert`'s `max_epochs` recipe to ≥ 20 for the dendritic condition, or hold it out.
+- **`distilbert`** — the recipe is 4 epochs. Dynamic mode needs many more to detect a real plateau (`history_lookback=8` already exceeds it). Either bump `distilbert`'s `max_epochs` recipe to ≥ 20 for the dendritic condition, or hold it out.
 
 Recommended first dynamic invocation:
 

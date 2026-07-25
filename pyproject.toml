@@ -17,7 +17,6 @@ dependencies = [
     "gymnasium[classic-control,box2d]>=1.0.0",
     "matplotlib>=3.10.9",
     "python-dotenv>=1.0.1",
-    "perforatedai>=3.2.0",
     "torch>=2.11.0",
     "torchao>=0.17.0",
     "torchaudio",
@@ -28,10 +27,11 @@ dependencies = [
     "pillow>=11.0.0",
     "tonic>=1.5.0",
     "torch-geometric>=2.6.0",
-    "perforatedbp>=3.2.0",
     "vulture>=2.16",
     "bandit>=1.9.4",
     "deadcode>=2.4.1",
+    "perforatedai>=3.2.3",
+    "perforatedbp>=3.2.2",
 ]
 
 [project.scripts]

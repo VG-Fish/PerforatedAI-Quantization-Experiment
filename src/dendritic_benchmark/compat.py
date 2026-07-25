@@ -19,6 +19,16 @@ _PAI_CONFIG_SAVED_PRINTED: bool = False
 _PAI_DEBUGGER_SUPPRESS_REMAINING: int = 0
 _PAI_GLOBALS_MODULE = "perforatedai.globals_perforatedai"
 MODULE_OUTPUT_DIMENSIONS_ATTR = "_dqb_module_output_dimensions"
+# PerforatedAI >= 3.2.3 rejects save names containing "/" and writes every
+# artifact to "{save_name}/" relative to the process working directory, so the
+# benchmark's PAI/{save_name}/ layout is reached by moving into PAI/ for the
+# duration of each library call instead of by nesting the save name.
+_PAI_ROOT = Path("PAI")
+_PAI_WORKING_DIRECTORY_DEPTH = 0
+# Name of the PAI system snapshot the benchmark writes alongside its own epoch
+# checkpoint. Distinct from PAI's internal "latest", which is written mid-way
+# through add_validation_score and so can disagree with the epoch checkpoint.
+PAI_RESUME_NAME = "dqb_resume"
 _PAI_CONFIG_LIST_SETTERS: tuple[str, ...] = (
     "set_modules_to_track",
     "set_module_names_to_track",
@@ -226,10 +236,25 @@ def _configure_dynamic_pai_schedule(
         {
             "set_n_epochs_to_switch": 10,
             "set_p_epochs_to_switch": 2,
-            "set_max_dendrites": 6,
-            "set_n_epochs_for_switch_history": 8,
-            "set_improvement_threshold": [0.005, 0.001, 0.0001, 0],
-            "set_reset_best_score_on_switch": True,
+            # Dendrites stopped paying for themselves well before the sixth on
+            # every model measured so far, and each extra one costs ~100 epochs
+            # at a steadily worse seconds-per-epoch.
+            "set_max_dendrites": 3,
+            # PAI names the plateau-detection window "history_lookback"; the
+            # default of 1 switches on transient noise.
+            "set_history_lookback": 8,
+            # Indexed by dendrites added (globals_perforatedai getter_val), so
+            # this needs max_dendrites + 1 entries. The final entry must stay
+            # above zero: at a threshold of 0 only improvement_threshold_raw
+            # (1e-5) separates a real gain from validation jitter, and the
+            # plateau detector never sees n_epochs_to_switch quiet epochs.
+            "set_improvement_threshold": [0.005, 0.002, 0.001, 0.001],
+            # Zeroing the best score on switch also zeroes running_accuracy,
+            # which is an EMA over history_lookback epochs. Climbing back from
+            # 0 to a ~0.99 metric takes ~70 epochs, and every one of them
+            # registers as an improvement, so epoch_last_improved is refreshed
+            # continuously and the switch trigger cannot fire.
+            "set_reset_best_score_on_switch": False,
             "set_candidate_weight_initialization_multiplier": 0.005,
         },
     )
@@ -562,6 +587,30 @@ def _suppress_pai_debugger() -> Iterator[None]:
 
 
 @contextmanager
+def pai_working_directory() -> Iterator[None]:
+    """Run PerforatedAI file I/O with ``PAI/`` as the working directory.
+
+    PerforatedAI resolves ``save_name`` relative to the process working
+    directory and refuses names containing a path separator, so every call that
+    reads or writes PAI artifacts has to be made from inside ``PAI/``. Re-entrant
+    so nested PAI calls share a single directory change.
+    """
+    global _PAI_WORKING_DIRECTORY_DEPTH
+    if _PAI_WORKING_DIRECTORY_DEPTH:
+        yield
+        return
+    _PAI_ROOT.mkdir(parents=True, exist_ok=True)
+    previous = Path.cwd()
+    _PAI_WORKING_DIRECTORY_DEPTH += 1
+    os.chdir(_PAI_ROOT)
+    try:
+        yield
+    finally:
+        _PAI_WORKING_DIRECTORY_DEPTH -= 1
+        os.chdir(previous)
+
+
+@contextmanager
 def pai_runtime_guard() -> Iterator[None]:
     original_print, original_stdout, original_stderr = _install_pai_output_filters()
     try:
@@ -614,14 +663,14 @@ def perforate_model(
                         runtime_options.initial_correlation_batches_limit
                     ),
                 )
-            pai_save_name = str(_pai_save_path(save_name))
-            perforated = upa_perforate_model(
-                model,
-                doing_pai=doing_pai,
-                save_name=pai_save_name,
-                maximizing_score=maximizing_score,
-                making_graphs=True,
-            )
+            with pai_working_directory():
+                perforated = upa_perforate_model(
+                    model,
+                    doing_pai=doing_pai,
+                    save_name=_pai_flat_save_name(save_name),
+                    maximizing_score=maximizing_score,
+                    making_graphs=True,
+                )
             if _set_tracked_params is not None:
                 _set_tracked_params(perforated)
             return perforated
@@ -631,8 +680,17 @@ def perforate_model(
                 perforated_model = _run_perforation()
         else:
             perforated_model = _run_perforation()
-        _snapshot_pai_config(_snapshot_stem(save_name), config_snapshot_path)
+        _snapshot_pai_config(save_name, config_snapshot_path)
         return perforated_model
+    except SystemExit as exc:
+        # PerforatedAI reports fatal configuration problems by calling
+        # sys.exit(), which would otherwise tear the benchmark down with no
+        # traceback and no log line.
+        raise RuntimeError(
+            f"PerforatedAI aborted perforation with SystemExit({exc.code}). "
+            "The preceding PerforatedAI output explains what it rejected; the "
+            "dendritic condition is invalid until that is resolved."
+        ) from exc
     except Exception as exc:
         if doing_pai:
             raise RuntimeError(
@@ -643,26 +701,86 @@ def perforate_model(
         return model
 
 
-def _pai_save_path(save_name: str) -> Path:
+def _pai_flat_save_name(save_name: str) -> str:
+    """Return ``save_name`` collapsed to a single path-separator-free segment."""
     path = Path(save_name)
     if path.is_absolute():
-        return Path("PAI") / path.name
-    if path.parts and path.parts[0] == "PAI":
-        return path
-    return Path("PAI") / path
+        return path.name
+    parts = [part for part in path.parts if part != _PAI_ROOT.name]
+    return "_".join(parts) if parts else path.name
 
 
-def _snapshot_stem(save_name: str) -> str:
-    return "_".join(Path(save_name).parts)
+def pai_save_path(save_name: str) -> Path:
+    """Return the ``PAI/`` directory PerforatedAI writes ``save_name`` into."""
+    return _PAI_ROOT / _pai_flat_save_name(save_name)
+
+
+def pai_resume_state_exists(save_name: str, name: str = PAI_RESUME_NAME) -> bool:
+    """Report whether a PAI system snapshot is available to resume from."""
+    return (pai_save_path(save_name) / f"{name}.pt").exists()
+
+
+def save_pai_system(
+    model: Any, save_name: str, name: str = PAI_RESUME_NAME
+) -> bool:
+    """Snapshot the perforated network *and* the PAI tracker's own state.
+
+    The benchmark's epoch checkpoint carries model and optimizer tensors only.
+    PAI keeps the dendrite schedule (dendrites added, cycle count, switch
+    epochs, plateau bookkeeping) in ``pai_tracker.member_vars``, which is not
+    part of any ``state_dict``, so without this snapshot a resumed run rebuilds
+    a zero-dendrite model and restarts the schedule from the first cycle.
+    """
+    try:
+        UPA = importlib.import_module("perforatedai.utils_perforatedai")
+        with _suppress_pai_debugger(), pai_working_directory():
+            UPA.save_system(model, _pai_flat_save_name(save_name), name)
+    except Exception as exc:
+        print(
+            f"[pai-state] could not snapshot PAI state ({exc}); a resumed run "
+            "would restart the dendrite schedule from zero."
+        )
+        return False
+    return True
+
+
+def load_pai_system(
+    model: Any, save_name: str, name: str = PAI_RESUME_NAME
+) -> Any | None:
+    """Restore a :func:`save_pai_system` snapshot, or return ``None`` on failure.
+
+    ``model`` must be a freshly perforated network; PAI reattaches its module
+    vector to it and rebuilds the saved dendrite structure, so the returned
+    model is not necessarily the object passed in.
+    """
+    try:
+        UPA = importlib.import_module("perforatedai.utils_perforatedai")
+        with _suppress_pai_debugger(), pai_working_directory():
+            # load_from_manual_save keeps PAI from advancing its epoch counter:
+            # its own periodic saves happen before start_epoch, whereas this
+            # snapshot is taken after add_validation_score has already run it.
+            return UPA.load_system(
+                model,
+                _pai_flat_save_name(save_name),
+                name,
+                load_from_manual_save=True,
+            )
+    except Exception as exc:
+        print(
+            f"[pai-state] could not restore PAI state ({exc}); continuing with "
+            "a fresh dendrite schedule."
+        )
+        return None
 
 
 def _snapshot_pai_config(
     save_name: str, config_snapshot_path: Path | str | None
 ) -> None:
-    config_path = Path("PAI") / "PAI_config.json"
+    flat_save_name = _pai_flat_save_name(save_name)
+    config_path = pai_save_path(save_name) / f"{flat_save_name}_config.json"
     if not config_path.exists():
         return
-    named_snapshot = config_path.with_name(f"{save_name}_PAI_config.json")
+    named_snapshot = _PAI_ROOT / f"{flat_save_name}_PAI_config.json"
     try:
         shutil.copy2(config_path, named_snapshot)
         if config_snapshot_path is not None:
@@ -675,7 +793,7 @@ def _snapshot_pai_config(
 
 def latest_pai_switch_checkpoint(save_name: str) -> str | None:
     """Return the latest source PAI switch checkpoint name, without ``.pt``."""
-    folder = _pai_save_path(save_name)
+    folder = pai_save_path(save_name)
     if not folder.is_dir():
         return None
     latest_switch: int | None = None
@@ -702,10 +820,10 @@ def load_pai_system_checkpoint(
         modules_mod = importlib.import_module("perforatedai.modules_perforatedai")
         load_system = getattr(UPA, "load_system")
         _set_tracked_params = getattr(modules_mod, "set_tracked_params", None)
-        with pai_runtime_guard():
+        with pai_runtime_guard(), pai_working_directory():
             loaded = load_system(
                 model,
-                str(_pai_save_path(save_name)),
+                _pai_flat_save_name(save_name),
                 checkpoint_name,
                 True,
             )
@@ -715,13 +833,13 @@ def load_pai_system_checkpoint(
     except SystemExit as exc:
         print(
             f"[state] PerforatedAI system load aborted from "
-            f"{_pai_save_path(save_name)}/{checkpoint_name}.pt: {exc}"
+            f"{pai_save_path(save_name)}/{checkpoint_name}.pt: {exc}"
         )
         raise
     except Exception as exc:
         raise RuntimeError(
             "PerforatedAI system checkpoint could not be loaded from "
-            f"{_pai_save_path(save_name)}/{checkpoint_name}.pt. The dendritic "
+            f"{pai_save_path(save_name)}/{checkpoint_name}.pt. The dendritic "
             "source architecture is required before loading the benchmark "
             "checkpoint."
         ) from exc
