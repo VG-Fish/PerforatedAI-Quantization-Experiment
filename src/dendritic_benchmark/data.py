@@ -168,6 +168,65 @@ def _split_dataset(
     return train_ds, val_ds, test_ds
 
 
+def _split_anomaly_dataset(
+    dataset: Any,
+    labels: Any,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+) -> tuple[Any, Any, Any]:
+    """Split a dataset so only normal rows reach the training split.
+
+    A reconstruction autoencoder flags anomalies by failing to reconstruct
+    them, which only works if it never learned to reconstruct them.  Under a
+    plain random split the anomalies land in training too, the model learns
+    them alongside the normal rows, and reconstruction error stops separating
+    the classes — the detector gets worse the longer it trains.
+
+    Normal rows are divided across all three splits.  Anomalous rows are held
+    out of training entirely and divided evenly between validation and test, so
+    both keep a mixed population to score AUC against.
+    """
+    label_values = labels.long().flatten()
+    normal: list[int] = (label_values == 0).nonzero(as_tuple=True)[0].tolist()
+    anomalous: list[int] = (label_values != 0).nonzero(as_tuple=True)[0].tolist()
+    if len(normal) < 3 or len(anomalous) < 2:
+        raise ValueError(
+            "Need at least three normal and two anomalous samples to build "
+            f"anomaly splits; got {len(normal)} normal and {len(anomalous)} "
+            "anomalous."
+        )
+
+    generator = torch.Generator().manual_seed(42)
+
+    def shuffled(indices: list[int]) -> list[int]:
+        order = torch.randperm(len(indices), generator=generator).tolist()
+        return [indices[position] for position in order]
+
+    normal = shuffled(normal)
+    anomalous = shuffled(anomalous)
+
+    # Clamp so validation and test always keep at least one normal row each.
+    normal_train: int = min(max(int(len(normal) * train_ratio), 1), len(normal) - 2)
+    normal_val: int = min(
+        max(int(len(normal) * val_ratio), 1), len(normal) - normal_train - 1
+    )
+    anomalous_val: int = min(max(len(anomalous) // 2, 1), len(anomalous) - 1)
+
+    subset = torch.utils.data.Subset
+    return (
+        subset(dataset, normal[:normal_train]),
+        subset(
+            dataset,
+            normal[normal_train : normal_train + normal_val]
+            + anomalous[:anomalous_val],
+        ),
+        subset(
+            dataset,
+            normal[normal_train + normal_val :] + anomalous[anomalous_val:],
+        ),
+    )
+
+
 def _bundle_from_splits(
     train_ds: Any,
     val_ds: Any,
@@ -1178,16 +1237,20 @@ class MedicalDatasets:
                 window = (window - window.mean()) / window.std().clamp_min(1e-6)
                 windows.append(window.unsqueeze(-1))
                 labels.append(0 if symbol == "N" else 1)
-        return _bundle_from_dataset(
-            _TensorRowsDataset(
-                torch.stack(windows),
-                torch.stack(windows),
-                torch.tensor(labels, dtype=torch.long),
+        stacked = torch.stack(windows)
+        label_tensor = torch.tensor(labels, dtype=torch.long)
+        # Anomalous beats are ~32% of this corpus, and two of the eight records
+        # (109, 111) are entirely abnormal, so a random split would put their
+        # morphology in training and the autoencoder would reconstruct them as
+        # readily as a normal beat.  Train on normal beats only.
+        return _bundle_from_splits(
+            *_split_anomaly_dataset(
+                _TensorRowsDataset(stacked, stacked, label_tensor), label_tensor
             ),
             batch_size,
             "AUC",
             "maximize",
-            "MIT-BIH Arrhythmia ECG beat windows",
+            "MIT-BIH Arrhythmia ECG beat windows (autoencoder trained on normal beats)",
         )
 
 

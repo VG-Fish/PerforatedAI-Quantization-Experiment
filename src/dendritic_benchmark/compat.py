@@ -256,6 +256,14 @@ def _configure_dynamic_pai_schedule(
             # continuously and the switch trigger cannot fire.
             "set_reset_best_score_on_switch": False,
             "set_candidate_weight_initialization_multiplier": 0.005,
+            # Not set here: pai_improvement_threshold / _raw, which gate how much
+            # a node's correlation must gain in one epoch to keep the dendrite
+            # phase alive.  Raising them from the (0.1, 1e-4) defaults to
+            # (0.2, 1e-3) was measured to change nothing — the dendrite-phase
+            # patience counter still reset on 91 of 92 switch checks — so the
+            # override was dropped rather than left as unexplained config.
+            # max_dendrite_phase_epochs in training.py is what actually bounds
+            # the phase.
         },
     )
     correlation_batches = _initial_correlation_batches(

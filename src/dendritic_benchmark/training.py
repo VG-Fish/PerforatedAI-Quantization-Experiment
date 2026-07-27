@@ -74,6 +74,18 @@ class TrainingConfig:
     pai_candidate_graph_batch_limit: int | None = None
     memory_cleanup_interval_batches: int | None = None
     pai_save_name: str | None = None
+    # Ceiling on a single dendrite ("p") phase in dynamic mode, and the only
+    # thing that bounds one.  PAI leaves the phase once no node's correlation
+    # has improved for p_epochs_to_switch epochs, but those scores keep drifting
+    # up on noise long after they have converged, so the patience counter resets
+    # almost every epoch: measured at 91 of 92 dendrite-mode switch checks, vs
+    # 27 of 52 in neuron mode where the counter behaves.  Left alone the phase
+    # runs unbounded — 207+ epochs on lstm_autoencoder without ever adding a
+    # dendrite, and 198/175/169 on mpnn/tabnet/lstm_forecaster.  Raising PAI's
+    # own pai_improvement_threshold(_raw) does not help (see compat.py).  The
+    # longest healthy phase measured is 37 epochs (textcnn), so 50 clears every
+    # real one while capping the stalls.  0 disables the guard.
+    max_dendrite_phase_epochs: int = 50
 
 
 @dataclass
@@ -2010,12 +2022,46 @@ def _load_compatible_best_state(model: Any, best_state: dict[str, Any]) -> None:
         print(f"[state] retained current values for missing tensors: {real_missing[:5]}")
 
 
+def _pai_dendrite_phase_epochs(pai_tracker: Any) -> int | None:
+    """Epochs PAI has spent in the current dendrite phase, or None if not in one."""
+    member_vars = getattr(pai_tracker, "member_vars", None)
+    if not isinstance(member_vars, dict) or member_vars.get("mode") != "p":
+        return None
+    switch_epochs = member_vars.get("switch_epochs")
+    num_epochs_run = member_vars.get("num_epochs_run")
+    if not switch_epochs or not isinstance(num_epochs_run, int):
+        return None
+    try:
+        return num_epochs_run - int(switch_epochs[-1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _pai_dendrite_phase_stalled(
+    context: EpochTrainingContext, pai_tracker: Any
+) -> bool:
+    """True when the dendrite phase has overrun its ceiling and must be cut short."""
+    limit = context.config.max_dendrite_phase_epochs
+    if limit <= 0:
+        return False
+    phase_epochs = _pai_dendrite_phase_epochs(pai_tracker)
+    if phase_epochs is None or phase_epochs < limit:
+        return False
+    print(
+        f"[pai] {context.run_label}: dendrite phase has run {phase_epochs} epochs "
+        f"(limit {limit}) without PAI electing to switch. Forcing the switch so "
+        "the candidate dendrites are evaluated instead of training on noise."
+    )
+    return True
+
+
 def _run_dynamic_dendrite_update(
     *,
     context: EpochTrainingContext,
     optimizer: Any,
     pai_tracker: Any,
     val_metric: float,
+    force_switch: bool = False,
 ) -> tuple[Any, Any | None, bool, bool]:
     import pdb as _pdb
     from typing import Any, Callable
@@ -2031,8 +2077,13 @@ def _run_dynamic_dendrite_update(
             context.model, MODULE_OUTPUT_DIMENSIONS_ATTR, None
         )
         with pai_working_directory():
-            model, restructured, training_complete = pai_tracker.add_validation_score(
-                val_metric, context.model
+            # The unforced path passes no third argument at all, so PAI builds
+            # without force_switch behave exactly as before; the forced path
+            # passes it positionally so it does not depend on the parameter name.
+            model, restructured, training_complete = (
+                pai_tracker.add_validation_score(val_metric, context.model, True)
+                if force_switch
+                else pai_tracker.add_validation_score(val_metric, context.model)
             )
         attach_module_output_dimensions(model, module_dimensions)
         context.model = model.to(context.device)
@@ -2249,11 +2300,12 @@ def _run_active_pai_update(
     pai_tracker: Any,
     val_metric: float,
 ) -> tuple[Any, Any | None, bool, bool]:
+    force_switch = _pai_dendrite_phase_stalled(context, pai_tracker)
     _set_pai_candidate_graph_for_context(context, True)
     try:
         return _run_dynamic_dendrite_update(
             context=context, optimizer=optimizer, pai_tracker=pai_tracker,
-            val_metric=val_metric,
+            val_metric=val_metric, force_switch=force_switch,
         )
     finally:
         _set_pai_candidate_graph_for_context(context, False)
