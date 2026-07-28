@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 from .compat import (
+    PAI_DIRECTORY_NAME,
     PAIModuleSelection,
     PAIRuntimeOptions,
     attach_module_output_dimensions,
@@ -19,6 +20,7 @@ from .compat import (
     load_pai_system_checkpoint,
     perforate_model,
     set_module_output_dimensions,
+    set_pai_root,
 )
 from .data import build_task_bundle
 from .models import build_model
@@ -146,6 +148,9 @@ class BenchmarkRunner:
         self.comparison_root = Path(comparison_root)
         self.results_root.mkdir(parents=True, exist_ok=True)
         self.comparison_root.mkdir(parents=True, exist_ok=True)
+        # Keep PAI artifacts with the results they belong to. The CLI already
+        # does this; repeating it here covers programmatic callers.
+        set_pai_root(self.results_root / PAI_DIRECTORY_NAME)
 
     def _split_compatible_state(
         self, state: dict[str, Any], current_state: dict[str, Any]

@@ -10,7 +10,12 @@ from typing import Any, Optional
 import torch
 
 from .benchmark import BenchmarkOrchestrator
-from .compat import load_project_environment, perforatedai_credentials_present
+from .compat import (
+    PAI_DIRECTORY_NAME,
+    load_project_environment,
+    perforatedai_credentials_present,
+    set_pai_root,
+)
 from .data import DATA_ROOT_ENV, DEFAULT_DATA_ROOT, build_task_bundle, dataset_exists
 from .log_utils import setup_logging
 from .pipeline import BenchmarkRunner
@@ -92,7 +97,7 @@ def _record_clean_config(args: Any, results_root: Path, comparison_root: Path, b
             [
                 _path_entry(results_root, "results"),
                 _path_entry(comparison_root, "comparison"),
-                _path_entry("PAI", "perforatedai"),
+                _path_entry(results_root / PAI_DIRECTORY_NAME, "perforatedai"),
                 _path_entry(Path(os.environ.get(DATA_ROOT_ENV, DEFAULT_DATA_ROOT)), "data"),
             ]
         )
@@ -631,6 +636,9 @@ def main() -> None:
         results_root = results_root / args.results_directory
     comparison_root = Path(getattr(args, "comparison_root", "comparison"))
     benchmark_root = Path(getattr(args, "benchmark_root", "benchmarks"))
+    # PerforatedAI's artifact tree belongs to the result set it was produced
+    # for, so it is scoped to --results-root rather than the working directory.
+    set_pai_root(results_root / PAI_DIRECTORY_NAME)
 
     _record_clean_config(args, results_root, comparison_root, benchmark_root)
     if args.command != "clean":

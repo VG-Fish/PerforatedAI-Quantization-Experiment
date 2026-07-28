@@ -23,7 +23,8 @@ MODULE_OUTPUT_DIMENSIONS_ATTR = "_dqb_module_output_dimensions"
 # artifact to "{save_name}/" relative to the process working directory, so the
 # benchmark's PAI/{save_name}/ layout is reached by moving into PAI/ for the
 # duration of each library call instead of by nesting the save name.
-_PAI_ROOT = Path("PAI")
+PAI_DIRECTORY_NAME = "PAI"
+_PAI_ROOT = Path(PAI_DIRECTORY_NAME).resolve()
 _PAI_WORKING_DIRECTORY_DEPTH = 0
 # Name of the PAI system snapshot the benchmark writes alongside its own epoch
 # checkpoint. Distinct from PAI's internal "latest", which is written mid-way
@@ -594,6 +595,24 @@ def _suppress_pai_debugger() -> Iterator[None]:
         setattr(sys, "settrace", original_sys_settrace)
 
 
+def set_pai_root(root: Path | str) -> Path:
+    """Point PerforatedAI's artifact tree at ``root`` and return it resolved.
+
+    Called once per invocation so PAI writes under ``--results-root`` rather
+    than into the directory the command happened to be run from. Resolved
+    eagerly because :func:`pai_working_directory` chdirs into this path, and a
+    relative one would re-resolve against the directory it just moved to.
+    """
+    global _PAI_ROOT
+    _PAI_ROOT = Path(root).expanduser().resolve()
+    return _PAI_ROOT
+
+
+def pai_root() -> Path:
+    """Return the directory PerforatedAI artifacts are written under."""
+    return _PAI_ROOT
+
+
 @contextmanager
 def pai_working_directory() -> Iterator[None]:
     """Run PerforatedAI file I/O with ``PAI/`` as the working directory.
@@ -714,7 +733,7 @@ def _pai_flat_save_name(save_name: str) -> str:
     path = Path(save_name)
     if path.is_absolute():
         return path.name
-    parts = [part for part in path.parts if part != _PAI_ROOT.name]
+    parts = [part for part in path.parts if part != PAI_DIRECTORY_NAME]
     return "_".join(parts) if parts else path.name
 
 
