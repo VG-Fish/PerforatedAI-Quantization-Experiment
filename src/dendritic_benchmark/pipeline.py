@@ -53,6 +53,14 @@ _DEFAULT_DENDRITIC_MEMORY_CLEANUP_INTERVAL = 512
 _MODEL_DENDRITIC_MEMORY_CLEANUP_INTERVALS = {
     "distilbert": 128,
 }
+# PAI's HISTORY mode needs n_epochs_to_switch (10) quiet epochs to decide a switch,
+# and its running average keeps resetting that counter (see
+# _configure_interval_pai_schedule). At DistilBERT's ~23 min/epoch the 2026-07-29
+# run never got past switch 0 in 40 epochs. Models listed here switch on a fixed
+# interval instead, sized to the epochs their baseline recipe needs to converge.
+_MODEL_DENDRITIC_FIXED_SWITCH_INTERVALS = {
+    "distilbert": 3,
+}
 # Full-transformer PAI wrapping makes DistilBERT's candidate forward exceed
 # Apple Silicon MPS memory. Keep dendrite search on the task-specific head.
 _DISTILBERT_PAI_CLASSIFICATION_HEAD = [
@@ -92,6 +100,7 @@ class SourceCheckpointLoadConfig:
     module_output_dimensions: dict[str, list[int]] | None = None
     candidate_graph_enabled: bool = True
     initial_correlation_batches_limit: int | None = None
+    fixed_switch_interval: int | None = None
 
 
 def _log(msg: str, *, before: bool = False, after: bool = False) -> None:
@@ -231,6 +240,7 @@ class BenchmarkRunner:
                     initial_correlation_batches_limit=(
                         load_config.initial_correlation_batches_limit
                     ),
+                    fixed_switch_interval=load_config.fixed_switch_interval,
                 ),
             )
             model = self._configure_perforated_model(
@@ -275,6 +285,7 @@ class BenchmarkRunner:
                     initial_correlation_batches_limit=(
                         load_config.initial_correlation_batches_limit
                     ),
+                    fixed_switch_interval=load_config.fixed_switch_interval,
                 ),
             )
             model = self._configure_perforated_model(
@@ -366,6 +377,12 @@ class BenchmarkRunner:
             # and the initial Conv2d sits inside Conv2dNormActivation (also an nn.Sequential);
             # perforating either leaves DendriteValueTracker.shape uninitialized at the PA switch.
             "mobilenetv2_cifar10": [".classifier.1", ".features.0.0"],
+            # Only the classification head is perforated (see
+            # _DISTILBERT_PAI_CLASSIFICATION_HEAD), which leaves all 100 backbone
+            # parameters neither perforated nor tracked. PAI cannot assign those a
+            # parameter_type, so in p-phase it warns on each one and calls
+            # pdb.set_trace. Tracking the backbone tags them "neuron" instead.
+            "distilbert": [".model.distilbert"],
         }.get(model_key, [])
 
     def _perforation_module_names_to_not_save(self, model_key: str) -> list[str]:
@@ -383,6 +400,9 @@ class BenchmarkRunner:
         return _MODEL_PAI_INITIAL_CORRELATION_BATCH_LIMITS.get(
             model_key, _DEFAULT_PAI_INITIAL_CORRELATION_BATCH_LIMIT
         )
+
+    def _pai_fixed_switch_interval(self, model_key: str) -> int | None:
+        return _MODEL_DENDRITIC_FIXED_SWITCH_INTERVALS.get(model_key)
 
     def _configure_perforated_model(
         self,
@@ -471,6 +491,11 @@ class BenchmarkRunner:
             if training_plan.update_dendrites_during_training
             else None
         )
+        fixed_switch_interval = (
+            self._pai_fixed_switch_interval(model_key)
+            if training_plan.update_dendrites_during_training
+            else None
+        )
         if condition.source_key in saved_dirs:
             checkpoint = self._artifact_path(
                 saved_dirs[condition.source_key],
@@ -496,6 +521,7 @@ class BenchmarkRunner:
                     initial_correlation_batches_limit=(
                         initial_correlation_batches_limit
                     ),
+                    fixed_switch_interval=fixed_switch_interval,
                 ),
             )
         if not condition.use_dendrites:
@@ -515,6 +541,7 @@ class BenchmarkRunner:
                 use_runtime_guard=self._use_pai_runtime_guard(),
                 candidate_graph_enabled=training_plan.update_dendrites_during_training,
                 initial_correlation_batches_limit=initial_correlation_batches_limit,
+                fixed_switch_interval=fixed_switch_interval,
             ),
         )
         configure_pai_candidate_graph(training_plan.update_dendrites_during_training)
@@ -556,10 +583,17 @@ class BenchmarkRunner:
         )
         dendritic_batch_size = _MODEL_DENDRITIC_BATCH_SIZES.get(model_key)
         if condition.use_dendrites and dendritic_batch_size is not None:
+            # Dendrite conditions run at a smaller batch so the candidate forward
+            # fits in memory. Carrying the recipe's learning rate over unchanged
+            # multiplies the per-sample step by batch_size / dendritic_batch_size,
+            # which is what diverged DistilBERT into a constant classifier on its
+            # second epoch (AdamW at 1e-4, batch 32 -> 4: an 8x effective step, on
+            # a recipe already 5x the canonical 2e-5 for BERT fine-tuning). Scale
+            # linearly with the batch so the step per sample matches the baseline.
             return ModelTrainingRecipe(
                 dendritic_batch_size,
                 recipe.max_epochs,
-                recipe.learning_rate,
+                recipe.learning_rate * dendritic_batch_size / recipe.batch_size,
                 recipe.optimizer_name,
                 recipe.momentum,
                 recipe.weight_decay,
@@ -618,8 +652,16 @@ class BenchmarkRunner:
         module_ids = set(config.get("module_ids_to_perforate") or [])
         modules_to_perforate = config.get("modules_to_perforate") or []
         correlation_batches = config.get("initial_correlation_batches")
+        # Records written before the backbone was tracked have untagged
+        # parameters, which changes both the p-phase parameter filtering and the
+        # state_dict key names, so they cannot be reused against today's config.
+        tracked_ids = set(config.get("module_ids_to_track") or [])
+        expected_tracked_ids = set(
+            self._perforation_track_only_module_ids("distilbert")
+        )
         return (
             module_ids == expected_ids
+            and tracked_ids == expected_tracked_ids
             and not modules_to_perforate
             and isinstance(correlation_batches, int)
             and correlation_batches <= self._pai_initial_correlation_batches_limit(
@@ -645,8 +687,9 @@ class BenchmarkRunner:
             and not self._distilbert_dendritic_config_current(condition_dir)
         ):
             _log(
-                f"[stale] {model_key} / {condition.key} — old full-transformer "
-                "PAI config found; retraining with memory-safe head-only PAI."
+                f"[stale] {model_key} / {condition.key} — PAI config predates the "
+                "current setup (memory-safe head-only perforation with the "
+                "backbone tracked); retraining."
             )
             return False
         return True

@@ -8,7 +8,7 @@ import os
 import shutil
 import subprocess
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -38,8 +38,12 @@ from .compat import (
 _MODEL_PT: str = "model.pt"
 _BEST_MODEL_STATS_CSV: str = "best_model_stats.csv"
 _EPOCH_CHECKPOINT_PT: str = "epoch_checkpoint.pt"
-_MEMORY_GUARD_THRESHOLD_BYTES = 10 * 1024**3
+_MEMORY_GUARD_THRESHOLD_BYTES = 20 * 1024**3
 _MEMORY_GUARD_CHECK_INTERVAL_BATCHES = 16
+# Consecutive epochs of a bit-for-bit identical validation metric that count as a
+# collapsed run rather than a plateau (see _training_collapsed). Generous enough
+# that a coarse metric on a small validation split can sit still without tripping.
+_COLLAPSE_GUARD_EPOCHS = 12
 _FALLBACK_MODULE_OUTPUT_DIMENSIONS: dict[str, dict[str, list[int]]] = {
     "gcn": {
         ".conv1.linear": [-1, -1, 0],
@@ -1164,6 +1168,39 @@ def _post_pai_run_config_event(config: TrainingConfig) -> None:
         pass
 
 
+@contextmanager
+def _pai_pdb_suppressed() -> "Any":
+    """Neutralize pdb.set_trace for the duration of a PerforatedAI call.
+
+    PAI drops into pdb for conditions it treats as "come look at this" rather
+    than as errors — notably once per parameter it cannot classify while
+    filtering optimizer param groups in p-phase. Under a non-interactive stdin
+    that raises BdbQuit, which is an ordinary Exception and so gets swallowed
+    by the fallbacks below, silently handing back a non-PAI optimizer.
+    """
+    import pdb as pdb_module
+
+    original = pdb_module.set_trace
+
+    def _no_set_trace(*, header: str | None = None) -> None:
+        _ = header
+
+    pdb_module.set_trace = _no_set_trace
+    try:
+        yield
+    finally:
+        pdb_module.set_trace = original
+
+
+def _warn_pai_optimizer_fallback(exc: BaseException) -> None:
+    print(
+        "[pai] WARNING: PerforatedAI's setup_optimizer failed "
+        f"({type(exc).__name__}: {exc}); falling back to a standard optimizer. "
+        "PAI's dendrite step will NOT run, so candidate dendrites train on "
+        "nothing until this is resolved."
+    )
+
+
 def _setup_pai_optimizer(
     model: Any,
     torch: Any,
@@ -1181,20 +1218,22 @@ def _setup_pai_optimizer(
         return optimizer, None
     _validate_pai_training_model(model)
     try:
-        with pai_working_directory():
+        with _pai_pdb_suppressed(), pai_working_directory():
             tracker.set_optimizer(_optimizer_class(torch, config))
             setup_result = tracker.setup_optimizer(
                 model, _optimizer_args(model, config), {}
             )
     except TypeError:
         try:
-            with pai_working_directory():
+            with _pai_pdb_suppressed(), pai_working_directory():
                 setup_result = tracker.setup_optimizer(
                     model, _optimizer_args(model, config)
                 )
-        except Exception:
+        except Exception as exc:
+            _warn_pai_optimizer_fallback(exc)
             return optimizer, tracker
-    except Exception:
+    except Exception as exc:
+        _warn_pai_optimizer_fallback(exc)
         return optimizer, tracker
     if isinstance(setup_result, tuple) and setup_result:
         return setup_result[0], tracker
@@ -1368,6 +1407,21 @@ def _pai_model_has_dendrites(model: Any) -> bool:
     return False
 
 
+def _pai_tracker_in_neuron_mode() -> bool:
+    """True only while PAI is in an all-neuron ("n") phase.
+
+    In "p" phase the candidate dendrites are being trained, and every
+    optimizer.step backpropagates through their graph, so it cannot be torn
+    down mid-epoch.  An unreadable tracker is treated as "not neuron mode"
+    because leaving the graph on only costs memory, while turning it off at
+    the wrong moment crashes the run.
+    """
+    member_vars = getattr(_pai_tracker(), "member_vars", None)
+    if not isinstance(member_vars, dict):
+        return False
+    return member_vars.get("mode") == "n"
+
+
 def _candidate_graph_batch_limit(
     config: "TrainingConfig",
     *,
@@ -1380,11 +1434,14 @@ def _candidate_graph_batch_limit(
         and not clear_pai_buffers
         and candidate_graph_batch_limit is not None
         and candidate_graph_batch_limit > 0
-        # Once any dendrites exist, PAI's optimizer.step (closure_pai_step) does
-        # an internal backward through the candidate graph in p-phase. Disabling
-        # that graph mid-epoch frees the saved tensors and the next p-step
-        # raises "Trying to backward through the graph a second time", so the
-        # limit is only safe during the initial all-neuron correlation phase.
+        # In p-phase PAI's optimizer.step (closure_pai_step) backwards through
+        # the candidate graph. Disabling that graph mid-epoch frees the saved
+        # tensors and the next p-step raises "Trying to backward through the
+        # graph a second time", so the limit is only safe during an all-neuron
+        # correlation phase. dendrite_modules_added stays 0 through the *first*
+        # p-phase, so the module check alone does not exclude it — the tracker
+        # mode is what actually distinguishes the two phases.
+        and _pai_tracker_in_neuron_mode()
         and not _pai_model_has_dendrites(model)
     ):
         return candidate_graph_batch_limit
@@ -2370,6 +2427,31 @@ def _run_training_pass_oom_guarded(
         raise
 
 
+def _training_collapsed(state: EpochTrainingState, metric_direction: str) -> bool:
+    """True when validation froze bit-for-bit at a value worse than the best seen.
+
+    An identical float across this many epochs means the model's outputs stopped
+    changing at all, which is a different thing from a plateau. The 2026-07-29
+    dendrite run diverged DistilBERT on its second epoch and then sat on one
+    constant class -- exactly the validation split's majority-class fraction --
+    for 39 more, because nothing in the loop was watching for it.
+
+    Requiring the frozen value to be *worse* than ``best_metric`` keeps a
+    genuinely converged run, whose frozen value is its best, from tripping this.
+    """
+    if len(state.history) < _COLLAPSE_GUARD_EPOCHS:
+        return False
+    recent = [
+        float(row["val_metric"]) for row in state.history[-_COLLAPSE_GUARD_EPOCHS:]
+    ]
+    frozen_metric = recent[0]
+    if any(metric != frozen_metric for metric in recent[1:]):
+        return False
+    if metric_direction == "maximize":
+        return frozen_metric < state.best_metric
+    return frozen_metric > state.best_metric
+
+
 def _run_training_epochs(
     context: EpochTrainingContext,
     optimizer: Any,
@@ -2427,6 +2509,15 @@ def _run_training_epochs(
                 context.output_dir, epoch, state, optimizer, context.model, context.torch
             )
         _update_epoch_progress(epoch_progress, context, state, val_metric)
+        if _training_collapsed(state, context.metric_direction):
+            print(
+                f"[collapse] {context.run_label}: validation "
+                f"{context.metric_name} frozen at {val_metric:.6f} for "
+                f"{_COLLAPSE_GUARD_EPOCHS} epochs, worse than the best "
+                f"{state.best_metric:.6f} from epoch {state.best_epoch + 1} — "
+                "stopping this condition rather than training a dead network."
+            )
+            break
         if pai_training_complete and run_until_pai_complete:
             break
     epoch_progress.close()

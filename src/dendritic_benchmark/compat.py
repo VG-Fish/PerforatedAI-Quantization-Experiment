@@ -103,6 +103,7 @@ class PAIRuntimeOptions:
     no_backward_workaround: bool = False
     candidate_graph_enabled: bool = True
     initial_correlation_batches_limit: int | None = None
+    fixed_switch_interval: int | None = None
 
 
 def _call_if_available(target: Any, method_name: str, *args: Any) -> None:
@@ -226,30 +227,65 @@ def _initial_correlation_batches(
     return correlation_batches
 
 
+def _configure_interval_pai_schedule(pc: Any, *, switch_interval: int) -> None:
+    """Switch every ``switch_interval`` epochs instead of on a detected plateau.
+
+    HISTORY mode compares a running average (an EMA over ``history_lookback``
+    epochs) that starts at 0 and only ever climbs toward the current score. Even
+    against a bit-for-bit frozen score it keeps clearing the relative
+    ``improvement_threshold`` every few epochs, so ``epoch_last_improved`` is
+    refreshed continuously and ``n_epochs_to_switch`` never counts down. The
+    2026-07-29 dynamic run spent 40 epochs and 15 h on DistilBERT that way with
+    ``num_cycles`` still 0 and an empty ``switch_epochs.csv``.
+
+    That trap is only affordable to wait out when epochs are cheap. For models
+    where they are not, switch on a fixed interval and accept a schedule that
+    ignores the plateau rather than one that never fires.
+    """
+    _set_pai_switch_mode(pc, "DOING_FIXED_SWITCH")
+    _apply_pai_schedule_values(
+        pc,
+        {
+            "set_first_fixed_switch_num": switch_interval,
+            "set_fixed_switch_num": switch_interval,
+            "set_n_epochs_to_switch": switch_interval,
+        },
+    )
+
+
 def _configure_dynamic_pai_schedule(
     pc: Any,
     batches_per_epoch: int | None = None,
     initial_correlation_batches_limit: int | None = None,
+    fixed_switch_interval: int | None = None,
 ) -> None:
-    _set_pai_switch_mode(pc, "DOING_HISTORY")
+    if fixed_switch_interval is not None:
+        _configure_interval_pai_schedule(pc, switch_interval=fixed_switch_interval)
+    else:
+        _set_pai_switch_mode(pc, "DOING_HISTORY")
+        _apply_pai_schedule_values(
+            pc,
+            {
+                "set_n_epochs_to_switch": 10,
+                # PAI names the plateau-detection window "history_lookback"; the
+                # default of 1 switches on transient noise.
+                "set_history_lookback": 8,
+                # Indexed by dendrites added (globals_perforatedai getter_val), so
+                # this needs max_dendrites + 1 entries. The final entry must stay
+                # above zero: at a threshold of 0 only improvement_threshold_raw
+                # (1e-5) separates a real gain from validation jitter, and the
+                # plateau detector never sees n_epochs_to_switch quiet epochs.
+                "set_improvement_threshold": [0.005, 0.002, 0.001, 0.001],
+            },
+        )
     _apply_pai_schedule_values(
         pc,
         {
-            "set_n_epochs_to_switch": 10,
             "set_p_epochs_to_switch": 2,
             # Dendrites stopped paying for themselves well before the sixth on
             # every model measured so far, and each extra one costs ~100 epochs
             # at a steadily worse seconds-per-epoch.
             "set_max_dendrites": 3,
-            # PAI names the plateau-detection window "history_lookback"; the
-            # default of 1 switches on transient noise.
-            "set_history_lookback": 8,
-            # Indexed by dendrites added (globals_perforatedai getter_val), so
-            # this needs max_dendrites + 1 entries. The final entry must stay
-            # above zero: at a threshold of 0 only improvement_threshold_raw
-            # (1e-5) separates a real gain from validation jitter, and the
-            # plateau detector never sees n_epochs_to_switch quiet epochs.
-            "set_improvement_threshold": [0.005, 0.002, 0.001, 0.001],
             # Zeroing the best score on switch also zeroes running_accuracy,
             # which is an EMA over history_lookback epochs. Climbing back from
             # 0 to a ~0.99 metric takes ~70 epochs, and every one of them
@@ -311,6 +347,7 @@ def _configure_pai_training_schedule(
     freeze_fraction: float,
     batches_per_epoch: int | None = None,
     initial_correlation_batches_limit: int | None = None,
+    fixed_switch_interval: int | None = None,
 ) -> None:
     pc = gpa.pc
     if dynamic_dendritic_training:
@@ -318,6 +355,7 @@ def _configure_pai_training_schedule(
             pc,
             batches_per_epoch=batches_per_epoch,
             initial_correlation_batches_limit=initial_correlation_batches_limit,
+            fixed_switch_interval=fixed_switch_interval,
         )
         return
 
@@ -689,6 +727,7 @@ def perforate_model(
                     initial_correlation_batches_limit=(
                         runtime_options.initial_correlation_batches_limit
                     ),
+                    fixed_switch_interval=runtime_options.fixed_switch_interval,
                 )
             with pai_working_directory():
                 perforated = upa_perforate_model(
