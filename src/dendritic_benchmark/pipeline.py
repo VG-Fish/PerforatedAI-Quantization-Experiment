@@ -368,7 +368,12 @@ class BenchmarkRunner:
     def _perforation_track_only_module_ids(self, model_key: str) -> list[str]:
         return {
             "actor_critic": [".value"],
-            "ppo_bipedalwalker": [".critic"],
+            # .backbone's two Linear layers cleared 0.65 Best-PBScore on the
+            # 2026-08-03 dynamic run; .actor_mean only reached 0.10, and
+            # perforating it left the policy worse than the un-dendrited
+            # baseline (-0.000458 vs -0.000439 mean reward). Track the action
+            # output instead of spending dendrite budget directly on it.
+            "ppo_bipedalwalker": [".critic", ".actor_mean"],
             # Recurrent gates run per-timestep; perforating them dominates wallclock
             # on long sequences. Marking .cells as track-only (not perforated)
             # confines dendrite insertion to the readout Linear in .head only.
@@ -377,6 +382,26 @@ class BenchmarkRunner:
             # and the initial Conv2d sits inside Conv2dNormActivation (also an nn.Sequential);
             # perforating either leaves DendriteValueTracker.shape uninitialized at the PA switch.
             "mobilenetv2_cifar10": [".classifier.1", ".features.0.0"],
+            # Every conv inside the 4 TemporalBlocks (.net.*) scored 0.017-0.023
+            # Best-PBScore on the 2026-08-03 dynamic run, 7-10x below .head's
+            # 0.166; perforating all of them just spreads the max_dendrites=3
+            # budget across near-noise candidates instead of the layer that
+            # actually correlates with the learning signal.
+            "tcn_forecaster": [".net"],
+            # Only .head.1 (0.229) and the row_blocks attn.qkv layers (0.10-0.15)
+            # cleared the >0.02 PBScore bar the perforatedai-analyze guidance
+            # treats as "efficient dendrite user" on the 2026-08-03 dynamic run;
+            # every column_blocks/ffn/attn.out/feature_embed/head.3 layer sat at
+            # 0.009-0.03. Track the ones that showed no real signal.
+            "saint_adult": [
+                ".feature_embed",
+                ".column_blocks",
+                ".row_blocks.0.attn.out",
+                ".row_blocks.0.ffn",
+                ".row_blocks.1.attn.out",
+                ".row_blocks.1.ffn",
+                ".head.3",
+            ],
             # Only the classification head is perforated (see
             # _DISTILBERT_PAI_CLASSIFICATION_HEAD), which leaves all 100 backbone
             # parameters neither perforated nor tracked. PAI cannot assign those a
