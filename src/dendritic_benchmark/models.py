@@ -713,12 +713,20 @@ class PointNet(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(256, num_classes),
         )
+        # Populated by every forward() call; not a buffer/parameter, so it
+        # rides along on the module instance through PAI's perforate_model()
+        # surgery and torch.compile's _orig_mod without affecting state_dict,
+        # ONNX export, or param counting. See _pointnet_feature_transform_penalty
+        # in training.py for why this needs to exist.
+        self._feature_transform_matrix: Any | None = None
 
     def forward(self, points: Any) -> Any:
         x = points.transpose(1, 2)
         x = torch.bmm(self.input_transform(x), x)
         x = self.conv1(x)
-        x = torch.bmm(self.feature_transform(x), x)
+        feature_matrix = self.feature_transform(x)
+        self._feature_transform_matrix = feature_matrix
+        x = torch.bmm(feature_matrix, x)
         x = self.conv2(x)
         x = self.conv3(x).amax(dim=-1)
         return self.head(x)

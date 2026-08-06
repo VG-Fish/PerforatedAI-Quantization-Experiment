@@ -1,4 +1,5 @@
 import csv
+import math
 import os
 import tarfile
 import urllib.request
@@ -330,6 +331,17 @@ class VisionDatasets:
             root=str(root), train=False, download=True, transform=test_transform
         )
         train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
+        # val_ds is a Subset of train_full, so without this it inherits
+        # train_full's RandomCrop/RandomHorizontalFlip transform — every
+        # validation read (and therefore every PAI dendrite-switch decision,
+        # which watches validation score) sees a randomly cropped/flipped
+        # image instead of the canonical one, adding pure augmentation noise
+        # to the signal PAI uses to decide when to add dendrites. Same
+        # indices, clean (no-augmentation) transform.
+        eval_view = torchvision.datasets.CIFAR10(
+            root=str(root), train=True, download=True, transform=test_transform
+        )
+        val_ds = torch.utils.data.Subset(eval_view, val_ds.indices)
         return _bundle_from_splits(
             train_ds,
             val_ds,
@@ -1108,9 +1120,49 @@ class _ModelNet40Dataset:
         return points, torch.tensor(label, dtype=torch.long)
 
 
+class _ModelNet40TrainAugment:
+    """Random rotation + jitter, applied only to the training split.
+
+    ``_ModelNet40Dataset.__getitem__`` downsamples each mesh to the same 1024
+    vertex indices (``torch.linspace``) every time it's called, so without
+    this wrapper the model sees the exact same points in the exact same pose
+    on every one of its ~60 epochs — effectively zero example diversity,
+    which is a big part of why train accuracy reached ~92% while val sat
+    near random-guess (~8%) with val_loss ballooning to double digits.
+    This mirrors the augmentation from the reference PointNet implementation
+    (Qi et al., https://github.com/charlesq34/pointnet, provider.py
+    ``rotate_point_cloud`` + ``jitter_point_cloud``): a random rotation about
+    the up axis plus small per-point Gaussian jitter, clipped to bound
+    outliers. Only wraps the train subset — val/test stay deterministic.
+    """
+
+    def __init__(self, base: Any, jitter_std: float = 0.01, jitter_clip: float = 0.05):
+        self.base = base
+        self.jitter_std = jitter_std
+        self.jitter_clip = jitter_clip
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, index: int) -> tuple[Any, Any]:
+        points, label = self.base[index]
+        angle = float(torch.rand(1).item()) * 2.0 * math.pi
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        rotation = torch.tensor(
+            [[cos_a, 0.0, sin_a], [0.0, 1.0, 0.0], [-sin_a, 0.0, cos_a]],
+            dtype=points.dtype,
+        )
+        points = points @ rotation.T
+        jitter = (torch.randn_like(points) * self.jitter_std).clamp(
+            -self.jitter_clip, self.jitter_clip
+        )
+        return points + jitter, label
+
+
 def _build_modelnet40(batch_size: int) -> TaskBundle:
     train_full = _ModelNet40Dataset(train=True)
     train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
+    train_ds = _ModelNet40TrainAugment(train_ds)
     test_ds = _ModelNet40Dataset(train=False)
     return _bundle_from_splits(
         train_ds,

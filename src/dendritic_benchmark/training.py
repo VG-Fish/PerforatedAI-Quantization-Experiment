@@ -770,11 +770,41 @@ def infer_module_output_dimensions(
     return dimensions
 
 
-def _compute_loss(model_key: str, criterion: Any, outputs: Any, targets: Any) -> Any:
+def _pointnet_feature_transform_penalty(model: Any) -> Any | None:
+    """Orthogonality penalty for PointNet's unconstrained 64x64 feature-transform.
+
+    Without this term the feature-transform T-Net is free to drift far from
+    orthogonal, which was blowing up val_loss to ~15 (vs. train_loss ~0.3) and
+    capping val accuracy near random (~8%) while train accuracy hit ~92% —
+    the model was fitting itself around whatever a wildly non-orthogonal
+    matrix did on a given batch rather than a stable point-cloud feature
+    space. This is the regularizer from the original PointNet paper (Qi et
+    al., https://arxiv.org/abs/1612.00593, sec 3.4), applied only to the
+    feature transform (not the 3x3 input transform, which is small enough
+    to stay stable unregularized).
+    """
+    base = _unwrap_compiled(model)
+    matrix = getattr(base, "_feature_transform_matrix", None)
+    if matrix is None:
+        return None
+    k = matrix.shape[-1]
+    eye = torch.eye(k, device=matrix.device, dtype=matrix.dtype).unsqueeze(0)
+    return torch.mean(
+        torch.norm(torch.bmm(matrix, matrix.transpose(2, 1)) - eye, dim=(1, 2))
+    )
+
+
+def _compute_loss(
+    model_key: str, criterion: Any, outputs: Any, targets: Any, model: Any = None
+) -> Any:
     if model_key == "actor_critic":
         return criterion(outputs[0], targets)
     if model_key == "vae_mnist":
         return _vae_loss(outputs, targets)
+    if model_key == "pointnet_modelnet40" and model is not None:
+        penalty = _pointnet_feature_transform_penalty(model)
+        loss = criterion(outputs, targets)
+        return loss if penalty is None else loss + 0.001 * penalty
     return criterion(outputs, targets)
 
 
@@ -1261,7 +1291,7 @@ def _eval_on_loader(
         for batch in loader:
             batch = tuple(item.to(device, non_blocking=True) for item in batch)
             outputs, targets, metric_targets = _forward(model_key, model, batch)
-            loss = _compute_loss(model_key, criterion, outputs, targets)
+            loss = _compute_loss(model_key, criterion, outputs, targets, model=model)
             batch_examples = _batch_size(targets)
             running_loss_t = running_loss_t + loss.detach() * batch_examples
             examples += batch_examples
@@ -1534,7 +1564,7 @@ def _run_training_batch(
     if clear_pai_buffers:
         clear_pai_processor_buffers(model)
     outputs, targets, metric_targets = _forward(model_key, model, batch)
-    loss = _compute_loss(model_key, criterion, outputs, targets)
+    loss = _compute_loss(model_key, criterion, outputs, targets, model=model)
     _backward_and_step(
         loss,
         optimizer,
