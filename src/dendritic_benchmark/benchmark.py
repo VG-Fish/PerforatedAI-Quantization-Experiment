@@ -9,10 +9,28 @@ from typing import Any
 import torch
 
 from .compat import choose_device
-from .models import build_model
+from .data import (
+    AG_NEWS_SEQ_LEN,
+    CORA_EGO_NODES,
+    ESOL_MAX_ATOMS,
+    FREESOLV_MAX_ATOMS,
+)
+from .models import (
+    ADULT_CATEGORICAL_CARDINALITIES,
+    ADULT_FEATURES,
+    FORECAST_SEQ_LEN,
+    MOLECULE_EDGE_FEATURES,
+    MOLECULE_NODE_FEATURES,
+    SOCIAL_GRAPH_NODE_FEATURES,
+    build_model,
+)
 from .specs import CONDITION_SPECS, MODEL_SPECS, condition_by_key
 
-_GRAPH_MODELS = {"gcn", "gin_imdbb", "mpnn", "attentivefp_freesolv"}
+# Take (node_features, adjacency); the molecular pair additionally take a dense
+# edge-feature tensor and so are handled separately.
+_GRAPH_MODELS = {"gcn", "gin_imdbb"}
+_MOLECULAR_MODELS = {"mpnn", "attentivefp_freesolv"}
+_TABULAR_MODELS = {"tabnet", "saint_adult"}
 _TEXT_MODELS = {"textcnn", "distilbert"}
 _LATENCY_CSV_FIELDS = [
     "condition_key",
@@ -50,39 +68,81 @@ def get_system_info() -> dict[str, Any]:
 
 
 def get_model_input_shapes(model_key: str) -> tuple:
+    """Per-sample input shapes used to synthesise latency-benchmark batches.
+
+    Derived from the loaders' own constants wherever one exists. Several entries
+    here were hand-written copies that had drifted from the featurisers — Cora
+    at 50 nodes against a 64-node ego graph, the molecular sets at 9 node
+    features against 20 — so latency was being measured on tensors no training
+    run ever sees.
+    """
     shapes_map: dict[str, tuple] = {
         "lenet5": (1, 28, 28),
         "m5": (1, 16000),
-        "lstm_forecaster": (24, 1),
-        "textcnn": (64,),
-        "gcn": ((50, 1433), (50, 50)),
-        "tabnet": (14,),
-        "mpnn": ((24, 9), (24, 24)),
+        "lstm_forecaster": (FORECAST_SEQ_LEN, 1),
+        "textcnn": (AG_NEWS_SEQ_LEN,),
+        "gcn": ((CORA_EGO_NODES, 1433), (CORA_EGO_NODES, CORA_EGO_NODES)),
+        "tabnet": (ADULT_FEATURES,),
+        "mpnn": (
+            (ESOL_MAX_ATOMS, MOLECULE_NODE_FEATURES),
+            (ESOL_MAX_ATOMS, ESOL_MAX_ATOMS),
+            (ESOL_MAX_ATOMS, ESOL_MAX_ATOMS, MOLECULE_EDGE_FEATURES),
+        ),
         "actor_critic": (4,),
         "lstm_autoencoder": (128, 1),
         "distilbert": (128,),
         "dqn_lunarlander": (8,),
         "ppo_bipedalwalker": (24,),
-        "attentivefp_freesolv": ((24, 9), (24, 24)),
-        "gin_imdbb": ((96, 8), (96, 96)),
-        "tcn_forecaster": (96, 7),
-        "gru_forecaster": (96, 21),
+        "attentivefp_freesolv": (
+            (FREESOLV_MAX_ATOMS, MOLECULE_NODE_FEATURES),
+            (FREESOLV_MAX_ATOMS, FREESOLV_MAX_ATOMS),
+            (FREESOLV_MAX_ATOMS, FREESOLV_MAX_ATOMS, MOLECULE_EDGE_FEATURES),
+        ),
+        "gin_imdbb": ((96, SOCIAL_GRAPH_NODE_FEATURES), (96, 96)),
+        "tcn_forecaster": (FORECAST_SEQ_LEN, 7),
+        "gru_forecaster": (FORECAST_SEQ_LEN, 21),
         "pointnet_modelnet40": (1024, 3),
         "vae_mnist": (1, 28, 28),
         "snn_nmnist": (2, 34, 34),
         "unet_isic": (3, 128, 128),
         "resnet18_cifar10": (3, 32, 32),
         "mobilenetv2_cifar10": (3, 32, 32),
-        "saint_adult": (14,),
+        "saint_adult": (ADULT_FEATURES,),
         "capsnet_mnist": (1, 28, 28),
     }
     return shapes_map[model_key]
 
 
 def generate_sample_inputs(model_key: str, batch_size: int) -> tuple[Any, Any]:
-    """Return a 2-tuple (primary_input, adjacency). adjacency is None for non-graph models."""
+    """Return a 2-tuple (primary_input, adjacency).
+
+    ``adjacency`` is None for non-graph models. When the model takes more than
+    two positional tensors, ``primary_input`` is a tuple and ``adjacency`` stays
+    None; ``benchmark_model_latency`` splats it.
+    """
     device = choose_device()
     shape: Any = get_model_input_shapes(model_key)
+
+    if model_key in _MOLECULAR_MODELS:
+        node_shape, adjacency_shape, edge_shape = shape
+        return (
+            (
+                torch.randn([batch_size, *node_shape], device=device),
+                torch.randn([batch_size, *adjacency_shape], device=device),
+                torch.randn([batch_size, *edge_shape], device=device),
+            ),
+            None,
+        )
+
+    if model_key in _TABULAR_MODELS:
+        # Categorical columns index embedding tables, so they need in-range
+        # integer codes; Gaussian noise would index with a negative float.
+        row = torch.randn([batch_size, *shape], device=device)
+        for column, cardinality in ADULT_CATEGORICAL_CARDINALITIES.items():
+            row[:, column] = torch.randint(
+                0, cardinality, (batch_size,), device=device
+            ).float()
+        return (row, None)
 
     if model_key in _GRAPH_MODELS:
         node_features_shape, adjacency_shape = shape

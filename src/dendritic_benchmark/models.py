@@ -9,6 +9,21 @@ import torch.nn.functional as F
 # Defined here because it is the models' input width; ``data.py`` imports it so the
 # featuriser and the molecular models cannot drift apart.
 MOLECULE_NODE_FEATURES: int = 20
+# Width of the per-bond feature vector produced alongside it: a one-hot over
+# single/double/triple/aromatic, a ring-membership flag, and a self-loop flag.
+# Messages were previously a function of the two endpoint states alone, which
+# throws away the bond order — the thing a message-passing network for molecules
+# is built to condition on (Gilmer et al. run their messages through an edge
+# network for exactly this reason). The self-loop channel exists because the
+# dense adjacency carries self-loops that are not bonds; without it they would
+# arrive as an all-zero edge vector, indistinguishable from padding.
+MOLECULE_EDGE_FEATURES: int = 6
+EDGE_SINGLE: int = 0
+EDGE_DOUBLE: int = 1
+EDGE_TRIPLE: int = 2
+EDGE_AROMATIC: int = 3
+EDGE_IN_RING: int = 4
+EDGE_SELF_LOOP: int = 5
 # Width of the per-node feature vector for the IMDB-BINARY social graphs, whose
 # nodes carry no labels: a one-hot degree bucket plus a real-node mask.
 SOCIAL_GRAPH_NODE_FEATURES: int = 10
@@ -23,6 +38,25 @@ SOCIAL_GRAPH_NODE_FEATURES: int = 10
 FORECAST_SEQ_LEN: int = 96
 ETT_FORECAST_HORIZON: int = 24
 WEATHER_FORECAST_HORIZON: int = 96
+
+# Adult (UCI Census Income) column schema, shared by the loader and the two
+# tabular models. The dataset is fixed and closed, so these are constants rather
+# than something inferred per run; ``_build_adult`` checks the codes it assigns
+# against them and fails loudly rather than silently overflowing an embedding.
+# Counts include Adult's "?" missing-value marker, which appears in workclass,
+# occupation and native-country.
+ADULT_FEATURES: int = 14
+ADULT_NUMERIC_COLUMNS: tuple[int, ...] = (0, 2, 4, 10, 11, 12)
+ADULT_CATEGORICAL_CARDINALITIES: dict[int, int] = {
+    1: 9,    # workclass
+    3: 16,   # education
+    5: 7,    # marital-status
+    6: 15,   # occupation
+    7: 6,    # relationship
+    8: 5,    # race
+    9: 2,    # sex
+    13: 42,  # native-country
+}
 
 
 class LeNet5(nn.Module):
@@ -260,6 +294,69 @@ def _sparsemax(logits: Any, dim: int = -1) -> Any:
     return torch.clamp(logits - tau, min=0.0)
 
 
+class TabularColumnEmbedding(nn.Module):
+    """Turn a mixed numeric/categorical row into one token per column.
+
+    Categorical columns arrive as integer codes. Handing a code to a linear
+    layer — raw or z-scored, as this benchmark previously did — asserts two
+    things that are not true of a nominal variable: that "Never-married" and
+    "Divorced" sit a meaningful distance apart on a line, and that every
+    category of a column lies on a single ray through the origin, so the model
+    can only scale them relative to one another. Both TabNet (Arik & Pfister)
+    and SAINT (Somepalli et al.) embed categorical columns instead, and it is
+    the main structural difference between this suite's Adult setup and theirs.
+
+    Numeric columns go through one shared projection plus the caller's own
+    per-column term, which is how SAINT builds its tokens.
+    ``embedding_dim=1`` reproduces pytorch-tabnet's ``cat_emb_dim`` default: a
+    learned scalar per category, leaving the flat feature width unchanged so
+    TabNet's attentive mask still selects whole columns one-for-one.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        categorical_cardinalities: dict[int, int] | None,
+        embedding_dim: int,
+    ):
+        super().__init__()
+        cardinalities: dict[int, int] = dict(categorical_cardinalities or {})
+        unknown = [column for column in cardinalities if not 0 <= column < in_features]
+        if unknown:
+            raise ValueError(
+                f"categorical column indices {unknown} fall outside "
+                f"[0, {in_features})"
+            )
+        self.in_features = in_features
+        self.embedding_dim = embedding_dim
+        self.categorical_columns: list[int] = sorted(cardinalities)
+        self.embeddings = nn.ModuleList(
+            nn.Embedding(cardinalities[column], embedding_dim)
+            for column in self.categorical_columns
+        )
+        self.numeric_proj = nn.Linear(1, embedding_dim)
+
+    @property
+    def output_features(self) -> int:
+        """Width of the flattened token block."""
+        return self.in_features * self.embedding_dim
+
+    def forward(self, x: Any) -> Any:
+        """``[B, in_features]`` -> ``[B, in_features, embedding_dim]``, order kept."""
+        x = x.float()
+        slots: dict[int, int] = {
+            column: slot for slot, column in enumerate(self.categorical_columns)
+        }
+        columns: list[Any] = []
+        for column in range(self.in_features):
+            slot = slots.get(column)
+            if slot is None:
+                columns.append(self.numeric_proj(x[:, column : column + 1]))
+            else:
+                columns.append(self.embeddings[slot](x[:, column].long()))
+        return torch.stack(columns, dim=1)
+
+
 class GLUBlock(nn.Module):
     def __init__(self, in_features: int, out_features: int):
         super().__init__()
@@ -307,30 +404,38 @@ class TabNet(nn.Module):
 
     def __init__(
         self,
-        in_features: int = 14,
+        in_features: int = ADULT_FEATURES,
         n_d: int = 16,
         n_a: int = 16,
         n_steps: int = 4,
         gamma: float = 1.5,
         num_classes: int = 2,
+        categorical_cardinalities: dict[int, int] | None = None,
+        categorical_embedding_dim: int = 1,
     ):
         super().__init__()
         self.n_d = n_d
         self.n_a = n_a
         self.n_steps = n_steps
         self.gamma = gamma
-        self.initial_bn = nn.BatchNorm1d(in_features)
-        self.shared = FeatureTransformer(in_features, n_d + n_a)
+        self.embedding = TabularColumnEmbedding(
+            in_features, categorical_cardinalities, categorical_embedding_dim
+        )
+        # At the default embedding dim of 1 this equals in_features, so the
+        # sparsemax feature mask keeps selecting whole columns.
+        width: int = self.embedding.output_features
+        self.initial_bn = nn.BatchNorm1d(width)
+        self.shared = FeatureTransformer(width, n_d + n_a)
         self.step_transformers = nn.ModuleList(
-            FeatureTransformer(in_features, n_d + n_a) for _ in range(n_steps)
+            FeatureTransformer(width, n_d + n_a) for _ in range(n_steps)
         )
         self.attentive = nn.ModuleList(
-            AttentiveTransformer(n_a, in_features) for _ in range(n_steps)
+            AttentiveTransformer(n_a, width) for _ in range(n_steps)
         )
         self.head = nn.Linear(n_d, num_classes)
 
     def forward(self, x: Any) -> Any:
-        x = self.initial_bn(x.float())
+        x = self.initial_bn(self.embedding(x).flatten(1))
         prior = torch.ones_like(x)
         transformed = self.shared(x)
         attention = transformed[:, self.n_d :]
@@ -346,20 +451,25 @@ class TabNet(nn.Module):
 
 
 class MPNNLayer(nn.Module):
-    def __init__(self, hidden: int):
+    def __init__(self, hidden: int, edge_features: int = MOLECULE_EDGE_FEATURES):
         super().__init__()
+        # The message is conditioned on the bond as well as the two endpoint
+        # states — the "edge network" of Gilmer et al., in the cheap variant that
+        # concatenates the edge vector rather than generating a weight matrix
+        # from it. Without it a double bond and a single bond between the same
+        # two atom types produce identical messages.
         self.edge_mlp = nn.Sequential(
-            nn.Linear(hidden * 2, hidden),
+            nn.Linear(hidden * 2 + edge_features, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
         )
         self.update = DendriticGRUCell(hidden, hidden)
 
-    def forward(self, h: Any, adjacency: Any) -> Any:
+    def forward(self, h: Any, adjacency: Any, edge_features: Any) -> Any:
         batch, nodes, hidden = h.shape
         source = h.unsqueeze(2).expand(batch, nodes, nodes, hidden)
         target = h.unsqueeze(1).expand(batch, nodes, nodes, hidden)
-        messages = self.edge_mlp(torch.cat([target, source], dim=-1))
+        messages = self.edge_mlp(torch.cat([target, source, edge_features], dim=-1))
         messages = messages * adjacency.unsqueeze(-1)
         degree = adjacency.sum(dim=-1, keepdim=True).clamp_min(1.0)
         aggregated = messages.sum(dim=2) / degree
@@ -391,10 +501,10 @@ class MPNN(nn.Module):
             nn.Linear(hidden, 1),
         )
 
-    def forward(self, node_features: Any, adjacency: Any) -> Any:
+    def forward(self, node_features: Any, adjacency: Any, edge_features: Any) -> Any:
         h = F.relu(self.node_encoder(node_features))
         for layer in self.layers:
-            h = layer(h, adjacency)
+            h = layer(h, adjacency, edge_features)
         # The featuriser writes a self-loop into every adjacency row, padding
         # slots included, so `adjacency.sum(-1) > 0` was true everywhere and
         # this mask was a no-op — padded atoms reached the gated readout with
@@ -524,21 +634,26 @@ class PPOPolicy(nn.Module):
 
 
 class AttentiveFPLayer(nn.Module):
-    def __init__(self, hidden: int):
+    def __init__(self, hidden: int, edge_features: int = MOLECULE_EDGE_FEATURES):
         super().__init__()
+        # Xiong et al. compute the attention over the neighbour state
+        # *concatenated with the bond*, so an aromatic and a single bond to the
+        # same neighbour can be weighted differently.
         self.attention = nn.Sequential(
-            nn.Linear(hidden * 2, hidden),
+            nn.Linear(hidden * 2 + edge_features, hidden),
             nn.LeakyReLU(0.2),
             nn.Linear(hidden, 1),
         )
         self.message = nn.Linear(hidden, hidden)
         self.update = DendriticGRUCell(hidden, hidden)
 
-    def forward(self, h: Any, adjacency: Any) -> Any:
+    def forward(self, h: Any, adjacency: Any, edge_features: Any) -> Any:
         batch, nodes, hidden = h.shape
         src = h.unsqueeze(2).expand(batch, nodes, nodes, hidden)
         dst = h.unsqueeze(1).expand(batch, nodes, nodes, hidden)
-        scores = self.attention(torch.cat([dst, src], dim=-1)).squeeze(-1)
+        scores = self.attention(
+            torch.cat([dst, src, edge_features], dim=-1)
+        ).squeeze(-1)
         scores = scores.masked_fill(adjacency <= 0, -1.0e9)
         weights = torch.softmax(scores, dim=-1)
         messages = torch.bmm(weights, self.message(h))
@@ -577,10 +692,10 @@ class AttentiveFP(nn.Module):
             nn.Linear(hidden, 1),
         )
 
-    def forward(self, node_features: Any, adjacency: Any) -> Any:
+    def forward(self, node_features: Any, adjacency: Any, edge_features: Any) -> Any:
         h = F.relu(self.node_proj(node_features))
         for layer in self.layers:
-            h = layer(h, adjacency)
+            h = layer(h, adjacency, edge_features)
         # Padding slots carry a self-loop in the adjacency, so `adjacency.sum > 0`
         # marks them real. Use the feature block instead: the featuriser leaves
         # padded rows all-zero, and only real atoms get a one-hot element.
@@ -982,14 +1097,22 @@ class SAINT(nn.Module):
 
     def __init__(
         self,
-        in_features: int = 14,
+        in_features: int = ADULT_FEATURES,
         hidden: int = 64,
         depth: int = 2,
         heads: int = 4,
         num_classes: int = 2,
+        categorical_cardinalities: dict[int, int] | None = None,
     ):
         super().__init__()
-        self.feature_embed = nn.Linear(1, hidden)
+        # SAINT embeds every column to the token width, categoricals through a
+        # lookup table rather than a scalar projection. The previous
+        # nn.Linear(1, hidden) over an integer code mapped category k to k*w —
+        # all categories of a column collinear, and spaced by an arbitrary
+        # encoding order.
+        self.feature_embed = TabularColumnEmbedding(
+            in_features, categorical_cardinalities, hidden
+        )
         self.column_embedding = nn.Parameter(torch.randn(1, in_features, hidden) * 0.02)
         self.column_blocks = nn.ModuleList(
             TransformerTabularBlock(hidden, heads) for _ in range(depth)
@@ -1005,7 +1128,7 @@ class SAINT(nn.Module):
         )
 
     def forward(self, x: Any) -> Any:
-        tokens = self.feature_embed(x.float().unsqueeze(-1)) + self.column_embedding
+        tokens = self.feature_embed(x) + self.column_embedding
         for column_block, row_block in zip(self.column_blocks, self.row_blocks):
             tokens = column_block(tokens)
             row_tokens = row_block(tokens.transpose(0, 1)).transpose(0, 1)
@@ -1126,7 +1249,11 @@ MODEL_FACTORIES: dict[str, Callable[..., Any]] = {
     "lstm_forecaster": lambda **_: LSTMForecaster(),
     "textcnn": lambda num_classes=4, **_: _construct(TextCNN, num_classes=num_classes),
     "gcn": lambda num_classes=7, **_: _construct(GCN, num_classes=num_classes),
-    "tabnet": lambda num_classes=2, **_: _construct(TabNet, num_classes=num_classes),
+    "tabnet": lambda num_classes=2, categorical_cardinalities=None, **_: _construct(
+        TabNet,
+        num_classes=num_classes,
+        categorical_cardinalities=categorical_cardinalities,
+    ),
     "mpnn": lambda **_: MPNN(),
     "actor_critic": lambda **_: ActorCritic(),
     "lstm_autoencoder": lambda **_: LSTMAutoencoder(),
@@ -1143,7 +1270,11 @@ MODEL_FACTORIES: dict[str, Callable[..., Any]] = {
     "unet_isic": lambda **_: TinyUNet(),
     "resnet18_cifar10": _build_resnet18_cifar10,
     "mobilenetv2_cifar10": _build_mobilenetv2_cifar10,
-    "saint_adult": lambda num_classes=2, **_: _construct(SAINT, num_classes=num_classes),
+    "saint_adult": lambda num_classes=2, categorical_cardinalities=None, **_: _construct(
+        SAINT,
+        num_classes=num_classes,
+        categorical_cardinalities=categorical_cardinalities,
+    ),
     "capsnet_mnist": lambda num_classes=10, **_: _construct(CapsNet, num_classes=num_classes),
 }
 

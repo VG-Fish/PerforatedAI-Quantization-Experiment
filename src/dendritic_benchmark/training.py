@@ -627,6 +627,100 @@ def _anomaly_metrics(
     return metrics
 
 
+_RL_ENVIRONMENTS: dict[str, tuple[str, bool]] = {
+    # model key -> (gymnasium id, continuous action space)
+    "actor_critic": ("CartPole-v1", False),
+    "dqn_lunarlander": ("LunarLander-v3", False),
+    "ppo_bipedalwalker": ("BipedalWalker-v3", True),
+}
+# Reference returns for the environments above, for reading the number against:
+# CartPole-v1 caps at 500, LunarLander counts 200 as solved, BipedalWalker 300.
+_RL_EVAL_EPISODES: int = 20
+_RL_EVAL_STEP_CAP: int = 2000
+
+
+def _evaluate_episodic_return(
+    model_key: str,
+    model: Any,
+    device: Any,
+    *,
+    episodes: int = _RL_EVAL_EPISODES,
+    seed: int = 12345,
+) -> dict[str, float]:
+    """Roll the trained policy out in its gym environment and summarise returns.
+
+    These three models are behaviour cloning. The metric they train and select
+    on is agreement with a scripted policy over cached observations, which has
+    no published counterpart at all — the suite's own docs warn that the scores
+    must not be read against published CartPole/LunarLander/BipedalWalker
+    results. Actually stepping the environment produces an episodic return that
+    can be, so it is recorded here alongside the training metric.
+
+    Deliberately *not* the selection metric: rollout return is stochastic and
+    environment-dependent, and promoting it would put a different objective in
+    front of the model than the loss it minimises — and a different one in front
+    of the dendritic arm than the baseline. It is an extra column, evaluated
+    once, after the best weights are restored.
+
+    Episode seeds are fixed, so the same policy scores the same return in both
+    arms. Returns an empty dict when gymnasium or the Box2D backend the two
+    harder environments need is missing, so an optional dependency degrades to
+    "no return recorded" rather than failing a finished training run.
+    """
+    entry = _RL_ENVIRONMENTS.get(model_key)
+    if entry is None:
+        return {}
+    env_id, continuous = entry
+    try:
+        gymnasium = importlib.import_module("gymnasium")
+        env = gymnasium.make(env_id)
+    except Exception as exc:  # missing gymnasium, missing Box2D, bad env id
+        print(f"[rl-eval] {model_key}: {env_id} unavailable ({exc}); skipping return")
+        return {}
+
+    was_training = model.training
+    model.eval()
+    returns: list[float] = []
+    try:
+        with torch.no_grad():
+            for episode in range(episodes):
+                observation, _ = env.reset(seed=seed + episode)
+                total = 0.0
+                for _ in range(_RL_EVAL_STEP_CAP):
+                    batch = torch.as_tensor(
+                        observation, dtype=torch.float32, device=device
+                    ).unsqueeze(0)
+                    output = model(batch)
+                    if isinstance(output, tuple):
+                        # ActorCritic returns (logits, value).
+                        output = output[0]
+                    if continuous:
+                        action = output.squeeze(0).float().cpu().numpy()
+                    else:
+                        action = int(output.argmax(dim=-1).item())
+                    observation, reward, terminated, truncated, _ = env.step(action)
+                    total += float(reward)
+                    if terminated or truncated:
+                        break
+                returns.append(total)
+    except Exception as exc:
+        print(f"[rl-eval] {model_key}: rollout failed ({exc}); skipping return")
+        return {}
+    finally:
+        env.close()
+        model.train(was_training)
+
+    mean_return = sum(returns) / len(returns)
+    variance = sum((value - mean_return) ** 2 for value in returns) / len(returns)
+    return {
+        "episodic_return_mean": mean_return,
+        "episodic_return_std": math.sqrt(variance),
+        "episodic_return_min": min(returns),
+        "episodic_return_max": max(returns),
+        "episodic_return_episodes": float(len(returns)),
+    }
+
+
 def _rescale_to_dataset_units(value: Any, offset: float, scale: float) -> Any:
     """Undo a dataset's target standardisation so metrics keep their real units."""
     if scale == 1.0 and offset == 0.0:
@@ -713,8 +807,8 @@ def _forward(model_key: str, model: Any, batch: tuple[Any, ...]) -> tuple[Any, A
         x, adjacency, targets = batch
         return model(x, adjacency), targets, None
     if model_key in {"mpnn", "attentivefp_freesolv"}:
-        node_features, adjacency, targets = batch
-        return model(node_features, adjacency), targets, None
+        node_features, adjacency, edge_features, targets = batch
+        return model(node_features, adjacency, edge_features), targets, None
     if model_key == "lstm_autoencoder":
         x, target, metric_targets = batch
         return model(x), target, metric_targets
@@ -3142,6 +3236,9 @@ def train_and_evaluate(
     final_metric = float(test_metrics.get(primary_metric_key, 0.0))
     if best_epoch == 0:
         best_metric = final_metric
+    # After final_metric is read, so the rollout can never become the primary
+    # metric by accident — it is recorded, not selected on.
+    test_metrics.update(_evaluate_episodic_return(model_key, model, eval_device))
 
     _plain_model = _unwrap_compiled(model)
     history = _attach_test_metrics_to_history(

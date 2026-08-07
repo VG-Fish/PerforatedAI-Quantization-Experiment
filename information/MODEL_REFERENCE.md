@@ -75,6 +75,11 @@ For each model below, this document captures:
     readout. Getting this wrong is silent — the shapes stay valid and the loss
     still falls — so it is worth restating per dataset (`CORA_EGO_NODES`,
     `ESOL_MAX_ATOMS`, `FREESOLV_MAX_ATOMS`, `IMDB_MAX_NODES`).
+  - Molecular graphs additionally carry a dense `[max_nodes, max_nodes,
+    MOLECULE_EDGE_FEATURES]` bond tensor (bond-order one-hot, ring flag,
+    self-loop flag). Padding slots and the adjacency's self-loops are distinct
+    there: an all-zero edge vector means padding, and the self-loop channel
+    marks "this atom, no bond".
   - Cora is sampled as one ego graph per labelled node, breadth-first to
     `CORA_EGO_HOPS = 2` so the subgraph matches the 2-layer GCN's receptive
     field, truncated to `CORA_EGO_NODES = 64` nearest-hop-first, and padded with
@@ -85,7 +90,9 @@ For each model below, this document captures:
     the adjacency carries a self-loop, every pair of centre copies was connected,
     and at Cora's median degree of 3 the 46 padding copies took 94% of the
     centre's normalised incoming weight against 6% for its true neighbours — the
-    GCN was effectively an MLP on the centre's own bag-of-words.
+    GCN was effectively an MLP on the centre's own bag-of-words. Which nodes
+    are labelled is now the Planetoid split (20 per class / 500 / 1000) rather
+    than a 70/15/15 draw — see the comparability note below.
 - Target standardisation:
   - The two molecular regression sets (ESOL, FreeSolv) z-score their targets
     using training-split statistics only. `TaskBundle.target_offset` /
@@ -94,20 +101,46 @@ For each model below, this document captures:
     kcal/mol respectively and remain comparable to MoleculeNet.
 - The three "RL" models are behaviour cloning, not reinforcement learning:
   - `actor_critic`, `dqn_lunarlander` and `ppo_bipedalwalker` train on a fixed
-    cache of observations labelled by a hand-written heuristic policy. No
-    environment is stepped at evaluation time and no return is ever accumulated,
-    so their scores must not be read against published CartPole / LunarLander /
-    BipedalWalker returns — there is no comparable published baseline for them.
-  - The metric was previously displayed as "Reward" for all three, which invited
-    exactly that comparison. It is now named for what it computes: **Action
-    Accuracy** (fraction of held-out states where the network selects the
-    heuristic's discrete action) for `actor_critic` and `dqn_lunarlander`, and
-    **Neg. Action MAE** (negated mean absolute error against the heuristic's
-    4-vector, negated so `maximize` still holds) for `ppo_bipedalwalker`.
-  - This also explains `ppo_bipedalwalker`'s previously alarming −0.0004: it is a
-    mean absolute error of 0.0004, i.e. near-exact imitation, not a near-zero
-    episodic return. Two of its four action dimensions are constant in the
-    heuristic, which is why the achievable error is so small.
+    cache of observations labelled by a heuristic policy. The training metric is
+    named for what it computes: **Action Accuracy** (fraction of held-out states
+    where the network picks the heuristic's discrete action) for `actor_critic`
+    and `dqn_lunarlander`, and **Neg. Action MAE** for `ppo_bipedalwalker`
+    (negated so `maximize` still holds). Neither is a return, and neither should
+    be read against published CartPole / LunarLander / BipedalWalker numbers.
+  - **An episodic return is now measured** once per run, after the best weights
+    are restored, by rolling the policy out in its gym environment for 20 seeded
+    episodes (`_evaluate_episodic_return` in `training.py`). It is recorded in
+    `test_metrics` as `episodic_return_mean` / `_std` / `_min` / `_max` and is
+    *never* the selection metric — rollout return is stochastic, and promoting it
+    would put a different objective in front of the dendritic arm than the loss
+    it actually minimises. This is the number that is comparable to published
+    results.
+  - Adding that measurement immediately exposed the label sources as broken. The
+    hand-written LunarLander heuristic returned **-519** (it crashed on nearly
+    every episode) and the BipedalWalker one **-120** (it held both knees at a
+    constant 0.45 and never took a step). The clones reproduced them faithfully —
+    98.8% action agreement and a 0.0004 action MAE respectively — so the headline
+    metrics looked excellent while the policies were worthless. That 0.0004 was
+    also flattered by two of the four action dimensions being constant.
+  - Both now clone Gymnasium's own reference heuristics
+    (`lunar_lander.heuristic`, `BipedalWalkerHeuristics`), and rollout collection
+    seeds every episode separately and injects exploration noise while still
+    recording the heuristic's correct action, so the cache covers recovery states
+    instead of one narrow on-policy chain. Measured effect:
+
+    | model | metric before → after | return before → after | heuristic ceiling | reference |
+    |---|---|---|---|---|
+    | `actor_critic` | 0.8300 → 0.9273 | 292.7 → **500.0** | 500.0 | 500 = max |
+    | `dqn_lunarlander` | 0.9882 → 0.9845 | −522.9 → **+245.3** | 230.5 | 200 = solved |
+    | `ppo_bipedalwalker` | −0.0004 → −0.0308 | −119.5 → **−79.6** | 89.2 | 300 = solved |
+
+  - `ppo_bipedalwalker` stays below its own label source and will not close that
+    gap by training longer: `BipedalWalkerHeuristics` is a state machine carrying
+    the swing leg and gait phase between steps, so one observation maps to
+    different actions depending on hidden state a feedforward policy cannot
+    observe. Matching it needs a recurrent policy or a real RL loop.
+  - `HEURISTIC_ROLLOUTS_FILENAME` is versioned, so changing a labelling policy
+    invalidates the cached rollouts instead of silently reusing old labels.
 - Perforation registration:
   - The benchmark registers tensor-returning `nn.Linear`, `nn.Conv1d`, and `nn.Conv2d` modules for PerforatedAI perforation.
   - Recurrent, graph-attention, capsule, and tabular-attention models expose their gates/projections as explicit Linear/Conv modules, rather than handing tuple-returning `nn.LSTM`, `nn.GRU`, or `nn.MultiheadAttention` modules directly to PerforatedAI.
@@ -120,6 +153,42 @@ For each model below, this document captures:
   - PerforatedAI insertion is active for the first 80% of that budget with fixed switch intervals, then frozen for the last 20%.
   - With `uv run dqb run --dynamic-dendritic-training`, training continues past that budget until PerforatedAI reports `training_complete=True`.
   - Dynamic epochs beyond `max_epochs` are saved under `continued_until_complete/`.
+- Comparability to published results:
+  - Several baselines were previously measured on a task that was not the one
+    the published number describes. Where that was true it has been corrected,
+    and the correction is recorded next to the code that implements it:
+    - **Forecasting** (`lstm_forecaster`, `tcn_forecaster`, `gru_forecaster`)
+      split sliding windows with `random_split` and z-scored using statistics
+      over the whole file. Adjacent windows share all but one of their
+      timesteps, so a test window's target was routinely inside some training
+      window's own lookback. Splits are now chronological with train-only
+      normalisation (`_chronological_forecast_bundle`), and the window geometry
+      matches the published settings: ETTh1 univariate and ETTm1 multivariate at
+      96→24 (Informer), Weather 21-variate at 96→96 (Autoformer). The ETTh1
+      window counts reproduce Informer's dataloader exactly (8521/2857/2857).
+      `lstm_forecaster` now predicts the whole horizon rather than one step.
+    - **`gcn`** trained on a 70/15/15 random split of Cora — 1895 labelled nodes
+      against the 140 that Kipf & Welling's 81.5% is measured with. It now uses
+      the Planetoid split sizes (20 per class / 500 / 1000).
+    - **`mobilenetv2_cifar10`** adapted only the stem stride for 32×32 input,
+      leaving 16× downsampling and a 2×2 final feature map. It now matches the
+      reference CIFAR stage table (8×, 4×4), worth roughly 2.5 points.
+    - **`tabnet`, `saint_adult`** received Adult's eight nominal columns as
+      z-scored ordinal codes, asserting an order and a distance between
+      categories. Both now embed them (`TabularColumnEmbedding`), as the
+      published models do.
+    - **`mpnn`, `attentivefp_freesolv`** conditioned messages on the two endpoint
+      atoms alone, discarding bond order entirely, and flagged ring membership
+      only on the two atoms closing a SMILES ring — 63% of ESOL's ring atoms
+      were left unlabelled. Ring perception is now exact (bridge detection) and a
+      dense edge-feature tensor reaches the message and attention functions.
+  - Numbers that remain **not** comparable, by construction:
+    - `gcn`'s setup is inductive ego-graph classification, not the transductive
+      full-graph propagation Kipf & Welling measure. The label budget now
+      matches; the mechanism still does not.
+    - The three forecasters run on three different datasets, so their MAEs are
+      not comparable *to each other* — only to that dataset's published numbers.
+    - `lstm_autoencoder` (MIT-BIH AUC) has no single standard protocol to cite.
 - Reproducibility note:
   - Model definitions are part of the experimental condition. After architecture changes, rerun affected keys with `--ignore-saved-models` or use a fresh `--results-directory` to avoid comparing old checkpoints against new implementations.
 
@@ -266,7 +335,7 @@ flowchart TD
 - Model kwargs: `num_classes=7`
 - Training recipe:
   - `batch_size=32`
-  - `max_epochs=100`
+  - `max_epochs=200`
   - `learning_rate=1.0e-2`
   - `optimizer_name=adam`
   - `momentum=0.9`
@@ -627,8 +696,8 @@ flowchart TD
 - Factory key: `gru_forecaster`
 - Model kwargs: none
 - Training recipe:
-  - `batch_size=24`
-  - `max_epochs=50`
+  - `batch_size=128`
+  - `max_epochs=80`
   - `learning_rate=1.0e-3`
   - `optimizer_name=adam`
   - `momentum=0.9`

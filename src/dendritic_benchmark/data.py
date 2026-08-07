@@ -1,4 +1,5 @@
 import csv
+import importlib
 import math
 import os
 import tarfile
@@ -12,8 +13,18 @@ from typing import Any, Iterable, Callable
 import torch
 
 from .models import (
+    ADULT_CATEGORICAL_CARDINALITIES,
+    ADULT_FEATURES,
+    ADULT_NUMERIC_COLUMNS,
+    EDGE_AROMATIC,
+    EDGE_DOUBLE,
+    EDGE_IN_RING,
+    EDGE_SELF_LOOP,
+    EDGE_SINGLE,
+    EDGE_TRIPLE,
     ETT_FORECAST_HORIZON,
     FORECAST_SEQ_LEN,
+    MOLECULE_EDGE_FEATURES,
     MOLECULE_NODE_FEATURES,
     SOCIAL_GRAPH_NODE_FEATURES,
     WEATHER_FORECAST_HORIZON,
@@ -22,7 +33,11 @@ from .models import (
 DATA_ROOT_ENV: str = "DQB_DATA_ROOT"
 DEFAULT_DATA_ROOT: str = "data"
 EXTRACTED_MARKER: str = ".extracted"
-HEURISTIC_ROLLOUTS_FILENAME: str = "heuristic_rollouts.pt"
+# Versioned: a cached rollout file records whichever heuristic produced it, so
+# reusing one after changing the labelling policy would train on stale labels.
+HEURISTIC_ROLLOUTS_FILENAME: str = "heuristic_rollouts_v2.pt"
+# Safety net only; each environment's own TimeLimit truncates first.
+_RL_ROLLOUT_STEP_CAP: int = 2000
 ADULT_DATA_FILENAME: str = "adult.data"
 ETTH1_URL: str = (
     "https://raw.githubusercontent.com/zhouhaoyi/ETDataset/main/ETT-small/ETTh1.csv"
@@ -191,8 +206,15 @@ def _extract_zip(archive: Path, destination: Path) -> None:
 
 
 def _require_dependency(import_name: str, package_name: str | None = None) -> Any:
+    """Import *import_name*, or raise with an install hint naming *package_name*.
+
+    ``importlib.import_module`` rather than ``__import__``: the latter hands
+    back the *top-level* package for a dotted name, so asking for
+    "gymnasium.envs.box2d.lunar_lander" would return bare ``gymnasium`` and the
+    attribute lookup would fail somewhere far from here.
+    """
     try:
-        return __import__(import_name)
+        return importlib.import_module(import_name)
     except ImportError as exc:
         package: str = package_name or import_name
         raise RuntimeError(
@@ -1016,7 +1038,8 @@ def _encode_adult_row(
         else:
             mapping: dict[str, int] = encoders[col]
             if value not in mapping:
-                mapping[value] = len(mapping) + 1
+                # 0-based: these codes index the models' embedding tables.
+                mapping[value] = len(mapping)
             encoded.append(float(mapping[value]))
     return encoded
 
@@ -1034,31 +1057,55 @@ def _encode_adult_rows(
     return values, labels
 
 def _build_adult(batch_size: int) -> TaskBundle:
+    """Adult census rows: standardised numerics, raw codes for nominal columns.
+
+    Every column used to be z-scored together, categorical codes included, which
+    presented eight nominal variables to the models as though they were ordered
+    measurements. TabNet and SAINT both embed categoricals instead, so the codes
+    now pass through untouched and ``TabularColumnEmbedding`` looks them up.
+    """
     root: Path = _data_root() / "adult"
     for filename, url in ADULT_URLS.items():
         _download(url, root / filename)
     train_rows: list[list[str]] = _parse_adult_file(root / ADULT_DATA_FILENAME)
     test_rows: list[list[str]] = _parse_adult_file(root / "adult.test")
-    feature_count = 14
+    feature_count = ADULT_FEATURES
     encoders: list[dict[str, int]] = [{} for _ in range(feature_count)]
-    numeric_columns: set[int] = {0, 2, 4, 10, 11, 12}
+    numeric_columns: set[int] = set(ADULT_NUMERIC_COLUMNS)
 
     train_x_raw, train_y_raw = _encode_adult_rows(train_rows, encoders, numeric_columns, feature_count)
     test_x_raw, test_y_raw = _encode_adult_rows(test_rows, encoders, numeric_columns, feature_count)
     train_x = torch.tensor(train_x_raw, dtype=torch.float32)
     test_x = torch.tensor(test_x_raw, dtype=torch.float32)
-    mean = train_x.mean(dim=0, keepdim=True)
-    std = train_x.std(dim=0, keepdim=True).clamp_min(1e-6)
+
+    # The models size their embedding tables from the constant schema, so an
+    # unexpected category would index past the end of a table. Adult is closed
+    # and this holds today; catch it here rather than in a CUDA/MPS assert.
+    for column, cardinality in ADULT_CATEGORICAL_CARDINALITIES.items():
+        observed: int = int(
+            max(train_x[:, column].max().item(), test_x[:, column].max().item())
+        )
+        if observed >= cardinality:
+            raise ValueError(
+                f"Adult column {column} produced code {observed}, beyond the "
+                f"declared cardinality {cardinality}; update "
+                "ADULT_CATEGORICAL_CARDINALITIES in models.py."
+            )
+
+    # Standardise the numeric columns only, on training rows only. Categorical
+    # codes stay as integers for the embedding lookup.
+    numeric_index = torch.tensor(sorted(numeric_columns), dtype=torch.long)
+    mean = train_x[:, numeric_index].mean(dim=0, keepdim=True)
+    std = train_x[:, numeric_index].std(dim=0, keepdim=True).clamp_min(1e-6)
+    for matrix in (train_x, test_x):
+        matrix[:, numeric_index] = (matrix[:, numeric_index] - mean) / std
+
     train_ds, val_ds, _ = _split_dataset(
-        _TensorRowsDataset(
-            (train_x - mean) / std, torch.tensor(train_y_raw, dtype=torch.long)
-        ),
+        _TensorRowsDataset(train_x, torch.tensor(train_y_raw, dtype=torch.long)),
         train_ratio=0.9,
         val_ratio=0.1,
     )
-    test_ds = _TensorRowsDataset(
-        (test_x - mean) / std, torch.tensor(test_y_raw, dtype=torch.long)
-    )
+    test_ds = _TensorRowsDataset(test_x, torch.tensor(test_y_raw, dtype=torch.long))
     return _bundle_from_splits(
         train_ds,
         val_ds,
@@ -1262,10 +1309,89 @@ class GraphDatasets:
         return atoms, bonds
 
     @staticmethod
+    def _ring_bond_flags(atom_count: int, bonds: list[_Bond]) -> list[bool]:
+        """Mark every bond that lies on a cycle, by finding the graph's bridges.
+
+        ``_Bond.ring_closure`` marks only the one bond that *closes* a SMILES
+        ring, so the previous featuriser set ``in_ring`` on two atoms of a
+        benzene and left the other four at zero — aromaticity and ring
+        membership are among the strongest signals for solubility, and the
+        models were being shown a corrupted version of both.
+
+        A bond lies on a cycle exactly when it is not a bridge, so one
+        bridge-finding pass labels every ring bond correctly, fused and
+        spiro systems included. Iterative rather than recursive: the DFS depth
+        is the molecule's atom count, and edge ids (not endpoint pairs) mark the
+        parent so parallel bonds are handled.
+        """
+        neighbours: list[list[tuple[int, int]]] = [[] for _ in range(atom_count)]
+        for edge_id, bond in enumerate(bonds):
+            if bond.source == bond.target:
+                continue
+            if not (0 <= bond.source < atom_count and 0 <= bond.target < atom_count):
+                continue
+            neighbours[bond.source].append((bond.target, edge_id))
+            neighbours[bond.target].append((bond.source, edge_id))
+
+        discovery: list[int] = [-1] * atom_count
+        low: list[int] = [0] * atom_count
+        on_cycle: list[bool] = [False] * len(bonds)
+        timer: int = 0
+        for root in range(atom_count):
+            if discovery[root] != -1:
+                continue
+            discovery[root] = low[root] = timer
+            timer += 1
+            # Each frame is [node, edge id we arrived by, next neighbour index].
+            stack: list[list[int]] = [[root, -1, 0]]
+            while stack:
+                node, parent_edge, cursor = stack[-1]
+                if cursor < len(neighbours[node]):
+                    stack[-1][2] += 1
+                    neighbour, edge_id = neighbours[node][cursor]
+                    if edge_id == parent_edge:
+                        continue
+                    if discovery[neighbour] == -1:
+                        discovery[neighbour] = low[neighbour] = timer
+                        timer += 1
+                        stack.append([neighbour, edge_id, 0])
+                    else:
+                        low[node] = min(low[node], discovery[neighbour])
+                    continue
+                stack.pop()
+                if not stack:
+                    continue
+                parent = stack[-1][0]
+                low[parent] = min(low[parent], low[node])
+                # low[node] > discovery[parent] means nothing below this edge can
+                # reach back above it: a bridge. Anything else closes a cycle.
+                if low[node] <= discovery[parent]:
+                    on_cycle[parent_edge] = True
+        return on_cycle
+
+    @staticmethod
+    def _bond_type_channel(bond: _Bond, atoms: list["_ParsedAtom"]) -> int:
+        """Pick the one-hot bond-order channel for *bond*.
+
+        Aromaticity is read off the endpoints rather than the bond order:
+        ``c1ccccc1`` writes no explicit bond symbol, so its ring bonds parse at
+        order 1.0 and only the lowercase atoms record the aromaticity.
+        """
+        if atoms[bond.source].aromatic and atoms[bond.target].aromatic:
+            return EDGE_AROMATIC
+        if bond.order >= 3.0:
+            return EDGE_TRIPLE
+        if bond.order >= 2.0:
+            return EDGE_DOUBLE
+        if bond.order == 1.5:
+            return EDGE_AROMATIC
+        return EDGE_SINGLE
+
+    @staticmethod
     def _build_graph_tensors(
         atoms: list["_ParsedAtom"], bonds: list[_Bond], max_nodes: int
-    ) -> tuple[Any, Any]:
-        """Featurise a parsed molecule into (node_features, dense adjacency).
+    ) -> tuple[Any, Any, Any]:
+        """Featurise a parsed molecule into (node features, adjacency, edge features).
 
         Padded rows are left all-zero, which is what the molecular models use to
         tell real atoms from padding (see ``MPNN.forward``/``AttentiveFP.forward``);
@@ -1274,23 +1400,37 @@ class GraphDatasets:
         width: int = MOLECULE_NODE_FEATURES
         x = torch.zeros((max_nodes, width), dtype=torch.float32)
         adjacency = torch.eye(max_nodes, dtype=torch.float32)
+        edges = torch.zeros(
+            (max_nodes, max_nodes, MOLECULE_EDGE_FEATURES), dtype=torch.float32
+        )
+        # Flag the self-loops the adjacency carries so the message function can
+        # tell "this atom, no bond" from "padding".
+        diagonal = torch.arange(max_nodes)
+        edges[diagonal, diagonal, EDGE_SELF_LOOP] = 1.0
         kept: int = min(len(atoms), max_nodes)
+        on_cycle: list[bool] = GraphDatasets._ring_bond_flags(len(atoms), bonds)
         degree = [0.0] * kept
         double_bond = [0.0] * kept
         triple_bond = [0.0] * kept
         in_ring = [0.0] * kept
-        for bond in bonds:
+        for edge_id, bond in enumerate(bonds):
             if bond.source >= kept or bond.target >= kept or bond.source == bond.target:
                 continue
             adjacency[bond.source, bond.target] = 1.0
             adjacency[bond.target, bond.source] = 1.0
+            feature = torch.zeros(MOLECULE_EDGE_FEATURES, dtype=torch.float32)
+            feature[GraphDatasets._bond_type_channel(bond, atoms)] = 1.0
+            if on_cycle[edge_id]:
+                feature[EDGE_IN_RING] = 1.0
+            edges[bond.source, bond.target] = feature
+            edges[bond.target, bond.source] = feature
             for end in (bond.source, bond.target):
                 degree[end] += 1.0
                 if bond.order >= 3.0:
                     triple_bond[end] = 1.0
                 elif bond.order >= 2.0:
                     double_bond[end] = 1.0
-                if bond.ring_closure:
+                if on_cycle[edge_id]:
                     in_ring[end] = 1.0
         offset: int = len(_ATOM_TYPES)
         for position in range(kept):
@@ -1306,10 +1446,10 @@ class GraphDatasets:
             x[position, offset + 5] = double_bond[position]
             x[position, offset + 6] = triple_bond[position]
             x[position, offset + 7] = in_ring[position]
-        return x, adjacency
+        return x, adjacency, edges
 
     @staticmethod
-    def _smiles_to_graph(smiles: str, max_nodes: int) -> tuple[Any, Any]:
+    def _smiles_to_graph(smiles: str, max_nodes: int) -> tuple[Any, Any, Any]:
         atoms, bonds = GraphDatasets._parse_smiles(smiles)
         return GraphDatasets._build_graph_tensors(atoms, bonds, max_nodes)
 
@@ -1324,6 +1464,7 @@ class GraphDatasets:
     ) -> TaskBundle:
         node_features: list[Any] = []
         adjacencies: list[Any] = []
+        edge_features: list[Any] = []
         labels: list[float] = []
         with path.open(newline="") as fh:
             reader: csv.DictReader[str] = csv.DictReader(fh)
@@ -1336,12 +1477,17 @@ class GraphDatasets:
                 )
                 if smiles is None or target is None:
                     continue
-                x, adjacency = GraphDatasets._smiles_to_graph(smiles, max_nodes)
+                x, adjacency, edges = GraphDatasets._smiles_to_graph(smiles, max_nodes)
                 node_features.append(x)
                 adjacencies.append(adjacency)
+                edge_features.append(edges)
                 labels.append(float(target))
         return _standardized_regression_bundle(
-            (torch.stack(node_features), torch.stack(adjacencies)),
+            (
+                torch.stack(node_features),
+                torch.stack(adjacencies),
+                torch.stack(edge_features),
+            ),
             torch.tensor(labels, dtype=torch.float32),
             batch_size,
             "RMSE",
@@ -1436,35 +1582,93 @@ class GraphDatasets:
         )
 
 
-def _build_cartpole(batch_size: int) -> TaskBundle:
-    gymnasium = _require_dependency("gymnasium", "gymnasium[classic-control]")
+def _collect_heuristic_rollouts(
+    env_id: str,
+    make_policy: Callable[[Any], Callable[[Any], Any]],
+    *,
+    samples: int,
+    cache: Path,
+    discrete: bool,
+    explore_probability: float = 0.15,
+    seed: int = 42,
+    package_hint: str = "gymnasium[box2d]",
+) -> tuple[Any, Any]:
+    """Cache (observation, heuristic action) pairs for behaviour cloning.
+
+    ``make_policy(env)`` returns a *fresh* per-episode callable, so a stateful
+    heuristic — ``BipedalWalkerHeuristics`` tracks which leg is swinging — is
+    reset at every episode boundary instead of carrying state across resets.
+
+    Two properties here decide how well the cloned policy actually flies, as
+    opposed to how well it matches labels:
+
+    * **Every episode gets its own seed.** The previous collector seeded only
+      the first reset, so the entire cache came from one chain of near-identical
+      starts and covered a narrow slice of the state space.
+    * **A fraction of steps take a random action while still recording what the
+      heuristic would have done.** Pure on-policy cloning only ever sees states
+      the heuristic itself reaches, so the network never learns to recover from
+      its own small errors and they compound: the CartPole clone returned 292
+      against a heuristic that scores a perfect 500. Labelling off-policy states
+      with the heuristic's correct response is the standard fix.
+    """
+    gymnasium = _require_dependency("gymnasium", package_hint)
     numpy = _require_dependency("numpy")
-    cache: Path = _data_root() / "cartpole" / HEURISTIC_ROLLOUTS_FILENAME
     if cache.exists():
         payload = torch.load(cache, map_location="cpu")
-        x, y = payload["x"], payload["y"]
-    else:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        env = gymnasium.make("CartPole-v1")
-        observations = []
-        actions = []
-        obs, _ = env.reset(seed=42)
-        while len(observations) < 10_000:
-            action: int = 1 if (obs[2] + 0.25 * obs[3]) > 0 else 0
-            observations.append(obs)
-            actions.append(action)
-            obs, _, terminated, truncated, _ = env.step(action)
-            if terminated or truncated:
-                obs, _ = env.reset()
+        return payload["x"], payload["y"]
+
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    env = gymnasium.make(env_id)
+    env.action_space.seed(seed)
+    rng = numpy.random.default_rng(seed)
+    observations: list[Any] = []
+    actions: list[Any] = []
+    episode: int = 0
+    try:
+        while len(observations) < samples:
+            observation, _ = env.reset(seed=seed + episode)
+            policy = make_policy(env)
+            episode += 1
+            for _ in range(_RL_ROLLOUT_STEP_CAP):
+                label = policy(observation)
+                observations.append(observation)
+                actions.append(label)
+                step_action = (
+                    env.action_space.sample()
+                    if rng.random() < explore_probability
+                    else label
+                )
+                observation, _, terminated, truncated, _ = env.step(step_action)
+                if terminated or truncated or len(observations) >= samples:
+                    break
+    finally:
         env.close()
-        x = torch.tensor(numpy.array(observations), dtype=torch.float32)
-        y = torch.tensor(actions, dtype=torch.long)
-        torch.save({"x": x, "y": y}, cache)
-    # Not a reward: no environment is stepped at evaluation time. This is
-    # behaviour cloning, and the score is the fraction of held-out observations
-    # where the network picks the same discrete action as the heuristic above.
-    # Naming it "Reward" invited comparison against published CartPole returns,
-    # which measure something else entirely.
+
+    x = torch.tensor(numpy.array(observations), dtype=torch.float32)
+    y = torch.tensor(
+        numpy.array(actions), dtype=torch.long if discrete else torch.float32
+    )
+    torch.save({"x": x, "y": y}, cache)
+    return x, y
+
+
+def _build_cartpole(batch_size: int) -> TaskBundle:
+    x, y = _collect_heuristic_rollouts(
+        "CartPole-v1",
+        # Scores a perfect 500 in the environment, so this one stays as written.
+        lambda _env: (lambda obs: 1 if (obs[2] + 0.25 * obs[3]) > 0 else 0),
+        samples=20_000,
+        cache=_data_root() / "cartpole" / HEURISTIC_ROLLOUTS_FILENAME,
+        discrete=True,
+        package_hint="gymnasium[classic-control]",
+    )
+    # Not a reward: no environment is stepped during training or validation.
+    # This is behaviour cloning, and the score is the fraction of held-out
+    # observations where the network picks the same discrete action as the
+    # heuristic. An episodic return *is* now measured once at the end of
+    # training — see _evaluate_episodic_return in training.py — and that is the
+    # number to read against published CartPole results.
     return _bundle_from_dataset(
         _TensorRowsDataset(x, y),
         batch_size,
@@ -1474,115 +1678,94 @@ def _build_cartpole(batch_size: int) -> TaskBundle:
     )
 
 
-def _lunarlander_heuristic_action(
-    x_pos: float,
-    y_pos: float,
-    x_vel: float,
-    y_vel: float,
-    angle: float,
-    left_contact: bool,
-    right_contact: bool,
-) -> int:
-    if left_contact or right_contact:
-        if abs(x_vel) < 0.2:
-            return 0
-        return 3 if x_vel < 0 else 1
-    if abs(angle) > 0.12:
-        return 1 if angle > 0 else 3
-    if y_vel < -0.25 or y_pos < 0.6:
-        return 2
-    if abs(x_pos) > 0.15:
-        return 3 if x_pos < 0 else 1
-    return 0
-
-
 def _build_lunarlander(batch_size: int) -> TaskBundle:
-    gymnasium = _require_dependency("gymnasium", "gymnasium[box2d]")
-    numpy = _require_dependency("numpy")
-    cache: Path = _data_root() / "lunarlander" / HEURISTIC_ROLLOUTS_FILENAME
-    if cache.exists():
-        payload = torch.load(cache, map_location="cpu")
-        x, y = payload["x"], payload["y"]
-    else:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            env = gymnasium.make("LunarLander-v3")
-        except Exception:
-            env = gymnasium.make("LunarLander-v2")
-        observations = []
-        actions = []
-        obs, _ = env.reset(seed=42)
-        while len(observations) < 40_000:
-            x_pos, y_pos, x_vel, y_vel, angle, _, left_contact, right_contact = obs
-            action = _lunarlander_heuristic_action(
-                x_pos, y_pos, x_vel, y_vel, angle, left_contact, right_contact
-            )
-            observations.append(obs)
-            actions.append(action)
-            obs, _, terminated, truncated, _ = env.step(action)
-            if terminated or truncated:
-                obs, _ = env.reset()
-        env.close()
-        x = torch.tensor(numpy.array(observations), dtype=torch.float32)
-        y = torch.tensor(actions, dtype=torch.long)
-        torch.save({"x": x, "y": y}, cache)
+    """LunarLander observations labelled by Gymnasium's own reference heuristic.
+
+    The hand-written policy this used to clone returns **-519** in the
+    environment — it crashes the lander on essentially every episode. The model
+    reproduced it faithfully (98.8% action agreement, -523 return), so the
+    headline metric looked excellent while the policy was worthless, and no
+    episodic number here could be read against LunarLander's 200-point solved
+    threshold. ``gymnasium.envs.box2d.lunar_lander.heuristic`` is the reference
+    policy shipped with the environment and returns roughly +230, above solved.
+    """
+
+    def make_policy(env: Any) -> Callable[[Any], int]:
+        lunar_lander = _require_dependency(
+            "gymnasium.envs.box2d.lunar_lander", "gymnasium[box2d]"
+        )
+        unwrapped = env.unwrapped
+        return lambda observation: int(lunar_lander.heuristic(unwrapped, observation))
+
+    x, y = _collect_heuristic_rollouts(
+        "LunarLander-v3",
+        make_policy,
+        samples=40_000,
+        cache=_data_root() / "lunarlander" / HEURISTIC_ROLLOUTS_FILENAME,
+        discrete=True,
+    )
     # Behaviour cloning, not reinforcement learning — see _build_cartpole.
     return _bundle_from_dataset(
         _TensorRowsDataset(x, y),
         batch_size,
         "Action Accuracy",
         "maximize",
-        "LunarLander-v3 observations labeled by a stabilizing heuristic policy",
+        "LunarLander-v3 observations labeled by Gymnasium's reference heuristic",
     )
 
 
 def _build_bipedalwalker(batch_size: int) -> TaskBundle:
-    gymnasium = _require_dependency("gymnasium", "gymnasium[box2d]")
-    numpy = _require_dependency("numpy")
-    cache: Path = _data_root() / "bipedalwalker" / HEURISTIC_ROLLOUTS_FILENAME
-    if cache.exists():
-        payload = torch.load(cache, map_location="cpu")
-        x, y = payload["x"], payload["y"]
-    else:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        env = gymnasium.make("BipedalWalker-v3")
-        observations = []
-        actions = []
-        obs, _ = env.reset(seed=42)
-        while len(observations) < 50_000:
-            hull_angle = obs[0]
-            hull_angular_velocity = obs[1]
-            hip_drive = -0.6 * hull_angle - 0.2 * hull_angular_velocity
-            action = numpy.array(
-                [
-                    numpy.clip(hip_drive + 0.35, -1.0, 1.0),
-                    0.45,
-                    numpy.clip(-hip_drive + 0.35, -1.0, 1.0),
-                    0.45,
-                ],
-                dtype=numpy.float32,
-            )
-            observations.append(obs)
-            actions.append(action)
-            obs, _, terminated, truncated, _ = env.step(action)
-            if terminated or truncated:
-                obs, _ = env.reset()
-        env.close()
-        x = torch.tensor(numpy.array(observations), dtype=torch.float32)
-        y = torch.tensor(numpy.array(actions), dtype=torch.float32)
-        torch.save({"x": x, "y": y}, cache)
+    """BipedalWalker observations labelled by Gymnasium's own reference heuristic.
+
+    The previous four-line hand-written controller held both knees at a constant
+    0.45 and never took a step: it returns **-120**, and the cloned network
+    matched it to a mean absolute error of 0.0004 — near-perfect imitation of a
+    policy that falls over. Two of its four action dimensions being constant is
+    also why the reported "Neg. Action MAE" sat so implausibly close to zero.
+    ``BipedalWalkerHeuristics`` is the walking state machine that ships with the
+    environment; it returns roughly +90. That is short of the 300-point solved
+    threshold and swings widely by seed, but it walks, and it is a reference
+    implementation rather than something invented here.
+
+    The clone reaches about -80, better than the -120 it managed before but
+    still well under its own label source, and that gap will not close by
+    training harder: the heuristic is a *state machine*, carrying the swing leg
+    and the gait phase between steps, so one observation maps to different
+    actions depending on hidden state a feedforward policy cannot see.
+    Reproducing +90 here would take a recurrent policy or a real RL loop, both
+    of which change what this benchmark is measuring. The number is reported as
+    it stands rather than dressed up.
+    """
+
+    def make_policy(env: Any) -> Callable[[Any], Any]:
+        numpy = _require_dependency("numpy")
+        bipedal_walker = _require_dependency(
+            "gymnasium.envs.box2d.bipedal_walker", "gymnasium[box2d]"
+        )
+        # Stateful: it tracks the swinging leg and the gait phase, so it must be
+        # constructed per episode rather than shared across resets.
+        heuristics = bipedal_walker.BipedalWalkerHeuristics()
+        return lambda observation: numpy.clip(
+            numpy.asarray(heuristics.step_heuristic(observation), dtype=numpy.float32),
+            -1.0,
+            1.0,
+        )
+
+    x, y = _collect_heuristic_rollouts(
+        "BipedalWalker-v3",
+        make_policy,
+        samples=50_000,
+        cache=_data_root() / "bipedalwalker" / HEURISTIC_ROLLOUTS_FILENAME,
+        discrete=False,
+    )
     # Continuous actions, so the score is -MAE against the heuristic's action
-    # vector (see _compute_all_metrics). Reported as a negated error so that
-    # "maximize" still holds. Two of the four action dimensions are the constant
-    # 0.45 above, so values sit very close to 0: the previously reported
-    # -0.0004 is a mean absolute error of 0.0004, i.e. near-exact imitation,
-    # not the near-zero *return* that the "Reward" label implied.
+    # vector (see _compute_all_metrics), negated so "maximize" still holds.
     return _bundle_from_dataset(
         _TensorRowsDataset(x, y),
         batch_size,
         "Neg. Action MAE",
         "maximize",
-        "BipedalWalker-v3 observations labeled by a continuous-action heuristic policy",
+        "BipedalWalker-v3 observations labeled by Gymnasium's reference heuristic",
     )
 
 

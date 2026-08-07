@@ -23,7 +23,7 @@ from .compat import (
     set_pai_root,
 )
 from .data import build_task_bundle
-from .models import build_model
+from .models import ADULT_CATEGORICAL_CARDINALITIES, build_model
 from .results import (
     save_training_record,
     write_comparison_reports,
@@ -369,7 +369,15 @@ class BenchmarkRunner:
             return {"num_classes": 4}
         if model_key == "gcn":
             return {"num_classes": 7}
-        if model_key in {"tabnet", "gin_imdbb", "saint_adult"}:
+        if model_key in {"tabnet", "saint_adult"}:
+            # Adult's 8 nominal columns reach the models as integer codes; both
+            # size embedding tables from this schema rather than treating a code
+            # as a number. See TabularColumnEmbedding.
+            return {
+                "num_classes": 2,
+                "categorical_cardinalities": ADULT_CATEGORICAL_CARDINALITIES,
+            }
+        if model_key == "gin_imdbb":
             return {"num_classes": 2}
         if model_key == "pointnet_modelnet40":
             return {"num_classes": 40}
@@ -643,13 +651,15 @@ class BenchmarkRunner:
                 128, 30, 1.0e-3, "adam", 0.9, 1.0e-4,
                 lr_schedule="cosine", lr_min_factor=0.02,
             ),
-            # Kipf & Welling train Cora for 200 epochs at Adam 1e-2 / wd 5e-4
-            # with early stopping on validation. Without the early stop this ran
-            # all 200 and best-epoch was 1: train loss hit 0.024 while val
-            # accuracy fell from 0.83 to 0.75. Halving the budget and annealing
-            # keeps the useful part of the run and drops the memorised tail.
+            # Kipf & Welling: Adam 1e-2, wd 5e-4, dropout 0.5, 200 epochs of
+            # full-batch descent over 140 labelled nodes — 200 optimiser steps.
+            # GraphDatasets.cora now supplies that Planetoid-sized split, so at
+            # batch 32 an epoch is 5 steps and 200 epochs lands at 1000, the same
+            # order as the reference. The budget had been halved to 100 to escape
+            # a memorisation tail that came from training on 1895 labels; with
+            # 140 that pressure is gone and the anneal handles the rest.
             "gcn": ModelTrainingRecipe(
-                32, 100, 1.0e-2, "adam", 0.9, 5.0e-4,
+                32, 200, 1.0e-2, "adam", 0.9, 5.0e-4,
                 lr_schedule="cosine", lr_min_factor=0.05,
             ),
             # TabNet (Arik & Pfister) reports 85.7% on Adult. Still improving at
