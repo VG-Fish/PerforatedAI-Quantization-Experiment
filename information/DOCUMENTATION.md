@@ -330,8 +330,11 @@ verified here.
 
 | Key | Metric | Old | New | Read |
 |---|---|---|---|---|
-| `lenet5` | Accuracy | 0.9839 | **0.9923** | Clears LeCun's ~99.05% |
 | `attentivefp_freesolv` | RMSE | 2.1378 | **0.8457** | 2.5× better; past MoleculeNet's ~1.15 |
+| `lenet5` | Accuracy | 0.9839 | **0.9923** | Clears LeCun's ~99.05% |
+| `textcnn` | Accuracy | 0.9103 | **0.9155** | Larger vocab/sequence + annealed 30 epochs |
+| `tabnet` | Accuracy | 0.8507 | 0.8530 | Flat — at the dataset ceiling, see below |
+| `saint_adult` | Accuracy | 0.8573 | 0.8566 | Flat — at the dataset ceiling, see below |
 | `mpnn` | RMSE | 0.7708 | 0.8117 → **0.6665** | See below |
 | `gcn` | Accuracy | 0.7862 | 0.7641 | See below |
 | `gin_imdbb` | Accuracy | 0.7933 | 0.7467 | See below |
@@ -343,6 +346,19 @@ the training set. The same recipe at 200 epochs tested at 0.6665, better than
 both, so the budget is now 200. A regularisation sweep (weight decay 1e-4/1e-3,
 dropout 0.3) was started and not finished; it is the obvious next thing to try
 if MPNN is worth pushing toward MoleculeNet's 0.58.
+
+**The two Adult Income models did not move**, despite doubling the epoch budget
+and adding annealing: TabNet 0.8507 → 0.8530, SAINT 0.8573 → 0.8566. Both were
+already within ~0.6% of their published numbers (85.7% and ~86%), so this is the
+expected outcome — the recipes were not what was holding them back. What is
+holding them back is the feature encoding: `_build_adult` maps each categorical
+column to an *ordinal* integer and then standardises it, which asserts a false
+ordering over unordered categories (workclass, occupation, native-country). The
+reference implementations one-hot or embed those. This was left alone
+deliberately — one-hot takes Adult from 14 to ~108 columns, and SAINT's
+row/column attention is quadratic in column count, so it would cost roughly 60×
+per step for a likely sub-1% gain. It is the right next lever for these two if
+tabular accuracy matters more than runtime.
 
 **GCN and GIN** both came out lower on test while training more healthily, and
 neither difference is larger than its split's noise:
@@ -364,6 +380,15 @@ fixes independent of the score (mean-pooling 96 slots when 20 are real is wrong
 whatever it measures), so they stay. But a single held-out split cannot
 distinguish a 2-6% move from noise on datasets this small, and neither of these
 should be reported as a regression or an improvement without repeated seeds.
+
+**Dendritic path.** `gin_imdbb / dendrites_fp32` was run end-to-end against the
+new architecture to confirm PerforatedAI still perforates a model whose input
+width changed (8 → 10 features): it completed with no errors, grew 39,302 →
+116,492 parameters, wrote the full artifact set (`best_arch_scores.csv`,
+`paramCounts.csv`, `pai_plots/`), and reached a best validation of 0.7800 against
+the baseline's 0.7667. That is a pipeline check, not a result — the other
+architecture changes (MPNN/AttentiveFP at 20 node features, TextCNN's 20k vocab)
+have not had their dendritic conditions exercised.
 
 ## Key Research Hypotheses
 1. Do dendritic models consistently outperform base models in accuracy before quantization?

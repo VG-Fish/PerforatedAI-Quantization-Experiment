@@ -55,6 +55,12 @@ _BOND_ORDERS: dict[str, float] = {"-": 1.0, "=": 2.0, "#": 3.0, ":": 1.5, "$": 4
 # dataset rather than taking the larger of the two.
 ESOL_MAX_ATOMS: int = 40
 FREESOLV_MAX_ATOMS: int = 24
+# Cora ego-graph width. Two hops to match the 2-layer GCN's receptive field; 64
+# slots because the 2-hop closed neighbourhood has median 18 and p75 40, so this
+# holds the whole neighbourhood for ~83% of nodes and the nearest 64 for the
+# rest. Costs 1.6x the old 50-wide subgraph in the dense [N,N] bmm.
+CORA_EGO_HOPS: int = 2
+CORA_EGO_NODES: int = 64
 # Degree buckets for the IMDB-BINARY featuriser: channel 0 is the real-node
 # indicator and channels 1..8 are a one-hot over log2 degree, matching the
 # degree-as-feature convention Xu et al. use for label-free social graphs.
@@ -744,34 +750,73 @@ class TextDataSets:
         )
 
 class _CoraEgoDataset:
-    """Module-level ego-graph dataset for Cora node classification.
+    """Two-hop ego graphs for Cora node classification.
 
     Storing all data as instance attributes (rather than capturing them via a
     closure inside ``_build_cora``) makes this class picklable, which lets
     ``DataLoader`` serialise it safely for multi-process worker prefetching.
+
+    Two details matter for accuracy, and both were wrong before:
+
+    *Padding.* Subgraphs are a fixed ``CORA_EGO_NODES`` wide so they can be
+    batched, but Cora's median degree is 3, so almost every subgraph is mostly
+    padding. Padding used to repeat the centre node's own index. That is not
+    neutral: ``adjacency`` has a self-loop, so every pair of centre copies is
+    connected, and after ``GraphConv``'s symmetric normalisation the copies took
+    94% of the centre's incoming weight against 6% for its true neighbours. The
+    GCN was an MLP on the centre's own bag-of-words. Padding now points at an
+    isolated virtual node (all-zero features, no edges, appended at index ``n``),
+    which contributes nothing to any real node's aggregation.
+
+    *Hops.* A 2-layer GCN has a 2-hop receptive field, but the subgraph only
+    held 1-hop neighbours, so ``conv2`` had no new information to aggregate.
+    Neighbours are now collected breadth-first to depth 2, nearest hop first, so
+    truncation drops the most distant nodes rather than an arbitrary set.
     """
 
     def __init__(self, adjacency: Any, x_all: Any, y_all: Any) -> None:
         self.adjacency = adjacency
         self.x_all = x_all
         self.y_all = y_all
+        self.pad_index = int(y_all.shape[0])
+        # Adjacency lists, built once: __getitem__ runs per sample per epoch and
+        # scanning a 2708-wide dense row for each BFS step is the whole cost.
+        self.neighbor_lists: list[list[int]] = [
+            [int(j) for j in row.nonzero().flatten().tolist() if int(j) != i]
+            for i, row in enumerate(adjacency[: self.pad_index])
+        ]
 
     def __len__(self) -> int:
         return int(self.y_all.shape[0])
 
+    def _ego_nodes(self, index: int) -> list[int]:
+        selected: list[int] = [index]
+        seen: set[int] = {index}
+        frontier: list[int] = [index]
+        for _ in range(CORA_EGO_HOPS):
+            next_frontier: list[int] = []
+            for node in frontier:
+                for neighbor in self.neighbor_lists[node]:
+                    if neighbor in seen:
+                        continue
+                    seen.add(neighbor)
+                    selected.append(neighbor)
+                    next_frontier.append(neighbor)
+                    if len(selected) >= CORA_EGO_NODES:
+                        return selected
+            if not next_frontier:
+                break
+            frontier = next_frontier
+        return selected
+
     def __getitem__(self, index: int) -> tuple[Any, Any, Any]:
-        neighbors = self.adjacency[index].nonzero().flatten()
-        neighbors = torch.cat(
-            [
-                torch.tensor([index], dtype=neighbors.dtype, device=neighbors.device),
-                neighbors[neighbors != index],
-            ]
-        )[:50]
-        if len(neighbors) < 50:
-            pad = neighbors.new_full((50 - len(neighbors),), index)
-            neighbors = torch.cat([neighbors, pad])
-        sub_x = self.x_all[neighbors]
-        sub_adj = self.adjacency[neighbors][:, neighbors]
+        selected = self._ego_nodes(index)
+        nodes = torch.tensor(
+            selected + [self.pad_index] * (CORA_EGO_NODES - len(selected)),
+            dtype=torch.long,
+        )
+        sub_x = self.x_all[nodes]
+        sub_adj = self.adjacency[nodes.unsqueeze(1), nodes.unsqueeze(0)]
         return sub_x, sub_adj, self.y_all[index]
 
 def _parse_adult_file(path: Path) -> list[list[str]]:
@@ -884,7 +929,14 @@ class GraphDatasets:
         # for reasons unrelated to the class.
         x_all = x_all / x_all.sum(dim=1, keepdim=True).clamp_min(1.0)
         y_all = torch.tensor([label_to_idx[label] for label in labels_raw], dtype=torch.long)
-        adjacency = torch.eye(len(paper_ids), dtype=torch.float32)
+        node_count = len(paper_ids)
+        # One extra row/column beyond the real nodes: an isolated virtual node
+        # that _CoraEgoDataset pads fixed-width subgraphs with. It carries no
+        # self-loop, so its normalised adjacency row is empty and it contributes
+        # nothing to any real node. See _CoraEgoDataset for why padding with a
+        # real node index was wrong.
+        adjacency = torch.zeros((node_count + 1, node_count + 1), dtype=torch.float32)
+        adjacency[:node_count, :node_count] = torch.eye(node_count, dtype=torch.float32)
         with cites.open() as fh:
             for line in fh:
                 src, dst = line.strip().split()
@@ -892,6 +944,7 @@ class GraphDatasets:
                     i, j = id_to_idx[src], id_to_idx[dst]
                     adjacency[i, j] = 1.0
                     adjacency[j, i] = 1.0
+        x_all = torch.cat([x_all, x_all.new_zeros((1, x_all.shape[1]))], dim=0)
 
         return _bundle_from_dataset(
             _CoraEgoDataset(adjacency, x_all, y_all),
@@ -1228,10 +1281,15 @@ def _build_cartpole(batch_size: int) -> TaskBundle:
         x = torch.tensor(numpy.array(observations), dtype=torch.float32)
         y = torch.tensor(actions, dtype=torch.long)
         torch.save({"x": x, "y": y}, cache)
+    # Not a reward: no environment is stepped at evaluation time. This is
+    # behaviour cloning, and the score is the fraction of held-out observations
+    # where the network picks the same discrete action as the heuristic above.
+    # Naming it "Reward" invited comparison against published CartPole returns,
+    # which measure something else entirely.
     return _bundle_from_dataset(
         _TensorRowsDataset(x, y),
         batch_size,
-        "Reward",
+        "Action Accuracy",
         "maximize",
         "CartPole-v1 observations labeled by a stabilizing policy",
     )
@@ -1289,10 +1347,11 @@ def _build_lunarlander(batch_size: int) -> TaskBundle:
         x = torch.tensor(numpy.array(observations), dtype=torch.float32)
         y = torch.tensor(actions, dtype=torch.long)
         torch.save({"x": x, "y": y}, cache)
+    # Behaviour cloning, not reinforcement learning — see _build_cartpole.
     return _bundle_from_dataset(
         _TensorRowsDataset(x, y),
         batch_size,
-        "Reward",
+        "Action Accuracy",
         "maximize",
         "LunarLander-v3 observations labeled by a stabilizing heuristic policy",
     )
@@ -1333,10 +1392,16 @@ def _build_bipedalwalker(batch_size: int) -> TaskBundle:
         x = torch.tensor(numpy.array(observations), dtype=torch.float32)
         y = torch.tensor(numpy.array(actions), dtype=torch.float32)
         torch.save({"x": x, "y": y}, cache)
+    # Continuous actions, so the score is -MAE against the heuristic's action
+    # vector (see _compute_all_metrics). Reported as a negated error so that
+    # "maximize" still holds. Two of the four action dimensions are the constant
+    # 0.45 above, so values sit very close to 0: the previously reported
+    # -0.0004 is a mean absolute error of 0.0004, i.e. near-exact imitation,
+    # not the near-zero *return* that the "Reward" label implied.
     return _bundle_from_dataset(
         _TensorRowsDataset(x, y),
         batch_size,
-        "Reward",
+        "Neg. Action MAE",
         "maximize",
         "BipedalWalker-v3 observations labeled by a continuous-action heuristic policy",
     )

@@ -68,12 +68,46 @@ For each model below, this document captures:
   - CapsNet is the exception: its output is a per-class capsule *length* in
     `[0, 1)`, not a logit, so it trains against `CapsuleMarginLoss` (Sabour et
     al., m+ = 0.9, m− = 0.1, λ = 0.5).
+- Fixed-width graph batching:
+  - Every graph model receives dense `[max_nodes, max_nodes]` adjacency tensors so
+    that graphs of different sizes can be batched. Padding slots must be inert:
+    they carry zero features and no edges, and each model masks them out of its
+    readout. Getting this wrong is silent — the shapes stay valid and the loss
+    still falls — so it is worth restating per dataset (`CORA_EGO_NODES`,
+    `ESOL_MAX_ATOMS`, `FREESOLV_MAX_ATOMS`, `IMDB_MAX_NODES`).
+  - Cora is sampled as one ego graph per labelled node, breadth-first to
+    `CORA_EGO_HOPS = 2` so the subgraph matches the 2-layer GCN's receptive
+    field, truncated to `CORA_EGO_NODES = 64` nearest-hop-first, and padded with
+    an isolated virtual node appended at index `n` of the feature and adjacency
+    tensors. Both details were previously wrong and cost roughly 8 accuracy
+    points: the subgraph held only 1-hop neighbours, so `conv2` had nothing new
+    to aggregate, and padding repeated the *centre node's own index*. Because
+    the adjacency carries a self-loop, every pair of centre copies was connected,
+    and at Cora's median degree of 3 the 46 padding copies took 94% of the
+    centre's normalised incoming weight against 6% for its true neighbours — the
+    GCN was effectively an MLP on the centre's own bag-of-words.
 - Target standardisation:
   - The two molecular regression sets (ESOL, FreeSolv) z-score their targets
     using training-split statistics only. `TaskBundle.target_offset` /
     `target_scale` carry the transform, and `_compute_all_metrics` maps
     predictions back through it, so reported RMSE/MAE stay in log-solubility and
     kcal/mol respectively and remain comparable to MoleculeNet.
+- The three "RL" models are behaviour cloning, not reinforcement learning:
+  - `actor_critic`, `dqn_lunarlander` and `ppo_bipedalwalker` train on a fixed
+    cache of observations labelled by a hand-written heuristic policy. No
+    environment is stepped at evaluation time and no return is ever accumulated,
+    so their scores must not be read against published CartPole / LunarLander /
+    BipedalWalker returns — there is no comparable published baseline for them.
+  - The metric was previously displayed as "Reward" for all three, which invited
+    exactly that comparison. It is now named for what it computes: **Action
+    Accuracy** (fraction of held-out states where the network selects the
+    heuristic's discrete action) for `actor_critic` and `dqn_lunarlander`, and
+    **Neg. Action MAE** (negated mean absolute error against the heuristic's
+    4-vector, negated so `maximize` still holds) for `ppo_bipedalwalker`.
+  - This also explains `ppo_bipedalwalker`'s previously alarming −0.0004: it is a
+    mean absolute error of 0.0004, i.e. near-exact imitation, not a near-zero
+    episodic return. Two of its four action dimensions are constant in the
+    heuristic, which is why the achievable error is so small.
 - Perforation registration:
   - The benchmark registers tensor-returning `nn.Linear`, `nn.Conv1d`, and `nn.Conv2d` modules for PerforatedAI perforation.
   - Recurrent, graph-attention, capsule, and tabular-attention models expose their gates/projections as explicit Linear/Conv modules, rather than handing tuple-returning `nn.LSTM`, `nn.GRU`, or `nn.MultiheadAttention` modules directly to PerforatedAI.
@@ -330,7 +364,7 @@ flowchart TD
 
 - Domain: Reinforcement Learning
 - Dataset: CartPole-v1
-- Primary metric: Reward
+- Primary metric: Action Accuracy
 - Metric direction: maximize
 - Factory key: `actor_critic`
 - Model kwargs: none
@@ -423,7 +457,7 @@ flowchart TD
 
 - Domain: Reinforcement Learning
 - Dataset: LunarLander-v2
-- Primary metric: Reward
+- Primary metric: Action Accuracy
 - Metric direction: maximize
 - Factory key: `dqn_lunarlander`
 - Model kwargs: none
@@ -452,7 +486,7 @@ flowchart TD
 
 - Domain: Reinforcement Learning
 - Dataset: BipedalWalker-v3
-- Primary metric: Reward
+- Primary metric: Neg. Action MAE
 - Metric direction: maximize
 - Factory key: `ppo_bipedalwalker`
 - Model kwargs: none
