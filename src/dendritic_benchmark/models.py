@@ -13,6 +13,17 @@ MOLECULE_NODE_FEATURES: int = 20
 # nodes carry no labels: a one-hot degree bucket plus a real-node mask.
 SOCIAL_GRAPH_NODE_FEATURES: int = 10
 
+# Forecasting window geometry, shared with ``data.py`` so a head's output width
+# and the target width it is trained against cannot drift apart.
+#
+# These are the settings the published long-sequence forecasting results use, so
+# the reported MAE has something to be read against. Informer (Zhou et al.) and
+# Autoformer (Wu et al.) both feed a 96-step lookback; ETT is evaluated at
+# horizon 24 and the 21-variable Weather set at horizon 96.
+FORECAST_SEQ_LEN: int = 96
+ETT_FORECAST_HORIZON: int = 24
+WEATHER_FORECAST_HORIZON: int = 96
+
 
 class LeNet5(nn.Module):
     """LeNet-5 style CNN for MNIST-sized grayscale images."""
@@ -107,15 +118,25 @@ class DendriticGRUCell(nn.Module):
 
 
 class LSTMForecaster(nn.Module):
+    """Univariate multi-step forecaster: [B, seq_len, 1] -> [B, horizon].
+
+    The head predicts the whole horizon in one shot rather than a single next
+    step. One-step-ahead prediction is a much easier problem than the horizons
+    the forecasting literature reports, so a single-output head left this
+    model's MAE with nothing to be compared against.
+    """
+
     def __init__(
         self,
         input_size: int = 1,
         hidden_size: int = 64,
         num_layers: int = 2,
         dropout: float = 0.1,
+        horizon: int = ETT_FORECAST_HORIZON,
     ):
         super().__init__()
         self.hidden_size = hidden_size
+        self.horizon = horizon
         self.cells = nn.ModuleList(
             DendriticLSTMCell(input_size if layer == 0 else hidden_size, hidden_size)
             for layer in range(num_layers)
@@ -125,7 +146,7 @@ class LSTMForecaster(nn.Module):
             nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
-            nn.Linear(hidden_size // 2, 1),
+            nn.Linear(hidden_size // 2, horizon),
         )
 
     def forward(self, x: Any) -> Any:
@@ -146,7 +167,7 @@ class LSTMForecaster(nn.Module):
                 next_states.append((h, c))
                 step = self.dropout(h) if index < len(self.cells) - 1 else h
             states = next_states
-        return self.head(states[-1][0]).squeeze(-1)
+        return self.head(states[-1][0])
 
 
 class TextCNN(nn.Module):
@@ -664,7 +685,9 @@ class TemporalBlock(nn.Module):
 
 
 class TCNForecaster(nn.Module):
-    def __init__(self, input_size: int = 7, horizon: int = 24, hidden: int = 64):
+    def __init__(
+        self, input_size: int = 7, horizon: int = ETT_FORECAST_HORIZON, hidden: int = 64
+    ):
         super().__init__()
         self.horizon = horizon
         self.input_size = input_size
@@ -682,7 +705,13 @@ class TCNForecaster(nn.Module):
 
 
 class GRUForecaster(nn.Module):
-    def __init__(self, input_size: int = 21, horizon: int = 24, hidden: int = 64, layers: int = 2):
+    def __init__(
+        self,
+        input_size: int = 21,
+        horizon: int = WEATHER_FORECAST_HORIZON,
+        hidden: int = 64,
+        layers: int = 2,
+    ):
         super().__init__()
         self.horizon = horizon
         self.input_size = input_size
@@ -1058,9 +1087,32 @@ def _build_resnet18_cifar10(**_: Any) -> Any:
 
 
 def _build_mobilenetv2_cifar10(**_: Any) -> Any:
+    """MobileNetV2 re-strided for 32x32 input, as in kuangliu/pytorch-cifar.
+
+    torchvision's stock model downsamples 32x for 224x224 ImageNet input. Fixing
+    only the stem leaves 16x, so CIFAR's 32x32 reaches the classifier as a 2x2
+    map: the last two inverted-residual stages run on 2x2 and 1x1 features and
+    the 7x7-equivalent spatial pooling the architecture is designed around never
+    happens. That cost ~2.5 points (91.65% measured against the ~94.1% published
+    CIFAR-10 baselines).
+
+    The reference CIFAR adaptation also drops the stride of the c=24 stage,
+    giving 8x total and a 4x4 final map; its stage table is otherwise identical
+    to torchvision's. `features[2]` is that stage's first block and the only
+    other stride-2 site before it, and `conv[1][0]` is its depthwise conv.
+    """
     torchvision_models = cast(Any, __import__("torchvision.models", fromlist=["models"]))
     model = torchvision_models.mobilenet_v2(weights=None, num_classes=10)
     model.features[0][0] = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1, bias=False)
+    depthwise = model.features[2].conv[1][0]
+    if depthwise.stride != (2, 2):
+        # The stage table moved under us; silently training a 16x-downsampling
+        # net again would look like a tuning regression rather than a bug.
+        raise RuntimeError(
+            "expected features[2] depthwise conv to have stride 2, got "
+            f"{depthwise.stride}; torchvision's mobilenet_v2 stage table changed."
+        )
+    depthwise.stride = (1, 1)
     return model
 
 

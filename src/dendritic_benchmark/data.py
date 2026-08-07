@@ -11,7 +11,13 @@ from typing import Any, Iterable, Callable
 
 import torch
 
-from .models import MOLECULE_NODE_FEATURES, SOCIAL_GRAPH_NODE_FEATURES
+from .models import (
+    ETT_FORECAST_HORIZON,
+    FORECAST_SEQ_LEN,
+    MOLECULE_NODE_FEATURES,
+    SOCIAL_GRAPH_NODE_FEATURES,
+    WEATHER_FORECAST_HORIZON,
+)
 
 DATA_ROOT_ENV: str = "DQB_DATA_ROOT"
 DEFAULT_DATA_ROOT: str = "data"
@@ -61,6 +67,24 @@ FREESOLV_MAX_ATOMS: int = 24
 # rest. Costs 1.6x the old 50-wide subgraph in the dense [N,N] bmm.
 CORA_EGO_HOPS: int = 2
 CORA_EGO_NODES: int = 64
+# The Planetoid semi-supervised split that every published Cora/Citeseer/Pubmed
+# number is measured on: 20 labelled nodes per class, then 500 validation and
+# 1000 test nodes. See _planetoid_style_split.
+PLANETOID_LABELS_PER_CLASS: int = 20
+PLANETOID_VAL_NODES: int = 500
+PLANETOID_TEST_NODES: int = 1000
+# ETT's published train/validation/test division is calendar-based rather than a
+# ratio: 12 months / 4 / 4, counted in each file's own sampling period. ETTh1 is
+# hourly and ETTm1 is the same series resampled to 15 minutes.
+_ETT_SPLIT_HOURLY: tuple[int, int, int] = (12 * 30 * 24, 4 * 30 * 24, 4 * 30 * 24)
+_ETT_SPLIT_15MIN: tuple[int, int, int] = (
+    _ETT_SPLIT_HOURLY[0] * 4,
+    _ETT_SPLIT_HOURLY[1] * 4,
+    _ETT_SPLIT_HOURLY[2] * 4,
+)
+# Weather has no calendar convention attached to it; Autoformer and everything
+# downstream of it splits 70/10/20 chronologically.
+_WEATHER_SPLIT_RATIOS: tuple[float, float] = (0.7, 0.1)
 # Degree buckets for the IMDB-BINARY featuriser: channel 0 is the real-node
 # indicator and channels 1..8 are a one-hot over log2 degree, matching the
 # degree-as-feature convention Xu et al. use for label-free social graphs.
@@ -277,6 +301,55 @@ def _split_anomaly_dataset(
             dataset,
             normal[normal_train + normal_val :] + anomalous[anomalous_val:],
         ),
+    )
+
+
+def _planetoid_style_split(
+    labels: Any, *, num_classes: int, seed: int = 42
+) -> tuple[list[int], list[int], list[int]]:
+    """Planetoid's semi-supervised node split: 20 per class / 500 val / 1000 test.
+
+    Cora was previously split 70/15/15 at random, which trains on 1895 labelled
+    nodes. Kipf & Welling's 81.5% — and every number quoted against it — is
+    measured with **140**. Training on 13x the labels and then reading the
+    result against the published figure compares two different problems, so the
+    87.47% that setup produced was not evidence of a stronger GCN.
+
+    The node identities here differ from Planetoid's own fixed index file, which
+    is ordered differently from ``cora.content``. Shchur et al. ("Pitfalls of
+    Graph Neural Network Evaluation") re-draw splits of exactly these sizes at
+    random and still place GCN at 81.5 +/- 1.3, so it is the sizes that carry the
+    comparison rather than the particular nodes. The draw is seeded, so it is
+    fixed across runs and identical in the baseline and dendritic arms.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    order: list[int] = torch.randperm(len(labels), generator=generator).tolist()
+    train_idx: list[int] = []
+    remaining: list[int] = []
+    per_class: Counter[int] = Counter()
+    for index in order:
+        label = int(labels[index])
+        if per_class[label] < PLANETOID_LABELS_PER_CLASS:
+            per_class[label] += 1
+            train_idx.append(index)
+        else:
+            remaining.append(index)
+    expected: int = PLANETOID_LABELS_PER_CLASS * num_classes
+    if len(train_idx) != expected:
+        raise ValueError(
+            f"expected {expected} training nodes ({PLANETOID_LABELS_PER_CLASS} per "
+            f"class across {num_classes} classes), got {len(train_idx)}"
+        )
+    needed: int = PLANETOID_VAL_NODES + PLANETOID_TEST_NODES
+    if len(remaining) < needed:
+        raise ValueError(
+            f"need {needed} nodes beyond the training set, only "
+            f"{len(remaining)} available"
+        )
+    return (
+        train_idx,
+        remaining[:PLANETOID_VAL_NODES],
+        remaining[PLANETOID_VAL_NODES:needed],
     )
 
 
@@ -557,89 +630,178 @@ class _TensorRowsDataset(torch.utils.data.Dataset[tuple[Any, ...]]):
         return tuple(tensor[index] for tensor in self.tensors)
 
 
+def _forecast_windows(
+    series: Any, start: int, stop: int, seq_len: int, horizon: int
+) -> tuple[Any, Any]:
+    """Sliding (lookback, horizon) pairs whose *targets* lie inside [start, stop).
+
+    The first lookback window opens ``seq_len`` steps before ``start``, so a
+    validation or test window may read timesteps belonging to the split before
+    it. That is the Informer/Autoformer convention and it is not leakage: those
+    steps are model inputs, never targets, and every predicted timestep falls
+    strictly inside ``[start, stop)``. Starting each split cold instead would
+    silently drop its first ``seq_len`` targets.
+    """
+    first: int = max(0, start - seq_len)
+    last: int = stop - seq_len - horizon
+    if last < first:
+        raise ValueError(
+            f"forecast split [{start}, {stop}) cannot hold a {seq_len}-step "
+            f"lookback plus a {horizon}-step horizon"
+        )
+    indices = range(first, last + 1)
+    xs = torch.stack([series[index : index + seq_len] for index in indices])
+    ys = torch.stack(
+        [series[index + seq_len : index + seq_len + horizon] for index in indices]
+    )
+    return xs, ys
+
+
+def _chronological_forecast_bundle(
+    values: Any,
+    *,
+    seq_len: int,
+    horizon: int,
+    split_sizes: tuple[int, int, int],
+    batch_size: int,
+    input_description: str,
+    univariate: bool = False,
+    num_workers: int = 2,
+) -> TaskBundle:
+    """Window a ``[T, C]`` series into chronologically disjoint forecasting splits.
+
+    Two properties here are what let the reported MAE be read against published
+    forecasting results:
+
+    * **The splits are contiguous in time.** These datasets were previously fed
+      through ``_split_dataset``, which calls ``random_split`` over the *windows*.
+      Window ``i`` and window ``i+1`` share ``seq_len - 1`` of their ``seq_len``
+      timesteps, so a random assignment routinely put one in train and its
+      near-duplicate in test — and a test window's target timestep was usually
+      also sitting inside some training window's lookback. Every forecasting
+      benchmark splits chronologically for exactly this reason.
+    * **Normalisation is fitted on the training span alone.** The previous code
+      z-scored using statistics over the whole file, which hands the model the
+      test period's level and scale before training starts.
+
+    Metrics stay on the z-scored scale, which is also what Informer, Autoformer
+    and their successors report, so no inverse transform is applied here.
+    """
+    num_train, num_val, num_test = split_sizes
+    total: int = num_train + num_val + num_test
+    if total > len(values):
+        raise ValueError(
+            f"split sizes sum to {total} rows but the series has {len(values)}"
+        )
+    train_span = values[:num_train]
+    mean = train_span.mean(dim=0, keepdim=True)
+    std = train_span.std(dim=0, keepdim=True).clamp_min(1e-6)
+    series = (values - mean) / std
+
+    borders: tuple[tuple[int, int], ...] = (
+        (0, num_train),
+        (num_train, num_train + num_val),
+        (num_train + num_val, total),
+    )
+    splits: list[Any] = []
+    for start, stop in borders:
+        x, y = _forecast_windows(series, start, stop, seq_len, horizon)
+        # A univariate task keeps the channel axis on the input so the model
+        # still sees [B, seq_len, 1], but drops it from the target to match a
+        # head that predicts a single series over the horizon.
+        splits.append(_TensorRowsDataset(x, y.squeeze(-1) if univariate else y))
+    return _bundle_from_splits(
+        splits[0],
+        splits[1],
+        splits[2],
+        batch_size,
+        "MAE",
+        "minimize",
+        input_description,
+        num_workers=num_workers,
+    )
+
+
 class TimeSeriesDatasets:
     @staticmethod
-    def etth1(batch_size: int) -> TaskBundle:
-        path: Path = _download(ETTH1_URL, _data_root() / "etth1" / "ETTh1.csv")
-        rows: list[float] = []
-        with path.open(newline="") as fh:
-            reader: csv.DictReader[str] = csv.DictReader(fh)
-            for row in reader:
-                rows.append(float(row["OT"]))
-        values = torch.tensor(rows, dtype=torch.float32)
-        mean = values.mean()
-        std = values.std().clamp_min(1e-6)
-        values = (values - mean) / std
-        seq_len = 24
-        x = torch.stack(
-            [values[index : index + seq_len] for index in range(len(values) - seq_len)]
-        ).unsqueeze(-1)
-        y = torch.stack([values[index + seq_len] for index in range(len(values) - seq_len)])
-        return _bundle_from_dataset(
-            _TensorRowsDataset(x, y),
-            batch_size,
-            "MAE",
-            "minimize",
-            "ETTh1 hourly oil temperature forecasting windows",
-        )
-
-    @staticmethod
-    def multivariate_forecast(
-        batch_size: int,
-        *,
-        url: str,
-        subdir: str,
-        filename: str,
-        seq_len: int,
-        horizon: int,
-        input_description: str,
-    ) -> TaskBundle:
-        path: Path = _download(url, _data_root() / subdir / filename)
+    def _numeric_columns(path: Path) -> Any:
+        """Read every numeric, non-date column of a CSV into a ``[T, C]`` tensor."""
         rows: list[list[float]] = []
         with path.open(newline="") as fh:
             reader: csv.DictReader[str] = csv.DictReader(fh)
             for row in reader:
                 values: list[float] = []
                 for key, value in row.items():
-                    if key.lower() == "date":
+                    if key is None or key.lower() == "date":
                         continue
                     try:
                         values.append(float(value))
-                    except ValueError:
-                        # skip non-numeric columns
-                        pass
+                    except (TypeError, ValueError):
+                        continue  # skip non-numeric columns
                 if values:
                     rows.append(values)
-        values_t = torch.tensor(rows, dtype=torch.float32)
-        mean = values_t.mean(dim=0, keepdim=True)
-        std = values_t.std(dim=0, keepdim=True).clamp_min(1e-6)
-        values_t = (values_t - mean) / std
-        xs = []
-        ys = []
-        limit: int = len(values_t) - seq_len - horizon + 1
-        for index in range(limit):
-            xs.append(values_t[index : index + seq_len])
-            ys.append(values_t[index + seq_len : index + seq_len + horizon])
-        return _bundle_from_dataset(
-            _TensorRowsDataset(torch.stack(xs), torch.stack(ys)),
-            batch_size,
-            "MAE",
-            "minimize",
-            input_description,
+        return torch.tensor(rows, dtype=torch.float32)
+
+    @staticmethod
+    def etth1(batch_size: int) -> TaskBundle:
+        """ETTh1 univariate (the OT column), 96-step lookback, 24-step horizon.
+
+        This is Informer's ETTh1 univariate setting, reported there at MSE 0.098
+        / MAE 0.247 with recurrent baselines in the high 0.2s. The previous setup
+        predicted one step ahead from a 24-step lookback, which no published
+        result uses — and under the random window split that made it easier
+        still, it scored MAE 0.069 against numbers that are not its own.
+        """
+        path: Path = _download(ETTH1_URL, _data_root() / "etth1" / "ETTh1.csv")
+        rows: list[float] = []
+        with path.open(newline="") as fh:
+            reader: csv.DictReader[str] = csv.DictReader(fh)
+            for row in reader:
+                rows.append(float(row["OT"]))
+        return _chronological_forecast_bundle(
+            torch.tensor(rows, dtype=torch.float32).unsqueeze(-1),
+            seq_len=FORECAST_SEQ_LEN,
+            horizon=ETT_FORECAST_HORIZON,
+            split_sizes=_ETT_SPLIT_HOURLY,
+            batch_size=batch_size,
+            input_description=(
+                "ETTh1 hourly oil temperature, 96-step lookback to 24-step "
+                "univariate horizon (Informer protocol)"
+            ),
+            univariate=True,
         )
+
     @staticmethod
     def ettm1(batch_size: int) -> TaskBundle:
-        return TimeSeriesDatasets.multivariate_forecast(
-            batch_size,
-            url=ETTM1_URL,
-            subdir="ettm1",
-            filename="ETTm1.csv",
-            seq_len=96,
-            horizon=24,
-            input_description="ETTm1 15-minute multivariate transformer-temperature windows",
+        """ETTm1 multivariate, 96-step lookback, 24-step horizon.
+
+        Informer's ETTm1 multivariate setting: MSE 0.323 / MAE 0.369 there. The
+        window geometry was already right; the split and the normalisation were
+        not.
+        """
+        return _chronological_forecast_bundle(
+            TimeSeriesDatasets._numeric_columns(
+                _download(ETTM1_URL, _data_root() / "ettm1" / "ETTm1.csv")
+            ),
+            seq_len=FORECAST_SEQ_LEN,
+            horizon=ETT_FORECAST_HORIZON,
+            split_sizes=_ETT_SPLIT_15MIN,
+            batch_size=batch_size,
+            input_description=(
+                "ETTm1 15-minute 7-variate windows, 96-step lookback to 24-step "
+                "horizon (Informer protocol)"
+            ),
         )
+
     @staticmethod
-    def weather(batch_size: int) ->TaskBundle:
+    def weather(batch_size: int) -> TaskBundle:
+        """Weather 21-variate, 96-step lookback, 96-step horizon.
+
+        Horizon 96 rather than 24: the 21-variable Weather set entered the
+        literature with Autoformer, which reports it at {96, 192, 336, 720} and
+        scores 0.266 MSE / 0.336 MAE at the shortest. Horizon 24 has no
+        published counterpart on this dataset.
+        """
         datasets = _require_dependency("datasets")
         loaded = datasets.load_dataset(
             "dunzane/time-series-dataset", "Weather", cache_dir=_hf_dataset_cache()
@@ -648,26 +810,28 @@ class TimeSeriesDatasets:
         columns: list[Any] = [
             name
             for name in split.column_names
-            if name.lower() != "date" and split.features[name].dtype in {"float32", "float64", "int32", "int64"}
+            if name.lower() != "date"
+            and split.features[name].dtype
+            in {"float32", "float64", "int32", "int64"}
         ]
-        rows: list[list[float]] = [[float(row[name]) for name in columns] for row in split]
-        values_t = torch.tensor(rows, dtype=torch.float32)
-        mean = values_t.mean(dim=0, keepdim=True)
-        std = values_t.std(dim=0, keepdim=True).clamp_min(1e-6)
-        values_t = (values_t - mean) / std
-        seq_len = 96
-        horizon = 24
-        xs = []
-        ys = []
-        for index in range(len(values_t) - seq_len - horizon + 1):
-            xs.append(values_t[index : index + seq_len])
-            ys.append(values_t[index + seq_len : index + seq_len + horizon])
-        return _bundle_from_dataset(
-            _TensorRowsDataset(torch.stack(xs), torch.stack(ys)),
-            batch_size,
-            "MAE",
-            "minimize",
-            "Weather multivariate meteorological forecasting windows",
+        rows: list[list[float]] = [
+            [float(row[name]) for name in columns] for row in split
+        ]
+        values = torch.tensor(rows, dtype=torch.float32)
+        total: int = len(values)
+        train_ratio, val_ratio = _WEATHER_SPLIT_RATIOS
+        num_train: int = int(total * train_ratio)
+        num_val: int = int(total * val_ratio)
+        return _chronological_forecast_bundle(
+            values,
+            seq_len=FORECAST_SEQ_LEN,
+            horizon=WEATHER_FORECAST_HORIZON,
+            split_sizes=(num_train, num_val, total - num_train - num_val),
+            batch_size=batch_size,
+            input_description=(
+                "Weather 21-variate meteorological windows, 96-step lookback to "
+                "96-step horizon (Autoformer protocol)"
+            ),
         )
 
 class TextDataSets:
@@ -954,12 +1118,19 @@ class GraphDatasets:
                     adjacency[j, i] = 1.0
         x_all = torch.cat([x_all, x_all.new_zeros((1, x_all.shape[1]))], dim=0)
 
-        return _bundle_from_dataset(
-            _CoraEgoDataset(adjacency, x_all, y_all),
+        train_idx, val_idx, test_idx = _planetoid_style_split(
+            y_all, num_classes=len(label_to_idx)
+        )
+        subset = torch.utils.data.Subset
+        dataset = _CoraEgoDataset(adjacency, x_all, y_all)
+        return _bundle_from_splits(
+            subset(dataset, train_idx),
+            subset(dataset, val_idx),
+            subset(dataset, test_idx),
             batch_size,
             "Accuracy",
             "maximize",
-            "Cora citation-network ego graphs for node labels",
+            "Cora citation-network ego graphs, Planetoid-sized label split",
         )
 
     @staticmethod
@@ -1673,7 +1844,10 @@ _BATCH_SIZES: dict[str, int] = {
     "attentivefp_freesolv": 32,
     "gin_imdbb": 32,
     "tcn_forecaster": 128,
-    "gru_forecaster": 24,  # Forecasting horizon-sized batches stabilize GRU training.
+    # Was 24, on the theory that horizon-sized batches stabilise GRU training.
+    # It bought nothing measurable and cost 1534 batches/epoch at 2.4 batch/s —
+    # 4.2 hours, a fifth of the entire base sweep, for a 74k-parameter model.
+    "gru_forecaster": 128,
     "pointnet_modelnet40": 32,  # PointNet reference batch size (Qi et al.).
     "vae_mnist": 128,  # PyTorch MNIST VAE example default.
     "snn_nmnist": 16,  # N-MNIST SNN literature setting.

@@ -14,10 +14,21 @@
 #
 # Usage:
 #   ./run_base_sweep.sh              launch, then print progress every 60s
+#   ./run_base_sweep.sh logs_run7    ...writing all logs under logs_run7/
+#   ./run_base_sweep.sh -l logs_run7 same thing, explicit flag
 #   ./run_base_sweep.sh -i 120       ...at a different interval
 #   ./run_base_sweep.sh --fresh      delete stale epoch checkpoints first
 #   ./run_base_sweep.sh --detach     launch and exit immediately
 #   ./run_base_sweep.sh --status     report on already-running streams, then exit
+#
+# Everything the sweep prints is also written under the log directory (default
+# logs_tuned/), so a detached run can be reconstructed after the terminal is gone:
+#   <log-dir>/                     dqb's own run_*.txt logs (its --logging-dir)
+#   <log-dir>/streams/<name>.log   raw per-stream stdout, tqdm bars and all
+#   <log-dir>/sweep_progress.log   every progress table this script has printed,
+#                                  appended across launches and --status queries
+# --status reads whichever log directory it is given, so pointing it at an old
+# sweep's directory replays that sweep's final state.
 #
 # Ctrl-C stops the progress display only; training keeps running (each stream
 # ignores SIGINT/SIGHUP). Use `pkill -f 'dqb run'` to actually stop training.
@@ -26,7 +37,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 RESULTS_DIR="updated_models"
-LOG_DIR="logs_tuned/streams"
+LOG_ROOT="logs_tuned"
 INTERVAL=60
 MODE="watch"
 FRESH=0
@@ -46,10 +57,21 @@ while [[ $# -gt 0 ]]; do
     --wait)     MODE="watch";  shift ;;
     --fresh)    FRESH=1; shift ;;
     -i|--interval) INTERVAL="${2:-60}"; shift 2 ;;
-    -h|--help)  sed -n '2,32p' "$0"; exit 0 ;;
-    *) echo "unknown option: $1" >&2; exit 2 ;;
+    -l|--log-dir)  LOG_ROOT="${2:?--log-dir needs a directory}"; shift 2 ;;
+    # Anchored on the comment text rather than line numbers so editing the
+    # header above cannot silently make --help print the wrong block.
+    -h|--help)  sed -n '/^# Usage:/,/^# ignores SIGINT/p' "$0" | sed 's/^#\{1,\} \{0,1\}//'; exit 0 ;;
+    -*) echo "unknown option: $1" >&2; exit 2 ;;
+    *)  LOG_ROOT="$1"; shift ;;
   esac
 done
+
+LOG_ROOT="${LOG_ROOT%/}"
+LOG_DIR="$LOG_ROOT/streams"
+# Deliberately a level above LOG_DIR: anything ending in .log inside LOG_DIR is a
+# candidate stream log to the reporter below, and a progress file sitting there
+# gets reported as a fifth stream stuck at "starting…".
+PROGRESS_LOG="$LOG_ROOT/sweep_progress.log"
 
 # ---------------------------------------------------------------- progress ---
 # Parsed in Python rather than shell: the interesting state lives in tqdm bars
@@ -68,7 +90,9 @@ START = re.compile(r"\[train\] (\S+) / (\S+) [—-]+ starting")
 BEST  = re.compile(r"best_\w+=(-?[\d.]+)")
 
 ORDER = ["cifar", "nlp_graph", "heavy", "light"]
-logs = sorted(log_dir.glob("*.log"), key=lambda p: ORDER.index(p.stem) if p.stem in ORDER else 99)
+# Named explicitly rather than globbed: the only files that parse as stream logs
+# are the four this script writes, and a glob would pick up anything else.
+logs = [p for p in (log_dir / f"{name}.log" for name in ORDER) if p.exists()]
 if not logs:
     print("  (no stream logs yet)")
     raise SystemExit
@@ -78,7 +102,15 @@ print(f"  {'stream':<10} {'model':<22} {'epoch':>10} {'%':>4}  {'remaining':>10}
 print(f"  {'-'*10} {'-'*22} {'-'*10} {'-'*4}  {'-'*10}  {'-'*9}")
 
 for log in logs:
-    text = ANSI.sub("", log.read_text(errors="replace")).replace("\r", "\n")
+    # These files belong to the stream subshells, not to us, and the watcher
+    # rereads them every INTERVAL for hours. A log that is rotated, truncated or
+    # removed between the listing above and this read must not take the watcher
+    # down mid-sweep.
+    try:
+        text = ANSI.sub("", log.read_text(errors="replace")).replace("\r", "\n")
+    except OSError as exc:
+        print(f"  {log.stem:<10} (unreadable: {exc.strerror})")
+        continue
     lines = text.splitlines()
 
     done = DONE.findall(text)
@@ -117,28 +149,42 @@ PY
 
 running() { pgrep -f "dqb run" >/dev/null 2>&1; }
 
+# Every progress table is appended to PROGRESS_LOG as well as printed. The
+# per-stream logs are unreadable after the fact — tqdm rewrites one line with \r
+# for hours — so this file is the only durable record of how the sweep advanced,
+# and it is what makes --detach usable.
+emit() { tee -a "$PROGRESS_LOG"; }
+
+report_block() {
+  {
+    echo
+    echo "=============================================================================="
+    echo "  $(date '+%Y-%m-%d %H:%M:%S')"
+    report
+  } | emit
+}
+
 watch_loop() {
   trap 'echo; echo "detached — training continues. stop with: pkill -f \"dqb run\""; exit 0' INT
   while :; do
-    echo
-    echo "=============================================================================="
-    report
-    running || { echo; echo "all streams finished."; break; }
+    report_block
+    running || { { echo; echo "all streams finished."; } | emit; break; }
     sleep "$INTERVAL"
   done
 }
 
+mkdir -p "$LOG_DIR"
+
 # ------------------------------------------------------------------ status ---
 if [[ "$MODE" == "status" ]]; then
-  report
-  running || echo "  (no dqb run processes active)"
+  report_block
+  running || echo "  (no dqb run processes active)" | emit
   exit 0
 fi
 
 # ------------------------------------------------------------------ launch ---
 # shellcheck disable=SC1091
 source .venv/bin/activate
-mkdir -p "$LOG_DIR"
 
 if running; then
   echo "refusing to launch: 'dqb run' is already active — two runs would race on the" >&2
@@ -159,17 +205,23 @@ done
 
 if (( ${#stale[@]} )); then
   if (( FRESH )); then
-    echo "removing ${#stale[@]} stale epoch checkpoint(s): ${stale[*]}"
+    # Logged, not just printed: which checkpoints were discarded is the one fact
+    # that decides whether a later result is a clean run or a resumed one.
+    echo "removing ${#stale[@]} stale epoch checkpoint(s): ${stale[*]}" | emit
     for model in "${stale[@]}"; do
       rm -rf "results/$RESULTS_DIR/$model/base_fp32"
     done
   else
-    echo "WARNING: ${#stale[@]} model(s) have an epoch_checkpoint.pt and WILL resume" >&2
-    echo "  mid-run rather than start clean: ${stale[*]}" >&2
-    echo "  --ignore-saved-models does not override this. If the model definitions" >&2
-    echo "  changed since those checkpoints, the run would be invalid." >&2
-    echo "  Re-run with --fresh to delete them first, or accept the resume." >&2
-    echo >&2
+    # Same reasoning as the --fresh branch: still stderr for the operator, but
+    # also on disk, so a resumed run cannot later be mistaken for a clean one.
+    {
+      echo "WARNING: ${#stale[@]} model(s) have an epoch_checkpoint.pt and WILL resume"
+      echo "  mid-run rather than start clean: ${stale[*]}"
+      echo "  --ignore-saved-models does not override this. If the model definitions"
+      echo "  changed since those checkpoints, the run would be invalid."
+      echo "  Re-run with --fresh to delete them first, or accept the resume."
+      echo
+    } | tee -a "$PROGRESS_LOG" >&2
   fi
 fi
 
@@ -181,16 +233,19 @@ stream() {
     exec dqb run \
       --results-root results \
       --results-directory "$RESULTS_DIR" \
-      --logging-dir logs_tuned \
+      --logging-dir "$LOG_ROOT" \
       --conditions base_fp32 \
       --ignore-saved-models \
       --models "$@" \
       >"$LOG_DIR/$name.log" 2>&1
   ) &
-  printf '  %-10s pid %-7s %s\n' "$name" "$!" "$*"
+  printf '  %-10s pid %-7s %s\n' "$name" "$!" "$*" | emit
 }
 
-echo "launching 4 parallel streams -> results/$RESULTS_DIR"
+{
+  echo
+  echo "=== launch $(date '+%Y-%m-%d %H:%M:%S') -> results/$RESULTS_DIR, logs -> $LOG_ROOT/"
+} | emit
 : >"$LOG_DIR/cifar.log"; : >"$LOG_DIR/nlp_graph.log"
 : >"$LOG_DIR/heavy.log"; : >"$LOG_DIR/light.log"
 
@@ -199,11 +254,12 @@ stream nlp_graph "${STREAM_NLP[@]}"
 stream heavy     "${STREAM_HEAVY[@]}"
 stream light     "${STREAM_LIGHT[@]}"
 
-cat <<EOF
+cat <<EOF | emit
 
-logs:    tail -f $LOG_DIR/*.log
-status:  ./run_base_sweep.sh --status
-stop:    pkill -f 'dqb run'
+logs:     tail -f $LOG_DIR/*.log
+progress: tail -f $PROGRESS_LOG
+status:   ./run_base_sweep.sh -l $LOG_ROOT --status
+stop:     pkill -f 'dqb run'
 EOF
 
 if [[ "$MODE" == "detach" ]]; then
@@ -212,4 +268,5 @@ fi
 
 echo
 echo "progress every ${INTERVAL}s — Ctrl-C detaches without stopping training"
+echo "(also appended to $PROGRESS_LOG)"
 watch_loop
