@@ -539,7 +539,14 @@ class AudioDatasets:
         )
 
 
-class _TensorRowsDataset:
+class _TensorRowsDataset(torch.utils.data.Dataset[tuple[Any, ...]]):
+    """Row-wise view over a set of equal-length tensors.
+
+    Subclasses ``Dataset`` rather than standing alone so that it type-checks
+    where torch expects a ``Dataset`` — chiefly ``Subset``, which
+    ``_standardized_regression_bundle`` wraps it in.
+    """
+
     def __init__(self, *tensors: Any) -> None:
         self.tensors: tuple[Any, ...] = tensors
 
@@ -548,6 +555,7 @@ class _TensorRowsDataset:
 
     def __getitem__(self, index: int) -> tuple[Any, ...]:
         return tuple(tensor[index] for tensor in self.tensors)
+
 
 class TimeSeriesDatasets:
     @staticmethod
