@@ -11,6 +11,8 @@ from typing import Any, Iterable, Callable
 
 import torch
 
+from .models import MOLECULE_NODE_FEATURES, SOCIAL_GRAPH_NODE_FEATURES
+
 DATA_ROOT_ENV: str = "DQB_DATA_ROOT"
 DEFAULT_DATA_ROOT: str = "data"
 EXTRACTED_MARKER: str = ".extracted"
@@ -39,6 +41,27 @@ ISIC_MASK_SAMPLE_URL: str = (
     "https://isic-archive.s3.amazonaws.com/challenges/2018/ISIC2018_Task1_Training_GroundTruth.zip"
 )
 MITBIH_RECORDS: list[str] = ["100", "101", "103", "105", "106", "108", "109", "111"]
+# Elements that get their own one-hot slot in the molecular featuriser; anything
+# else falls into a shared "other" slot. Order is load-bearing: it fixes the
+# feature layout that MOLECULE_NODE_FEATURES counts.
+_ATOM_TYPES: tuple[str, ...] = (
+    "C", "N", "O", "S", "F", "CL", "BR", "I", "P", "B", "SI", "SE",
+)
+_TWO_LETTER_ELEMENTS: frozenset[str] = frozenset({"Cl", "Br", "Si", "Se"})
+_BOND_ORDERS: dict[str, float] = {"-": 1.0, "=": 2.0, "#": 3.0, ":": 1.5, "$": 4.0}
+# Node capacity per molecular dataset, sized from the data: ESOL's heavy-atom
+# count reaches 55 with a 99th percentile of 31, FreeSolv's maximum is 24. The
+# dense [N,N] adjacency makes this quadratic in cost, so the cap tracks each
+# dataset rather than taking the larger of the two.
+ESOL_MAX_ATOMS: int = 40
+FREESOLV_MAX_ATOMS: int = 24
+# Degree buckets for the IMDB-BINARY featuriser: channel 0 is the real-node
+# indicator and channels 1..8 are a one-hot over log2 degree, matching the
+# degree-as-feature convention Xu et al. use for label-free social graphs.
+_SOCIAL_DEGREE_BUCKETS: int = SOCIAL_GRAPH_NODE_FEATURES - 2
+# Kept in step with TextCNN's `vocab_size` default in models.py.
+AG_NEWS_VOCAB_SIZE: int = 20_000
+AG_NEWS_SEQ_LEN: int = 128
 SPEECH_COMMAND_LABELS: tuple[str, ...] = (
     "yes",
     "no",
@@ -55,6 +78,22 @@ SPEECH_COMMAND_LABELS: tuple[str, ...] = (
 )
 
 
+@dataclass(frozen=True)
+class _ParsedAtom:
+    element: str
+    aromatic: bool
+    charge: int
+    hydrogens: int
+
+
+@dataclass(frozen=True)
+class _Bond:
+    source: int
+    target: int
+    order: float
+    ring_closure: bool
+
+
 @dataclass
 class TaskBundle:
     train_loader: Any
@@ -63,6 +102,13 @@ class TaskBundle:
     metric_name: str
     metric_direction: str
     input_description: str
+    # Set when a regression task standardises its targets for training. The
+    # loaders then yield z-scores, so metrics have to be mapped back through
+    # ``value * target_scale + target_offset`` to stay in the dataset's own
+    # units (log-solubility, kcal/mol, ...) and comparable to published numbers.
+    # Identity by default; every classification task leaves it alone.
+    target_offset: float = 0.0
+    target_scale: float = 1.0
 
 # Making the following into static methods is not necessary since every domain class 
 # after calls them. Adding inheritance by making some shared base class is pointless.
@@ -249,6 +295,51 @@ def _bundle_from_splits(
     )
 
 
+def _standardized_regression_bundle(
+    inputs: tuple[Any, ...],
+    targets: Any,
+    batch_size: int,
+    metric_name: str,
+    metric_direction: str,
+    input_description: str,
+    *,
+    num_workers: int = 2,
+) -> TaskBundle:
+    """Split, then z-score the regression target using training rows only.
+
+    FreeSolv's hydration energies span roughly -25..+4 kcal/mol and ESOL's log
+    solubilities -11.6..+1.6. Trained on those raw values the models spent their
+    opening epochs just learning the offset — AttentiveFP's train MSE sat at
+    ~14.8 (FreeSolv's target variance) for its first ten epochs and the run
+    finished at RMSE 2.14 against MoleculeNet's ~1.15.
+
+    Statistics come from the training split alone so the validation and test
+    rows contribute nothing to the transform. The offset and scale ride along on
+    the bundle, and ``_compute_all_metrics`` maps predictions back through them,
+    so reported RMSE/MAE stay in the dataset's own units.
+    """
+    dataset = _TensorRowsDataset(*inputs, targets)
+    train_ds, val_ds, test_ds = _split_dataset(dataset)
+    train_targets = targets[torch.tensor(list(train_ds.indices), dtype=torch.long)]
+    offset = float(train_targets.mean().item())
+    scale = float(train_targets.std().clamp_min(1e-6).item())
+    standardized = _TensorRowsDataset(*inputs, (targets - offset) / scale)
+    subset = torch.utils.data.Subset
+    bundle = _bundle_from_splits(
+        subset(standardized, list(train_ds.indices)),
+        subset(standardized, list(val_ds.indices)),
+        subset(standardized, list(test_ds.indices)),
+        batch_size,
+        metric_name,
+        metric_direction,
+        input_description,
+        num_workers=num_workers,
+    )
+    bundle.target_offset = offset
+    bundle.target_scale = scale
+    return bundle
+
+
 def _bundle_from_dataset(
     dataset: Any,
     batch_size: int,
@@ -278,23 +369,52 @@ def _hf_dataset_cache() -> str:
 
 class VisionDatasets:
     @staticmethod
-    def mnist(batch_size: int) -> TaskBundle:
+    def mnist(batch_size: int, *, augment: bool = False) -> TaskBundle:
+        """MNIST, optionally with the 2-pixel-shift augmentation.
+
+        ``augment`` is on for the two MNIST *classifiers* (LeNet-5, CapsNet) and
+        off for the VAE, whose ELBO is measured against the canonical images.
+        Sabour et al. train CapsNet on "MNIST shifted by up to 2 pixels in each
+        direction with zero padding" and nothing else, which is what the small
+        random translation below reproduces; LeNet-5 benefits from the same.
+        """
         torchvision = _require_dependency("torchvision")
         transforms = __import__("torchvision.transforms", fromlist=["transforms"])
         root: Path = _data_root() / "mnist"
         root.mkdir(parents=True, exist_ok=True)
-        transform = transforms.Compose([transforms.ToTensor()])
+        eval_transform = transforms.Compose([transforms.ToTensor()])
+        train_transform = (
+            transforms.Compose(
+                [
+                    transforms.RandomAffine(
+                        degrees=0, translate=(2 / 28, 2 / 28), fill=0
+                    ),
+                    transforms.ToTensor(),
+                ]
+            )
+            if augment
+            else eval_transform
+        )
         train_full = torchvision.datasets.MNIST(
-            root=str(root), train=True, download=True, transform=transform
+            root=str(root), train=True, download=True, transform=train_transform
         )
         test_ds = torchvision.datasets.MNIST(
-            root=str(root), train=False, download=True, transform=transform
+            root=str(root), train=False, download=True, transform=eval_transform
         )
         train_ds, val_ds = torch.utils.data.random_split(
             train_full,
             [55_000, 5_000],
             generator=torch.Generator().manual_seed(42),
         )
+        if augment:
+            # val_ds is a Subset of train_full and would otherwise inherit the
+            # random shift, adding augmentation noise to the score PerforatedAI
+            # reads when deciding whether to add dendrites. Same indices, clean
+            # transform — mirrors what cifar10() does below.
+            eval_view = torchvision.datasets.MNIST(
+                root=str(root), train=True, download=True, transform=eval_transform
+            )
+            val_ds = torch.utils.data.Subset(eval_view, val_ds.indices)
         return _bundle_from_splits(
             train_ds,
             val_ds,
@@ -304,6 +424,10 @@ class VisionDatasets:
             "maximize",
             "MNIST handwritten digit images",
         )
+    @staticmethod
+    def mnist_augmented(batch_size: int) -> TaskBundle:
+        return VisionDatasets.mnist(batch_size, augment=True)
+
     @staticmethod
     def cifar10(batch_size: int) -> TaskBundle:
         torchvision = _require_dependency("torchvision")
@@ -560,13 +684,21 @@ class TextDataSets:
     def ag_news(batch_size: int) -> TaskBundle:
         datasets = _require_dependency("datasets")
         loaded = datasets.load_dataset("ag_news", cache_dir=_hf_dataset_cache())
-        vocab: dict[str, int] = TextDataSets._build_vocab(loaded["train"]["text"], 5_000)
+        # AG News rows are a title plus a full description sentence, averaging
+        # ~38 tokens and running past 100. Truncating at 64 tokens with a 5k
+        # vocabulary threw away the tail of the longer rows and mapped a large
+        # share of content words to the OOV id; Kim's TextCNN results rely on
+        # covering the vocabulary. AG_NEWS_VOCAB_SIZE must stay in step with
+        # TextCNN's `vocab_size` default in models.py.
+        vocab: dict[str, int] = TextDataSets._build_vocab(
+            loaded["train"]["text"], AG_NEWS_VOCAB_SIZE
+        )
         train_texts = loaded["train"]["text"]
         train_labels = torch.tensor(loaded["train"]["label"], dtype=torch.long)
-        x_train = TextDataSets._encode_texts(train_texts, vocab, 64)
+        x_train = TextDataSets._encode_texts(train_texts, vocab, AG_NEWS_SEQ_LEN)
         train_full = _TensorRowsDataset(x_train, train_labels)
         train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
-        x_test = TextDataSets._encode_texts(loaded["test"]["text"], vocab, 64)
+        x_test = TextDataSets._encode_texts(loaded["test"]["text"], vocab, AG_NEWS_SEQ_LEN)
         y_test = torch.tensor(loaded["test"]["label"], dtype=torch.long)
         return _bundle_from_splits(
             train_ds,
@@ -745,6 +877,12 @@ class GraphDatasets:
         id_to_idx: dict[str, int] = {paper_id: index for index, paper_id in enumerate(paper_ids)}
         label_to_idx: dict[str, int] = {label: index for index, label in enumerate(sorted(set(labels_raw)))}
         x_all = torch.tensor(features, dtype=torch.float32)
+        # Row-normalise the bag-of-words, as in Kipf & Welling's reference
+        # implementation. Without it a node's feature magnitude scales with how
+        # many vocabulary words its abstract happens to contain, so the GCN's
+        # first layer sees inputs whose norm varies several-fold across nodes
+        # for reasons unrelated to the class.
+        x_all = x_all / x_all.sum(dim=1, keepdim=True).clamp_min(1.0)
         y_all = torch.tensor([label_to_idx[label] for label in labels_raw], dtype=torch.long)
         adjacency = torch.eye(len(paper_ids), dtype=torch.float32)
         with cites.open() as fh:
@@ -764,123 +902,244 @@ class GraphDatasets:
         )
 
     @staticmethod
-    def _parse_smiles_token(
-        smiles: str, index: int
-    ) -> tuple[str | None, int]:
-        """Return (token, new_index). token is None for non-atom characters."""
-        char = smiles[index]
-        if index + 1 < len(smiles) and smiles[index : index + 2] in {"Cl", "Br"}:
-            return smiles[index : index + 2], index + 2
+    def _parse_bracket_atom(body: str) -> _ParsedAtom:
+        """Parse the inside of a SMILES bracket atom, e.g. ``nH``, ``O-``, ``N+``."""
+        index = 0
+        while index < len(body) and body[index].isdigit():  # strip the isotope
+            index += 1
+        body = body[index:]
+        if not body:
+            return _ParsedAtom("C", False, 0, 0)
+        element: str = body[0]
+        rest: str = body[1:]
+        if rest and rest[0].islower() and (element + rest[0]).upper() in _ATOM_TYPES:
+            element += rest[0]
+            rest = rest[1:]
+        aromatic: bool = element[0].islower()
+        charge = 0
+        hydrogens = 0
+        index = 0
+        while index < len(rest):
+            char = rest[index]
+            index += 1
+            if char == "H":
+                digits = ""
+                while index < len(rest) and rest[index].isdigit():
+                    digits += rest[index]
+                    index += 1
+                hydrogens = int(digits) if digits else 1
+                continue
+            if char in "+-":
+                sign = 1 if char == "+" else -1
+                digits = ""
+                while index < len(rest) and rest[index].isdigit():
+                    digits += rest[index]
+                    index += 1
+                if digits:
+                    charge += sign * int(digits)
+                else:
+                    repeats = 1
+                    while index < len(rest) and rest[index] == char:
+                        repeats += 1
+                        index += 1
+                    charge += sign * repeats
+        return _ParsedAtom(element.upper(), aromatic, charge, hydrogens)
+
+    @staticmethod
+    def _read_atom(smiles: str, index: int) -> tuple["_ParsedAtom | None", int]:
+        """Return (atom, next_index); atom is None for a non-atom character."""
+        char: str = smiles[index]
+        if char == "[":
+            end: int = smiles.find("]", index)
+            if end == -1:
+                return None, index + 1
+            return GraphDatasets._parse_bracket_atom(smiles[index + 1 : end]), end + 1
+        pair: str = smiles[index : index + 2]
+        if pair in _TWO_LETTER_ELEMENTS:
+            return _ParsedAtom(pair.upper(), False, 0, 0), index + 2
         if char.isalpha():
-            return char.upper(), index + 1
+            return _ParsedAtom(char.upper(), char.islower(), 0, 0), index + 1
         return None, index + 1
 
     @staticmethod
-    def _build_graph_tensors(
-        atoms: list[str], edges: list[tuple[int, int]], torch: Any
-    ) -> tuple[Any, Any]:
-        atom_types: list[str] = ["C", "N", "O", "S", "F", "CL", "BR", "I"]
-        x = torch.zeros((24, 9), dtype=torch.float32)
-        for atom_index, atom in enumerate(atoms[:24]):
-            feature_index: int = atom_types.index(atom) if atom in atom_types else 8
-            x[atom_index, feature_index] = 1.0
-        adjacency = torch.eye(24, dtype=torch.float32)
-        for src, dst in edges:
-            if src < 24 and dst < 24:
-                adjacency[src, dst] = 1.0
-                adjacency[dst, src] = 1.0
-        return x, adjacency
+    def _parse_smiles(smiles: str) -> tuple[list["_ParsedAtom"], list[_Bond]]:
+        """Parse SMILES into atoms and bonds, honouring branches and ring closures.
 
-    @staticmethod
-    def _smiles_to_graph(smiles: str) -> tuple[Any, Any]:
-        atoms: list[str] = []
-        edges: list[tuple[int, int]] = []
-        last_atom: int | None = None
-        ring_open: dict[str, int] = {}
+        The previous parser skipped every non-alphabetic character, so ``(`` and
+        ``)`` silently vanished and a branched molecule came out as one long
+        chain — wrong topology for 76% of ESOL and 70% of FreeSolv. It also
+        dropped bond orders and bracket atoms entirely.
+        """
+        atoms: list[_ParsedAtom] = []
+        bonds: list[_Bond] = []
+        branch_stack: list[int | None] = []
+        ring_open: dict[str, tuple[int, float]] = {}
+        previous: int | None = None
+        pending_order: float | None = None
         index = 0
         while index < len(smiles):
             char: str = smiles[index]
-            if char.isdigit() and last_atom is not None:
-                if char in ring_open:
-                    edges.append((ring_open.pop(char), last_atom))
-                else:
-                    ring_open[char] = last_atom
+            if char == "(":
+                branch_stack.append(previous)
                 index += 1
                 continue
-            token, index = GraphDatasets._parse_smiles_token(smiles, index)
-            if token is None:
+            if char == ")":
+                previous = branch_stack.pop() if branch_stack else None
+                index += 1
                 continue
-            atom_index: int = len(atoms)
-            atoms.append(token)
-            if last_atom is not None:
-                edges.append((last_atom, atom_index))
-            last_atom = atom_index
+            if char in _BOND_ORDERS:
+                pending_order = _BOND_ORDERS[char]
+                index += 1
+                continue
+            if char in "/\\":  # directional bonds are single bonds
+                index += 1
+                continue
+            if char == ".":  # disconnected component
+                previous = None
+                pending_order = None
+                index += 1
+                continue
+            if previous is not None and (char == "%" or char.isdigit()):
+                if char == "%":
+                    label: str = smiles[index + 1 : index + 3]
+                    index += 3
+                else:
+                    label = char
+                    index += 1
+                order: float = pending_order or 1.0
+                pending_order = None
+                if label in ring_open:
+                    partner, partner_order = ring_open.pop(label)
+                    bonds.append(
+                        _Bond(partner, previous, max(order, partner_order), True)
+                    )
+                else:
+                    ring_open[label] = (previous, order)
+                continue
+            atom, index = GraphDatasets._read_atom(smiles, index)
+            if atom is None:
+                continue
+            current: int = len(atoms)
+            atoms.append(atom)
+            if previous is not None:
+                bonds.append(_Bond(previous, current, pending_order or 1.0, False))
+            pending_order = None
+            previous = current
         if not atoms:
-            atoms = ["C"]
-        return GraphDatasets._build_graph_tensors(atoms, edges, torch)
+            atoms = [_ParsedAtom("C", False, 0, 0)]
+        return atoms, bonds
 
     @staticmethod
-    def esol(batch_size: int) -> TaskBundle:
-        path: Path = _download(ESOL_URL, _data_root() / "esol" / "delaney-processed.csv")
-        node_features = []
-        adjacencies = []
-        labels = []
+    def _build_graph_tensors(
+        atoms: list["_ParsedAtom"], bonds: list[_Bond], max_nodes: int
+    ) -> tuple[Any, Any]:
+        """Featurise a parsed molecule into (node_features, dense adjacency).
+
+        Padded rows are left all-zero, which is what the molecular models use to
+        tell real atoms from padding (see ``MPNN.forward``/``AttentiveFP.forward``);
+        the adjacency's self-loops cannot serve that purpose.
+        """
+        width: int = MOLECULE_NODE_FEATURES
+        x = torch.zeros((max_nodes, width), dtype=torch.float32)
+        adjacency = torch.eye(max_nodes, dtype=torch.float32)
+        kept: int = min(len(atoms), max_nodes)
+        degree = [0.0] * kept
+        double_bond = [0.0] * kept
+        triple_bond = [0.0] * kept
+        in_ring = [0.0] * kept
+        for bond in bonds:
+            if bond.source >= kept or bond.target >= kept or bond.source == bond.target:
+                continue
+            adjacency[bond.source, bond.target] = 1.0
+            adjacency[bond.target, bond.source] = 1.0
+            for end in (bond.source, bond.target):
+                degree[end] += 1.0
+                if bond.order >= 3.0:
+                    triple_bond[end] = 1.0
+                elif bond.order >= 2.0:
+                    double_bond[end] = 1.0
+                if bond.ring_closure:
+                    in_ring[end] = 1.0
+        offset: int = len(_ATOM_TYPES)
+        for position in range(kept):
+            atom = atoms[position]
+            if atom.element in _ATOM_TYPES:
+                x[position, _ATOM_TYPES.index(atom.element)] = 1.0
+            else:
+                x[position, offset] = 1.0
+            x[position, offset + 1] = 1.0 if atom.aromatic else 0.0
+            x[position, offset + 2] = atom.charge / 2.0
+            x[position, offset + 3] = degree[position] / 4.0
+            x[position, offset + 4] = atom.hydrogens / 4.0
+            x[position, offset + 5] = double_bond[position]
+            x[position, offset + 6] = triple_bond[position]
+            x[position, offset + 7] = in_ring[position]
+        return x, adjacency
+
+    @staticmethod
+    def _smiles_to_graph(smiles: str, max_nodes: int) -> tuple[Any, Any]:
+        atoms, bonds = GraphDatasets._parse_smiles(smiles)
+        return GraphDatasets._build_graph_tensors(atoms, bonds, max_nodes)
+
+    @staticmethod
+    def _molecular_regression_bundle(
+        path: Path,
+        *,
+        target_keys: tuple[str, ...],
+        max_nodes: int,
+        batch_size: int,
+        input_description: str,
+    ) -> TaskBundle:
+        node_features: list[Any] = []
+        adjacencies: list[Any] = []
+        labels: list[float] = []
         with path.open(newline="") as fh:
             reader: csv.DictReader[str] = csv.DictReader(fh)
             for row in reader:
-                smiles: str | Any | None = row.get("smiles") or row.get("smile") or row.get("SMILES")
-                target: str | Any | None = row.get("measured log solubility in mols per litre") or row.get(
-                    "ESOL predicted log solubility in mols per litre"
+                smiles: str | None = (
+                    row.get("smiles") or row.get("smile") or row.get("SMILES")
+                )
+                target: str | None = next(
+                    (row[key] for key in target_keys if row.get(key)), None
                 )
                 if smiles is None or target is None:
                     continue
-                x, adjacency = GraphDatasets._smiles_to_graph(smiles)
+                x, adjacency = GraphDatasets._smiles_to_graph(smiles, max_nodes)
                 node_features.append(x)
                 adjacencies.append(adjacency)
                 labels.append(float(target))
-        return _bundle_from_dataset(
-            _TensorRowsDataset(
-                torch.stack(node_features),
-                torch.stack(adjacencies),
-                torch.tensor(labels, dtype=torch.float32),
-            ),
+        return _standardized_regression_bundle(
+            (torch.stack(node_features), torch.stack(adjacencies)),
+            torch.tensor(labels, dtype=torch.float32),
             batch_size,
             "RMSE",
             "minimize",
-            "ESOL MoleculeNet molecular graphs from SMILES",
+            input_description,
+        )
+
+    @staticmethod
+    def esol(batch_size: int) -> TaskBundle:
+        return GraphDatasets._molecular_regression_bundle(
+            _download(ESOL_URL, _data_root() / "esol" / "delaney-processed.csv"),
+            target_keys=(
+                "measured log solubility in mols per litre",
+                "ESOL predicted log solubility in mols per litre",
+            ),
+            max_nodes=ESOL_MAX_ATOMS,
+            batch_size=batch_size,
+            input_description="ESOL MoleculeNet molecular graphs from SMILES",
         )
 
     @staticmethod
     def freesolv(batch_size: int) -> TaskBundle:
-        path: Path = _download(FREESOLV_URL, _data_root() / "freesolv" / "SAMPL.csv")
-        node_features = []
-        adjacencies = []
-        labels = []
-        with path.open(newline="") as fh:
-            reader: csv.DictReader[str] = csv.DictReader(fh)
-            for row in reader:
-                smiles: str | Any | None = row.get("smiles") or row.get("SMILES")
-                target: str | Any | None = (
-                    row.get("expt")
-                    or row.get("measured log solubility in mols per litre")
-                    or row.get("y")
-                )
-                if smiles is None or target is None:
-                    continue
-                x, adjacency = GraphDatasets._smiles_to_graph(smiles)
-                node_features.append(x)
-                adjacencies.append(adjacency)
-                labels.append(float(target))
-        return _bundle_from_dataset(
-            _TensorRowsDataset(
-                torch.stack(node_features),
-                torch.stack(adjacencies),
-                torch.tensor(labels, dtype=torch.float32),
+        return GraphDatasets._molecular_regression_bundle(
+            _download(FREESOLV_URL, _data_root() / "freesolv" / "SAMPL.csv"),
+            target_keys=("expt", "measured log solubility in mols per litre", "y"),
+            max_nodes=FREESOLV_MAX_ATOMS,
+            batch_size=batch_size,
+            input_description=(
+                "FreeSolv molecular hydration free-energy graphs from SMILES"
             ),
-            batch_size,
-            "RMSE",
-            "minimize",
-            "FreeSolv molecular hydration free-energy graphs from SMILES",
         )
 
     @staticmethod
@@ -918,9 +1177,17 @@ class GraphDatasets:
                     i, j = node_map[src], node_map[dst]
                     adjacency[i, j] = 1.0
                     degree[i] += 1.0
-            x = torch.zeros((max_nodes, 8), dtype=torch.float32)
-            x[: len(nodes), 0] = 1.0
-            x[:, 1] = degree / degree.clamp_min(1.0).max().clamp_min(1.0)
+            # IMDB-BINARY nodes carry no labels, so the degree *is* the feature.
+            # Xu et al. one-hot it for GIN; the previous single normalised-degree
+            # scalar collapsed every node into one nearly-constant channel, which
+            # is most of why train loss moved only 0.705 -> 0.622 in 100 epochs.
+            x = torch.zeros((max_nodes, SOCIAL_GRAPH_NODE_FEATURES), dtype=torch.float32)
+            x[: len(nodes), 0] = 1.0  # real-node indicator; GIN pools on this
+            buckets = torch.log2(degree.clamp_min(1.0)).floor().long()
+            buckets = buckets.clamp(0, _SOCIAL_DEGREE_BUCKETS - 1)
+            for node_index in range(len(nodes)):
+                x[node_index, 1 + int(buckets[node_index].item())] = 1.0
+            x[: len(nodes), -1] = degree[: len(nodes)] / float(max_nodes)
             features.append(x)
             adjacencies.append(adjacency)
             labels.append(1 if labels_raw[graph_id - 1] > 0 else 0)
@@ -1312,16 +1579,21 @@ class MedicalDatasets:
 # keeping the GPU busy for longer between CPU round-trips.  Each value was
 # chosen to be well within the M3 Pro's unified-memory budget while giving
 # the GPU enough work per step to approach saturation.
+# Fallback batch sizes for callers that build a bundle without one — chiefly
+# `dqb download_data` and ad-hoc use. `BenchmarkRunner._run_condition` always
+# passes the batch size from that model's ModelTrainingRecipe, so training never
+# reads this table; the values are kept in step with the recipes anyway, since a
+# table that silently disagreed with them is a trap for anyone reading either one.
 _BATCH_SIZES: dict[str, int] = {
-    "lenet5": 512,  # MNIST 28×28 greyscale — negligible per-sample cost
+    "lenet5": 128,  # MNIST 28×28 greyscale — negligible per-sample cost
     "m5": 128,  # SpeechCommands 16 K-sample 1-D waveform
     "lstm_forecaster": 256,  # ETTh1 short sliding windows
-    "textcnn": 256,  # AG News fixed-length token sequences
+    "textcnn": 128,  # AG News fixed-length token sequences
     "gcn": 32,  # Cora ego-graphs — adjacency matrix limits batch size
-    "tabnet": 512,  # Adult Income 14-feature tabular rows
+    "tabnet": 1024,  # Adult Income 14-feature tabular rows
     "mpnn": 32,  # ESOL molecular graphs — variable topology
-    "actor_critic": 1024,  # CartPole 4-D observations — negligible per-sample cost
-    "lstm_autoencoder": 256,  # MIT-BIH 128-sample ECG windows
+    "actor_critic": 512,  # CartPole 4-D observations — negligible per-sample cost
+    "lstm_autoencoder": 128,  # MIT-BIH 128-sample ECG windows
     "distilbert": 32,  # DistilBERT 128-token sequences — larger model requires smaller batches
     "dqn_lunarlander": 128,  # Matches tuned SB3 RL Zoo DQN batch size.
     "ppo_bipedalwalker": 64,  # Matches tuned SB3 RL Zoo PPO minibatch size.
@@ -1329,14 +1601,14 @@ _BATCH_SIZES: dict[str, int] = {
     "gin_imdbb": 32,
     "tcn_forecaster": 128,
     "gru_forecaster": 24,  # Forecasting horizon-sized batches stabilize GRU training.
-    "pointnet_modelnet40": 16,  # PointNet++/ModelNet40 reference batch size.
+    "pointnet_modelnet40": 32,  # PointNet reference batch size (Qi et al.).
     "vae_mnist": 128,  # PyTorch MNIST VAE example default.
     "snn_nmnist": 16,  # N-MNIST SNN literature setting.
     "unet_isic": 8,  # ISIC lesion segmentation studies favor small batches.
-    "resnet18_cifar10": 64,  # CIFAR SGD recipe batch size.
-    "mobilenetv2_cifar10": 64,  # CIFAR SGD recipe batch size.
+    "resnet18_cifar10": 128,  # CIFAR SGD recipe batch size.
+    "mobilenetv2_cifar10": 128,  # CIFAR SGD recipe batch size.
     "saint_adult": 256,  # Official SAINT implementation default.
-    "capsnet_mnist": 64,  # Efficient-CapsNet MNIST recipe.
+    "capsnet_mnist": 128,  # CapsNet MNIST recipe.
 }
 
 
@@ -1387,7 +1659,7 @@ def build_task_bundle(model_key: str, batch_size: int | None = None) -> TaskBund
     ``_BATCH_SIZES`` (useful for smoke tests or ablation studies).
     """
     builders: dict[str, Callable[..., TaskBundle]] = {
-        "lenet5": VisionDatasets.mnist,
+        "lenet5": VisionDatasets.mnist_augmented,
         "m5": AudioDatasets.speechcommands,
         "lstm_forecaster": TimeSeriesDatasets.etth1,
         "textcnn": TextDataSets.ag_news,
@@ -1410,7 +1682,7 @@ def build_task_bundle(model_key: str, batch_size: int | None = None) -> TaskBund
         "resnet18_cifar10": VisionDatasets.cifar10,
         "mobilenetv2_cifar10": VisionDatasets.cifar10,
         "saint_adult": _build_adult,
-        "capsnet_mnist": VisionDatasets.mnist,
+        "capsnet_mnist": VisionDatasets.mnist_augmented,
     }
     if model_key not in builders:
         raise KeyError(f"Unknown model key: {model_key}")

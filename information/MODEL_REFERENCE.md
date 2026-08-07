@@ -21,14 +21,59 @@ For each model below, this document captures:
 - Default training recipe fields:
   - `batch_size`
   - `max_epochs`
-  - `learning_rate`
-  - `optimizer_name`
-  - `momentum`
+  - `learning_rate` — the *base* rate; the schedule below is applied on top of it
+  - `optimizer_name` — `adam`, `adamw`, or `sgd`
+  - `momentum` — SGD only
   - `weight_decay`
+  - `nesterov` — SGD only; ignored when `momentum` is 0
+- Learning-rate schedule fields (only the ones a recipe actually uses are listed
+  per model). `training._scheduled_learning_rate` recomputes the rate from the
+  base value and the epoch index every epoch rather than mutating it in place,
+  so it survives both checkpoint resume and PerforatedAI rebuilding the
+  optimizer on dendrite restructuring:
+  - `lr_schedule` — `constant`, `step`, `cosine`, or `linear`
+  - `lr_decay_every`, `lr_decay_gamma` — `step` only: multiply by gamma every N epochs
+  - `lr_min_factor` — `cosine`/`linear` floor, as a fraction of the base rate
+  - `warmup_epochs` — linear ramp from `base/warmup` up to `base`, applied under
+    every schedule. Granularity is one epoch, so it is only used on budgets long
+    enough for that to be meaningful.
+- Regularisation fields:
+  - `label_smoothing` — passed to `CrossEntropyLoss`; classification models only
+  - `grad_clip_norm` — global-norm clip applied after `backward()` and before
+    `optimizer.step()`, so PerforatedAI's own step sees the clipped gradients
+- Why the schedule is not handed to PerforatedAI:
+  - The `perforatedai` skill's default advice is to pass the schedule to
+    `pai_tracker.setup_optimizer(model, optimArgs, schedArgs)` and let PAI call
+    `scheduler.step()`. This benchmark deliberately passes an empty `schedArgs`
+    and drives the rate itself. A stateful `torch.optim.lr_scheduler` object is
+    rebuilt whenever PAI restructures the model to add dendrites, which resets
+    its epoch counter — a cosine curve would restart from the top at every
+    dendrite switch, and the baseline and dendritic arms would then see
+    different rate trajectories for the same recipe. Recomputing the rate from
+    `(base_lr, epoch)` each epoch is stateless, so it is identical in both arms
+    and unaffected by restructuring or checkpoint resume. `_setup_pai_optimizer`
+    accordingly discards any scheduler PAI hands back.
+- Dendritic batch-size scaling:
+  - A model listed in `_MODEL_DENDRITIC_BATCH_SIZES` (only DistilBERT today) runs
+    its dendritic conditions at a smaller batch so the candidate forward fits in
+    memory. `ModelTrainingRecipe.with_batch_size` scales the learning rate by the
+    same factor, holding the per-sample step equal to the baseline's.
 - Derived PQAT budget:
   - `ceil(max_epochs * 0.30)`, capped to the range `1..10`
 - Model kwargs:
   - Only listed when the pipeline passes non-empty kwargs to `build_model(...)`
+- Losses:
+  - Classification uses `CrossEntropyLoss`; forecasting, molecular regression and
+    the reconstruction autoencoder use `MSELoss`; the VAE uses BCE + KL.
+  - CapsNet is the exception: its output is a per-class capsule *length* in
+    `[0, 1)`, not a logit, so it trains against `CapsuleMarginLoss` (Sabour et
+    al., m+ = 0.9, m− = 0.1, λ = 0.5).
+- Target standardisation:
+  - The two molecular regression sets (ESOL, FreeSolv) z-score their targets
+    using training-split statistics only. `TaskBundle.target_offset` /
+    `target_scale` carry the transform, and `_compute_all_metrics` maps
+    predictions back through it, so reported RMSE/MAE stay in log-solubility and
+    kcal/mol respectively and remain comparable to MoleculeNet.
 - Perforation registration:
   - The benchmark registers tensor-returning `nn.Linear`, `nn.Conv1d`, and `nn.Conv2d` modules for PerforatedAI perforation.
   - Recurrent, graph-attention, capsule, and tabular-attention models expose their gates/projections as explicit Linear/Conv modules, rather than handing tuple-returning `nn.LSTM`, `nn.GRU`, or `nn.MultiheadAttention` modules directly to PerforatedAI.
@@ -53,14 +98,16 @@ For each model below, this document captures:
 - Factory key: `lenet5`
 - Model kwargs: `num_classes=10`
 - Training recipe:
-  - `batch_size=256`
-  - `max_epochs=20`
+  - `batch_size=128`
+  - `max_epochs=40`
   - `learning_rate=1.0e-2`
   - `optimizer_name=sgd`
   - `momentum=0.9`
-  - `weight_decay=0.0`
+  - `weight_decay=5.0e-4`
+  - `lr_schedule=cosine`
+  - `nesterov=True`
 - Perforation registration: default
-- PQAT epoch budget: `6`
+- PQAT epoch budget: `10`
 - Architecture diagram:
 
 ```mermaid
@@ -81,13 +128,16 @@ flowchart TD
 - Model kwargs: `num_classes=12`
 - Training recipe:
   - `batch_size=128`
-  - `max_epochs=30`
+  - `max_epochs=40`
   - `learning_rate=1.0e-2`
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=1.0e-4`
+  - `lr_schedule=step`
+  - `lr_decay_every=20`
+  - `lr_decay_gamma=0.1`
 - Perforation registration: default
-- PQAT epoch budget: `9`
+- PQAT epoch budget: `10`
 - Architecture diagram:
 
 ```mermaid
@@ -109,11 +159,14 @@ flowchart TD
 - Model kwargs: none
 - Training recipe:
   - `batch_size=256`
-  - `max_epochs=40`
+  - `max_epochs=60`
   - `learning_rate=1.0e-3`
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
+  - `lr_schedule=cosine`
+  - `lr_min_factor=0.01`
+  - `grad_clip_norm=1.0`
 - Architecture: two-layer LSTM forecaster implemented with explicit Linear input/hidden gates so recurrent gates are eligible for dendritic perforation.
 - Perforation registration: default
 - PQAT epoch budget: `10`
@@ -144,13 +197,15 @@ flowchart TD
 - Model kwargs: `num_classes=4`
 - Training recipe:
   - `batch_size=128`
-  - `max_epochs=10`
+  - `max_epochs=30`
   - `learning_rate=1.0e-3`
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=1.0e-4`
+  - `lr_schedule=cosine`
+  - `lr_min_factor=0.02`
 - Perforation registration: default
-- PQAT epoch budget: `3`
+- PQAT epoch budget: `9`
 - Architecture diagram:
 
 ```mermaid
@@ -177,11 +232,13 @@ flowchart TD
 - Model kwargs: `num_classes=7`
 - Training recipe:
   - `batch_size=32`
-  - `max_epochs=200`
+  - `max_epochs=100`
   - `learning_rate=1.0e-2`
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=5.0e-4`
+  - `lr_schedule=cosine`
+  - `lr_min_factor=0.05`
 - Perforation registration: default
 - Special dendritic note:
   - The pipeline adjusts the GCN `GraphConv` linears to `set_this_output_dimensions([-1, -1, 0])` when available.
@@ -224,11 +281,13 @@ flowchart TD
 ```
 - Training recipe:
   - `batch_size=1024`
-  - `max_epochs=100`
+  - `max_epochs=200`
   - `learning_rate=2.0e-3`
   - `optimizer_name=adamw`
   - `momentum=0.9`
   - `weight_decay=1.0e-5`
+  - `lr_schedule=cosine`
+  - `lr_min_factor=0.02`
 - Perforation registration: default
 - PQAT epoch budget: `10`
 
@@ -256,11 +315,14 @@ flowchart TD
 ```
 - Training recipe:
   - `batch_size=32`
-  - `max_epochs=100`
+  - `max_epochs=200`
   - `learning_rate=1.0e-3`
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=1.0e-5`
+  - `lr_schedule=cosine`
+  - `lr_min_factor=0.02`
+  - `grad_clip_norm=5.0`
 - Perforation registration: default
 - PQAT epoch budget: `10`
 
@@ -274,11 +336,13 @@ flowchart TD
 - Model kwargs: none
 - Training recipe:
   - `batch_size=512`
-  - `max_epochs=40`
+  - `max_epochs=60`
   - `learning_rate=3.0e-4`
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
+  - `lr_schedule=cosine`
+  - `lr_min_factor=0.05`
 - Perforation registration: default (`nn.Linear`, `nn.Conv1d`, `nn.Conv2d`). The `.value` head is registered as track-only (PAI wraps it for observation but does not insert dendrites into it); dendrite insertion applies to the shared backbone and policy head only.
 - PQAT epoch budget: `10`
 - Architecture diagram:
@@ -301,11 +365,14 @@ flowchart TD
 - Model kwargs: none
 - Training recipe:
   - `batch_size=128`
-  - `max_epochs=50`
+  - `max_epochs=60`
   - `learning_rate=1.0e-3`
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
+  - `lr_schedule=cosine`
+  - `lr_min_factor=0.02`
+  - `grad_clip_norm=1.0`
 - Architecture: sequence-to-sequence LSTM autoencoder implemented with explicit Linear gates and a compact latent bottleneck.
 - Perforation registration: default
 - PQAT epoch budget: `10`
@@ -331,14 +398,16 @@ flowchart TD
 - Architecture: `distilbert-base-uncased` loaded via `transformers.AutoModelForSequenceClassification`. 6-layer Transformer encoder (66M parameters) fine-tuned for binary sentiment classification. Input batches are 3-tuples `(input_ids, attention_mask, label)` produced by the matching HuggingFace tokenizer with `max_length=128`.
 - Training recipe:
   - `batch_size=32`
-  - `max_epochs=4`
-  - `learning_rate=1.0e-4`
+  - `max_epochs=3`
+  - `learning_rate=2.0e-5`
   - `optimizer_name=adamw`
   - `momentum=0.9`
   - `weight_decay=1.0e-2`
+  - `lr_schedule=linear`
+  - `grad_clip_norm=1.0`
 - Perforation registration: head-only (`.model.pre_classifier`, `.model.classifier`) to keep DistilBERT dendritic runs within Apple Silicon MPS memory. The base transformer is excluded from PerforatedAI saving through `.model.base_model`.
 - Dendritic runtime note: dendritic DistilBERT uses `batch_size=4`, caps initial PAI correlation to 4 batches, and clears memory every 128 completed batches.
-- PQAT epoch budget: `2`
+- PQAT epoch budget: `1`
 - Architecture diagram:
 
 ```mermaid
@@ -374,6 +443,8 @@ flowchart TD
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
+  - `lr_schedule=cosine`
+  - `lr_min_factor=0.05`
 - Perforation registration: default
 - PQAT epoch budget: `10`
 
@@ -403,6 +474,8 @@ flowchart TD
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
+  - `lr_schedule=cosine`
+  - `lr_min_factor=0.05`
 - Perforation registration: default (`nn.Linear`, `nn.Conv1d`, `nn.Conv2d`). The `.critic` head is registered as track-only; dendrite insertion applies to the shared backbone and actor head only.
 - PQAT epoch budget: `10`
 
@@ -416,11 +489,14 @@ flowchart TD
 - Model kwargs: none
 - Training recipe:
   - `batch_size=32`
-  - `max_epochs=100`
+  - `max_epochs=300`
   - `learning_rate=1.0e-3`
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=1.0e-5`
+  - `lr_schedule=cosine`
+  - `lr_min_factor=0.02`
+  - `grad_clip_norm=5.0`
 - Architecture: AttentiveFP-style graph attention/message-passing network with attention-weighted neighbor updates, gated graph readout, and scalar regression head. GRU-style updates are implemented from Linear gates.
 - Architecture diagram:
 
@@ -449,11 +525,14 @@ flowchart TD
 - Model kwargs: `num_classes=2`
 - Training recipe:
   - `batch_size=32`
-  - `max_epochs=100`
+  - `max_epochs=200`
   - `learning_rate=1.0e-2`
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=5.0e-4`
+  - `lr_schedule=step`
+  - `lr_decay_every=50`
+  - `lr_decay_gamma=0.5`
 - Perforation registration: default
 - PQAT epoch budget: `10`
 - Architecture diagram:
@@ -478,11 +557,14 @@ flowchart TD
 - Model kwargs: none
 - Training recipe:
   - `batch_size=128`
-  - `max_epochs=60`
+  - `max_epochs=80`
   - `learning_rate=1.0e-3`
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=1.0e-4`
+  - `lr_schedule=cosine`
+  - `lr_min_factor=0.01`
+  - `grad_clip_norm=1.0`
 - Perforation registration: default
 - PQAT epoch budget: `10`
 - Architecture diagram:
@@ -517,6 +599,9 @@ flowchart TD
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
+  - `lr_schedule=cosine`
+  - `lr_min_factor=0.01`
+  - `grad_clip_norm=1.0`
 - Architecture: two-layer GRU forecaster implemented with explicit Linear update/reset/new gates so recurrent projections can be perforated.
 - Perforation registration: default (`nn.Linear`, `nn.Conv1d`, `nn.Conv2d`). The recurrent `.cells` modules are registered as track-only (PAI wraps them for observation but does not insert dendrites into them); dendrite insertion is confined to the readout `Linear` in `.head` only. This avoids per-timestep perforation overhead on long sequences.
 - PQAT epoch budget: `10`
@@ -566,11 +651,14 @@ flowchart TD
 ```
 - Training recipe:
   - `batch_size=32`
-  - `max_epochs=60`
+  - `max_epochs=100`
   - `learning_rate=1.0e-3`
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=1.0e-4`
+  - `lr_schedule=step`
+  - `lr_decay_every=20`
+  - `lr_decay_gamma=0.7`
 - Perforation registration: default
 - PQAT epoch budget: `10`
 
@@ -596,13 +684,15 @@ flowchart TD
 ```
 - Training recipe:
   - `batch_size=128`
-  - `max_epochs=20`
+  - `max_epochs=50`
   - `learning_rate=1.0e-3`
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
+  - `lr_schedule=cosine`
+  - `lr_min_factor=0.02`
 - Perforation registration: default
-- PQAT epoch budget: `6`
+- PQAT epoch budget: `10`
 
 ## 19. `snn_nmnist` — Spiking Neural Network
 
@@ -630,7 +720,10 @@ flowchart TD
   - `learning_rate=1.0e-3`
   - `optimizer_name=adam`
   - `momentum=0.9`
-  - `weight_decay=0.0`
+  - `weight_decay=1.0e-5`
+  - `lr_schedule=cosine`
+  - `lr_min_factor=0.01`
+  - `grad_clip_norm=5.0`
 - Perforation registration: default
 - PQAT epoch budget: `10`
 
@@ -681,11 +774,15 @@ flowchart TD
 - Model kwargs: none
 - Training recipe:
   - `batch_size=128`
-  - `max_epochs=90`
-  - `learning_rate=5.0e-2`
+  - `max_epochs=200`
+  - `learning_rate=1.0e-1`
   - `optimizer_name=sgd`
   - `momentum=0.9`
   - `weight_decay=5.0e-4`
+  - `lr_schedule=cosine`
+  - `warmup_epochs=5`
+  - `label_smoothing=0.1`
+  - `nesterov=True`
 - Perforation registration: default
 - PQAT epoch budget: `10`
 - Architecture diagram:
@@ -711,11 +808,15 @@ flowchart TD
 - Model kwargs: none
 - Training recipe:
   - `batch_size=128`
-  - `max_epochs=150`
-  - `learning_rate=5.0e-2`
+  - `max_epochs=200`
+  - `learning_rate=1.0e-1`
   - `optimizer_name=sgd`
   - `momentum=0.9`
   - `weight_decay=4.0e-5`
+  - `lr_schedule=cosine`
+  - `warmup_epochs=5`
+  - `label_smoothing=0.1`
+  - `nesterov=True`
 - Perforation registration: default
 - PQAT epoch budget: `10`
 - Architecture diagram:
@@ -738,11 +839,15 @@ flowchart TD
 - Model kwargs: `num_classes=2`
 - Training recipe:
   - `batch_size=256`
-  - `max_epochs=100`
+  - `max_epochs=200`
   - `learning_rate=1.0e-4`
   - `optimizer_name=adamw`
   - `momentum=0.9`
   - `weight_decay=1.0e-5`
+  - `lr_schedule=cosine`
+  - `lr_min_factor=0.02`
+  - `warmup_epochs=5`
+  - `grad_clip_norm=1.0`
 - Architecture: SAINT-style tabular transformer with explicit Linear Q/K/V projections, column attention, row attention across the mini-batch, and pooled classification head.
 - Architecture diagram:
 
@@ -781,9 +886,12 @@ flowchart TD
 - Training recipe:
   - `batch_size=128`
   - `max_epochs=30`
-  - `learning_rate=3.0e-3`
+  - `learning_rate=1.0e-3`
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
+  - `lr_schedule=step`
+  - `lr_decay_every=1`
+  - `lr_decay_gamma=0.96`
 - Perforation registration: default (`nn.Linear`, `nn.Conv1d`, `nn.Conv2d`). The decoder reconstruction head linears (`.decoder.0` and `.decoder.2`) are registered as track-only; dendrite insertion applies to the convolutional stem, primary capsules, and routing weights only.
 - PQAT epoch budget: `9`

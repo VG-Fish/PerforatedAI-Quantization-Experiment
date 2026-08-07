@@ -57,7 +57,7 @@ flowchart TD
     N --> O
     O --> R{"Quantization<br>condition?"}
     R -->|Q8/Q4/Q2/Q1.58/Q1| S["Load source checkpoint and<br>apply PTQ snapshot"]
-    R -->|FP32| T["Train full epochs with<br>model-specific recipe"]
+    R -->|FP32| T["Train full epochs with<br>model-specific recipe<br>(LR schedule applied per epoch)"]
     S --> S2{"--allow-PQAT?"}
     S2 -->|No| U
     S2 -->|Yes| S3["Save before_pqat/<br>then fine-tune for a<br>model-aware PQAT budget<br>then save after_pqat/"]

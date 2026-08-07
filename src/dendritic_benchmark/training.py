@@ -55,6 +55,12 @@ _FALLBACK_MODULE_OUTPUT_DIMENSIONS: dict[str, dict[str, list[int]]] = {
     },
 }
 OptimizerName = Literal["adam", "adamw", "sgd"]
+# "constant" leaves the learning rate alone for the whole run.
+# "step"     multiplies it by lr_decay_gamma every lr_decay_every epochs.
+# "cosine"   anneals it from learning_rate down to learning_rate*lr_min_factor.
+# "linear"   decays it linearly to learning_rate*lr_min_factor (BERT-style).
+# All three honour warmup_epochs first. See ModelTrainingRecipe in pipeline.py.
+LRScheduleName = Literal["constant", "step", "cosine", "linear"]
 
 
 @dataclass
@@ -71,6 +77,19 @@ class TrainingConfig:
     optimizer_name: OptimizerName = "adam"
     momentum: float = 0.9
     weight_decay: float = 0.0
+    nesterov: bool = False
+    lr_schedule: LRScheduleName = "constant"
+    # Step decay: multiply lr by lr_decay_gamma every lr_decay_every epochs.
+    # Only read when lr_schedule == "step".
+    lr_decay_every: int | None = None
+    lr_decay_gamma: float = 1.0
+    # Floor for "cosine"/"linear", as a fraction of the base learning rate.
+    lr_min_factor: float = 0.0
+    # Linear ramp from 0 to learning_rate over this many epochs, applied under
+    # every schedule. Fractional epochs are not supported; the ramp is per-epoch.
+    warmup_epochs: int = 0
+    label_smoothing: float = 0.0
+    grad_clip_norm: float | None = None
     source_condition_key: str | None = None
     enable_pai_dendrite_updates: bool = False
     train_dendrites_until_complete: bool = False
@@ -279,7 +298,42 @@ _PRIMARY_METRIC_KEY: dict[str, str] = {
 }
 
 
-def _binary_or_multi_loss(model_key: str) -> Any:
+class CapsuleMarginLoss(torch.nn.Module):
+    """Margin loss from Sabour et al., "Dynamic Routing Between Capsules" (sec. 3).
+
+    CapsNet's output is a per-class capsule *length* in [0, 1), not a logit.
+    Feeding those to ``CrossEntropyLoss`` squeezes every class into a softmax over
+    a range narrower than one nat, so the gradient is tiny and nearly uniform:
+    the 2026-08-05 run's train loss moved from 1.578 to 1.468 across 30 epochs
+    and validation accuracy stalled at 98.7% against the paper's 99.5%. The
+    margin loss scores each capsule independently against m+ / m-, which is what
+    the architecture's routing was designed for.
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        m_positive: float = 0.9,
+        m_negative: float = 0.1,
+        down_weight: float = 0.5,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.m_positive = m_positive
+        self.m_negative = m_negative
+        self.down_weight = down_weight
+
+    def forward(self, lengths: Any, targets: Any) -> Any:
+        onehot = torch.nn.functional.one_hot(
+            targets.long().flatten(), num_classes=self.num_classes
+        ).to(lengths.dtype)
+        present = torch.clamp(self.m_positive - lengths, min=0.0).square()
+        absent = torch.clamp(lengths - self.m_negative, min=0.0).square()
+        loss = onehot * present + self.down_weight * (1.0 - onehot) * absent
+        return loss.sum(dim=-1).mean()
+
+
+def _binary_or_multi_loss(model_key: str, config: TrainingConfig | None = None) -> Any:
     if model_key in {"lstm_forecaster", "mpnn", "attentivefp_freesolv", "tcn_forecaster", "gru_forecaster", "ppo_bipedalwalker"}:
         return torch.nn.MSELoss()
     if model_key in {"lstm_autoencoder"}:
@@ -288,9 +342,10 @@ def _binary_or_multi_loss(model_key: str) -> Any:
         return torch.nn.BCEWithLogitsLoss()
     if model_key == "vae_mnist":
         return None
-    if model_key == "actor_critic":
-        return torch.nn.CrossEntropyLoss()
-    return torch.nn.CrossEntropyLoss()
+    if model_key == "capsnet_mnist":
+        return CapsuleMarginLoss(num_classes=10)
+    label_smoothing = float(getattr(config, "label_smoothing", 0.0) or 0.0)
+    return torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
 
 def _safe_ratio(numerator: float, denominator: float, default: float = 0.0) -> float:
@@ -572,6 +627,13 @@ def _anomaly_metrics(
     return metrics
 
 
+def _rescale_to_dataset_units(value: Any, offset: float, scale: float) -> Any:
+    """Undo a dataset's target standardisation so metrics keep their real units."""
+    if scale == 1.0 and offset == 0.0:
+        return value
+    return value.float() * scale + offset
+
+
 def _compute_all_metrics(
     model_key: str,
     outputs: Any,
@@ -579,11 +641,16 @@ def _compute_all_metrics(
     metric_targets: Any | None,
     *,
     metric_name: str,
+    target_offset: float = 0.0,
+    target_scale: float = 1.0,
 ) -> dict[str, float]:
     if model_key == "actor_critic" and isinstance(outputs, tuple):
         outputs = outputs[0]
     if model_key in {"lstm_forecaster", "mpnn", "attentivefp_freesolv", "tcn_forecaster", "gru_forecaster"}:
-        return _regression_metrics(outputs, targets)
+        return _regression_metrics(
+            _rescale_to_dataset_units(outputs, target_offset, target_scale),
+            _rescale_to_dataset_units(targets, target_offset, target_scale),
+        )
     if model_key == "ppo_bipedalwalker":
         metrics = _regression_metrics(outputs, targets)
         metrics["reward_proxy"] = -metrics["mae"]
@@ -759,7 +826,7 @@ def infer_module_output_dimensions(
     try:
         model.eval()
         batch = _sample_batch_from_loader(bundle.train_loader)
-        batch = tuple(item.to(device, non_blocking=True) for item in batch)
+        batch = _move_batch_to_device(batch, device)
         with torch.no_grad():
             _forward(model_key, model, batch)
     finally:
@@ -1098,6 +1165,7 @@ def _build_optimizer(model: Any, torch: Any, config: TrainingConfig) -> Any:
             lr=config.learning_rate,
             momentum=config.momentum,
             weight_decay=config.weight_decay,
+            nesterov=config.nesterov and config.momentum > 0.0,
         )
     if config.optimizer_name == "adamw":
         return torch.optim.AdamW(
@@ -1128,6 +1196,7 @@ def _optimizer_args(model: Any, config: TrainingConfig) -> dict[str, Any]:
     }
     if config.optimizer_name == "sgd":
         args["momentum"] = config.momentum
+        args["nesterov"] = config.nesterov and config.momentum > 0.0
     return args
 
 
@@ -1208,8 +1277,11 @@ def _pai_pdb_suppressed() -> "Any":
     that raises BdbQuit, which is an ordinary Exception and so gets swallowed
     by the fallbacks below, silently handing back a non-PAI optimizer.
     """
-    import pdb as pdb_module
+    import pdb as _pdb
 
+    # Typed as Any so reassigning set_trace below is a plain attribute write
+    # rather than a redefinition of the stdlib symbol's declared type.
+    pdb_module: Any = _pdb
     original = pdb_module.set_trace
 
     def _no_set_trace(*, header: str | None = None) -> None:
@@ -1280,6 +1352,8 @@ def _eval_on_loader(
     criterion: Any,
     metric_name: str,
     torch: Any,
+    target_offset: float = 0.0,
+    target_scale: float = 1.0,
 ) -> tuple[float, dict[str, Any]]:
     """Run evaluation on a dataloader, return (loss, metrics)."""
     running_loss_t = torch.zeros(1, device=device)
@@ -1289,7 +1363,7 @@ def _eval_on_loader(
     metric_targets_list: list[Any] = []
     with torch.no_grad():
         for batch in loader:
-            batch = tuple(item.to(device, non_blocking=True) for item in batch)
+            batch = _move_batch_to_device(batch, device)
             outputs, targets, metric_targets = _forward(model_key, model, batch)
             loss = _compute_loss(model_key, criterion, outputs, targets, model=model)
             batch_examples = _batch_size(targets)
@@ -1311,6 +1385,8 @@ def _eval_on_loader(
             torch.cat(targets_list, dim=0),
             torch.cat(metric_targets_list, dim=0) if metric_targets_list else None,
             metric_name=metric_name,
+            target_offset=target_offset,
+            target_scale=target_scale,
         )
     return loss_val, metrics
 
@@ -1487,7 +1563,33 @@ def _maybe_disable_candidate_graph_for_batch(
 
 
 def _move_batch_to_device(batch: Any, device: Any) -> tuple[Any, ...]:
-    return tuple(item.to(device, non_blocking=True) for item in batch)
+    """Copy a batch to ``device``, asynchronously only when that is actually safe.
+
+    ``non_blocking=True`` only buys overlap when the *source* is page-locked, and
+    ``_make_loader`` deliberately sets ``pin_memory=False`` (MPS uses unified
+    memory, so pinning is pure overhead there).  From pageable memory the flag
+    therefore bought nothing — but on MPS it still returned before the copy had
+    landed, so a caller that dropped its reference to the CPU tensor let the
+    allocator recycle those bytes underneath the in-flight copy.  ``_eval_on_loader``
+    did exactly that (``batch = tuple(item.to(...) for item in batch)`` rebinds the
+    only reference), which fed PointNet's eval passes partly-garbage point clouds:
+    val accuracy pinned near chance for all 60 epochs while train accuracy climbed
+    to 78%, test_loss came out at 1.9e33, and two identical eval runs disagreed
+    (5.47% vs 5.02%) — the non-determinism that gives a memory race away.
+    Gating on ``is_pinned()`` keeps the async path for any future pinned loader
+    while making the pageable case a plain synchronous copy.
+    """
+    return tuple(item.to(device, non_blocking=_is_pinned(item)) for item in batch)
+
+
+def _is_pinned(item: Any) -> bool:
+    """True only for page-locked CPU tensors, where async H2D copies are safe."""
+    if getattr(item, "device", None) is None or item.device.type != "cpu":
+        return False
+    try:
+        return bool(item.is_pinned())
+    except (AttributeError, RuntimeError, NotImplementedError):
+        return False
 
 
 def _backward_and_step(
@@ -1495,11 +1597,17 @@ def _backward_and_step(
     optimizer: Any,
     *,
     retain_graph_for_optimizer_step: bool,
+    model: Any = None,
+    grad_clip_norm: float | None = None,
 ) -> None:
     # PerforatedAI's optimizer step may run its own backward pass after the
     # benchmark's loss backward. Standard torch optimizers do not need the
     # graph retained; keeping it on long MPS runs causes per-batch memory growth.
     loss.backward(retain_graph=retain_graph_for_optimizer_step)
+    if grad_clip_norm and model is not None:
+        # Clipped before the step so PerforatedAI's own step (which may run a
+        # second backward) still sees the clipped gradients on the first pass.
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
     optimizer.step()
 
 
@@ -1569,6 +1677,8 @@ def _run_training_batch(
         loss,
         optimizer,
         retain_graph_for_optimizer_step=retain_graph_for_optimizer_step,
+        model=model,
+        grad_clip_norm=config.grad_clip_norm,
     )
     if clear_pai_buffers:
         clear_pai_processor_buffers(model)
@@ -1582,6 +1692,8 @@ def _finalize_training_batch_metrics(
     model_key: str,
     torch: Any,
     metric_name: str,
+    target_offset: float = 0.0,
+    target_scale: float = 1.0,
 ) -> tuple[float, dict[str, Any]]:
     train_loss = (
         accumulator.running_loss_t / max(1, accumulator.examples)
@@ -1596,6 +1708,8 @@ def _finalize_training_batch_metrics(
         if accumulator.metric_targets
         else None,
         metric_name=metric_name,
+        target_offset=target_offset,
+        target_scale=target_scale,
     )
     return train_loss, train_metrics
 
@@ -1684,6 +1798,8 @@ def _run_epoch_batches(
         model_key=model_key,
         torch=torch,
         metric_name=metric_name,
+        target_offset=getattr(bundle, "target_offset", 0.0),
+        target_scale=getattr(bundle, "target_scale", 1.0),
     )
 
 
@@ -1908,21 +2024,29 @@ def _apply_epoch_checkpoint(
     return resume_epoch
 
 
-def _pai_state_is_persistable(context: "EpochTrainingContext") -> bool:
-    """Whether this run owns PAI tracker state worth snapshotting."""
-    return bool(
+def _persistable_pai_save_name(context: "EpochTrainingContext") -> str | None:
+    """The save name for this run's PAI state, or None if there's none worth keeping.
+
+    Returns the name rather than a bool so callers get a genuinely non-optional
+    ``str`` to hand to the ``*_pai_system`` helpers; a bool predicate left them
+    passing ``config.pai_save_name`` (``str | None``) on a branch only a human
+    could see was already guarded.
+    """
+    if not (
         context.config.use_dendrites
-        and context.config.pai_save_name
         and _pai_updates_enabled(context.config)
         and _pai_tracker() is not None
-    )
+    ):
+        return None
+    return context.config.pai_save_name or None
 
 
 def _save_pai_resume_state(context: "EpochTrainingContext") -> None:
     """Snapshot PAI's dendrite structure and schedule beside the epoch checkpoint."""
-    if not _pai_state_is_persistable(context):
+    save_name = _persistable_pai_save_name(context)
+    if save_name is None:
         return
-    save_pai_system(_unwrap_compiled(context.model), context.config.pai_save_name)
+    save_pai_system(_unwrap_compiled(context.model), save_name)
 
 
 def _restore_pai_resume_state(
@@ -1936,9 +2060,9 @@ def _restore_pai_resume_state(
     parameter groups stop lining up as soon as dendrites come back — that
     mismatch is what silently reset the optimizer on every earlier resume.
     """
-    if not _pai_state_is_persistable(context):
+    save_name = _persistable_pai_save_name(context)
+    if save_name is None:
         return optimizer
-    save_name = context.config.pai_save_name
     if not pai_resume_state_exists(save_name):
         return optimizer
     module_dimensions = getattr(context.model, MODULE_OUTPUT_DIMENSIONS_ATTR, None)
@@ -2346,7 +2470,9 @@ def _run_validation_pass(
     context.model.eval()
     return _eval_on_loader(
         context.model, context.model_key, context.bundle.val_loader,
-        context.device, context.criterion, context.metric_name, context.torch
+        context.device, context.criterion, context.metric_name, context.torch,
+        target_offset=getattr(context.bundle, "target_offset", 0.0),
+        target_scale=getattr(context.bundle, "target_scale", 1.0),
     )
 
 
@@ -2482,6 +2608,50 @@ def _training_collapsed(state: EpochTrainingState, metric_direction: str) -> boo
     return frozen_metric > state.best_metric
 
 
+def _scheduled_learning_rate(
+    config: "TrainingConfig", epoch: int, max_epochs: int
+) -> float | None:
+    """Learning rate this schedule prescribes at ``epoch``, or None for no-op.
+
+    Always computed from the base learning rate and the epoch index rather than
+    mutated in place, so it stays correct regardless of checkpoint resume (which
+    re-enters the loop mid-way) or PerforatedAI recreating the optimizer on
+    dendrite restructuring (which resets param groups back to the base lr).
+
+    ``max_epochs`` is the recipe's budget, not the actual epoch count, so a
+    dynamic dendritic run that trains past the budget holds at the floor instead
+    of wrapping the cosine curve back up.
+    """
+    base = config.learning_rate
+    warmup = max(0, config.warmup_epochs)
+    if warmup and epoch < warmup:
+        # epoch 0 gets base/warmup rather than 0, which would be a dead epoch.
+        return base * float(epoch + 1) / float(warmup)
+    if config.lr_schedule == "step":
+        if not config.lr_decay_every:
+            return None
+        return base * (config.lr_decay_gamma ** (epoch // config.lr_decay_every))
+    if config.lr_schedule not in {"cosine", "linear"}:
+        return None
+    floor = base * config.lr_min_factor
+    decay_span = max(1, max_epochs - warmup)
+    progress = min(1.0, max(0.0, float(epoch - warmup) / float(decay_span)))
+    if config.lr_schedule == "linear":
+        return floor + (base - floor) * (1.0 - progress)
+    return floor + 0.5 * (base - floor) * (1.0 + math.cos(math.pi * progress))
+
+
+def _apply_lr_schedule(
+    optimizer: Any, config: "TrainingConfig", epoch: int, max_epochs: int
+) -> None:
+    """Set every param group's lr to what the configured schedule says at ``epoch``."""
+    target_lr = _scheduled_learning_rate(config, epoch, max_epochs)
+    if target_lr is None:
+        return
+    for group in optimizer.param_groups:
+        group["lr"] = target_lr
+
+
 def _run_training_epochs(
     context: EpochTrainingContext,
     optimizer: Any,
@@ -2510,6 +2680,7 @@ def _run_training_epochs(
             pai_tracker = None
             _release_accelerator_cache(context.torch)
             pai_status = PAIUpdateStatus(frozen=True, active=False)
+        _apply_lr_schedule(optimizer, context.config, epoch, context.max_epochs)
         train_loss, train_metrics = _run_training_pass_oom_guarded(
             context, optimizer, epoch, pai_status
         )
@@ -2630,7 +2801,9 @@ def _capture_before_pqat_snapshot(
     metadata: ArtifactMetadata,
 ) -> None:
     before_test_loss, before_test_metrics = _eval_on_loader(
-        model, model_key, bundle.test_loader, device, criterion, metric_name, torch
+        model, model_key, bundle.test_loader, device, criterion, metric_name, torch,
+        target_offset=getattr(bundle, "target_offset", 0.0),
+        target_scale=getattr(bundle, "target_scale", 1.0),
     )
     before_final_metric = float(before_test_metrics.get(primary_metric_key, 0.0))
     payload = ArtifactPayload(
@@ -2892,7 +3065,7 @@ def train_and_evaluate(
     )
     with pai_guard:
         optimizer, pai_tracker = _setup_pai_optimizer(model, torch, config)
-        criterion = _binary_or_multi_loss(model_key)
+        criterion = _binary_or_multi_loss(model_key, config)
         start_time = time.perf_counter()
         run_label = f"{model_key} | {condition_key}"
 
@@ -2962,7 +3135,9 @@ def train_and_evaluate(
     model.eval()
     test_loss, test_metrics = _eval_on_loader(
         model, model_key, bundle.test_loader, eval_device, criterion,
-        metric_name, torch
+        metric_name, torch,
+        target_offset=getattr(bundle, "target_offset", 0.0),
+        target_scale=getattr(bundle, "target_scale", 1.0),
     )
     final_metric = float(test_metrics.get(primary_metric_key, 0.0))
     if best_epoch == 0:

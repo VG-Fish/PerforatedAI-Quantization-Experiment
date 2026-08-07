@@ -4,6 +4,19 @@ Migration plan for switching from the current bounded (FIXED_SWITCH) dendritic p
 
 Everything in this doc is grounded in the current codebase and the 23-model result set in `results/`. File and line references point to the exact spots that need editing.
 
+> **Status note (2026-08-06).** The per-model numbers quoted below — the
+> win/regression buckets in §1, the best-epoch-vs-switch observations, the
+> "baseline was 13%" note on PointNet — come from the `results/` set produced
+> *before* the baseline-quality pass. That pass changed every model's
+> learning-rate schedule, CapsNet's loss, three models' input widths, and the
+> molecular/graph/text preprocessing (see "Baseline Quality" in
+> [DOCUMENTATION.md](DOCUMENTATION.md)). AttentiveFP alone moved from RMSE 2.14
+> to 0.85. The *structural* arguments in this doc still hold — fixed-schedule
+> switching firing before the base network converges is a property of the
+> schedule, not of any one baseline — but the specific deltas are stale and
+> should be recomputed from a fresh run before being cited. Change 4 in §7
+> (restore recipe `weight_decay` for dendrite runs) has since been applied.
+
 ---
 
 ## 1. Motivation — what the current runs actually did

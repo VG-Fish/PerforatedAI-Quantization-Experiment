@@ -248,6 +248,123 @@ prune.remove(module, 'weight')  # make permanent before quantization
 For the current benchmark, pruning is not part of the primary condition grid so the dendritic/non-dendritic comparison stays clean.
 
 ***
+## Baseline Quality: Why the FP32 Recipes Track Published Setups
+
+Every question this benchmark asks is a *comparison* against `base_fp32`. An
+under-trained baseline does not just lower one number — it inflates the measured
+"dendrite delta" and the measured quantization robustness, because a model still
+far from its own optimum has slack that either intervention can take up. So the
+FP32 recipes deliberately track the reference training setup for each
+model/dataset pair rather than a shared default.
+
+The 2026-08-06 pass re-derived those recipes from the published sources and
+fixed four classes of problem found by reading `results/<model>/base_fp32/`:
+
+**1. No learning-rate schedule.** Every model but PointNet trained at a flat
+rate. ResNet-18 sat at lr 0.05 for all 90 epochs, train loss stuck at 0.18 and
+validation oscillating around 88% — the classic signature of a run that needs
+annealing, not more epochs. MobileNetV2 showed the same at 150 epochs. The
+`lr_schedule` field (`constant` / `step` / `cosine` / `linear`, all with optional
+warmup) now exists for this; see MODEL_REFERENCE.md for what each model uses.
+
+**2. A loss that did not match the architecture.** CapsNet's forward returns
+per-class capsule *lengths* in `[0, 1)`, but the loop applied `CrossEntropyLoss`
+to them. A softmax over a range narrower than one nat produces a tiny, nearly
+uniform gradient: train loss moved 1.578 → 1.468 across 30 whole epochs. It now
+uses the margin loss from Sabour et al., which is what routing-by-agreement was
+designed against.
+
+**3. Unnormalised regression targets.** ESOL's log solubilities span −11.6..+1.6
+and FreeSolv's hydration energies −25.5..+3.4 kcal/mol. Trained on raw values,
+AttentiveFP spent its first ten epochs at train MSE ≈ 14.8 — exactly FreeSolv's
+target variance, i.e. it had learned the mean and nothing else — and finished at
+RMSE 2.14 against MoleculeNet's ~1.15. Targets are now z-scored from
+training-split statistics, with `TaskBundle.target_offset` / `target_scale`
+carrying the transform so reported RMSE stays in the dataset's own units.
+
+**4. Featurisation that discarded the structure being measured.** The SMILES
+parser skipped every non-alphabetic character, so `(` and `)` vanished and any
+branched molecule was flattened into a single chain — wrong topology for 76% of
+ESOL and 70% of FreeSolv. It also dropped bond orders, ring closures and bracket
+atoms. Separately, three models pooled over padded node slots: IMDB-BINARY graphs
+average 19.8 nodes padded to 96, so GIN's `mean(dim=1)` divided the graph
+embedding by ~5 and mixed in whatever the layer biases produced for empty slots.
+MPNN and AttentiveFP masked on `adjacency.sum(-1) > 0`, which is true everywhere
+because the featuriser writes a self-loop into every row — a no-op mask. All
+three now pool on the feature block, which is zero for padding.
+
+Two more changes are ordinary under-training fixes rather than bugs: DistilBERT
+fine-tuned at 1e-4, five times the canonical 2e-5 for BERT-family models, and
+AG News was truncated to 64 tokens with a 5k vocabulary.
+
+### Reference points for `base_fp32`
+
+These are the published numbers the recipes aim at, not results:
+
+| Key | Metric | Reference | Source |
+|---|---|---|---|
+| `lenet5` | Accuracy | ~99.1% | LeCun et al. 1998 |
+| `capsnet_mnist` | Accuracy | 99.5% | Sabour et al. 2017 |
+| `resnet18_cifar10` | Accuracy | ~94–95% | He et al.; PyTorch Lightning CIFAR-10 baseline |
+| `mobilenetv2_cifar10` | Accuracy | ~94.1% | Sandler et al.; CIFAR-adapted reimplementations |
+| `distilbert` | Accuracy | 91.3% (SST-2 dev) | `distilbert-base-uncased-finetuned-sst-2-english` |
+| `gcn` | Accuracy | 81.5% (public split) | Kipf & Welling 2017 |
+| `gin_imdbb` | Accuracy | 75.1% ± 5.1 | Xu et al. 2019 |
+| `mpnn` | RMSE | ~0.58 | MoleculeNet (ESOL, random split) |
+| `attentivefp_freesolv` | RMSE | ~1.15 | MoleculeNet (FreeSolv) |
+| `tabnet` | Accuracy | 85.7% | Arık & Pfister 2021 |
+| `saint_adult` | Accuracy | ~86% | Somepalli et al. 2021 |
+
+Note that this benchmark's splits are not always the reference splits — Cora uses
+a random 70/15/15 node split rather than the 140-label public split, and
+IMDB-BINARY uses one held-out split rather than 10-fold CV — so the numbers are
+targets to be near, not thresholds to hit exactly. IMDB-BINARY's test split in
+particular is 150 graphs, where a single graph moves accuracy by 0.67%.
+
+### What has actually been re-measured
+
+A subset was retrained on the new recipes and compared against the old
+`results/` records. The rest of the roster is changed but **not yet re-measured**
+— treat the recipes for those as reasoned from the reference setups, not
+verified here.
+
+| Key | Metric | Old | New | Read |
+|---|---|---|---|---|
+| `lenet5` | Accuracy | 0.9839 | **0.9923** | Clears LeCun's ~99.05% |
+| `attentivefp_freesolv` | RMSE | 2.1378 | **0.8457** | 2.5× better; past MoleculeNet's ~1.15 |
+| `mpnn` | RMSE | 0.7708 | 0.8117 → **0.6665** | See below |
+| `gcn` | Accuracy | 0.7862 | 0.7641 | See below |
+| `gin_imdbb` | Accuracy | 0.7933 | 0.7467 | See below |
+
+**MPNN.** The first re-run at 300 epochs *regressed* to 0.8117. The cause is
+visible in the curve: with the richer featuriser and only ~790 training
+molecules the model reached train RMSE 0.29 against val 0.80 — it had memorised
+the training set. The same recipe at 200 epochs tested at 0.6665, better than
+both, so the budget is now 200. A regularisation sweep (weight decay 1e-4/1e-3,
+dropout 0.3) was started and not finished; it is the obvious next thing to try
+if MPNN is worth pushing toward MoleculeNet's 0.58.
+
+**GCN and GIN** both came out lower on test while training more healthily, and
+neither difference is larger than its split's noise:
+
+- GCN's *old* best epoch was epoch 1 of 200 — a checkpoint from before the model
+  had learned anything, which happened to generalise. By epoch 200 the old run
+  had driven train loss to 0.027 (pure memorisation) and validation down to
+  0.766. The new run peaks at epoch 17 with a genuine optimum, holds a mean
+  validation of 0.791 across its last 20 epochs against the old run's 0.761, and
+  ends at train loss 0.232. Test moved 0.786 → 0.764 on a ~406-node split whose
+  standard error is about 2.1%, i.e. within one sigma.
+- GIN's train loss now reaches 0.573 (was 0.622) and its mean validation over
+  the last 20 epochs is 0.729 (was 0.704); best validation is identical at
+  0.7667. Test moved 0.793 → 0.747 on a 150-graph split — seven graphs. The new
+  figure sits on Xu et al.'s 75.1%; the old one sat above it.
+
+The masked pooling and degree featurisation behind those two are correctness
+fixes independent of the score (mean-pooling 96 slots when 20 are real is wrong
+whatever it measures), so they stay. But a single held-out split cannot
+distinguish a 2-6% move from noise on datasets this small, and neither of these
+should be reported as a regression or an improvement without repeated seeds.
+
 ## Key Research Hypotheses
 1. Do dendritic models consistently outperform base models in accuracy before quantization?
 2. Does the dendrite + pruning combination produce better accuracy-per-byte than base + quantization alone?
@@ -446,19 +563,19 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 ## Complete 25-Model Roster
 | # | Key | Domain | Dataset | ~Params |
 |---|---|---|---|---|
-| 1 | `lenet5` | Image (tiny CNN) | MNIST | 60K |
+| 1 | `lenet5` | Image (tiny CNN) | MNIST | 62K |
 | 2 | `m5` | Audio (1D-CNN) | SpeechCommands | 25K |
 | 3 | `lstm_forecaster` | Time-Series (RNN) | ETTh1 | 52K |
-| 4 | `textcnn` | NLP (Text CNN) | AG News | 873K |
+| 4 | `textcnn` | NLP (Text CNN) | AG News | ~2.8M |
 | 5 | `gcn` | Graph (Conv) | Cora | 92K |
 | 6 | `tabnet` | Tabular (Seq Att) | Adult Income | 39K |
-| 7 | `mpnn` | Molecular (GNN) | ESOL | 353K |
+| 7 | `mpnn` | Molecular (GNN) | ESOL | 355K |
 | 8 | `actor_critic` | RL (CartPole) | CartPole-v1 | 18K |
 | 9 | `lstm_autoencoder` | Anomaly Detect | MIT-BIH ECG | 71K |
-| 10 | `distilbert` | Large NLP (Xfmr) | SST-2 | 66M |
+| 10 | `distilbert` | Large NLP (Xfmr) | SST-2 | ~67M |
 | 11 | `dqn_lunarlander` | RL (Q-net) | LunarLander-v2 | 69K |
 | 12 | `ppo_bipedalwalker` | RL (continuous) | BipedalWalker-v3 | 20K |
-| 13 | `attentivefp_freesolv` | Molecular (Att-GNN) | FreeSolv | 611K |
+| 13 | `attentivefp_freesolv` | Molecular (Att-GNN) | FreeSolv | 612K |
 | 14 | `gin_imdbb` | Graph Classif. | IMDB-B | 39K |
 | 15 | `tcn_forecaster` | Time-Series (TCN) | ETTm1 | 99K |
 | 16 | `gru_forecaster` | Time-Series (GRU) | Weather | 74K |
@@ -466,10 +583,10 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 | 18 | `vae_mnist` | Generative (VAE) | MNIST | ~1.1M |
 | 19 | `snn_nmnist` | Neuromorphic SNN | N-MNIST | 60K |
 <!-- | 20 | `unet_isic` | Medical Seg. | ISIC 2018 | ~1.9M | -->
-| 21 | `resnet18_cifar10` | Image (ResNet) | CIFAR-10 | ~11M |
+| 21 | `resnet18_cifar10` | Image (ResNet) | CIFAR-10 | ~11.2M |
 | 22 | `mobilenetv2_cifar10` | Image (Efficient) | CIFAR-10 | ~2.2M |
 | 23 | `saint_adult` | Tabular (Xfmr) | Adult Income | 205K |
-| 24 | `capsnet_mnist` | Image (CapsNet) | MNIST | ~8M |
+| 24 | `capsnet_mnist` | Image (CapsNet) | MNIST | ~6.8M |
 
 ***
 ## Additional Experiments Beyond New Models

@@ -17,6 +17,21 @@ The benchmark automates training neural networks under different quantization an
 
 Each condition applies only two experimental factors to the same models: quantization level and whether the model is dendritic, allowing cleaner side-by-side comparison of efficiency vs. accuracy tradeoffs.
 
+## Baseline Quality
+
+Every result here is a comparison against `base_fp32`, so an under-trained
+baseline distorts both the dendrite delta and the measured quantization
+robustness — a model still far from its own optimum has slack that either
+intervention can take up. The FP32 recipes therefore track each model's
+published training setup rather than a shared default, and each entry in
+`BenchmarkRunner._training_hyperparameters` cites its reference.
+
+Practically, that means every model carries its own learning-rate schedule
+(`constant`, `step`, `cosine`, or `linear`, with optional warmup, label
+smoothing, and gradient clipping) instead of a flat rate for the whole run.
+`information/DOCUMENTATION.md` has the full account of what was changed and why;
+`information/MODEL_REFERENCE.md` lists the per-model settings.
+
 Dendritic FP32 training defaults to the same fixed epoch budget as the matching non-dendritic model. PerforatedAI dendrite insertion is active during the first 80% of those epochs with a fixed switch cadence tuned to the budget, then dendrite insertion is frozen for the final 20% so the selected architecture can settle. Pass `--dynamic-dendritic-training` to restore the open-ended PerforatedAI mode that keeps training until `training_complete=True`; any epochs beyond the canonical budget are written under `results/<model>/<condition>/continued_until_complete/`.
 
 For Apple Silicon runs, the training path selects MPS automatically, disables CUDA-only pinned memory, keeps DataLoader workers persistent, uses larger per-model batch sizes, sets high float32 matmul precision where supported, and compiles non-dendritic MPS models with `torch.compile(..., backend="aot_eager")` when available. Long dendritic runs periodically clear PerforatedAI processor buffers and the accelerator cache to avoid MPS memory pressure during late epochs.
@@ -83,6 +98,15 @@ The model implementations are part of the experimental definition. After
 changing architectures, rerun affected models with `--ignore-saved-models` or a
 fresh `--results-directory` so old checkpoints and records do not mix with the
 new model definitions.
+
+The same applies to the dataset builders and the training recipes. The
+2026-08-06 baseline-quality pass changed model input widths (TextCNN's vocabulary,
+the molecular and IMDB-BINARY node features), dataset preprocessing (SMILES
+parsing, target standardization, Cora feature normalization, MNIST augmentation
+for the classifiers), CapsNet's loss, and every model's learning-rate schedule.
+Results under `results/` and `results_dynamic/` predate all of it, so they are
+not comparable to new runs — rerun into a fresh `--results-root` rather than
+mixing them.
 
 ## Compare Existing Runs
 

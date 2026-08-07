@@ -5,6 +5,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Width of the per-atom feature vector produced by ``GraphDatasets._smiles_to_graph``.
+# Defined here because it is the models' input width; ``data.py`` imports it so the
+# featuriser and the molecular models cannot drift apart.
+MOLECULE_NODE_FEATURES: int = 20
+# Width of the per-node feature vector for the IMDB-BINARY social graphs, whose
+# nodes carry no labels: a one-hot degree bucket plus a real-node mask.
+SOCIAL_GRAPH_NODE_FEATURES: int = 10
+
 
 class LeNet5(nn.Module):
     """LeNet-5 style CNN for MNIST-sized grayscale images."""
@@ -144,7 +152,8 @@ class LSTMForecaster(nn.Module):
 class TextCNN(nn.Module):
     def __init__(
         self,
-        vocab_size: int = 5000,
+        # Must match AG_NEWS_VOCAB_SIZE in data.py.
+        vocab_size: int = 20_000,
         embed_dim: int = 128,
         num_classes: int = 4,
         channels: int = 128,
@@ -199,8 +208,14 @@ class GCN(nn.Module):
         self.conv1 = GraphConv(in_features, hidden)
         self.conv2 = GraphConv(hidden, num_classes)
         self.dropout = nn.Dropout(dropout)
+        # Kipf & Welling apply dropout to the *input* features as well as the
+        # hidden layer. Cora's 1433-dim bag-of-words over 2708 nodes is easy to
+        # memorise from the input alone: without this the run drove train loss
+        # to 0.024 while validation accuracy fell from 0.83 (epoch 1) to 0.75.
+        self.input_dropout = nn.Dropout(dropout)
 
     def forward(self, x: Any, adjacency: Any) -> Any:
+        x = self.input_dropout(x)
         x = self.dropout(F.relu(self.conv1(x, adjacency)))
         x = self.conv2(x, adjacency)
         # The Cora loader puts the target paper at node slot 0.
@@ -334,7 +349,12 @@ class MPNNLayer(nn.Module):
 
 
 class MPNN(nn.Module):
-    def __init__(self, node_features: int = 9, hidden: int = 96, steps: int = 4):
+    def __init__(
+        self,
+        node_features: int = MOLECULE_NODE_FEATURES,
+        hidden: int = 96,
+        steps: int = 4,
+    ):
         super().__init__()
         self.node_encoder = nn.Sequential(
             nn.Linear(node_features, hidden),
@@ -354,7 +374,11 @@ class MPNN(nn.Module):
         h = F.relu(self.node_encoder(node_features))
         for layer in self.layers:
             h = layer(h, adjacency)
-        node_mask = (adjacency.sum(dim=-1) > 0).float()
+        # The featuriser writes a self-loop into every adjacency row, padding
+        # slots included, so `adjacency.sum(-1) > 0` was true everywhere and
+        # this mask was a no-op — padded atoms reached the gated readout with
+        # whatever the encoder biases gave them. Zero feature rows mark padding.
+        node_mask = (node_features.abs().sum(dim=-1) > 0).to(h.dtype)
         gate = torch.sigmoid(self.readout_gate(h)).squeeze(-1) * node_mask
         graph_repr = (h * gate.unsqueeze(-1)).sum(dim=1) / gate.sum(
             dim=1, keepdim=True
@@ -506,7 +530,7 @@ class AttentiveFPLayer(nn.Module):
 class AttentiveFP(nn.Module):
     def __init__(
         self,
-        node_features: int = 9,
+        node_features: int = MOLECULE_NODE_FEATURES,
         hidden: int = 128,
         layers: int = 3,
         readout_steps: int = 2,
@@ -536,8 +560,17 @@ class AttentiveFP(nn.Module):
         h = F.relu(self.node_proj(node_features))
         for layer in self.layers:
             h = layer(h, adjacency)
-        node_mask = adjacency.sum(dim=-1) > 0
-        graph = h.mean(dim=1)
+        # Padding slots carry a self-loop in the adjacency, so `adjacency.sum > 0`
+        # marks them real. Use the feature block instead: the featuriser leaves
+        # padded rows all-zero, and only real atoms get a one-hot element.
+        node_mask = node_features.abs().sum(dim=-1) > 0
+        mask = node_mask.unsqueeze(-1).to(h.dtype)
+        node_count = mask.sum(dim=1).clamp_min(1.0)
+        # Mean over *real* atoms only. Averaging across all padded slots shrank
+        # the seed graph vector by the padding ratio (a 6-atom molecule in a
+        # 24-slot tensor started the readout at a quarter scale), which the
+        # attention readout then had to spend its steps undoing.
+        graph = (h * mask).sum(dim=1) / node_count
         for _ in range(self.readout_steps):
             expanded_graph = graph.unsqueeze(1).expand_as(h)
             scores = self.readout_attn(torch.cat([h, expanded_graph], dim=-1)).squeeze(-1)
@@ -567,7 +600,12 @@ class GINLayer(nn.Module):
 
 
 class GIN(nn.Module):
-    def __init__(self, in_features: int = 8, hidden: int = 64, num_classes: int = 2):
+    def __init__(
+        self,
+        in_features: int = SOCIAL_GRAPH_NODE_FEATURES,
+        hidden: int = 64,
+        num_classes: int = 2,
+    ):
         super().__init__()
         self.input_proj = nn.Linear(in_features, hidden)
         self.layers = nn.ModuleList(GINLayer(hidden, hidden) for _ in range(4))
@@ -579,10 +617,17 @@ class GIN(nn.Module):
         )
 
     def forward(self, x: Any, adjacency: Any) -> Any:
+        # IMDB-BINARY graphs average 19.8 nodes but are padded to 96 slots, so a
+        # plain `x.mean(dim=1)` divided the graph embedding by ~5 and mixed in
+        # whatever the layer biases produced for the empty slots. Train loss
+        # moved only 0.705 -> 0.622 across 100 epochs as a result. Channel 0 of
+        # the featuriser is the real-node indicator; pool over those rows only.
+        node_mask = (x[..., 0] > 0).unsqueeze(-1).to(x.dtype)
         x = F.relu(self.input_proj(x))
         for layer in self.layers:
             x = F.relu(layer(x, adjacency))
-        return self.head(x.mean(dim=1))
+        pooled = (x * node_mask).sum(dim=1) / node_mask.sum(dim=1).clamp_min(1.0)
+        return self.head(pooled)
 
 
 class Chomp1d(nn.Module):
