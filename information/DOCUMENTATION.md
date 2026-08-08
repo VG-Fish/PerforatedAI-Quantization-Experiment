@@ -55,7 +55,7 @@ fine-tuning after an initial PTQ snapshot is saved.
 For each of the 25 models, generate **3 comparison bar charts** — one for each metric — with all 12 conditions on the x-axis:
 
 ### Graph Set A: Accuracy (or Task Metric)
-- Y-axis: Accuracy % (classification), MAE/MSE (regression/forecasting), Reward (RL), AUC (anomaly), ELBO (VAE)
+- Y-axis: Accuracy % (classification), MAE/MSE (regression/forecasting), Action Accuracy (behaviour-cloned RL: `actor_critic`, `dqn_lunarlander`), Episodic Return (on-policy RL: `ppo_bipedalwalker`), AUC (anomaly), ELBO (VAE)
 - X-axis: All 12 conditions
 - Color coding: Base conditions in blue family, Dendrite conditions in green family
 
@@ -413,6 +413,30 @@ have not had their dendritic conditions exercised.
 ---
 
 # Part 2: 15 New Models & Extended Experiments (Round 2)
+
+> **Superseded (2026-08-08) — every number in the Executive Summary and in
+> "Key Findings from Round 1" below is pre-fix.** They come from runs that
+> predate the 2026-08-06 baseline-quality pass and the 2026-08-07 comparability
+> fixes, and several are known to measure the wrong thing:
+>
+> - **Actor-Critic's "0.815 → 0.931 Reward" is not a reward.** The RL models were
+>   scored as negative action MAE against a heuristic policy. `actor_critic` and
+>   `dqn_lunarlander` now report *Action Accuracy*, and `ppo_bipedalwalker` was
+>   converted to real on-policy PPO reporting *Episodic Return*. The +14.3%
+>   "policy optimization benefits greatly" reading has no basis in the new metric.
+> - **The forecasters' MAEs were 3–5× optimistic** — the windows leaked across
+>   the split. That invalidates the LSTM Forecaster row and the entire "Q4
+>   Rescue" table built on it.
+> - **GCN was restructured** to full-graph transductive Cora, so 79.61% → 79.12%
+>   describes a model that no longer exists.
+> - **DistilBERT's validation set was carved out of GLUE SST-2's train split**
+>   and leaked; its 82.80% is not a clean number.
+>
+> The conclusions drawn from these tables — which domains gain from dendrites,
+> where Q4 rescue happens, whether transformers absorb dendritic capacity — are
+> **not established** and must not be cited until the retraining sweep
+> (`REMAINING_FIXES.md` §3.4) has run. "What has actually been re-measured"
+> above is the only measured, post-fix table in this document.
 
 ## Executive Summary
 The first 10-model round reveals three distinct behavioral clusters. **Dendrites deliver large, consistent gains** in reinforcement learning (Actor-Critic: +14.3%), molecular property prediction (MPNN: +15.6%), and audio classification (M5: +4.5%), while also rescuing Q4 accuracy in time-series forecasting (LSTM Forecaster's Q4 normalized score jumps from 45.6% → 97.0% — a +51.4 point rescue). **Dendrites are neutral-to-mildly-harmful** for transformers (DistilBERT: −1.1%), graph convolutions (GCN: −0.6%), tabular attention (TabNet: −0.1%), and text CNNs (TextCNN: −0.1%). **Q2 universally collapses** (≤35% normalized score for almost every model regardless of dendrites), while Q4 is the critical threshold where dendrites matter most.

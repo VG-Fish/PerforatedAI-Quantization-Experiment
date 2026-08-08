@@ -293,11 +293,19 @@ point, since a 4.7-point-inflated signal is a poor plateau detector.
 `results/updated_models` is **pre-fix for every model listed in §2**. Those
 records were produced by the code as it stood before `49b90c1`.
 
+> **Update (2026-08-08): `results/` is now empty.** The pre-fix trees were
+> archived to `archive/old_models_pre-fix_20260808.zip` and
+> `archive/results_dynamic_pre-fix_20260808.zip` (verified, then removed), and
+> `results/updated_models` is gone as well — it held one post-fix record, a
+> `gcn` `base_fp32` at 0.796 Accuracy, worth 31 seconds to reproduce. So there
+> is no longer any partial state to reconcile: the sweep below starts from
+> nothing, and `--fresh` has nothing to clear.
+
 At the time of writing the original sweep is **still running**
 `pointnet_modelnet40` (unaffected by these changes). Once it exits:
 
 ```bash
-./run_base_sweep.sh --fresh -l logs_fixed
+uv run dqb run --conditions base_fp32 --fresh --logging-dir logs_fixed
 ```
 
 `--fresh` matters: `--ignore-saved-models` does **not** prevent epoch-level
@@ -330,6 +338,15 @@ manifest unexplained — the per-model records are intact either way. The
 `--detach` exit path prints the same command as a hint, since detaching means
 nothing is left watching for the streams to end. The behaviour is described in
 the script header, which is what `--help` prints.
+
+**Update (2026-08-08): the defect above is fixed, and the shell script is gone.**
+The parallel streams now live inside `dqb run` itself (`--jobs`, default 4), so
+there is no longer a `run_base_sweep.sh` or a `dqb sweep`. Workers run with
+`write_reports=False` and the coordinator writes `manifest.csv` and the
+comparison reports once, from every record on disk, after the last worker exits
+— so the overwrite race cannot happen rather than being repaired afterwards.
+`--detach` still skips that step, and prints the `dqb compare --manifest`
+command to run by hand.
 
 #### Still owed: the sweep itself
 
@@ -443,6 +460,9 @@ dendritic; `pointnet_modelnet40` 10 epochs base. `ruff check src/` is clean. The
 numbers those runs produced are quoted in the subsections above. **None of this
 is a full-budget result** — that is what the §3.4 sweep is for.
 
-**Do not trust `results/dendritic_pai_graphs` CSV `best_epoch` values** without
-checking them against the PNG; 5 of 14 disagree. This is a known pre-existing
-issue unrelated to the current work.
+**Do not trust `dendritic_pai_graphs` CSV `best_epoch` values** without checking
+them against the PNG; 5 of 14 disagreed when this was measured. A known
+pre-existing issue, unrelated to the current work. The directory it referred to
+(`results/dendritic_pai_graphs`) no longer exists and is in neither archive, so
+this stands as a caution about the graphs PerforatedAI emits, not as a pointer
+to files you can still inspect.

@@ -811,15 +811,15 @@ def _evaluate_episodic_return(
     was_training = model.training
     model.eval()
     returns: list[float] = []
+    # low/high live on Box, not on the generic Space that `make` is declared to
+    # return, and `continuous` is exactly the flag saying this env has a Box.
+    # gymnasium's annotation cannot express that, so the narrowing happens here.
+    action_space: Any = env.action_space
     action_low = (
-        torch.as_tensor(env.action_space.low, dtype=torch.float32)
-        if continuous
-        else None
+        torch.as_tensor(action_space.low, dtype=torch.float32) if continuous else None
     )
     action_high = (
-        torch.as_tensor(env.action_space.high, dtype=torch.float32)
-        if continuous
-        else None
+        torch.as_tensor(action_space.high, dtype=torch.float32) if continuous else None
     )
     try:
         with torch.no_grad():

@@ -75,8 +75,8 @@ subcommand and may be given either before or after it, so both of these are
 equivalent:
 
 ```bash
-uv run dqb --results-root results_dynamic compare
-uv run dqb compare --results-root results_dynamic
+uv run dqb --results-root results_archive compare
+uv run dqb compare --results-root results_archive
 ```
 
 If a flag is given in both positions, the one after the subcommand wins.
@@ -103,10 +103,24 @@ The same applies to the dataset builders and the training recipes. The
 2026-08-06 baseline-quality pass changed model input widths (TextCNN's vocabulary,
 the molecular and IMDB-BINARY node features), dataset preprocessing (SMILES
 parsing, target standardization, Cora feature normalization, MNIST augmentation
-for the classifiers), CapsNet's loss, and every model's learning-rate schedule.
-Results under `results/` and `results_dynamic/` predate all of it, so they are
-not comparable to new runs — rerun into a fresh `--results-root` rather than
-mixing them.
+for the classifiers), CapsNet's loss, and every model's learning-rate schedule,
+and the 2026-08-07 pass then rewrote `ppo_bipedalwalker` (real PPO), `gcn`
+(full-graph transductive Cora), DistilBERT's validation split, and PointNet's
+dataloader.
+
+**No results in this repository reflect any of that yet.** The pre-fix result
+trees were archived on 2026-08-08 and removed from the working tree:
+
+| Archive | Was |
+|---|---|
+| `archive/old_models_pre-fix_20260808.zip` | `results/old_models` |
+| `archive/results_dynamic_pre-fix_20260808.zip` | `results_dynamic/`, `comparison_dynamic/`, `logs_dynamic/` |
+
+Each zip stores original relative paths, so `unzip archive/<name>.zip` from the
+repository root restores the tree where it was. They are kept for provenance
+only — the numbers in them are not comparable to anything produced by the
+current code. See `information/REMAINING_FIXES.md` §3.4 for the retraining that
+is still owed.
 
 ## Compare Existing Runs
 
@@ -140,6 +154,14 @@ uv run dqb run --conditions base_fp32 dendrites_fp32
 uv run dqb run --allow-PQAT
 uv run dqb run --dynamic-dendritic-training
 uv run dqb run --ignore-saved-models
+
+# Control how a run is parallelised (default: 4 workers + live progress table)
+uv run dqb run --jobs 1                 # train in this process, print to terminal
+uv run dqb run --jobs 8
+uv run dqb run --fresh                  # drop stale epoch checkpoints first
+uv run dqb run --detach                 # launch workers and exit
+uv run dqb run --status                 # report on a running (or finished) run
+uv run dqb run --logging-dir logs_run7 -i 120
 
 # Compare outputs (includes per-model benchmark timing plots when benchmarks/manifest.csv exists)
 uv run dqb compare
@@ -205,7 +227,9 @@ The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` f
 
 - `uv run dqb run`
 	- Train models across one or more conditions. By default runs all models & conditions defined in the project.
-	- Useful flags: `--models`, `--conditions`, `--results-root`, `--results-directory`, `--comparison-root`, `--ignore-saved-models`, `--allow-PQAT`, `--dynamic-dendritic-training`.
+	- Splits the selected models across 4 worker processes by default and prints a live progress table until they all exit. Training is compute-bound rather than data-bound, so this cuts wall-clock close to linearly — the full 23-model FP32 pass is ~24h sequentially. Each model keeps all of its conditions in one worker, so the `dendrites_q8` → `dendrites_fp32` dependency order still holds. Worker output goes to `<logging-dir>/streams/stream_N.log`, and every progress table is appended to `<logging-dir>/run_progress.log`.
+	- Ctrl-C detaches the progress display without stopping training. Stop training with `pkill -f 'dqb run'`.
+	- Useful flags: `--models`, `--conditions`, `--results-root`, `--results-directory`, `--comparison-root`, `--ignore-saved-models`, `--allow-PQAT`, `--dynamic-dendritic-training`, `--jobs` (1 trains in-process and prints to the terminal), `--fresh` (delete stale `epoch_checkpoint.pt` files first — `--ignore-saved-models` does *not* cover those), `--detach`, `--status`, `-i/--interval`.
 	- Examples:
         ```bash
         uv run dqb run

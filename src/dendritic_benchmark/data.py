@@ -8,7 +8,7 @@ import zipfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Callable
+from typing import Any, Callable, Iterable, Iterator
 
 import torch
 
@@ -1655,8 +1655,8 @@ def _collect_heuristic_rollouts(
     explore_probability: float = 0.15,
     seed: int = 42,
     package_hint: str = "gymnasium[box2d]",
-) -> tuple[Any, Any]:
-    """Cache (observation, heuristic action) pairs for behaviour cloning.
+) -> tuple[Any, Any, Any]:
+    """Cache (observation, heuristic action, episode id) triples for cloning.
 
     Used by ``actor_critic`` and ``dqn_lunarlander``, which stay behaviour
     cloning. ``ppo_bipedalwalker`` no longer comes through here: cloning a
@@ -1767,8 +1767,9 @@ def _split_by_episode(
     }
     episode_list: list[int] = episode_ids.tolist()
     subset = torch.utils.data.Subset
-    return tuple(
-        subset(
+
+    def split_for(name: str) -> Any:
+        return subset(
             dataset,
             [
                 index
@@ -1776,8 +1777,11 @@ def _split_by_episode(
                 if episode in assignment[name]
             ],
         )
-        for name in ("train", "val", "test")
-    )
+
+    # Built as a literal rather than tuple(... for name in ...): a generator
+    # gives tuple[Subset, ...] of unknown length, which does not satisfy the
+    # three-tuple this returns into.
+    return split_for("train"), split_for("val"), split_for("test")
 
 
 def _build_cartpole(batch_size: int) -> TaskBundle:
@@ -2128,7 +2132,10 @@ class _RepeatedPermutationSampler(torch.utils.data.Sampler[int]):
         self.repeats = repeats
         self.seed = seed
 
-    def __iter__(self) -> Iterable[int]:
+    # Iterator, not Iterable: this is a generator function, and Sampler.__iter__
+    # is declared to return an Iterator — widening it here makes the sampler
+    # unusable as a DataLoader `sampler=` argument.
+    def __iter__(self) -> Iterator[int]:
         generator = torch.Generator().manual_seed(self.seed)
         for _ in range(self.repeats):
             yield from torch.randperm(self.length, generator=generator).tolist()

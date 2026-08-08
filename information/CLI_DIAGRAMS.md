@@ -26,6 +26,10 @@ Generating commands update `.dqb/command_config.json` with the concrete user-sup
 
 Trains models across all (or a subset of) conditions and saves results.
 
+By default the selected models are split across four worker processes and a
+live progress table is printed until they all exit. Partitioning is by *model*,
+never by condition, so the dependency chain below stays inside one worker.
+
 ```bash
 uv run dqb run
 uv run dqb --results-directory experiment_a run
@@ -36,13 +40,28 @@ uv run dqb run --comparison-root comparison
 uv run dqb run --allow-PQAT
 uv run dqb run --dynamic-dendritic-training
 uv run dqb run --ignore-saved-models
+
+# parallelism
+uv run dqb run --jobs 1          # train in this process, print to the terminal
+uv run dqb run --jobs 8
+uv run dqb run --fresh           # drop stale epoch_checkpoint.pt files first
+uv run dqb run --detach          # launch workers and exit
+uv run dqb run --status          # report on a running (or finished) run
+uv run dqb run -i 120            # seconds between progress tables
 ```
 
 ```mermaid
 flowchart TD
-    A([uv run dqb run]) --> B["Parse args<br>--models, --conditions,<br>--ignore-saved-models,<br>--allow-PQAT,<br>--dynamic-dendritic-training"]
+    A([uv run dqb run]) --> B["Parse args<br>--models, --conditions,<br>--ignore-saved-models,<br>--allow-PQAT,<br>--dynamic-dendritic-training,<br>--jobs, --fresh, --detach, --status"]
     B --> C["Load .env credentials<br>via compat.py"]
-    C --> D["BenchmarkRunner<br>pipeline.py"]
+    C --> PJ{"--jobs > 1<br>and more than<br>one model?"}
+    PJ -->|"No — or --worker,<br>set on spawned processes"| D["BenchmarkRunner<br>pipeline.py"]
+    PJ -->|Yes| PA["partition_models<br>longest-first by cost,<br>all conditions of a model<br>stay in one worker"]
+    PA --> PB["Spawn N workers:<br>dqb run --worker ...<br>stdout to logs/streams/stream_N.log"]
+    PB --> PC["Each worker runs the<br>BenchmarkRunner flow below<br>with write_reports=False"]
+    PC --> PD["Progress table every<br>--interval seconds until<br>every worker exits"]
+    PD --> PE["load_training_records<br>then write_manifest +<br>write_comparison_reports<br>once, across all workers"]
+    PE --> ZZ
     D --> E["Create results/ and<br>comparison/ directories"]
     E --> F["Resolve conditions in<br>dependency order"]
     F --> G{"For each<br>model + condition"}
@@ -76,10 +95,16 @@ flowchart TD
     style ZZ fill:#2d6a4f,color:#fff
     style H fill:#457b9d,color:#fff
     style L fill:#457b9d,color:#fff
-    style P fill:#457b9d,color:#fff
+    style PJ fill:#457b9d,color:#fff
     style R fill:#457b9d,color:#fff
     style W fill:#457b9d,color:#fff
 ```
+
+`--status` reads a run's log directory without launching anything, and
+`--detach` exits as soon as the workers are running — in that case nothing is
+left watching for them to finish, so the final `write_manifest` /
+`write_comparison_reports` step is skipped and has to be run by hand with
+`dqb compare --manifest`.
 
 ### Condition Dependency Chain
 
@@ -358,8 +383,13 @@ Recorded targets include results, comparison reports, benchmark outputs, logs, d
 │   └── model_key/                       # created by dqb benchmark_models / dqb compare
 │       ├── latency_comparison_batch_1.svg
 │       └── latency_comparison_batch_32.svg
+├── archive/                             # zipped pre-fix result trees, gitignored
 ├── logs/
-│   └── command_timestamp.txt
+│   ├── command_timestamp.txt
+│   ├── run_progress.log                 # every progress table a parallel run printed
+│   ├── run_plan.json                    # that run's models/conditions, read by --status
+│   └── streams/
+│       └── stream_N.log                 # one parallel worker's raw stdout, tqdm bars and all
 ├── PAI/
 │   ├── PAI_config.json
 │   ├── model_key_condition_key_PAI_config.json

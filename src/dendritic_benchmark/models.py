@@ -675,6 +675,14 @@ class RunningObsNorm(nn.Module):
     rollout can be folded in with one pass and no history retained.
     """
 
+    # register_buffer installs these at runtime but tells a type checker
+    # nothing, so every use resolves through nn.Module.__getattr__ to
+    # `Tensor | Module`. Declaring them here is PyTorch's own idiom for typed
+    # buffers: annotations only, so registration still owns the values.
+    mean: torch.Tensor
+    var: torch.Tensor
+    count: torch.Tensor
+
     def __init__(self, obs_dim: int, clip: float = 10.0, epsilon: float = 1e-8):
         super().__init__()
         self.register_buffer("mean", torch.zeros(obs_dim))

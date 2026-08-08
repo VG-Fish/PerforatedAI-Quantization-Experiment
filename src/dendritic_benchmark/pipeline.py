@@ -1,6 +1,13 @@
+import functools
 import gc
 import json
 import math
+import re
+import shutil
+import subprocess
+import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +32,7 @@ from .compat import (
 from .data import build_task_bundle
 from .models import ADULT_CATEGORICAL_CARDINALITIES, build_model
 from .results import (
+    load_training_records,
     save_training_record,
     write_comparison_reports,
     write_manifest,
@@ -1063,7 +1071,17 @@ class BenchmarkRunner:
         ignore_saved: bool = False,
         allow_pqat: bool = False,
         dynamic_dendritic_training: bool = False,
+        write_reports: bool = True,
     ) -> list[dict[str, Any]]:
+        """Train the selected models sequentially in this process.
+
+        ``write_reports=False`` suppresses the manifest and the cross-model
+        comparison reports, which are built from *this* runner's records and so
+        would each hold only one worker's share when several workers run at
+        once. :func:`run_parallel` writes them once, from every record on disk,
+        after the last worker exits. Per-model reports stay on: each lands in
+        its own model's directory, which exactly one worker ever writes to.
+        """
         selected_models = [
             model_by_key(key)
             for key in (model_keys or [spec.key for spec in MODEL_SPECS])
@@ -1082,7 +1100,7 @@ class BenchmarkRunner:
                 dynamic_dendritic_training,
             )
             print("-" * 50)
-            if newly_trained:
+            if newly_trained and write_reports:
                 completed_model_keys = {r["model_key"] for r in all_records}
                 if len(completed_model_keys) >= 2:
                     _log(
@@ -1093,8 +1111,9 @@ class BenchmarkRunner:
                     write_manifest(all_records, self.results_root / "manifest.csv")
                     write_comparison_reports(all_records, self.comparison_root)
 
-        write_manifest(all_records, self.results_root / "manifest.csv")
-        write_comparison_reports(all_records, self.comparison_root)
+        if write_reports:
+            write_manifest(all_records, self.results_root / "manifest.csv")
+            write_comparison_reports(all_records, self.comparison_root)
         return all_records
 
     @staticmethod
@@ -1196,3 +1215,479 @@ class BenchmarkRunner:
             output_dir=condition_dir,
             config=training_config,
         )
+
+
+# ============================================================== parallel run ===
+# `run` trains one model at a time in this process. Splitting the selected models
+# across several worker processes cuts wall-clock close to linearly on this
+# machine: training is accelerator-compute-bound rather than data-bound, so a
+# second concurrent job costs the first only a few percent (ResNet-18 held
+# 3.80 -> 3.61 batch/s alongside another run). The full 23-model FP32 sweep is
+# ~24h sequentially, and ResNet-18 alone is ~155s/epoch x 200 epochs.
+#
+# Partitioning is by *model*, never by condition: conditions form a dependency
+# chain within a model (dendrites_q8 is quantized from dendrites_fp32), so a
+# model and all of its conditions must stay in one worker to keep that order.
+
+_STREAM_LOG_DIRNAME = "streams"
+_PROGRESS_LOG_NAME = "run_progress.log"
+# What the launching invocation selected, so that a later --status against this
+# log directory reports progress against that run's workload rather than against
+# whatever the --status invocation itself happens to select.
+_PLAN_NAME = "run_plan.json"
+DEFAULT_JOBS = 4
+DEFAULT_PROGRESS_INTERVAL = 60
+
+# Rough FP32 training cost per model, in approximate hours, used *only* to
+# balance the workers. Measured where a recent record exists (snn_nmnist 4.4h,
+# capsnet_mnist 3.8h, gcn ~1min) and estimated from the epoch budget and the
+# relative costs in results/old_models otherwise. An entry being wrong costs
+# wall-clock balance, never correctness; an unlisted model is treated as
+# _DEFAULT_COST_HOURS.
+_MODEL_COST_HOURS: dict[str, float] = {
+    "resnet18_cifar10": 8.6,
+    "mobilenetv2_cifar10": 8.0,
+    "snn_nmnist": 4.4,
+    "capsnet_mnist": 3.8,
+    "pointnet_modelnet40": 3.0,
+    "gru_forecaster": 2.5,
+    "distilbert": 2.0,
+    "m5": 1.0,
+    "ppo_bipedalwalker": 0.3,
+    "tcn_forecaster": 0.3,
+    "saint_adult": 0.2,
+    "vae_mnist": 0.2,
+    "dqn_lunarlander": 0.2,
+    "lstm_autoencoder": 0.2,
+}
+_DEFAULT_COST_HOURS = 0.1
+
+# The interesting state lives in tqdm bars that are rewritten in place, and the
+# bar's postfix carries the running best metric, so worker logs are parsed
+# rather than skimmed.
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_EPOCH = re.compile(r"^(\S+) \| (\S+):\s+(\d+)%\|[^|]*\|\s*(\d+)/(\d+) \[([^<\]]+)<([^,\]]+),\s*(.*)\]\s*$")
+_DONE = re.compile(r"\[done\] (\S+) / (\S+) [—-]+ (.+?): (-?[\d.]+)")
+_START = re.compile(r"\[train\] (\S+) / (\S+) [—-]+ starting")
+_BEST = re.compile(r"best_\w+=(-?[\d.]+)")
+
+# Checked against full command lines. Workers are spawned through the `dqb`
+# console script when one is on PATH and through `python -m` otherwise, so both
+# spellings have to be recognised — including runs started from another terminal.
+_WORKER_PATTERNS = ("dqb run", "dendritic_benchmark.cli run")
+
+
+def partition_models(model_keys: list[str], jobs: int) -> list[list[str]]:
+    """Split models across ``jobs`` workers, longest-first, balancing by cost.
+
+    Greedy longest-processing-time: repeatedly hand the most expensive model to
+    whichever worker is cheapest so far. With the default four jobs this keeps
+    the two CIFAR models — the long poles, together nearly 17 of the sweep's 24
+    hours — out of the same worker, which is the split that actually decides
+    wall-clock.
+    """
+    jobs = max(1, min(jobs, len(model_keys)))
+    streams: list[list[str]] = [[] for _ in range(jobs)]
+    loads = [0.0] * jobs
+    for key in sorted(model_keys, key=lambda k: -_MODEL_COST_HOURS.get(k, _DEFAULT_COST_HOURS)):
+        cheapest = loads.index(min(loads))
+        streams[cheapest].append(key)
+        loads[cheapest] += _MODEL_COST_HOURS.get(key, _DEFAULT_COST_HOURS)
+    # A worker with nothing to do would still pay interpreter and import startup
+    # and then show up in the progress table as a stream stuck at "starting…".
+    return [stream for stream in streams if stream]
+
+
+class _Emitter:
+    """Print a block and append it to the progress log.
+
+    Worker logs are unreadable after the fact — tqdm rewrites a single line in
+    place for hours — so the progress log is the only durable record of how the
+    run advanced, and it is what makes ``--detach`` usable.
+    """
+
+    def __init__(self, progress_log: Path) -> None:
+        self._progress_log = progress_log
+
+    def __call__(self, text: str = "", *, stderr: bool = False) -> None:
+        print(text, file=sys.stderr if stderr else sys.stdout)
+        try:
+            with self._progress_log.open("a", encoding="utf-8") as handle:
+                handle.write(text + "\n")
+        except OSError as exc:
+            print(f"  (could not append to {self._progress_log}: {exc.strerror})", file=sys.stderr)
+
+
+def _dqb_command() -> list[str]:
+    """Resolve the command used to spawn worker processes.
+
+    Preferring the console script keeps ``pkill -f 'dqb run'`` — printed by this
+    command and used everywhere else — matching the processes it launches. The
+    ``python -m`` form is only a fallback for when nothing named ``dqb`` is
+    reachable; either way the workers stay inside the interpreter running now.
+    """
+    argv0 = Path(sys.argv[0])
+    if argv0.name == "dqb" and argv0.exists():
+        return [str(argv0.resolve())]
+    found = shutil.which("dqb")
+    if found:
+        return [found]
+    return [sys.executable, "-m", "dendritic_benchmark.cli"]
+
+
+def _stop_pattern(dqb_cmd: list[str]) -> str:
+    return "dqb run" if Path(dqb_cmd[0]).name == "dqb" else "dendritic_benchmark.cli run"
+
+
+def _workers_running() -> bool:
+    """Whether any `dqb run` process is active, including ones we did not start.
+
+    Only used before launching and by ``--status``; the coordinator tracks its
+    own children instead, so a worker that has exited but not yet been reaped
+    cannot keep the progress loop alive.
+    """
+    for pattern in _WORKER_PATTERNS:
+        try:
+            completed = subprocess.run(
+                ["pgrep", "-f", pattern],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            return False
+        if completed.returncode == 0:
+            return True
+    return False
+
+
+def _stream_logs(log_dir: Path) -> list[Path]:
+    return sorted(log_dir.glob("stream_*.log"), key=lambda p: int(p.stem.split("_")[1]))
+
+
+def _render_progress(log_dir: Path, results_root: Path, total_pairs: int | None) -> str:
+    logs = _stream_logs(log_dir)
+    if not logs:
+        return "  (no worker logs yet)"
+
+    # The condition gets its own column rather than being folded into the model
+    # label: `run` now covers all twelve, and the widest pairing
+    # (attentivefp_freesolv / dendrites_q1_58) would otherwise overflow the
+    # column and knock every row after it out of alignment.
+    lines: list[str] = [
+        f"  {'stream':<9} {'model':<21} {'condition':<16} {'epoch':>9} {'%':>4}  "
+        f"{'remaining':>10}  {'best':>9}",
+        f"  {'-' * 9} {'-' * 21} {'-' * 16} {'-' * 9} {'-' * 4}  {'-' * 10}  {'-' * 9}",
+    ]
+    total_done = 0
+
+    for log in logs:
+        # These files belong to the workers, not to us, and the coordinator
+        # rereads them every interval for hours. A log that is rotated,
+        # truncated or removed between the listing above and this read must not
+        # take the coordinator down mid-run.
+        try:
+            text = _ANSI.sub("", log.read_text(errors="replace")).replace("\r", "\n")
+        except OSError as exc:
+            lines.append(f"  {log.stem:<10} (unreadable: {exc.strerror})")
+            continue
+
+        done = _DONE.findall(text)
+        total_done += len(done)
+
+        current, current_condition, last_epoch = None, None, None
+        for line in text.splitlines():
+            started = _START.search(line)
+            if started:
+                current, current_condition, last_epoch = started.group(1), started.group(2), None
+            epoch = _EPOCH.match(line.strip())
+            if epoch:
+                last_epoch = epoch
+        if (current, current_condition) in {(entry[0], entry[1]) for entry in done}:
+            current = None
+
+        if current is None:
+            state = "all queued work finished" if done else "starting…"
+            lines.append(f"  {log.stem:<9} {state}")
+        elif last_epoch is None:
+            lines.append(
+                f"  {log.stem:<9} {current:<21} {current_condition or '—':<16} "
+                f"{'—':>9} {'—':>4}  {'warming up':>10}  {'—':>9}"
+            )
+        else:
+            _, _, pct, cur, tot, _elapsed, remaining, postfix = last_epoch.groups()
+            best = _BEST.search(postfix)
+            lines.append(
+                f"  {log.stem:<9} {current:<21} {current_condition or '—':<16} "
+                f"{cur + '/' + tot:>9} {pct + '%':>4}  "
+                f"{remaining:>10}  {(best.group(1) if best else '—'):>9}"
+            )
+
+        for model, condition, metric, value in done:
+            lines.append(f"  {'':<9} ✓ {model:<21} {condition:<16} {metric}: {value}")
+
+    completed = f"{total_done}/{total_pairs}" if total_pairs else str(total_done)
+    lines.append("")
+    lines.append(
+        f"  {completed} model/condition pairs complete   "
+        f"({time.strftime('%H:%M:%S')})   -> {results_root}"
+    )
+    return "\n".join(lines)
+
+
+def _write_plan(log_root: Path, model_keys: list[str], condition_keys: list[str]) -> None:
+    payload = {"models": model_keys, "conditions": condition_keys}
+    try:
+        (log_root / _PLAN_NAME).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        # Only costs --status its denominator; never worth failing a launch over.
+        pass
+
+
+def _planned_pairs(log_root: Path) -> int | None:
+    try:
+        payload = json.loads((log_root / _PLAN_NAME).read_text(encoding="utf-8"))
+        return len(payload["models"]) * len(payload["conditions"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _emit_progress(emit: _Emitter, log_dir: Path, results_root: Path, total_pairs: int | None) -> None:
+    emit()
+    emit("=" * 88)
+    emit(f"  {datetime.now():%Y-%m-%d %H:%M:%S}")
+    emit(_render_progress(log_dir, results_root, total_pairs))
+
+
+def clear_epoch_checkpoints(
+    results_root: Path,
+    model_keys: list[str],
+    condition_keys: list[str],
+    *,
+    fresh: bool,
+    emit: _Emitter,
+) -> None:
+    """Deal with epoch checkpoints left behind by an earlier run.
+
+    ``--ignore-saved-models`` does NOT prevent epoch-level resume: training.py
+    calls ``_load_epoch_checkpoint()`` unconditionally whenever the output
+    directory exists, and never consults that flag. The flag only stops a
+    finished record.json from causing a skip. So after any model-definition
+    change, a leftover epoch_checkpoint.pt would silently continue an
+    old-architecture run.
+    """
+    stale = [
+        (model, condition)
+        for model in model_keys
+        for condition in condition_keys
+        if (results_root / model / condition / "epoch_checkpoint.pt").is_file()
+    ]
+    if not stale:
+        return
+
+    labels = " ".join(f"{model}/{condition}" for model, condition in stale)
+    if fresh:
+        # Logged, not just printed: which checkpoints were discarded is the one
+        # fact that decides whether a later result is a clean run or a resumed one.
+        emit(f"removing {len(stale)} stale epoch checkpoint(s): {labels}")
+        for model, condition in stale:
+            shutil.rmtree(results_root / model / condition, ignore_errors=True)
+        return
+
+    # Same reasoning as the --fresh branch: still stderr for the operator, but
+    # also on disk, so a resumed run cannot later be mistaken for a clean one.
+    emit(f"WARNING: {len(stale)} model/condition pair(s) have an epoch_checkpoint.pt", stderr=True)
+    emit(f"  and WILL resume mid-run rather than start clean: {labels}", stderr=True)
+    emit("  --ignore-saved-models does not override this. If the model definitions", stderr=True)
+    emit("  changed since those checkpoints, the run would be invalid.", stderr=True)
+    emit("  Re-run with --fresh to delete them first, or accept the resume.", stderr=True)
+    emit("", stderr=True)
+
+
+def _launch_worker(
+    index: int,
+    models: list[str],
+    *,
+    dqb_cmd: list[str],
+    passthrough: list[str],
+    condition_keys: list[str] | None,
+    log_dir: Path,
+) -> subprocess.Popen[bytes]:
+    command = [*dqb_cmd, "run", "--worker", *passthrough]
+    if condition_keys:
+        command += ["--conditions", *condition_keys]
+    command += ["--models", *models]
+    # Truncated, not appended to: the reporter reads the whole file, and a
+    # previous run's [done] lines would be counted as this one's.
+    handle = (log_dir / f"stream_{index}.log").open("wb")
+    try:
+        # start_new_session detaches the worker from the controlling terminal, so
+        # Ctrl-C in the coordinator and closing the terminal both leave training
+        # running.
+        return subprocess.Popen(
+            command,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    finally:
+        handle.close()
+
+
+def _build_final_reports(
+    results_root: Path, comparison_root: Path, *, emit: _Emitter
+) -> None:
+    """Write the manifest and comparison reports from every record on disk.
+
+    Workers run with ``write_reports=False`` precisely so this can happen once,
+    here, across all of their records at the same time. Only reached when the
+    coordinator saw every worker exit — ``--detach`` and ``--status`` leave it to
+    the operator, since neither knows when (or whether) training finished.
+    """
+    emit()
+    emit("building manifest.csv and comparison reports from all per-model records")
+    try:
+        records = load_training_records(results_root)
+        write_manifest(records, results_root / "manifest.csv")
+        write_comparison_reports(records, comparison_root)
+    except Exception as exc:
+        # Non-fatal on purpose: training results are already on disk, and a
+        # failed report build must not make the run look like it lost them.
+        emit(f"  WARNING: report build failed ({exc}). Results are intact; rerun with:")
+        emit(f"    dqb compare --manifest --results-root {results_root}")
+        return
+    emit(f"  {len(records)} record(s) -> {results_root / 'manifest.csv'}")
+
+
+def _watch(
+    procs: list[subprocess.Popen[bytes]],
+    *,
+    emit: _Emitter,
+    log_dir: Path,
+    results_root: Path,
+    total_pairs: int,
+    interval: int,
+    stop_pattern: str,
+    on_finish: Callable[[], None],
+) -> None:
+    try:
+        while True:
+            _emit_progress(emit, log_dir, results_root, total_pairs)
+            # poll() also reaps, which keeps exited workers from lingering as
+            # zombies for the lifetime of the run.
+            if all(proc.poll() is not None for proc in procs):
+                emit()
+                emit("all workers finished.")
+                on_finish()
+                return
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print()
+        print(f'detached — training continues. stop with: pkill -f "{stop_pattern}"')
+
+
+def run_parallel(
+    *,
+    results_root: Path,
+    comparison_root: Path,
+    model_keys: list[str],
+    condition_keys: list[str] | None,
+    expanded_condition_keys: list[str],
+    log_root: Path,
+    passthrough: list[str],
+    jobs: int = DEFAULT_JOBS,
+    mode: str = "watch",
+    interval: int = DEFAULT_PROGRESS_INTERVAL,
+    fresh: bool = False,
+) -> None:
+    """Train ``model_keys`` across parallel worker processes, reporting progress.
+
+    ``passthrough`` carries the flags a worker needs to reproduce this
+    invocation's paths and training options verbatim; ``condition_keys`` is
+    passed separately because it is the one list the coordinator may leave
+    unset, while ``expanded_condition_keys`` is the resolved set used for
+    counting work and clearing stale checkpoints.
+    """
+    log_dir = log_root / _STREAM_LOG_DIRNAME
+    # Deliberately a level above log_dir: every stream_*.log inside log_dir is a
+    # worker log to the reporter, and a progress file sitting there would be
+    # reported as an extra worker stuck at "starting…".
+    progress_log = log_root / _PROGRESS_LOG_NAME
+    log_dir.mkdir(parents=True, exist_ok=True)
+    emit = _Emitter(progress_log)
+
+    if mode == "status":
+        # The launching run's plan, not this invocation's: --status is normally
+        # typed without --models/--conditions, which would otherwise measure a
+        # two-model run against all 276 pairs.
+        _emit_progress(emit, log_dir, results_root, _planned_pairs(log_root))
+        if not _workers_running():
+            emit("  (no dqb run processes active)")
+        return
+
+    total_pairs = len(model_keys) * len(expanded_condition_keys)
+
+    if _workers_running():
+        print(
+            "refusing to launch: 'dqb run' is already active — two runs would race on the",
+            file=sys.stderr,
+        )
+        print(
+            f"same {results_root} paths. Use --status to watch, or pkill -f 'dqb run'.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    dqb_cmd = _dqb_command()
+    clear_epoch_checkpoints(
+        results_root, model_keys, expanded_condition_keys, fresh=fresh, emit=emit
+    )
+
+    streams = partition_models(model_keys, jobs)
+    _write_plan(log_root, model_keys, expanded_condition_keys)
+    emit()
+    emit(f"=== launch {datetime.now():%Y-%m-%d %H:%M:%S} -> {results_root}, logs -> {log_root}/")
+
+    procs: list[subprocess.Popen[bytes]] = []
+    for index, models in enumerate(streams, 1):
+        proc = _launch_worker(
+            index,
+            models,
+            dqb_cmd=dqb_cmd,
+            passthrough=passthrough,
+            condition_keys=condition_keys,
+            log_dir=log_dir,
+        )
+        procs.append(proc)
+        cost = sum(_MODEL_COST_HOURS.get(key, _DEFAULT_COST_HOURS) for key in models)
+        emit(f"  stream_{index:<3} pid {proc.pid:<7} ~{cost:>4.1f}h  {' '.join(models)}")
+
+    stop_pattern = _stop_pattern(dqb_cmd)
+    emit()
+    emit(f"logs:     tail -f {log_dir}/stream_*.log")
+    emit(f"progress: tail -f {progress_log}")
+    emit(f"status:   dqb run --logging-dir {log_root} --status")
+    emit(f"stop:     pkill -f '{stop_pattern}'")
+
+    if mode == "detach":
+        emit(f"reports:  dqb compare --manifest --results-root {results_root}")
+        emit("          (run once every worker has exited — detached runs skip the automatic")
+        emit("           report build, so manifest.csv is not written at all)")
+        return
+
+    print()
+    print(f"progress every {interval}s — Ctrl-C detaches without stopping training")
+    print(f"(also appended to {progress_log})")
+    _watch(
+        procs,
+        emit=emit,
+        log_dir=log_dir,
+        results_root=results_root,
+        total_pairs=total_pairs,
+        interval=interval,
+        stop_pattern=stop_pattern,
+        on_finish=functools.partial(
+            _build_final_reports, results_root, comparison_root, emit=emit
+        ),
+    )

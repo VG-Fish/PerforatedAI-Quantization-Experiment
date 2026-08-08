@@ -256,8 +256,8 @@ If a specific model regresses on the dynamic run because of this, isolate it via
 
 Two models cannot benefit from dynamic dendrites in their current form:
 
-- **`pointnet_modelnet40`** — baseline accuracy is **13.4%** on ModelNet40 (10-class random ≈ 10%, 40-class random ≈ 2.5%). The base model is broken. Dendrites made it worse (−66%) because they're amplifying a non-signal. Fix the baseline first — investigate `models.py`'s pointnet definition and the modelnet40 dataloader — before including it in a dendritic sweep.
-- **`distilbert`** — the recipe is 4 epochs. Dynamic mode needs many more to detect a real plateau (`history_lookback=8` already exceeds it). Either bump `distilbert`'s `max_epochs` recipe to ≥ 20 for the dendritic condition, or hold it out.
+- ~~**`pointnet_modelnet40`** — baseline accuracy is **13.4%** on ModelNet40 (10-class random ≈ 10%, 40-class random ≈ 2.5%). The base model is broken. Dendrites made it worse (−66%) because they're amplifying a non-signal. Fix the baseline first — investigate `models.py`'s pointnet definition and the modelnet40 dataloader — before including it in a dendritic sweep.~~ **Obsolete — see the banner above. The baseline is 0.7937, not 13.4%, and the model is not broken.**
+- **`distilbert`** — the recipe is 3 epochs (it was 4 when this was written). Dynamic mode needs many more to detect a real plateau (`history_lookback=8` already exceeds it). Either bump `distilbert`'s `max_epochs` recipe to ≥ 20 for the dendritic condition, or hold it out.
 
 Recommended first dynamic invocation:
 

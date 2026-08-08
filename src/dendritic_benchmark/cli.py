@@ -18,7 +18,12 @@ from .compat import (
 )
 from .data import DATA_ROOT_ENV, DEFAULT_DATA_ROOT, build_task_bundle, dataset_exists
 from .log_utils import setup_logging
-from .pipeline import BenchmarkRunner
+from .pipeline import (
+    DEFAULT_JOBS,
+    DEFAULT_PROGRESS_INTERVAL,
+    BenchmarkRunner,
+    run_parallel,
+)
 from .results import (
     generate_training_graphs,
     load_training_records,
@@ -90,6 +95,12 @@ def _write_clean_config(config: dict[str, Any]) -> None:
 
 def _record_clean_config(args: Any, results_root: Path, comparison_root: Path, benchmark_root: Path) -> None:
     if args.command == "clean":
+        return
+    # Workers are spawned by a 'run' that has already recorded these exact
+    # paths. Letting each of them record too would add nothing and would have
+    # several processes read-modify-writing one JSON file at the same moment,
+    # which is how entries get lost.
+    if getattr(args, "worker", False):
         return
     paths: list[dict[str, str]] = [_path_entry(args.logging_dir, "logs")]
     if args.command == "run":
@@ -211,7 +222,9 @@ def _add_common_options(parser: argparse.ArgumentParser, *, is_subcommand: bool)
         help=(
             "Directory where timestamped log files are written. Each invocation "
             "creates a new file named <command>_YYYYMMDD_HHMMSS.txt. "
-            "All stdout and stderr are teed to this file. (default: logs)" + position_note
+            "All stdout and stderr are teed to this file. A parallel 'run' also "
+            "writes <dir>/streams/stream_N.log and <dir>/run_progress.log here. "
+            "(default: logs)" + position_note
         ),
     )
 
@@ -247,6 +260,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Conditions are executed in dependency order — e.g. dendrites_q8 "
             "requires dendrites_fp32 — so "
             "omitting an upstream condition will cause its dependents to be skipped.\n\n"
+            f"By default the selected models are split across {DEFAULT_JOBS} worker "
+            "processes and a live progress table is printed until they all exit; "
+            "training is compute-bound rather than data-bound, so this cuts "
+            "wall-clock close to linearly. Each model keeps all of its conditions "
+            "in one worker, so the dependency order above still holds. Worker "
+            "output goes to <logging-dir>/streams/stream_N.log, and every progress "
+            "table is appended to <logging-dir>/run_progress.log. Use --jobs 1 to "
+            "train in this process and print straight to the terminal instead.\n\n"
+            "Ctrl-C stops the progress display only; training keeps running. Use "
+            "\"pkill -f 'dqb run'\" to actually stop it.\n\n"
             f"Available model keys:\n  {_MODEL_KEYS}\n\n"
             f"Available condition keys:\n  {_CONDITION_KEYS}"
         ),
@@ -310,6 +333,69 @@ def build_parser() -> argparse.ArgumentParser:
             "the matching non-dendritic run and freeze dendrite insertion for "
             "the final 20%% of epochs."
         ),
+    )
+    run_parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=DEFAULT_JOBS,
+        metavar="N",
+        help=(
+            "Number of worker processes to split the selected models across. "
+            "Never exceeds the number of models selected. 1 trains in this "
+            f"process and prints straight to the terminal. (default: {DEFAULT_JOBS})"
+        ),
+    )
+    run_parser.add_argument(
+        "-i",
+        "--interval",
+        type=int,
+        default=DEFAULT_PROGRESS_INTERVAL,
+        metavar="SECONDS",
+        help=(
+            "Seconds between progress tables while waiting on the workers. "
+            f"(default: {DEFAULT_PROGRESS_INTERVAL})"
+        ),
+    )
+    run_parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "Delete any leftover epoch_checkpoint.pt (and its condition directory) "
+            "for the selected pairs before launching. --ignore-saved-models does "
+            "not cover these: training resumes from an epoch checkpoint whenever "
+            "one exists, so after a model definition change a stale checkpoint "
+            "would silently continue an old-architecture run."
+        ),
+    )
+    run_mode = run_parser.add_mutually_exclusive_group()
+    run_mode.add_argument(
+        "--detach",
+        dest="mode",
+        action="store_const",
+        const="detach",
+        default="watch",
+        help=(
+            "Launch the workers and exit immediately. Training continues, but the "
+            "final manifest and comparison reports are skipped — run "
+            "'dqb compare --manifest' by hand once every worker has exited."
+        ),
+    )
+    run_mode.add_argument(
+        "--status",
+        dest="mode",
+        action="store_const",
+        const="status",
+        help=(
+            "Report on the workers recorded in --logging-dir without launching "
+            "anything, then exit. Pointing this at an old run's log directory "
+            "replays that run's final state."
+        ),
+    )
+    run_parser.add_argument(
+        "--worker",
+        action="store_true",
+        help=argparse.SUPPRESS,  # internal: set on the processes 'run' spawns
     )
 
     download_parser: argparse.ArgumentParser = subparsers.add_parser(
@@ -516,13 +602,68 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
     runner = BenchmarkRunner(results_root=results_root, comparison_root=comparison_root)
-    runner.run(
-        model_keys=args.models,
+    selected_models = args.models or [spec.key for spec in MODEL_SPECS]
+
+    # A worker is one of the processes a parallel run spawned. It trains its
+    # slice in this process and leaves the manifest and comparison reports to
+    # the coordinator, which builds them once from every worker's records.
+    if args.worker:
+        runner.run(
+            model_keys=selected_models,
+            condition_keys=args.conditions,
+            ignore_saved=args.ignore_saved_models,
+            allow_pqat=args.allow_pqat,
+            dynamic_dendritic_training=args.dynamic_dendritic_training,
+            write_reports=False,
+        )
+        return
+
+    if args.mode == "watch" and (args.jobs <= 1 or len(selected_models) == 1):
+        runner.run(
+            model_keys=selected_models,
+            condition_keys=args.conditions,
+            ignore_saved=args.ignore_saved_models,
+            allow_pqat=args.allow_pqat,
+            dynamic_dendritic_training=args.dynamic_dendritic_training,
+        )
+        return
+
+    run_parallel(
+        results_root=results_root,
+        comparison_root=comparison_root,
+        model_keys=selected_models,
         condition_keys=args.conditions,
-        ignore_saved=args.ignore_saved_models,
-        allow_pqat=args.allow_pqat,
-        dynamic_dendritic_training=args.dynamic_dendritic_training,
+        expanded_condition_keys=runner._expand_condition_keys(args.conditions),
+        log_root=Path(args.logging_dir),
+        passthrough=_run_passthrough(args, comparison_root),
+        jobs=args.jobs,
+        mode=args.mode,
+        interval=args.interval,
+        fresh=args.fresh,
     )
+
+
+def _run_passthrough(args: Any, comparison_root: Path) -> list[str]:
+    """The flags a worker needs to reproduce this invocation's paths and options.
+
+    --models and --conditions are omitted: the coordinator supplies each worker
+    with its own slice of the models, and passes the conditions separately so it
+    can leave them unset (meaning "all") exactly as this invocation did.
+    """
+    flags = [
+        "--results-root", str(args.results_root),
+        "--logging-dir", str(args.logging_dir),
+        "--comparison-root", str(comparison_root),
+    ]
+    if args.results_directory:
+        flags += ["--results-directory", str(args.results_directory)]
+    if args.ignore_saved_models:
+        flags.append("--ignore-saved-models")
+    if args.allow_pqat:
+        flags.append("--allow-PQAT")
+    if args.dynamic_dendritic_training:
+        flags.append("--dynamic-dendritic-training")
+    return flags
 
 
 def _handle_download_data(args: Any) -> None:
