@@ -314,12 +314,25 @@ These are the published numbers the recipes aim at, not results:
 | `attentivefp_freesolv` | RMSE | ~1.15 | MoleculeNet (FreeSolv) |
 | `tabnet` | Accuracy | 85.7% | Arık & Pfister 2021 |
 | `saint_adult` | Accuracy | ~86% | Somepalli et al. 2021 |
+| `pointnet_modelnet40` | Accuracy | 89.2% | Qi et al. 2017 |
+| `ppo_bipedalwalker` | Episodic Return | 300 = solved; ~213 at 5M steps | Gymnasium; SB3 RL Zoo |
+| `actor_critic` | Episodic Return | 500 = max | CartPole-v1 |
+| `dqn_lunarlander` | Episodic Return | 200 = solved | LunarLander-v3 |
 
-Note that this benchmark's splits are not always the reference splits — Cora uses
-a random 70/15/15 node split rather than the 140-label public split, and
-IMDB-BINARY uses one held-out split rather than 10-fold CV — so the numbers are
-targets to be near, not thresholds to hit exactly. IMDB-BINARY's test split in
-particular is 150 graphs, where a single graph moves accuracy by 0.67%.
+Note that this benchmark's splits are not always the reference splits — Cora now
+uses the 140-label Planetoid split and full-graph transductive propagation, but
+IMDB-BINARY uses one held-out split rather than 10-fold CV, and `distilbert`
+tests on 611 of the GLUE dev set's 872 rows (the other 261 are its validation
+split) — so the numbers are targets to be near, not thresholds to hit exactly.
+IMDB-BINARY's test split in particular is 150 graphs, where a single graph moves
+accuracy by 0.67%.
+
+Two budgets are knowingly short of their reference and should be read as such:
+`ppo_bipedalwalker` trains 1.6M environment steps against the RL Zoo's 5M, and
+`pointnet_modelnet40` 200 epochs against Qi et al.'s 250. For `actor_critic` and
+`dqn_lunarlander` the return is a recorded extra column, not what they train on
+— their headline metric is agreement with a scripted policy and has no published
+counterpart.
 
 ### What has actually been re-measured
 
@@ -456,9 +469,10 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 | **Key** | `ppo_bipedalwalker` |
 | **Domain** | Reinforcement Learning — continuous action space |
 | **Dataset/Env** | `gymnasium BipedalWalker-v3` |
-| **Architecture** | Shared backbone MLP + separate actor/critic heads, GAE advantage estimation |
-| **Metric** | Mean episodic reward (solved ≥ 300) |
-| **PAI Notes** | Perforate shared backbone; heads can remain standard |
+| **Architecture** | Shared backbone MLP + separate actor/critic heads, diagonal Gaussian policy, GAE(λ) advantage estimation |
+| **Training** | Real on-policy PPO — one epoch = one iteration of 2048 env steps + 10 minibatch passes. The only model in the suite with no cached dataset. |
+| **Metric** | Mean episodic return (solved ≥ 300), and here it is the selection metric, not a recorded extra |
+| **PAI Notes** | Perforate the shared backbone; `.actor_mean` and `.critic` stay track-only — a dendrite switching in on either head invalidates the live rollout buffer (clip range on one, advantage baseline on the other) |
 
 ### Group B: Molecular/Graph Depth (Probe the MPNN Win)
 
@@ -510,7 +524,7 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 |---|---|
 | **Key** | `pointnet_modelnet40` |
 | **Domain** | 3D Point Cloud Classification |
-| **Dataset** | ModelNet40 (12,311 CAD models, 40 classes) |
+| **Dataset** | ModelNet40 (12,311 CAD models, 40 classes), sampled uniformly over mesh faces to 1024 points and cached |
 | **Architecture** | T-Net input/feature transform, shared MLP on per-point features, global max pooling |
 | **Metric** | Accuracy (%) |
 

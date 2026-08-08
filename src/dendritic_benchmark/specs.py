@@ -44,7 +44,7 @@ MODEL_SPECS: list[ModelSpec] = [
     ModelSpec("lstm_autoencoder", "LSTM Autoencoder", "MIT-BIH", "AUC", "maximize"),
     ModelSpec("distilbert", "DistilBERT", "SST-2", "Accuracy", "maximize"),
     ModelSpec("dqn_lunarlander", "DQN (LunarLander)", "LunarLander-v2", "Action Accuracy", "maximize"),
-    ModelSpec("ppo_bipedalwalker", "PPO Policy Network", "BipedalWalker-v3", "Neg. Action MAE", "maximize"),
+    ModelSpec("ppo_bipedalwalker", "PPO Policy Network", "BipedalWalker-v3", "Episodic Return", "maximize"),
     ModelSpec("attentivefp_freesolv", "AttentiveFP", "FreeSolv", "RMSE", "minimize"),
     ModelSpec("gin_imdbb", "GIN", "IMDB-Binary", "Accuracy", "maximize"),
     ModelSpec("tcn_forecaster", "TCN Forecaster", "ETTm1", "MAE", "minimize"),

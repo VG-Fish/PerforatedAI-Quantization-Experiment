@@ -28,14 +28,17 @@ from .models import (
     MOLECULE_NODE_FEATURES,
     SOCIAL_GRAPH_NODE_FEATURES,
     WEATHER_FORECAST_HORIZON,
+    RunningObsNorm,
 )
 
 DATA_ROOT_ENV: str = "DQB_DATA_ROOT"
 DEFAULT_DATA_ROOT: str = "data"
 EXTRACTED_MARKER: str = ".extracted"
-# Versioned: a cached rollout file records whichever heuristic produced it, so
-# reusing one after changing the labelling policy would train on stale labels.
-HEURISTIC_ROLLOUTS_FILENAME: str = "heuristic_rollouts_v2.pt"
+# Versioned: a cached rollout file records whichever heuristic produced it and
+# whatever payload schema was current when it was written. Reusing one after
+# changing either would train on stale labels or fail on a missing key, so the
+# version is bumped for both kinds of change. v3 added per-step episode ids.
+HEURISTIC_ROLLOUTS_FILENAME: str = "heuristic_rollouts_v3.pt"
 # Safety net only; each environment's own TimeLimit truncates first.
 _RL_ROLLOUT_STEP_CAP: int = 2000
 ADULT_DATA_FILENAME: str = "adult.data"
@@ -76,12 +79,12 @@ _BOND_ORDERS: dict[str, float] = {"-": 1.0, "=": 2.0, "#": 3.0, ":": 1.5, "$": 4
 # dataset rather than taking the larger of the two.
 ESOL_MAX_ATOMS: int = 40
 FREESOLV_MAX_ATOMS: int = 24
-# Cora ego-graph width. Two hops to match the 2-layer GCN's receptive field; 64
-# slots because the 2-hop closed neighbourhood has median 18 and p75 40, so this
-# holds the whole neighbourhood for ~83% of nodes and the nearest 64 for the
-# rest. Costs 1.6x the old 50-wide subgraph in the dense [N,N] bmm.
-CORA_EGO_HOPS: int = 2
-CORA_EGO_NODES: int = 64
+# Cora is trained transductively on the whole graph — every node's features and
+# edges are present in every forward pass, and only the labels are split. See
+# _CoraTransductiveDataset for why the previous fixed-width 2-hop ego graphs
+# were not the task Kipf & Welling's 81.5% measures.
+CORA_NODES: int = 2708
+CORA_NODE_FEATURES: int = 1433
 # The Planetoid semi-supervised split that every published Cora/Citeseer/Pubmed
 # number is measured on: 20 labelled nodes per class, then 500 validation and
 # 1000 test nodes. See _planetoid_style_split.
@@ -107,6 +110,12 @@ _SOCIAL_DEGREE_BUCKETS: int = SOCIAL_GRAPH_NODE_FEATURES - 2
 # Kept in step with TextCNN's `vocab_size` default in models.py.
 AG_NEWS_VOCAB_SIZE: int = 20_000
 AG_NEWS_SEQ_LEN: int = 128
+# Fraction of GLUE's 872-row SST-2 dev set held out as validation, leaving the
+# rest as test. SST-2's *train* split is phrase-level, so a validation set drawn
+# from it shares constituency subtrees with training rows; see TextDataSets.sst2.
+# 0.3 keeps ~610 test rows (standard error ~1.2%) while giving the plateau
+# detector ~262 rows, enough that one flipped prediction moves it by 0.38%.
+SST2_DEV_VALIDATION_RATIO: float = 0.3
 SPEECH_COMMAND_LABELS: tuple[str, ...] = (
     "yes",
     "no",
@@ -154,6 +163,14 @@ class TaskBundle:
     # Identity by default; every classification task leaves it alone.
     target_offset: float = 0.0
     target_scale: float = 1.0
+    # Set only for on-policy reinforcement learning, where the training data is
+    # a function of the current weights rather than a fixed file. Holds a
+    # ``PPORolloutSource``; ``_run_epoch_batches`` calls ``collect(model, device)``
+    # at the top of every epoch and replaces ``train_loader`` with the result.
+    # ``ppo_bipedalwalker`` is the only model in the suite that sets it, and it
+    # is the one property that makes that model structurally unlike the other
+    # 21 — worth checking before assuming a bundle's loaders are static.
+    on_policy: Any | None = None
 
 # Making the following into static methods is not necessary since every domain class 
 # after calls them. Adding inheritance by making some shared base class is pointless.
@@ -373,6 +390,34 @@ def _planetoid_style_split(
         remaining[:PLANETOID_VAL_NODES],
         remaining[PLANETOID_VAL_NODES:needed],
     )
+
+
+def _stratified_holdout(
+    labels: Any, *, holdout_ratio: float, seed: int = 42
+) -> tuple[list[int], list[int]]:
+    """Split row indices into (holdout, remainder), keeping the label mix in both.
+
+    Used to cut a validation set out of an evaluation split that is too small
+    for the class balance to survive an unstratified draw — GLUE's SST-2 dev set
+    is 872 rows, where a plain random 30% can drift the positive rate by several
+    points and move the accuracy it reports for reasons that have nothing to do
+    with the model. Seeded, so the two splits are fixed across runs and
+    identical in the baseline and dendritic arms.
+    """
+    if not 0.0 < holdout_ratio < 1.0:
+        raise ValueError(f"holdout_ratio must be in (0, 1), got {holdout_ratio}")
+    generator = torch.Generator().manual_seed(seed)
+    holdout: list[int] = []
+    remainder: list[int] = []
+    for label in torch.unique(labels).tolist():
+        rows = (labels == label).nonzero(as_tuple=True)[0]
+        order = torch.randperm(len(rows), generator=generator)
+        shuffled = rows[order].tolist()
+        # Clamped so neither side of a small class can come out empty.
+        count = min(max(1, round(len(shuffled) * holdout_ratio)), len(shuffled) - 1)
+        holdout.extend(shuffled[:count])
+        remainder.extend(shuffled[count:])
+    return sorted(holdout), sorted(remainder)
 
 
 def _bundle_from_splits(
@@ -912,6 +957,31 @@ class TextDataSets:
 
     @staticmethod
     def sst2(batch_size: int) -> TaskBundle:
+        """SST-2 with validation and test both carved out of the GLUE dev set.
+
+        Validation used to be a random 10% of GLUE's ``train`` split. That split
+        is **phrase-level**: Stanford parsed each sentence into a constituency
+        tree and labelled every subtree, so one sentence contributes the full
+        sentence plus many overlapping sub-phrases. A random row-wise draw
+        therefore routinely put a phrase in validation whose parent sentence sat
+        in training, and the measured effect was large — validation read 95.19%
+        against a test accuracy of 90.48%.
+
+        The reported *test* number was never wrong (it is the real GLUE dev set,
+        and 90.48% sits on the published ~91%). The reason to care is
+        PerforatedAI: its switch logic reads the validation metric, so a signal
+        inflated by 4.7 points and moving for the wrong reasons is a poor
+        plateau detector, and dendrite insertion timing depends on it.
+
+        Both evaluation splits now come from the 872-row GLUE dev set, which is
+        one row per sentence with no phrase overlap against anything. The
+        trade-off is deliberate and has to be stated wherever the number is
+        read: test is ~610 rows rather than 872, so its standard error rises
+        from roughly 1.0% to 1.2%, and it is no longer the whole standard dev
+        set. Training still uses every phrase-level train row — phrase
+        augmentation is what SST-2's train split is *for*, and it only becomes a
+        leak when the same tree lands on both sides of an evaluation boundary.
+        """
         datasets = _require_dependency("datasets")
         transformers = _require_dependency("transformers")
         tokenizer = transformers.AutoTokenizer.from_pretrained("distilbert-base-uncased")
@@ -929,89 +999,78 @@ class TextDataSets:
 
         train_ids, train_mask = _tokenize(loaded["train"]["sentence"])
         y_train = torch.tensor(list(loaded["train"]["label"]), dtype=torch.long)
-        train_full = _TensorRowsDataset(train_ids, train_mask, y_train)
-        train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
-        test_ids, test_mask = _tokenize(loaded["validation"]["sentence"])
-        y_test = torch.tensor(list(loaded["validation"]["label"]), dtype=torch.long)
+        dev_ids, dev_mask = _tokenize(loaded["validation"]["sentence"])
+        y_dev = torch.tensor(list(loaded["validation"]["label"]), dtype=torch.long)
+        dev_dataset = _TensorRowsDataset(dev_ids, dev_mask, y_dev)
+        val_idx, test_idx = _stratified_holdout(
+            y_dev, holdout_ratio=SST2_DEV_VALIDATION_RATIO
+        )
+        subset = torch.utils.data.Subset
         return _bundle_from_splits(
-            train_ds,
-            val_ds,
-            _TensorRowsDataset(test_ids, test_mask, y_test),
+            _TensorRowsDataset(train_ids, train_mask, y_train),
+            subset(dev_dataset, val_idx),
+            subset(dev_dataset, test_idx),
             batch_size,
             "Accuracy",
             "maximize",
-            "SST-2 sentences tokenized with distilbert-base-uncased tokenizer",
+            "SST-2 sentences tokenized with distilbert-base-uncased tokenizer; "
+            "validation and test are disjoint halves of the GLUE dev set",
         )
 
-class _CoraEgoDataset:
-    """Two-hop ego graphs for Cora node classification.
+class _CoraTransductiveDataset:
+    """The whole Cora graph as a single item, plus the node indices to score.
 
-    Storing all data as instance attributes (rather than capturing them via a
-    closure inside ``_build_cora``) makes this class picklable, which lets
-    ``DataLoader`` serialise it safely for multi-process worker prefetching.
+    Cora node classification used to be cut into one fixed-width 2-hop ego graph
+    per labelled node, 64 nodes wide, batched 32 at a time. That is a legitimate
+    task — inductive GraphSAGE-style classification — but it is not the task
+    Kipf & Welling's 81.5% measures, and the difference is not a detail:
 
-    Two details matter for accuracy, and both were wrong before:
+    | | Kipf transductive | ego-graph |
+    |---|---|---|
+    | receptive field | the full 2708-node graph | 2 hops, capped at 64 nodes |
+    | batching | one graph, one optimiser step | 32 independent subgraphs |
+    | unlabelled nodes | propagate information | only where a subgraph reaches |
+    | high-degree node | every neighbour present | truncated to 64 |
 
-    *Padding.* Subgraphs are a fixed ``CORA_EGO_NODES`` wide so they can be
-    batched, but Cora's median degree is 3, so almost every subgraph is mostly
-    padding. Padding used to repeat the centre node's own index. That is not
-    neutral: ``adjacency`` has a self-loop, so every pair of centre copies is
-    connected, and after ``GraphConv``'s symmetric normalisation the copies took
-    94% of the centre's incoming weight against 6% for its true neighbours. The
-    GCN was an MLP on the centre's own bag-of-words. Padding now points at an
-    isolated virtual node (all-zero features, no edges, appended at index ``n``),
-    which contributes nothing to any real node's aggregation.
+    Cora's 2-hop closed neighbourhood has a 75th percentile of 40 nodes but a
+    long tail, so the 64-slot cap silently truncated the best-connected nodes —
+    exactly the ones a graph convolution has most to say about. And because
+    every subgraph was scored independently, a test node's 2-hop neighbourhood
+    was re-encoded from scratch rather than sharing the representation the rest
+    of the graph had built.
 
-    *Hops.* A 2-layer GCN has a 2-hop receptive field, but the subgraph only
-    held 1-hop neighbours, so ``conv2`` had no new information to aggregate.
-    Neighbours are now collected breadth-first to depth 2, nearest hop first, so
-    truncation drops the most distant nodes rather than an arbitrary set.
+    The transductive setup restores the reference mechanism. One item holds the
+    full feature matrix and the full normalised-input adjacency; the split
+    supplies which node indices its loss and metrics are computed over. Every
+    node's features and edges are visible in every forward pass, of every split
+    — that is what "transductive" means and it is not a leak, because only the
+    *labels* are partitioned. ``_planetoid_style_split`` already partitions
+    those 20-per-class / 500 / 1000.
+
+    One item per split means one optimiser step per epoch, which is also the
+    reference setup: Kipf & Welling run 200 epochs of full-batch descent, i.e.
+    200 steps, which the 200-epoch recipe now reproduces exactly.
+
+    Attributes are stored on the instance rather than captured in a closure so
+    the class stays picklable for DataLoader worker processes.
     """
 
-    def __init__(self, adjacency: Any, x_all: Any, y_all: Any) -> None:
+    def __init__(self, adjacency: Any, x_all: Any, node_indices: list[int], y_all: Any) -> None:
         self.adjacency = adjacency
         self.x_all = x_all
-        self.y_all = y_all
-        self.pad_index = int(y_all.shape[0])
-        # Adjacency lists, built once: __getitem__ runs per sample per epoch and
-        # scanning a 2708-wide dense row for each BFS step is the whole cost.
-        self.neighbor_lists: list[list[int]] = [
-            [int(j) for j in row.nonzero().flatten().tolist() if int(j) != i]
-            for i, row in enumerate(adjacency[: self.pad_index])
-        ]
+        self.node_indices = torch.tensor(node_indices, dtype=torch.long)
+        self.labels = y_all[self.node_indices]
 
     def __len__(self) -> int:
-        return int(self.y_all.shape[0])
+        return 1
 
-    def _ego_nodes(self, index: int) -> list[int]:
-        selected: list[int] = [index]
-        seen: set[int] = {index}
-        frontier: list[int] = [index]
-        for _ in range(CORA_EGO_HOPS):
-            next_frontier: list[int] = []
-            for node in frontier:
-                for neighbor in self.neighbor_lists[node]:
-                    if neighbor in seen:
-                        continue
-                    seen.add(neighbor)
-                    selected.append(neighbor)
-                    next_frontier.append(neighbor)
-                    if len(selected) >= CORA_EGO_NODES:
-                        return selected
-            if not next_frontier:
-                break
-            frontier = next_frontier
-        return selected
-
-    def __getitem__(self, index: int) -> tuple[Any, Any, Any]:
-        selected = self._ego_nodes(index)
-        nodes = torch.tensor(
-            selected + [self.pad_index] * (CORA_EGO_NODES - len(selected)),
-            dtype=torch.long,
-        )
-        sub_x = self.x_all[nodes]
-        sub_adj = self.adjacency[nodes.unsqueeze(1), nodes.unsqueeze(0)]
-        return sub_x, sub_adj, self.y_all[index]
+    def __getitem__(self, index: int) -> tuple[Any, Any, Any, Any]:
+        if index != 0:
+            raise IndexError(
+                "the transductive Cora dataset holds one item (the whole graph); "
+                f"got index {index}"
+            )
+        return self.x_all, self.adjacency, self.node_indices, self.labels
 
 def _parse_adult_file(path: Path) -> list[list[str]]:
     rows = []
@@ -1149,13 +1208,9 @@ class GraphDatasets:
         x_all = x_all / x_all.sum(dim=1, keepdim=True).clamp_min(1.0)
         y_all = torch.tensor([label_to_idx[label] for label in labels_raw], dtype=torch.long)
         node_count = len(paper_ids)
-        # One extra row/column beyond the real nodes: an isolated virtual node
-        # that _CoraEgoDataset pads fixed-width subgraphs with. It carries no
-        # self-loop, so its normalised adjacency row is empty and it contributes
-        # nothing to any real node. See _CoraEgoDataset for why padding with a
-        # real node index was wrong.
-        adjacency = torch.zeros((node_count + 1, node_count + 1), dtype=torch.float32)
-        adjacency[:node_count, :node_count] = torch.eye(node_count, dtype=torch.float32)
+        # A-hat = A + I, symmetric. The self-loop is Kipf & Welling's renormalisation
+        # trick, so every node keeps its own features through the convolution.
+        adjacency = torch.eye(node_count, dtype=torch.float32)
         with cites.open() as fh:
             for line in fh:
                 src, dst = line.strip().split()
@@ -1163,21 +1218,29 @@ class GraphDatasets:
                     i, j = id_to_idx[src], id_to_idx[dst]
                     adjacency[i, j] = 1.0
                     adjacency[j, i] = 1.0
-        x_all = torch.cat([x_all, x_all.new_zeros((1, x_all.shape[1]))], dim=0)
 
-        train_idx, val_idx, test_idx = _planetoid_style_split(
-            y_all, num_classes=len(label_to_idx)
+        splits = _planetoid_style_split(y_all, num_classes=len(label_to_idx))
+        # Each split is one item carrying the whole graph and its own node
+        # indices, so all three see identical features and edges and differ only
+        # in which labels are scored. batch_size is ignored on purpose: a
+        # transductive epoch is one full-graph step, which is the reference
+        # setup, and _BATCH_SIZES pins the recipe to 1 to keep that visible.
+        train_ds, val_ds, test_ds = (
+            _CoraTransductiveDataset(adjacency, x_all, node_indices, y_all)
+            for node_indices in splits
         )
-        subset = torch.utils.data.Subset
-        dataset = _CoraEgoDataset(adjacency, x_all, y_all)
         return _bundle_from_splits(
-            subset(dataset, train_idx),
-            subset(dataset, val_idx),
-            subset(dataset, test_idx),
-            batch_size,
+            train_ds,
+            val_ds,
+            test_ds,
+            1,
             "Accuracy",
             "maximize",
-            "Cora citation-network ego graphs, Planetoid-sized label split",
+            "Cora full citation graph, transductive Planetoid split "
+            f"({len(splits[0])} train / {len(splits[1])} val / {len(splits[2])} test labels)",
+            # The whole graph is one already-materialised tensor pair; a worker
+            # process would only add a 44 MB pickle round-trip per epoch.
+            num_workers=0,
         )
 
     @staticmethod
@@ -1595,9 +1658,14 @@ def _collect_heuristic_rollouts(
 ) -> tuple[Any, Any]:
     """Cache (observation, heuristic action) pairs for behaviour cloning.
 
+    Used by ``actor_critic`` and ``dqn_lunarlander``, which stay behaviour
+    cloning. ``ppo_bipedalwalker`` no longer comes through here: cloning a
+    *stateful* gait controller with a feedforward policy is ill-posed, so it
+    trains on policy instead — see ``PPORolloutSource``.
+
     ``make_policy(env)`` returns a *fresh* per-episode callable, so a stateful
-    heuristic — ``BipedalWalkerHeuristics`` tracks which leg is swinging — is
-    reset at every episode boundary instead of carrying state across resets.
+    heuristic is reset at every episode boundary rather than carrying state
+    across resets.
 
     Two properties here decide how well the cloned policy actually flies, as
     opposed to how well it matches labels:
@@ -1616,7 +1684,7 @@ def _collect_heuristic_rollouts(
     numpy = _require_dependency("numpy")
     if cache.exists():
         payload = torch.load(cache, map_location="cpu")
-        return payload["x"], payload["y"]
+        return payload["x"], payload["y"], payload["episode"]
 
     cache.parent.mkdir(parents=True, exist_ok=True)
     env = gymnasium.make(env_id)
@@ -1624,16 +1692,17 @@ def _collect_heuristic_rollouts(
     rng = numpy.random.default_rng(seed)
     observations: list[Any] = []
     actions: list[Any] = []
+    episodes: list[int] = []
     episode: int = 0
     try:
         while len(observations) < samples:
             observation, _ = env.reset(seed=seed + episode)
             policy = make_policy(env)
-            episode += 1
             for _ in range(_RL_ROLLOUT_STEP_CAP):
                 label = policy(observation)
                 observations.append(observation)
                 actions.append(label)
+                episodes.append(episode)
                 step_action = (
                     env.action_space.sample()
                     if rng.random() < explore_probability
@@ -1642,6 +1711,7 @@ def _collect_heuristic_rollouts(
                 observation, _, terminated, truncated, _ = env.step(step_action)
                 if terminated or truncated or len(observations) >= samples:
                     break
+            episode += 1
     finally:
         env.close()
 
@@ -1649,12 +1719,69 @@ def _collect_heuristic_rollouts(
     y = torch.tensor(
         numpy.array(actions), dtype=torch.long if discrete else torch.float32
     )
-    torch.save({"x": x, "y": y}, cache)
-    return x, y
+    episode_ids = torch.tensor(episodes, dtype=torch.long)
+    torch.save({"x": x, "y": y, "episode": episode_ids}, cache)
+    return x, y, episode_ids
+
+
+def _split_by_episode(
+    dataset: Any,
+    episode_ids: Any,
+    *,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    seed: int = 42,
+) -> tuple[Any, Any, Any]:
+    """Split trajectory data so that no episode spans two splits.
+
+    A rollout cache is a sequence, not a bag of independent rows: consecutive
+    timesteps in one episode differ by a single simulator tick and are nearly
+    identical. Splitting those rows at random — which is what ``_split_dataset``
+    does — puts step *t* in training and step *t+1* in test, so the reported
+    action accuracy is substantially a measure of how well the network
+    interpolates between two frames of the same episode. It is the same defect
+    the forecasting windows had.
+
+    Whole episodes are assigned instead. Episodes are independent of one another
+    (each starts from its own seeded reset), so a random assignment *of
+    episodes* is sound; it is only the within-episode correlation that has to be
+    kept on one side of the split.
+    """
+    unique = torch.unique(episode_ids).tolist()
+    generator = torch.Generator().manual_seed(seed)
+    order = torch.randperm(len(unique), generator=generator).tolist()
+    shuffled = [unique[position] for position in order]
+
+    train_count = max(1, int(len(shuffled) * train_ratio))
+    val_count = max(1, int(len(shuffled) * val_ratio))
+    if train_count + val_count >= len(shuffled):
+        raise ValueError(
+            f"{len(shuffled)} episodes cannot fill a "
+            f"{train_ratio}/{val_ratio} train/validation split with a test "
+            "remainder; collect more samples"
+        )
+    assignment = {
+        "train": set(shuffled[:train_count]),
+        "val": set(shuffled[train_count : train_count + val_count]),
+        "test": set(shuffled[train_count + val_count :]),
+    }
+    episode_list: list[int] = episode_ids.tolist()
+    subset = torch.utils.data.Subset
+    return tuple(
+        subset(
+            dataset,
+            [
+                index
+                for index, episode in enumerate(episode_list)
+                if episode in assignment[name]
+            ],
+        )
+        for name in ("train", "val", "test")
+    )
 
 
 def _build_cartpole(batch_size: int) -> TaskBundle:
-    x, y = _collect_heuristic_rollouts(
+    x, y, episode_ids = _collect_heuristic_rollouts(
         "CartPole-v1",
         # Scores a perfect 500 in the environment, so this one stays as written.
         lambda _env: (lambda obs: 1 if (obs[2] + 0.25 * obs[3]) > 0 else 0),
@@ -1669,8 +1796,8 @@ def _build_cartpole(batch_size: int) -> TaskBundle:
     # heuristic. An episodic return *is* now measured once at the end of
     # training — see _evaluate_episodic_return in training.py — and that is the
     # number to read against published CartPole results.
-    return _bundle_from_dataset(
-        _TensorRowsDataset(x, y),
+    return _bundle_from_splits(
+        *_split_by_episode(_TensorRowsDataset(x, y), episode_ids),
         batch_size,
         "Action Accuracy",
         "maximize",
@@ -1697,7 +1824,7 @@ def _build_lunarlander(batch_size: int) -> TaskBundle:
         unwrapped = env.unwrapped
         return lambda observation: int(lunar_lander.heuristic(unwrapped, observation))
 
-    x, y = _collect_heuristic_rollouts(
+    x, y, episode_ids = _collect_heuristic_rollouts(
         "LunarLander-v3",
         make_policy,
         samples=40_000,
@@ -1705,8 +1832,8 @@ def _build_lunarlander(batch_size: int) -> TaskBundle:
         discrete=True,
     )
     # Behaviour cloning, not reinforcement learning — see _build_cartpole.
-    return _bundle_from_dataset(
-        _TensorRowsDataset(x, y),
+    return _bundle_from_splits(
+        *_split_by_episode(_TensorRowsDataset(x, y), episode_ids),
         batch_size,
         "Action Accuracy",
         "maximize",
@@ -1714,62 +1841,524 @@ def _build_lunarlander(batch_size: int) -> TaskBundle:
     )
 
 
-def _build_bipedalwalker(batch_size: int) -> TaskBundle:
-    """BipedalWalker observations labelled by Gymnasium's own reference heuristic.
+# ----------------------------------------------------------------- PPO ------
+# BipedalWalker is the one model in the suite trained by reinforcement learning
+# rather than on a fixed dataset. Values follow Stable-Baselines3's RL Zoo entry
+# for BipedalWalker-v3 + PPO, which is the tuned reference configuration.
+BIPEDAL_PPO_ROLLOUT_STEPS: int = 2048
+BIPEDAL_PPO_GAMMA: float = 0.999
+BIPEDAL_PPO_GAE_LAMBDA: float = 0.95
+# Passes over each rollout buffer per PPO iteration (SB3's `n_epochs`). One
+# benchmark epoch is one PPO iteration, so a "batch" count per epoch is
+# ceil(BIPEDAL_PPO_ROLLOUT_STEPS * this / minibatch).
+BIPEDAL_PPO_UPDATE_PASSES: int = 10
+# Rewards are divided by the running standard deviation of the discounted return
+# before advantages are computed, then clipped. This is CleanRL's NormalizeReward
+# wrapper. It only rescales the critic's targets — the reported episodic return
+# is always the raw environment reward, so published comparisons are unaffected.
+BIPEDAL_PPO_REWARD_CLIP: float = 10.0
 
-    The previous four-line hand-written controller held both knees at a constant
-    0.45 and never took a step: it returns **-120**, and the cloned network
-    matched it to a mean absolute error of 0.0004 — near-perfect imitation of a
-    policy that falls over. Two of its four action dimensions being constant is
-    also why the reported "Neg. Action MAE" sat so implausibly close to zero.
-    ``BipedalWalkerHeuristics`` is the walking state machine that ships with the
-    environment; it returns roughly +90. That is short of the 300-point solved
-    threshold and swings widely by seed, but it walks, and it is a reference
-    implementation rather than something invented here.
 
-    The clone reaches about -80, better than the -120 it managed before but
-    still well under its own label source, and that gap will not close by
-    training harder: the heuristic is a *state machine*, carrying the swing leg
-    and the gait phase between steps, so one observation maps to different
-    actions depending on hidden state a feedforward policy cannot see.
-    Reproducing +90 here would take a recurrent policy or a real RL loop, both
-    of which change what this benchmark is measuring. The number is reported as
-    it stands rather than dressed up.
+class _RunningScalarNorm:
+    """Running mean/variance of a scalar stream, for reward scaling.
+
+    Deliberately *not* an ``nn.Module``: unlike the observation statistics, this
+    never touches the network's forward pass, so it belongs to the collector and
+    not to ``model.pt``. A checkpoint resume therefore re-warms it over the first
+    couple of iterations, which is harmless — it only rescales the value target.
     """
 
-    def make_policy(env: Any) -> Callable[[Any], Any]:
-        numpy = _require_dependency("numpy")
-        bipedal_walker = _require_dependency(
-            "gymnasium.envs.box2d.bipedal_walker", "gymnasium[box2d]"
-        )
-        # Stateful: it tracks the swinging leg and the gait phase, so it must be
-        # constructed per episode rather than shared across resets.
-        heuristics = bipedal_walker.BipedalWalkerHeuristics()
-        return lambda observation: numpy.clip(
-            numpy.asarray(heuristics.step_heuristic(observation), dtype=numpy.float32),
-            -1.0,
-            1.0,
+    def __init__(self, epsilon: float = 1e-8) -> None:
+        self.mean: float = 0.0
+        self.var: float = 1.0
+        self.count: float = 1e-4
+        self.epsilon = epsilon
+
+    def update(self, values: Any) -> None:
+        batch_count = int(values.numel())
+        if batch_count == 0:
+            return
+        batch_mean = float(values.mean().item())
+        batch_var = float(values.var(unbiased=False).item())
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        self.var = (
+            self.var * self.count
+            + batch_var * batch_count
+            + delta * delta * self.count * batch_count / total
+        ) / total
+        self.mean += delta * batch_count / total
+        self.count = total
+
+    @property
+    def std(self) -> float:
+        return math.sqrt(self.var + self.epsilon)
+
+
+class PPORolloutSource:
+    """Generates PPO training batches by running the current policy in the env.
+
+    This is what makes ``ppo_bipedalwalker`` unlike every other model here: its
+    training data is a function of its own weights, so there is no cached file
+    and no train/validation/test split of one. Each call to ``collect`` runs
+    ``n_steps`` of the live policy, computes GAE(lambda) advantages against the
+    critic's own value estimates, and hands back a fresh ``DataLoader`` over
+    ``(observation, action, old_log_prob, advantage, return)``.
+
+    Why this replaced behaviour cloning. The previous setup cloned
+    ``BipedalWalkerHeuristics``, a *stateful* gait controller that carries the
+    swing leg and phase between steps. One observation therefore maps to
+    different actions depending on hidden state a feedforward policy cannot
+    observe, so the clone was fitting an ill-posed function: it reached -80
+    against the heuristic's +90 and could not have closed that gap by training
+    longer. Its reported metric was also not a return at all but the negated
+    mean absolute error against the heuristic's action vector, which has no
+    published counterpart.
+
+    Rollout continuity. The environment is created once and its observation
+    carried across calls, so iteration *k+1* resumes the episode iteration *k*
+    ended mid-way through. Truncating an episode at the buffer boundary and
+    bootstrapping its value there is standard PPO and is why ``truncated`` and
+    ``terminated`` are handled differently below: a terminated state has value
+    0 by definition, a truncated one does not.
+
+    Statistics timing. ``obs_norm`` is folded forward with the *previous*
+    iteration's observations, before this iteration's rollout begins, and then
+    left alone. Updating it mid-iteration would mean the log-probabilities
+    stored during collection were computed under different normalisation than
+    the ones the surrogate objective recomputes, so the importance ratio would
+    not start at 1 and the clipped objective would be measuring the wrong thing.
+    """
+
+    def __init__(
+        self,
+        env_id: str,
+        *,
+        n_steps: int,
+        minibatch_size: int,
+        gamma: float,
+        gae_lambda: float,
+        update_passes: int,
+        seed: int = 0,
+        package_hint: str = "gymnasium[box2d]",
+    ) -> None:
+        self.env_id = env_id
+        self.n_steps = n_steps
+        self.minibatch_size = minibatch_size
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.update_passes = update_passes
+        self.seed = seed
+        self.package_hint = package_hint
+        self._env: Any | None = None
+        self._observation: Any | None = None
+        self._episode_return: float = 0.0
+        self._episode_length: int = 0
+        self._pending_obs: Any | None = None
+        self._return_norm = _RunningScalarNorm()
+        self._discounted_return: float = 0.0
+        self._iterations: int = 0
+
+    # ------------------------------------------------------------ env setup --
+    def _ensure_env(self) -> Any:
+        if self._env is None:
+            gymnasium = _require_dependency("gymnasium", self.package_hint)
+            self._env = gymnasium.make(self.env_id)
+            self._env.action_space.seed(self.seed)
+            self._observation, _ = self._env.reset(seed=self.seed)
+        return self._env
+
+    def close(self) -> None:
+        if self._env is not None:
+            self._env.close()
+            self._env = None
+
+    @property
+    def action_low(self) -> Any:
+        env = self._ensure_env()
+        return env.action_space.low
+
+    @property
+    def action_high(self) -> Any:
+        env = self._ensure_env()
+        return env.action_space.high
+
+    # ------------------------------------------------------------- rollout --
+    def _fold_pending_observation_statistics(self, model: Any) -> None:
+        normalizer = _find_obs_normalizer(model)
+        if normalizer is None or self._pending_obs is None:
+            return
+        normalizer.update(self._pending_obs)
+        self._pending_obs = None
+
+    def _scaled_rewards(self, rewards: Any, dones: Any) -> Any:
+        """Divide rewards by the running std of the discounted return."""
+        discounted: list[float] = []
+        for reward, done in zip(rewards.tolist(), dones.tolist()):
+            self._discounted_return = self._discounted_return * self.gamma + reward
+            discounted.append(self._discounted_return)
+            if done:
+                self._discounted_return = 0.0
+        self._return_norm.update(torch.tensor(discounted, dtype=torch.float32))
+        return (rewards / self._return_norm.std).clamp(
+            -BIPEDAL_PPO_REWARD_CLIP, BIPEDAL_PPO_REWARD_CLIP
         )
 
-    x, y = _collect_heuristic_rollouts(
+    def _advantages_and_returns(
+        self, rewards: Any, values: Any, dones: Any, last_value: float
+    ) -> tuple[Any, Any]:
+        """GAE(lambda), computed backwards over the buffer.
+
+        ``dones`` marks *terminal* states only. A step truncated by the time
+        limit, or one merely sitting at the buffer boundary, still has future
+        reward, so its next-state value is bootstrapped rather than zeroed.
+        """
+        advantages = torch.zeros_like(rewards)
+        running = 0.0
+        next_value = last_value
+        for index in range(len(rewards) - 1, -1, -1):
+            non_terminal = 0.0 if bool(dones[index]) else 1.0
+            delta = rewards[index] + self.gamma * next_value * non_terminal - values[index]
+            running = delta + self.gamma * self.gae_lambda * non_terminal * running
+            advantages[index] = running
+            next_value = float(values[index])
+        return advantages, advantages + values
+
+    def collect(self, model: Any, device: Any) -> tuple[Any, dict[str, float]]:
+        """Run one PPO iteration's worth of environment steps.
+
+        Returns the training ``DataLoader`` and the summary statistics of any
+        episodes that finished inside this rollout — the latter is what the
+        training loop reports as the epoch's train-side episodic return.
+        """
+        env = self._ensure_env()
+        self._fold_pending_observation_statistics(model)
+
+        was_training = model.training
+        model.eval()
+        observations = torch.zeros(self.n_steps, env.observation_space.shape[0])
+        actions = torch.zeros(self.n_steps, env.action_space.shape[0])
+        log_probs = torch.zeros(self.n_steps)
+        values = torch.zeros(self.n_steps)
+        rewards = torch.zeros(self.n_steps)
+        dones = torch.zeros(self.n_steps, dtype=torch.bool)
+        completed: list[float] = []
+        lengths: list[int] = []
+        low = torch.as_tensor(env.action_space.low, dtype=torch.float32)
+        high = torch.as_tensor(env.action_space.high, dtype=torch.float32)
+
+        try:
+            with torch.no_grad():
+                for step in range(self.n_steps):
+                    observation = torch.as_tensor(
+                        self._observation, dtype=torch.float32
+                    )
+                    mean, log_std, value = model(observation.unsqueeze(0).to(device))
+                    distribution = torch.distributions.Normal(
+                        mean.squeeze(0).cpu(), log_std.squeeze(0).cpu().exp()
+                    )
+                    action = distribution.sample()
+                    observations[step] = observation
+                    actions[step] = action
+                    # Log-probability of the *unclipped* sample: clipping happens
+                    # only on the way into the environment, and pretending the
+                    # clipped value was the sample would put a point mass at the
+                    # bounds that this density does not have.
+                    log_probs[step] = distribution.log_prob(action).sum()
+                    values[step] = value.squeeze(0).cpu()
+
+                    stepped = env.step(
+                        torch.clamp(action, low, high).numpy()
+                    )
+                    self._observation, reward, terminated, truncated, _ = stepped
+                    rewards[step] = float(reward)
+                    dones[step] = bool(terminated)
+                    self._episode_return += float(reward)
+                    self._episode_length += 1
+                    if terminated or truncated:
+                        completed.append(self._episode_return)
+                        lengths.append(self._episode_length)
+                        self._episode_return = 0.0
+                        self._episode_length = 0
+                        self._observation, _ = env.reset()
+
+                final = torch.as_tensor(self._observation, dtype=torch.float32)
+                last_value = float(model(final.unsqueeze(0).to(device))[2].squeeze(0))
+        finally:
+            model.train(was_training)
+
+        scaled_rewards = self._scaled_rewards(rewards, dones)
+        advantages, returns = self._advantages_and_returns(
+            scaled_rewards, values, dones, last_value
+        )
+        self._pending_obs = observations
+        self._iterations += 1
+
+        dataset = _TensorRowsDataset(
+            observations, actions, log_probs, advantages, returns
+        )
+        loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self.minibatch_size,
+            sampler=_RepeatedPermutationSampler(
+                len(dataset), self.update_passes, seed=self.seed + self._iterations
+            ),
+            # The buffer is already a handful of in-memory tensors; a worker
+            # process would only add a pickle round-trip per epoch.
+            num_workers=0,
+            pin_memory=False,
+        )
+        return loader, _rollout_statistics(completed, lengths, values, returns)
+
+
+class _RepeatedPermutationSampler(torch.utils.data.Sampler[int]):
+    """``update_passes`` independent shuffles of the buffer, back to back.
+
+    PPO runs several passes over each rollout before discarding it, and the
+    benchmark's epoch loop iterates a DataLoader exactly once per epoch. Rather
+    than restructure the loop, the passes are folded into the sampler: one
+    epoch's iteration yields K full permutations, so every sample is seen
+    exactly K times and each pass is its own shuffle. Concatenating K copies of
+    the dataset and shuffling globally would instead let one minibatch hold the
+    same transition twice.
+    """
+
+    def __init__(self, length: int, repeats: int, seed: int) -> None:
+        self.length = length
+        self.repeats = repeats
+        self.seed = seed
+
+    def __iter__(self) -> Iterable[int]:
+        generator = torch.Generator().manual_seed(self.seed)
+        for _ in range(self.repeats):
+            yield from torch.randperm(self.length, generator=generator).tolist()
+
+    def __len__(self) -> int:
+        return self.length * self.repeats
+
+
+def _find_obs_normalizer(model: Any) -> Any | None:
+    """Locate the model's ``RunningObsNorm``, wherever perforation left it.
+
+    Attribute access would be enough today, but PerforatedAI rebuilds a model's
+    module tree when it inserts dendrites, and the benchmark also hands around
+    ``torch.compile`` wrappers. A type scan over ``modules()`` survives both.
+    """
+    for module in model.modules():
+        if isinstance(module, RunningObsNorm):
+            return module
+    return None
+
+
+def _rollout_statistics(
+    completed: list[float], lengths: list[int], values: Any, returns: Any
+) -> dict[str, float]:
+    stats: dict[str, float] = {
+        "rollout_episodes": float(len(completed)),
+        # Explained variance of the critic over the buffer: 1.0 means the value
+        # head predicts the discounted return exactly, <= 0 means it is no
+        # better than predicting the mean. The single most useful number for
+        # telling "PPO is learning slowly" apart from "the critic is broken".
+        "rollout_explained_variance": _explained_variance(values, returns),
+    }
+    if completed:
+        episode_returns = torch.tensor(completed, dtype=torch.float32)
+        stats["episodic_return"] = float(episode_returns.mean())
+        stats["rollout_return_min"] = float(episode_returns.min())
+        stats["rollout_return_max"] = float(episode_returns.max())
+        stats["rollout_episode_length"] = float(
+            torch.tensor(lengths, dtype=torch.float32).mean()
+        )
+    return stats
+
+
+def _explained_variance(predictions: Any, targets: Any) -> float:
+    target_variance = float(targets.var(unbiased=False))
+    if target_variance < 1e-12:
+        return 0.0
+    return 1.0 - float((targets - predictions).var(unbiased=False)) / target_variance
+
+
+def _build_bipedalwalker(batch_size: int) -> TaskBundle:
+    """BipedalWalker-v3 trained with PPO, on policy.
+
+    The bundle's loaders are placeholders with the right shapes and length;
+    ``train_loader`` is replaced at the top of every epoch by
+    ``PPORolloutSource.collect``, and validation and test are episodic rollouts
+    rather than dataset passes (see ``_rollout_evaluation`` in training.py).
+    The placeholders exist because the pipeline reads ``len(train_loader)`` to
+    size PerforatedAI's correlation window and runs one batch through the model
+    to infer per-module output dimensions, both before any training starts.
+
+    The metric is the mean episodic return, which *is* comparable to the
+    published 300-point solved threshold — unlike the negated action MAE this
+    model used to report, which measured agreement with a scripted gait
+    controller and had no published counterpart. For reference points on the
+    same environment: Gymnasium's own ``BipedalWalkerHeuristics`` scores about
+    +90, and the behaviour-cloning setup this replaced reached about -80.
+    """
+    # Fail here rather than three layers into the first epoch if Box2D is absent.
+    gymnasium = _require_dependency("gymnasium", "gymnasium[box2d]")
+    probe = gymnasium.make("BipedalWalker-v3")
+    obs_dim = int(probe.observation_space.shape[0])
+    action_dim = int(probe.action_space.shape[0])
+    probe.close()
+
+    source = PPORolloutSource(
         "BipedalWalker-v3",
-        make_policy,
-        samples=50_000,
-        cache=_data_root() / "bipedalwalker" / HEURISTIC_ROLLOUTS_FILENAME,
-        discrete=False,
+        n_steps=BIPEDAL_PPO_ROLLOUT_STEPS,
+        minibatch_size=batch_size,
+        gamma=BIPEDAL_PPO_GAMMA,
+        gae_lambda=BIPEDAL_PPO_GAE_LAMBDA,
+        update_passes=BIPEDAL_PPO_UPDATE_PASSES,
     )
-    # Continuous actions, so the score is -MAE against the heuristic's action
-    # vector (see _compute_all_metrics), negated so "maximize" still holds.
-    return _bundle_from_dataset(
-        _TensorRowsDataset(x, y),
-        batch_size,
-        "Neg. Action MAE",
+    placeholder = _TensorRowsDataset(
+        torch.zeros(BIPEDAL_PPO_ROLLOUT_STEPS, obs_dim),
+        torch.zeros(BIPEDAL_PPO_ROLLOUT_STEPS, action_dim),
+        torch.zeros(BIPEDAL_PPO_ROLLOUT_STEPS),
+        torch.zeros(BIPEDAL_PPO_ROLLOUT_STEPS),
+        torch.zeros(BIPEDAL_PPO_ROLLOUT_STEPS),
+    )
+    bundle = TaskBundle(
+        torch.utils.data.DataLoader(
+            placeholder,
+            batch_size=batch_size,
+            sampler=_RepeatedPermutationSampler(
+                len(placeholder), BIPEDAL_PPO_UPDATE_PASSES, seed=0
+            ),
+            num_workers=0,
+        ),
+        # Never iterated: _eval_on_loader routes on-policy models to rollouts.
+        # Kept non-empty so anything that probes a loader's length or first item
+        # finds a correctly shaped batch instead of raising.
+        torch.utils.data.DataLoader(placeholder, batch_size=batch_size, num_workers=0),
+        torch.utils.data.DataLoader(placeholder, batch_size=batch_size, num_workers=0),
+        "Episodic Return",
         "maximize",
-        "BipedalWalker-v3 observations labeled by Gymnasium's reference heuristic",
+        "BipedalWalker-v3 on-policy PPO rollouts "
+        f"({BIPEDAL_PPO_ROLLOUT_STEPS} steps per iteration)",
+    )
+    bundle.on_policy = source
+    return bundle
+
+
+# Points sampled once per mesh and cached, and the number actually fed to the
+# network. Caching a superset and drawing from it every epoch is the reference
+# protocol: Qi et al. distribute `modelnet40_ply_hdf5_2048` and train on a
+# 1024-point subsample of it.
+MODELNET40_CACHE_POINTS: int = 2048
+MODELNET40_POINTS: int = 1024
+# Bumped whenever the sampling above changes in a way that makes an existing
+# cache wrong; it is part of the cache filename, so a stale cache is rebuilt
+# rather than silently reused.
+MODELNET40_CACHE_VERSION: int = 1
+
+
+def _read_off_mesh(path: Path) -> tuple[Any, Any]:
+    """Parse an OFF file into ``(vertices [V, 3], faces [F, 3])``.
+
+    Tokenised rather than read line by line because a good number of
+    ModelNet40's files have the vertex/face counts glued onto the ``OFF``
+    keyword (``OFF6 8 0``) instead of on the following line, and because faces
+    are not all triangles — quads and larger polygons are fan-triangulated
+    here so the sampler downstream only has to handle triangles.
+    """
+    tokens = path.read_text().split()
+    if tokens[0] == "OFF":
+        cursor = 1
+    else:  # "OFF<v> <f> <e>" with no separator after the keyword
+        tokens[0] = tokens[0][3:]
+        cursor = 0
+    vertex_count = int(tokens[cursor])
+    face_count = int(tokens[cursor + 1])
+    cursor += 3  # counts are vertices, faces, edges (edges is always 0 here)
+
+    stop = cursor + 3 * vertex_count
+    vertices = torch.tensor(
+        [float(value) for value in tokens[cursor:stop]], dtype=torch.float32
+    ).view(vertex_count, 3)
+    cursor = stop
+
+    faces: list[tuple[int, int, int]] = []
+    for _ in range(face_count):
+        sides = int(tokens[cursor])
+        corners = [int(value) for value in tokens[cursor + 1 : cursor + 1 + sides]]
+        cursor += 1 + sides
+        for offset in range(1, sides - 1):
+            faces.append((corners[0], corners[offset], corners[offset + 1]))
+    return vertices, torch.tensor(faces, dtype=torch.long).view(-1, 3)
+
+
+def _sample_mesh_surface(vertices: Any, faces: Any, count: int, seed: int) -> Any:
+    """Draw ``count`` points uniformly over the *surface* of a triangle mesh.
+
+    This is the substantive difference from reading vertices straight out of
+    the file. ModelNet40 is CAD geometry, so vertex density tracks how the
+    model was authored, not how big the surface is: a tabletop can be four
+    vertices while a moulding detail is several thousand. Taking evenly spaced
+    *vertex indices* — what this loader used to do — therefore samples the
+    authoring order, and it has no way to describe a mesh with fewer vertices
+    than the network's input width, which is 24% of ModelNet40 (8% have under
+    256 vertices); those were padded by repeating the same handful of corner
+    points until the tensor was full.
+
+    Picking triangles with probability proportional to area and a uniform
+    barycentric point inside each gives a genuine surface sample at any
+    density, for every mesh. It is what Qi et al.'s released point clouds are.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    triangles = vertices[faces]
+    edge_a = triangles[:, 1] - triangles[:, 0]
+    edge_b = triangles[:, 2] - triangles[:, 0]
+    areas = 0.5 * torch.cross(edge_a, edge_b, dim=-1).norm(dim=-1)
+    if not torch.isfinite(areas).all() or float(areas.sum()) <= 0.0:
+        # Fully degenerate mesh (zero area, or NaN coordinates). Nothing to
+        # sample a surface from, so fall back to the vertices.
+        index = torch.randint(len(vertices), (count,), generator=generator)
+        return vertices[index]
+
+    chosen = torch.multinomial(areas, count, replacement=True, generator=generator)
+    corner = triangles[chosen, 0]
+    span_a = edge_a[chosen]
+    span_b = edge_b[chosen]
+    u = torch.rand(count, 1, generator=generator)
+    v = torch.rand(count, 1, generator=generator)
+    # Reflect the half of the unit square that falls outside the triangle back
+    # into it, which keeps the result uniform.
+    outside = (u + v) > 1.0
+    u = torch.where(outside, 1.0 - u, u)
+    v = torch.where(outside, 1.0 - v, v)
+    return corner + u * span_a + v * span_b
+
+
+def _normalize_unit_sphere(points: Any) -> Any:
+    points = points - points.mean(dim=0, keepdim=True)
+    return points / points.norm(dim=1).max().clamp_min(1e-6)
+
+
+def _modelnet40_cache_path(root: Path, split: str) -> Path:
+    """Where a split's sampled clouds live. Shared with ``dataset_exists``."""
+    return (
+        root
+        / f"surface_points_v{MODELNET40_CACHE_VERSION}"
+        f"_{split}_{MODELNET40_CACHE_POINTS}.pt"
     )
 
 
 class _ModelNet40Dataset:
+    """ModelNet40 as cached surface point clouds.
+
+    Parsing the OFF meshes costs about 19 ms each, which over 9.8k training
+    meshes is ~3 minutes of single-threaded text parsing *per epoch* — it was
+    the dominant cost of this model's runs, ahead of the network itself. The
+    sampled clouds are therefore written once to a tensor file and reused;
+    ``__getitem__`` becomes an index into a resident tensor.
+
+    Each entry holds ``MODELNET40_CACHE_POINTS`` points; callers take the
+    ``MODELNET40_POINTS`` the network wants from it (randomly, per epoch, for
+    training — see ``_ModelNet40TrainAugment``).
+    """
+
     def __init__(self, train: bool) -> None:
         self.root: Path = _data_root() / "modelnet40"
         archive: Path = _download("http://modelnet.cs.princeton.edu/ModelNet40.zip", self.root / "ModelNet40.zip")
@@ -1786,52 +2375,92 @@ class _ModelNet40Dataset:
         for category in categories:
             for path in sorted((raw_root / category / split).glob("*.off")):
                 self.samples.append((path, self.class_to_idx[category]))
+        self.points, self.labels = self._load_or_build_cache(split)
+
+    def _load_or_build_cache(self, split: str) -> tuple[Any, Any]:
+        cache = _modelnet40_cache_path(self.root, split)
+        if cache.exists():
+            payload = torch.load(cache)
+            if len(payload["points"]) == len(self.samples):
+                return payload["points"], payload["labels"]
+        print(
+            f"[modelnet40] sampling {MODELNET40_CACHE_POINTS} surface points from "
+            f"{len(self.samples)} {split} meshes (one time, then cached)"
+        )
+        clouds = torch.zeros(
+            len(self.samples), MODELNET40_CACHE_POINTS, 3, dtype=torch.float32
+        )
+        labels = torch.zeros(len(self.samples), dtype=torch.long)
+        for index, (path, label) in enumerate(self.samples):
+            vertices, faces = _read_off_mesh(path)
+            # Seeded by position so the cache is reproducible.
+            sampled = _sample_mesh_surface(
+                vertices, faces, MODELNET40_CACHE_POINTS, seed=index
+            )
+            clouds[index] = _normalize_unit_sphere(sampled)
+            labels[index] = label
+            if (index + 1) % 1000 == 0:
+                print(f"[modelnet40]   {index + 1}/{len(self.samples)}")
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"points": clouds, "labels": labels}, cache)
+        return clouds, labels
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, index: int) -> tuple[Any, Any]:
-        path, label = self.samples[index]
-        with path.open() as fh:
-            header: str = fh.readline().strip()
-            if header != "OFF":
-                counts: list[str] = header[3:].strip().split()
-            else:
-                counts: list[str] = fh.readline().strip().split()
-            vertex_count = int(counts[0])
-            vertices = []
-            for _ in range(vertex_count):
-                vertices.append([float(value) for value in fh.readline().split()[:3]])
-        points = torch.tensor(vertices, dtype=torch.float32)
-        points = points - points.mean(dim=0, keepdim=True)
-        points = points / points.norm(dim=1).max().clamp_min(1e-6)
-        if len(points) >= 1024:
-            choice = torch.linspace(0, len(points) - 1, steps=1024).long()
-            points = points[choice]
-        else:
-            pad = points[torch.arange(1024 - len(points)) % len(points)]
-            points = torch.cat([points, pad], dim=0)
-        return points, torch.tensor(label, dtype=torch.long)
+        return self.points[index], self.labels[index]
+
+
+class _ModelNet40FixedView:
+    """The first ``MODELNET40_POINTS`` of each cached cloud, unaugmented.
+
+    Used for validation and test. The cached points are already in random
+    surface order, so taking a prefix is an unbiased subsample and — unlike
+    drawing a fresh one every call — gives the same input on every epoch, which
+    is what an evaluation split has to do.
+    """
+
+    def __init__(self, base: Any, points: int = MODELNET40_POINTS):
+        self.base = base
+        self.points = points
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, index: int) -> tuple[Any, Any]:
+        cloud, label = self.base[index]
+        return cloud[: self.points], label
 
 
 class _ModelNet40TrainAugment:
-    """Random rotation + jitter, applied only to the training split.
+    """Resample, rotate, and jitter — the training view of a cached cloud.
 
-    ``_ModelNet40Dataset.__getitem__`` downsamples each mesh to the same 1024
-    vertex indices (``torch.linspace``) every time it's called, so without
-    this wrapper the model sees the exact same points in the exact same pose
-    on every one of its ~60 epochs — effectively zero example diversity,
-    which is a big part of why train accuracy reached ~92% while val sat
-    near random-guess (~8%) with val_loss ballooning to double digits.
-    This mirrors the augmentation from the reference PointNet implementation
-    (Qi et al., https://github.com/charlesq34/pointnet, provider.py
-    ``rotate_point_cloud`` + ``jitter_point_cloud``): a random rotation about
-    the up axis plus small per-point Gaussian jitter, clipped to bound
-    outliers. Only wraps the train subset — val/test stay deterministic.
+    Mirrors the reference PointNet implementation (Qi et al.,
+    https://github.com/charlesq34/pointnet, provider.py ``rotate_point_cloud``
+    + ``jitter_point_cloud``), plus the random 1024-of-2048 subsample its data
+    pipeline does: a fresh subset, a random rotation about the up axis, and
+    small clipped Gaussian jitter, every epoch.
+
+    The rotation is about **Z**. ModelNet40's raw OFF meshes are Z-up — chairs,
+    bottles, lamps, and people all have their largest extent on that axis — and
+    the axis is consistent across the dataset, so an object's orientation is a
+    usable cue and the evaluation splits are never rotated. Spinning about Y,
+    as this wrapper previously did, tips objects onto their sides during
+    training only, which discards that cue and trains on a pose distribution
+    the model is never evaluated on. (The distributed HDF5 clouds are Y-up
+    because the conversion rotated them; the OFF files here are not.)
     """
 
-    def __init__(self, base: Any, jitter_std: float = 0.01, jitter_clip: float = 0.05):
+    def __init__(
+        self,
+        base: Any,
+        points: int = MODELNET40_POINTS,
+        jitter_std: float = 0.01,
+        jitter_clip: float = 0.05,
+    ):
         self.base = base
+        self.points = points
         self.jitter_std = jitter_std
         self.jitter_clip = jitter_clip
 
@@ -1839,11 +2468,13 @@ class _ModelNet40TrainAugment:
         return len(self.base)
 
     def __getitem__(self, index: int) -> tuple[Any, Any]:
-        points, label = self.base[index]
+        cloud, label = self.base[index]
+        choice = torch.randperm(cloud.shape[0])[: self.points]
+        points = cloud[choice]
         angle = float(torch.rand(1).item()) * 2.0 * math.pi
         cos_a, sin_a = math.cos(angle), math.sin(angle)
         rotation = torch.tensor(
-            [[cos_a, 0.0, sin_a], [0.0, 1.0, 0.0], [-sin_a, 0.0, cos_a]],
+            [[cos_a, -sin_a, 0.0], [sin_a, cos_a, 0.0], [0.0, 0.0, 1.0]],
             dtype=points.dtype,
         )
         points = points @ rotation.T
@@ -1856,16 +2487,14 @@ class _ModelNet40TrainAugment:
 def _build_modelnet40(batch_size: int) -> TaskBundle:
     train_full = _ModelNet40Dataset(train=True)
     train_ds, val_ds, _ = _split_dataset(train_full, train_ratio=0.9, val_ratio=0.1)
-    train_ds = _ModelNet40TrainAugment(train_ds)
-    test_ds = _ModelNet40Dataset(train=False)
     return _bundle_from_splits(
-        train_ds,
-        val_ds,
-        test_ds,
+        _ModelNet40TrainAugment(train_ds),
+        _ModelNet40FixedView(val_ds),
+        _ModelNet40FixedView(_ModelNet40Dataset(train=False)),
         batch_size,
         "Accuracy",
         "maximize",
-        "ModelNet40 1024-point CAD object clouds",
+        f"ModelNet40 {MODELNET40_POINTS}-point mesh-surface samples",
         num_workers=0,
     )
 
@@ -2016,7 +2645,7 @@ _BATCH_SIZES: dict[str, int] = {
     "m5": 128,  # SpeechCommands 16 K-sample 1-D waveform
     "lstm_forecaster": 256,  # ETTh1 short sliding windows
     "textcnn": 128,  # AG News fixed-length token sequences
-    "gcn": 32,  # Cora ego-graphs — adjacency matrix limits batch size
+    "gcn": 1,  # Transductive Cora — one full-graph step per epoch, as in Kipf
     "tabnet": 1024,  # Adult Income 14-feature tabular rows
     "mpnn": 32,  # ESOL molecular graphs — variable topology
     "actor_critic": 512,  # CartPole 4-D observations — negligible per-sample cost
@@ -2070,9 +2699,19 @@ def dataset_exists(model_key: str) -> bool:
         "gin_imdbb":            [root / "imdb_binary" / EXTRACTED_MARKER],
         "actor_critic":         [root / "cartpole" / HEURISTIC_ROLLOUTS_FILENAME],
         "dqn_lunarlander":      [root / "lunarlander" / HEURISTIC_ROLLOUTS_FILENAME],
-        "ppo_bipedalwalker":    [root / "bipedalwalker" / HEURISTIC_ROLLOUTS_FILENAME],
+        # No entry for ppo_bipedalwalker: it trains on policy, so it has nothing
+        # to cache. Reporting it as "not cached" makes `dqb download_data` build
+        # its bundle, which is a cheap Box2D availability check and exactly the
+        # thing worth failing early on.
         "lstm_autoencoder":     [root / "mit-bih" / "100.dat"],
-        "pointnet_modelnet40":  [root / "modelnet40" / "raw"],
+        # Both the extracted meshes and the sampled-cloud caches. Without the
+        # caches listed, `dqb download-data` would report the dataset ready and
+        # the first training run would still stall ~4 minutes building them.
+        "pointnet_modelnet40":  [
+            root / "modelnet40" / "raw",
+            _modelnet40_cache_path(root / "modelnet40", "train"),
+            _modelnet40_cache_path(root / "modelnet40", "test"),
+        ],
         "snn_nmnist":           [root / "nmnist"],
         "unet_isic":            [root / "isic2018" / "images" / EXTRACTED_MARKER],
     }

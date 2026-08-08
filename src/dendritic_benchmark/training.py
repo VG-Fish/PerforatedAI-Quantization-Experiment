@@ -34,6 +34,7 @@ from .compat import (
     symmetric_quantize_tensor,
     ternary_quantize_tensor,
 )
+from .data import _explained_variance
 
 _MODEL_PT: str = "model.pt"
 _BEST_MODEL_STATS_CSV: str = "best_model_stats.csv"
@@ -270,6 +271,120 @@ def _vae_metrics(outputs: Any, targets: Any) -> dict[str, float]:
     }
 
 
+# --------------------------------------------------------------- PPO --------
+# Models whose training data is produced by the current policy rather than read
+# from a split. Their bundle carries a `.on_policy` rollout source, their
+# training loader is rebuilt every epoch, and validation/test are episodic
+# rollouts rather than passes over a loader.
+_ON_POLICY_MODELS: frozenset[str] = frozenset({"ppo_bipedalwalker"})
+# Stable-Baselines3 RL Zoo's tuned BipedalWalker-v3 PPO entry.
+_PPO_CLIP_RANGE: float = 0.18
+_PPO_VALUE_COEF: float = 0.5
+_PPO_ENTROPY_COEF: float = 0.001
+# Deterministic evaluation episodes. Validation runs every epoch, so it is kept
+# small; test runs once. Seeds are disjoint so the test return is not the
+# validation return the best checkpoint was selected on.
+_PPO_VAL_EPISODES: int = 5
+_PPO_VAL_SEED: int = 4242
+_PPO_TEST_SEED: int = 12345
+
+
+def _is_on_policy(model_key: str) -> bool:
+    return model_key in _ON_POLICY_MODELS
+
+
+def _unpack_ppo_targets(targets: Any, action_dim: int) -> tuple[Any, Any, Any, Any]:
+    """Split the packed PPO target tensor into its four columns.
+
+    The rollout yields five tensors per row; ``_forward`` concatenates the last
+    four into one ``[B, action_dim + 3]`` tensor so that everything downstream —
+    ``_batch_size``, the metric accumulator's ``torch.cat``, the detach helper —
+    keeps working on a plain tensor instead of needing a tuple special case at
+    every step.
+    """
+    action = targets[:, :action_dim]
+    old_log_prob = targets[:, action_dim]
+    advantage = targets[:, action_dim + 1]
+    returns = targets[:, action_dim + 2]
+    return action, old_log_prob, advantage, returns
+
+
+def _ppo_terms(outputs: Any, targets: Any) -> dict[str, Any]:
+    """The pieces of PPO's objective, as tensors, for one minibatch.
+
+    Shared by the loss and the metrics so the two cannot describe different
+    quantities. Everything here is Schulman et al.'s clipped-surrogate PPO as
+    implemented in Stable-Baselines3:
+
+    * advantages are standardised **per minibatch**, which is SB3's default and
+      keeps the policy-gradient step scale-free as the reward magnitude grows;
+    * the ratio is ``exp(new_log_prob - old_log_prob)`` over the *unclipped*
+      Gaussian sample, matching how the rollout recorded ``old_log_prob``;
+    * ``approx_kl`` is Schulman's low-variance estimator ``(r - 1) - log r``,
+      which unlike ``-log r`` is non-negative and much less noisy.
+    """
+    mean, log_std, value = outputs
+    action, old_log_prob, advantage, returns = _unpack_ppo_targets(
+        targets, mean.shape[-1]
+    )
+    distribution = torch.distributions.Normal(mean, log_std.exp())
+    log_prob = distribution.log_prob(action).sum(dim=-1)
+    entropy = distribution.entropy().sum(dim=-1).mean()
+
+    advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+    log_ratio = log_prob - old_log_prob
+    ratio = log_ratio.exp()
+    clipped = torch.clamp(ratio, 1.0 - _PPO_CLIP_RANGE, 1.0 + _PPO_CLIP_RANGE)
+    policy_loss = -torch.min(ratio * advantage, clipped * advantage).mean()
+    value_loss = 0.5 * (value - returns).square().mean()
+    return {
+        "policy_loss": policy_loss,
+        "value_loss": value_loss,
+        "entropy": entropy,
+        "approx_kl": ((ratio - 1.0) - log_ratio).mean(),
+        "clip_fraction": (
+            (ratio - 1.0).abs() > _PPO_CLIP_RANGE
+        ).to(ratio.dtype).mean(),
+        "value": value,
+        "returns": returns,
+    }
+
+
+def _ppo_loss(outputs: Any, targets: Any) -> Any:
+    terms = _ppo_terms(outputs, targets)
+    return (
+        terms["policy_loss"]
+        + _PPO_VALUE_COEF * terms["value_loss"]
+        - _PPO_ENTROPY_COEF * terms["entropy"]
+    )
+
+
+def _ppo_metrics(outputs: Any, targets: Any) -> dict[str, float]:
+    """Diagnostics for a PPO epoch.
+
+    None of these is the selection metric — that is the episodic return, which
+    only an environment rollout can produce and which is merged in separately
+    (see ``_run_epoch_batches`` and ``_rollout_evaluation``). These are the
+    numbers that say *why* a return is or is not moving: a ``clip_fraction``
+    near zero means the updates are too small to matter, an ``approx_kl`` that
+    runs away means they are too large, and an ``explained_variance`` at or
+    below zero means the critic is not predicting returns at all, so every
+    advantage the policy is trained on is noise.
+    """
+    with torch.no_grad():
+        terms = _ppo_terms(outputs, targets)
+        return {
+            "policy_loss": float(terms["policy_loss"]),
+            "value_loss": float(terms["value_loss"]),
+            "entropy": float(terms["entropy"]),
+            "approx_kl": float(terms["approx_kl"]),
+            "clip_fraction": float(terms["clip_fraction"]),
+            "explained_variance": _explained_variance(
+                terms["value"], terms["returns"]
+            ),
+        }
+
+
 _PRIMARY_METRIC_KEY: dict[str, str] = {
     "lenet5": "accuracy",
     "m5": "accuracy",
@@ -282,7 +397,10 @@ _PRIMARY_METRIC_KEY: dict[str, str] = {
     "lstm_autoencoder": "auc",
     "distilbert": "accuracy",
     "dqn_lunarlander": "reward_proxy",
-    "ppo_bipedalwalker": "reward_proxy",
+    # A real return from the environment, not a proxy: ppo_bipedalwalker trains
+    # on policy, so the natural selection metric is the thing being optimised.
+    # It is also leak-free by construction — a rollout cannot overlap a split.
+    "ppo_bipedalwalker": "episodic_return",
     "attentivefp_freesolv": "rmse",
     "gin_imdbb": "accuracy",
     "tcn_forecaster": "mae",
@@ -334,13 +452,16 @@ class CapsuleMarginLoss(torch.nn.Module):
 
 
 def _binary_or_multi_loss(model_key: str, config: TrainingConfig | None = None) -> Any:
-    if model_key in {"lstm_forecaster", "mpnn", "attentivefp_freesolv", "tcn_forecaster", "gru_forecaster", "ppo_bipedalwalker"}:
+    if model_key in {"lstm_forecaster", "mpnn", "attentivefp_freesolv", "tcn_forecaster", "gru_forecaster"}:
         return torch.nn.MSELoss()
     if model_key in {"lstm_autoencoder"}:
         return torch.nn.MSELoss()
     if model_key == "unet_isic":
         return torch.nn.BCEWithLogitsLoss()
-    if model_key == "vae_mnist":
+    # These build their objective from the model's own multi-part output rather
+    # than a criterion over (prediction, target): the VAE's ELBO, and PPO's
+    # clipped surrogate + value + entropy. See _compute_loss.
+    if model_key in {"vae_mnist", "ppo_bipedalwalker"}:
         return None
     if model_key == "capsnet_mnist":
         return CapsuleMarginLoss(num_classes=10)
@@ -365,7 +486,9 @@ def _detach_metric_payload(
 ) -> tuple[Any, Any, Any | None]:
     if model_key == "actor_critic":
         outputs = outputs[0]
-    if model_key == "vae_mnist" and isinstance(outputs, tuple):
+    # vae_mnist returns (reconstruction, mu, logvar) and ppo_bipedalwalker
+    # returns (mean, log_std, value); anything multi-headed detaches per head.
+    if isinstance(outputs, tuple):
         outputs = tuple(item.detach().cpu() for item in outputs)
     else:
         outputs = outputs.detach().cpu()
@@ -649,18 +772,25 @@ def _evaluate_episodic_return(
 ) -> dict[str, float]:
     """Roll the trained policy out in its gym environment and summarise returns.
 
-    These three models are behaviour cloning. The metric they train and select
-    on is agreement with a scripted policy over cached observations, which has
-    no published counterpart at all — the suite's own docs warn that the scores
-    must not be read against published CartPole/LunarLander/BipedalWalker
-    results. Actually stepping the environment produces an episodic return that
-    can be, so it is recorded here alongside the training metric.
+    ``actor_critic`` and ``dqn_lunarlander`` are behaviour cloning. The metric
+    they train and select on is agreement with a scripted policy over cached
+    observations, which has no published counterpart at all — the suite's own
+    docs warn that the scores must not be read against published
+    CartPole/LunarLander results. Actually stepping the environment produces an
+    episodic return that can be, so it is recorded here alongside the training
+    metric. For those two it is deliberately *not* the selection metric:
+    promoting it would put a different objective in front of the model than the
+    loss it minimises, and a different one in front of the dendritic arm than
+    the baseline. It is an extra column, evaluated once, after the best weights
+    are restored.
 
-    Deliberately *not* the selection metric: rollout return is stochastic and
-    environment-dependent, and promoting it would put a different objective in
-    front of the model than the loss it minimises — and a different one in front
-    of the dendritic arm than the baseline. It is an extra column, evaluated
-    once, after the best weights are restored.
+    ``ppo_bipedalwalker`` is the exception: it trains on policy, so the return
+    *is* the objective, and this function is also its validation and test
+    evaluation by way of ``_rollout_evaluation``.
+
+    Actions are taken deterministically — the Gaussian policy's mean, the
+    Q-network's argmax — and continuous ones are clipped into the action space,
+    since an unsquashed mean is not bounded by it.
 
     Episode seeds are fixed, so the same policy scores the same return in both
     arms. Returns an empty dict when gymnasium or the Box2D backend the two
@@ -681,6 +811,16 @@ def _evaluate_episodic_return(
     was_training = model.training
     model.eval()
     returns: list[float] = []
+    action_low = (
+        torch.as_tensor(env.action_space.low, dtype=torch.float32)
+        if continuous
+        else None
+    )
+    action_high = (
+        torch.as_tensor(env.action_space.high, dtype=torch.float32)
+        if continuous
+        else None
+    )
     try:
         with torch.no_grad():
             for episode in range(episodes):
@@ -692,10 +832,14 @@ def _evaluate_episodic_return(
                     ).unsqueeze(0)
                     output = model(batch)
                     if isinstance(output, tuple):
-                        # ActorCritic returns (logits, value).
+                        # ActorCritic returns (logits, value); PPOPolicy returns
+                        # (action mean, log std, value). The first element is
+                        # the deterministic action in both cases.
                         output = output[0]
                     if continuous:
-                        action = output.squeeze(0).float().cpu().numpy()
+                        action = torch.clamp(
+                            output.squeeze(0).float().cpu(), action_low, action_high
+                        ).numpy()
                     else:
                         action = int(output.argmax(dim=-1).item())
                     observation, reward, terminated, truncated, _ = env.step(action)
@@ -746,9 +890,7 @@ def _compute_all_metrics(
             _rescale_to_dataset_units(targets, target_offset, target_scale),
         )
     if model_key == "ppo_bipedalwalker":
-        metrics = _regression_metrics(outputs, targets)
-        metrics["reward_proxy"] = -metrics["mae"]
-        return metrics
+        return _ppo_metrics(outputs, targets)
     if model_key == "vae_mnist":
         return _vae_metrics(outputs, targets)
     if model_key == "unet_isic":
@@ -803,7 +945,15 @@ def _history_fieldnames(history: list[dict[str, Any]]) -> list[str]:
 
 
 def _forward(model_key: str, model: Any, batch: tuple[Any, ...]) -> tuple[Any, Any, Any]:
-    if model_key in {"gcn", "gin_imdbb"}:
+    if model_key == "gcn":
+        # Transductive: the batch is the whole graph (batch dimension 1) plus
+        # the node indices this split scores. The model returns a logit row per
+        # node; selecting the split's rows here keeps the loss and every metric
+        # downstream working on a plain [n_split, num_classes] tensor.
+        x, adjacency, node_indices, targets = batch
+        logits = model(x, adjacency)
+        return logits[0].index_select(0, node_indices[0]), targets[0], None
+    if model_key == "gin_imdbb":
         x, adjacency, targets = batch
         return model(x, adjacency), targets, None
     if model_key in {"mpnn", "attentivefp_freesolv"}:
@@ -821,6 +971,22 @@ def _forward(model_key: str, model: Any, batch: tuple[Any, ...]) -> tuple[Any, A
     if model_key == "vae_mnist":
         x, _ = batch
         return model(x), x, None
+    if model_key == "ppo_bipedalwalker":
+        # The rollout yields (obs, action, old_log_prob, advantage, return).
+        # The last four are packed into one tensor so the accumulator, the
+        # batch-size helper and the detach helper all keep seeing a tensor;
+        # _unpack_ppo_targets reverses it inside the loss and the metrics.
+        observation, action, old_log_prob, advantage, returns = batch
+        targets = torch.cat(
+            [
+                action,
+                old_log_prob.unsqueeze(-1),
+                advantage.unsqueeze(-1),
+                returns.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        return model(observation), targets, None
     x, targets = batch
     return model(x), targets, None
 
@@ -962,6 +1128,8 @@ def _compute_loss(
         return criterion(outputs[0], targets)
     if model_key == "vae_mnist":
         return _vae_loss(outputs, targets)
+    if model_key == "ppo_bipedalwalker":
+        return _ppo_loss(outputs, targets)
     if model_key == "pointnet_modelnet40" and model is not None:
         penalty = _pointnet_feature_transform_penalty(model)
         loss = criterion(outputs, targets)
@@ -1438,6 +1606,37 @@ def _setup_pai_optimizer(
     return optimizer, tracker
 
 
+def _rollout_evaluation(
+    model_key: str, model: Any, device: Any, split: str
+) -> tuple[float, dict[str, Any]]:
+    """Evaluate an on-policy model by stepping the environment, not a split.
+
+    There is no held-out set to read: a policy's quality is what it scores when
+    it acts. The validation and test seeds are disjoint so that the return the
+    best checkpoint was selected on is not the return reported for it, and
+    validation uses fewer episodes because it runs every epoch.
+
+    The returned "loss" is the negated mean return, so the loop's loss column
+    keeps pointing the same way it does everywhere else (lower is better) while
+    the selection metric stays the return itself.
+    """
+    validating = split == "val"
+    metrics = _evaluate_episodic_return(
+        model_key,
+        model,
+        device,
+        episodes=_PPO_VAL_EPISODES if validating else _RL_EVAL_EPISODES,
+        seed=_PPO_VAL_SEED if validating else _PPO_TEST_SEED,
+    )
+    if not metrics:
+        # gymnasium or Box2D missing: reported as a flat zero rather than a
+        # crash, matching how _evaluate_episodic_return degrades elsewhere.
+        return 0.0, {}
+    mean_return = float(metrics["episodic_return_mean"])
+    metrics["episodic_return"] = mean_return
+    return -mean_return, metrics
+
+
 def _eval_on_loader(
     model: Any,
     model_key: str,
@@ -1448,8 +1647,11 @@ def _eval_on_loader(
     torch: Any,
     target_offset: float = 0.0,
     target_scale: float = 1.0,
+    split: str = "test",
 ) -> tuple[float, dict[str, Any]]:
     """Run evaluation on a dataloader, return (loss, metrics)."""
+    if _is_on_policy(model_key):
+        return _rollout_evaluation(model_key, model, device, split)
     running_loss_t = torch.zeros(1, device=device)
     examples = 0
     outputs_list: list[Any] = []
@@ -1808,6 +2010,47 @@ def _finalize_training_batch_metrics(
     return train_loss, train_metrics
 
 
+def _refresh_on_policy_batches(
+    *,
+    model: Any,
+    model_key: str,
+    bundle: Any,
+    device: Any,
+    config: "TrainingConfig",
+    candidate_graph_active: bool,
+) -> dict[str, float]:
+    """Replace an on-policy model's training loader with a fresh rollout.
+
+    Off-policy models read the same cached tensors every epoch. PPO's training
+    data is a function of the weights it is about to update, so the buffer has
+    to be regenerated here, before the epoch's progress bar is built over
+    ``bundle.train_loader``.
+
+    Collection runs ``n_steps`` single-observation forward passes. Those are
+    data generation, not training, so PerforatedAI's candidate graph is turned
+    off around them and its processor buffers are cleared afterwards: left on,
+    the dendrite candidates would be correlated against batch-of-one
+    activations that no optimizer step ever backpropagates through.
+
+    Returns the rollout's own statistics — including ``episodic_return``, the
+    epoch's train-side selection number — for merging into the train metrics.
+    """
+    source = getattr(bundle, "on_policy", None)
+    if source is None or not _is_on_policy(model_key):
+        return {}
+    if candidate_graph_active:
+        configure_pai_candidate_graph(False)
+    try:
+        loader, stats = source.collect(model, device)
+    finally:
+        if config.use_dendrites:
+            clear_pai_processor_buffers(model)
+        if candidate_graph_active:
+            configure_pai_candidate_graph(True)
+    bundle.train_loader = loader
+    return stats
+
+
 def _run_epoch_batches(
     model: Any,
     model_key: str,
@@ -1831,6 +2074,14 @@ def _run_epoch_batches(
         torch=torch,
         config=config,
         location=f"{run_label} epoch {epoch + 1} start",
+    )
+    rollout_metrics = _refresh_on_policy_batches(
+        model=model,
+        model_key=model_key,
+        bundle=bundle,
+        device=device,
+        config=config,
+        candidate_graph_active=config.use_dendrites and not clear_pai_buffers,
     )
     accumulator = _new_training_batch_accumulator(torch, device)
     batch_progress = _training_batch_progress(
@@ -1887,7 +2138,7 @@ def _run_epoch_batches(
                 config=config,
             )
     batch_progress.close()
-    return _finalize_training_batch_metrics(
+    train_loss, train_metrics = _finalize_training_batch_metrics(
         accumulator,
         model_key=model_key,
         torch=torch,
@@ -1895,6 +2146,11 @@ def _run_epoch_batches(
         target_offset=getattr(bundle, "target_offset", 0.0),
         target_scale=getattr(bundle, "target_scale", 1.0),
     )
+    # The rollout's numbers describe the same epoch as the surrogate-loss
+    # diagnostics computed above, and are the only ones expressed in the
+    # environment's own units.
+    train_metrics.update(rollout_metrics)
+    return train_loss, train_metrics
 
 
 def _release_accelerator_cache(torch: Any, *, collect_python: bool = True) -> None:
@@ -2567,6 +2823,7 @@ def _run_validation_pass(
         context.device, context.criterion, context.metric_name, context.torch,
         target_offset=getattr(context.bundle, "target_offset", 0.0),
         target_scale=getattr(context.bundle, "target_scale", 1.0),
+        split="val",
     )
 
 
@@ -3237,8 +3494,12 @@ def train_and_evaluate(
     if best_epoch == 0:
         best_metric = final_metric
     # After final_metric is read, so the rollout can never become the primary
-    # metric by accident — it is recorded, not selected on.
-    test_metrics.update(_evaluate_episodic_return(model_key, model, eval_device))
+    # metric by accident — for the behaviour-cloning models it is recorded, not
+    # selected on. On-policy models already got their return from
+    # _eval_on_loader above; rolling out again would only burn a minute to
+    # produce the same number under the same seed.
+    if "episodic_return_mean" not in test_metrics:
+        test_metrics.update(_evaluate_episodic_return(model_key, model, eval_device))
 
     _plain_model = _unwrap_compiled(model)
     history = _attach_test_metrics_to_history(

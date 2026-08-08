@@ -238,17 +238,38 @@ class TextCNN(nn.Module):
 
 
 class GraphConv(nn.Module):
-    """Dense Kipf-Welling GCN convolution for fixed ego-graph tensors."""
+    """Dense Kipf-Welling GCN convolution: ``D^-1/2 A D^-1/2 (X W) + b``.
+
+    The transform is applied *before* the propagation, and the bias *after*, as
+    in Kipf & Welling's reference implementation. Both details matter:
+
+    *Order.* ``A(XW)`` and ``(AX)W`` are the same matrix, but not the same
+    amount of work. On the full 2708-node Cora graph the first layer costs
+    2708x1433x64 + 2708x2708x64 = 0.72 GFLOP this way against 2708x2708x1433 =
+    10.5 GFLOP the other, a 15x difference that is what makes full-graph
+    transductive training affordable here at all.
+
+    *Bias placement.* ``linear(A X)`` adds the bias after propagation only if
+    the bias is not itself propagated; ``A(linear(X))`` would compute
+    ``A X W + A b``, scaling every bias by the node's normalised degree. The
+    bias is therefore held outside ``self.linear`` and added at the end. The
+    ``nn.Linear`` is still *called* as a module, which is what keeps it visible
+    to PerforatedAI's perforation wrapper — computing ``F.linear`` against its
+    weight directly would bypass the wrapper and silently disable dendrites on
+    this layer.
+    """
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
         super().__init__()
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.linear = nn.Linear(in_features, out_features, bias=False)
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
 
     def forward(self, x: Any, adjacency: Any) -> Any:
         degree = adjacency.sum(dim=-1).clamp_min(1.0)
         inv_sqrt = degree.rsqrt()
         norm_adj = adjacency * inv_sqrt.unsqueeze(-1) * inv_sqrt.unsqueeze(-2)
-        return self.linear(torch.bmm(norm_adj, x))
+        propagated = torch.bmm(norm_adj, self.linear(x))
+        return propagated if self.bias is None else propagated + self.bias
 
 
 class GCN(nn.Module):
@@ -270,11 +291,17 @@ class GCN(nn.Module):
         self.input_dropout = nn.Dropout(dropout)
 
     def forward(self, x: Any, adjacency: Any) -> Any:
+        """Logits for *every* node in the graph, shape ``[B, N, num_classes]``.
+
+        Transductive: one graph in, one logit row per node out. Which of those
+        rows get a loss and a metric is the split's business, not the model's —
+        ``_forward`` in training.py selects them by index. This used to read out
+        ``x[:, 0]`` because each batch element was a separate ego graph with its
+        target paper parked at slot 0.
+        """
         x = self.input_dropout(x)
         x = self.dropout(F.relu(self.conv1(x, adjacency)))
-        x = self.conv2(x, adjacency)
-        # The Cora loader puts the target paper at node slot 0.
-        return x[:, 0]
+        return self.conv2(x, adjacency)
 
 
 def _sparsemax(logits: Any, dim: int = -1) -> Any:
@@ -612,9 +639,116 @@ class DQN(nn.Module):
         return self.net(x)
 
 
-class PPOPolicy(nn.Module):
-    def __init__(self, obs_dim: int = 24, hidden: int = 128, action_dim: int = 4):
+def _orthogonal_init(layer: nn.Linear, gain: float, bias: float = 0.0) -> None:
+    """Orthogonal weights, constant bias — the standard PPO layer initialisation.
+
+    Orthogonal initialisation preserves gradient norm through the tanh backbone,
+    and the small gain on the policy head keeps the initial action distribution
+    from starting saturated against the action bounds. Engstrom et al.
+    ("Implementation Matters in Deep Policy Gradients") measure this as one of
+    the code-level choices that actually moves PPO's returns.
+    """
+    nn.init.orthogonal_(layer.weight, gain)
+    if layer.bias is not None:
+        nn.init.constant_(layer.bias, bias)
+
+
+class RunningObsNorm(nn.Module):
+    """Whitens observations with statistics accumulated over training rollouts.
+
+    PPO reference implementations wrap the environment in an observation
+    normaliser (SB3's ``VecNormalize``, CleanRL's ``NormalizeObservation``), and
+    on BipedalWalker it is not cosmetic: the 24-dim observation mixes a hull
+    angle in radians, angular and linear velocities, four joint angles and ten
+    lidar distances, and the raw scales differ enough that a shared-backbone MLP
+    spends its early updates undoing them.
+
+    It lives *inside* the model rather than in a wrapper for three reasons: the
+    statistics then ride along in ``model.pt`` and in the checkpoints
+    PerforatedAI writes, ``_evaluate_episodic_return`` gets the same
+    normalisation as training without knowing it exists, and the quantized
+    conditions — which load the FP32 state dict into a fresh model — cannot
+    silently lose it. Buffers, not parameters, so no gradient reaches them and
+    ``weight_decay`` cannot pull them around.
+
+    ``update`` is Chan et al.'s parallel variance combination, so a whole
+    rollout can be folded in with one pass and no history retained.
+    """
+
+    def __init__(self, obs_dim: int, clip: float = 10.0, epsilon: float = 1e-8):
         super().__init__()
+        self.register_buffer("mean", torch.zeros(obs_dim))
+        self.register_buffer("var", torch.ones(obs_dim))
+        # Not zero: the first update divides by the running total, and starting
+        # at a small positive count keeps that finite while leaving the prior
+        # (mean 0, var 1) with negligible weight.
+        self.register_buffer("count", torch.tensor(1e-4))
+        self.clip = clip
+        self.epsilon = epsilon
+
+    @torch.no_grad()
+    def update(self, observations: Any) -> None:
+        observations = observations.detach().to(self.mean.device, torch.float32)
+        batch_count = observations.shape[0]
+        if batch_count == 0:
+            return
+        batch_mean = observations.mean(dim=0)
+        batch_var = observations.var(dim=0, unbiased=False)
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        combined_m2 = (
+            self.var * self.count
+            + batch_var * batch_count
+            + delta.square() * self.count * batch_count / total
+        )
+        self.mean.copy_(self.mean + delta * batch_count / total)
+        self.var.copy_(combined_m2 / total)
+        self.count.copy_(total)
+
+    def forward(self, x: Any) -> Any:
+        normalized = (x - self.mean) * (self.var + self.epsilon).rsqrt()
+        return normalized.clamp(-self.clip, self.clip)
+
+
+class PPOPolicy(nn.Module):
+    """Actor-critic network for PPO with a diagonal Gaussian policy.
+
+    ``forward`` returns ``(mean, log_std, value)``. All three are on the same
+    graph and all three are trained, which is the substantive change from the
+    behaviour-cloning version: that one returned ``tanh(actor_mean(...))`` only,
+    so ``.critic`` and ``actor_log_std`` — 133 of 20361 parameters — received
+    zero gradient for the whole run, and ``value_function`` had no caller
+    anywhere in the repo.
+
+    Two deliberate choices:
+
+    *No tanh on the mean.* The action is sampled from ``N(mean, exp(log_std))``
+    and clipped to the action space only when the environment is stepped; the
+    log-probability is taken on the unclipped sample. This is Stable-Baselines3's
+    default for ``Box`` spaces (``squash_output=False``) and it avoids the
+    change-of-variables correction a tanh squash would require in the
+    log-probability. Squashing the *mean* while computing log-probabilities as
+    if it were unsquashed — which is what keeping the old tanh would do — is
+    simply an incorrect density.
+
+    *State-independent log_std.* One learnable vector rather than a head, again
+    matching SB3 and CleanRL. It keeps exploration from collapsing early on the
+    strength of a few lucky states.
+
+    Initialisation is the standard PPO orthogonal scheme: gain sqrt(2) through
+    the backbone, 0.01 on the policy mean so the initial policy is close to
+    uniform-in-scale rather than saturated, and 1.0 on the value head.
+    """
+
+    def __init__(
+        self,
+        obs_dim: int = 24,
+        hidden: int = 128,
+        action_dim: int = 4,
+        log_std_init: float = 0.0,
+    ):
+        super().__init__()
+        self.obs_norm = RunningObsNorm(obs_dim)
         self.backbone = nn.Sequential(
             nn.Linear(obs_dim, hidden),
             nn.Tanh(),
@@ -622,15 +756,18 @@ class PPOPolicy(nn.Module):
             nn.Tanh(),
         )
         self.actor_mean = nn.Linear(hidden, action_dim)
-        self.actor_log_std = nn.Parameter(torch.zeros(action_dim))
+        self.actor_log_std = nn.Parameter(torch.full((action_dim,), log_std_init))
         self.critic = nn.Linear(hidden, 1)
+        for layer in self.backbone:
+            if isinstance(layer, nn.Linear):
+                _orthogonal_init(layer, math.sqrt(2.0))
+        _orthogonal_init(self.actor_mean, 0.01)
+        _orthogonal_init(self.critic, 1.0)
 
     def forward(self, x: Any) -> Any:
-        hidden = self.backbone(x)
-        return torch.tanh(self.actor_mean(hidden))
-
-    def value_function(self, x: Any) -> Any:
-        return self.critic(self.backbone(x)).squeeze(-1)
+        hidden = self.backbone(self.obs_norm(x))
+        mean = self.actor_mean(hidden)
+        return mean, self.actor_log_std.expand_as(mean), self.critic(hidden).squeeze(-1)
 
 
 class AttentiveFPLayer(nn.Module):

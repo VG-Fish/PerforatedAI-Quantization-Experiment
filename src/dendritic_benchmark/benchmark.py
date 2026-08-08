@@ -11,7 +11,8 @@ import torch
 from .compat import choose_device
 from .data import (
     AG_NEWS_SEQ_LEN,
-    CORA_EGO_NODES,
+    CORA_NODE_FEATURES,
+    CORA_NODES,
     ESOL_MAX_ATOMS,
     FREESOLV_MAX_ATOMS,
 )
@@ -32,6 +33,9 @@ _GRAPH_MODELS = {"gcn", "gin_imdbb"}
 _MOLECULAR_MODELS = {"mpnn", "attentivefp_freesolv"}
 _TABULAR_MODELS = {"tabnet", "saint_adult"}
 _TEXT_MODELS = {"textcnn", "distilbert"}
+# Largest latency batch a model's input can meaningfully be stacked to; see
+# _supported_batch_sizes. Absent means unconstrained.
+_MAX_LATENCY_BATCH_SIZE = {"gcn": 1}
 _LATENCY_CSV_FIELDS = [
     "condition_key",
     "batch_size",
@@ -81,7 +85,7 @@ def get_model_input_shapes(model_key: str) -> tuple:
         "m5": (1, 16000),
         "lstm_forecaster": (FORECAST_SEQ_LEN, 1),
         "textcnn": (AG_NEWS_SEQ_LEN,),
-        "gcn": ((CORA_EGO_NODES, 1433), (CORA_EGO_NODES, CORA_EGO_NODES)),
+        "gcn": ((CORA_NODES, CORA_NODE_FEATURES), (CORA_NODES, CORA_NODES)),
         "tabnet": (ADULT_FEATURES,),
         "mpnn": (
             (ESOL_MAX_ATOMS, MOLECULE_NODE_FEATURES),
@@ -111,6 +115,23 @@ def get_model_input_shapes(model_key: str) -> tuple:
         "capsnet_mnist": (1, 28, 28),
     }
     return shapes_map[model_key]
+
+
+def _supported_batch_sizes(model_key: str, requested: list[int]) -> list[int]:
+    """Clamp requested latency batch sizes to what the model can actually take.
+
+    Only transductive Cora needs this. Its "batch" is the entire 2708-node
+    graph, so a batch of 32 would mean 32 copies of a 2708x2708 adjacency —
+    939 MB of synthetic input for a measurement that means nothing, because no
+    training or inference path ever stacks the graph. Everything above 1 is
+    clamped to 1 and de-duplicated, so gcn reports a single batch-1 latency
+    instead of an out-of-memory error at every other size.
+    """
+    ceiling = _MAX_LATENCY_BATCH_SIZE.get(model_key)
+    if ceiling is None:
+        return list(requested)
+    clamped = [min(batch_size, ceiling) for batch_size in requested]
+    return list(dict.fromkeys(clamped))
 
 
 def generate_sample_inputs(model_key: str, batch_size: int) -> tuple[Any, Any]:
@@ -286,7 +307,7 @@ class BenchmarkOrchestrator:
             "batch_sizes": {},
         }
 
-        for batch_size in batch_sizes:
+        for batch_size in _supported_batch_sizes(model_key, batch_sizes):
             try:
                 primary, adjacency = generate_sample_inputs(model_key, batch_size)
                 inputs: tuple[Any, Any] = (

@@ -73,48 +73,55 @@ For each model below, this document captures:
     that graphs of different sizes can be batched. Padding slots must be inert:
     they carry zero features and no edges, and each model masks them out of its
     readout. Getting this wrong is silent — the shapes stay valid and the loss
-    still falls — so it is worth restating per dataset (`CORA_EGO_NODES`,
-    `ESOL_MAX_ATOMS`, `FREESOLV_MAX_ATOMS`, `IMDB_MAX_NODES`).
+    still falls — so it is worth restating per dataset (`ESOL_MAX_ATOMS`,
+    `FREESOLV_MAX_ATOMS`, `IMDB_MAX_NODES`). Cora is the exception and is no
+    longer padded at all; see below.
   - Molecular graphs additionally carry a dense `[max_nodes, max_nodes,
     MOLECULE_EDGE_FEATURES]` bond tensor (bond-order one-hot, ring flag,
     self-loop flag). Padding slots and the adjacency's self-loops are distinct
     there: an all-zero edge vector means padding, and the self-loop channel
     marks "this atom, no bond".
-  - Cora is sampled as one ego graph per labelled node, breadth-first to
-    `CORA_EGO_HOPS = 2` so the subgraph matches the 2-layer GCN's receptive
-    field, truncated to `CORA_EGO_NODES = 64` nearest-hop-first, and padded with
-    an isolated virtual node appended at index `n` of the feature and adjacency
-    tensors. Both details were previously wrong and cost roughly 8 accuracy
-    points: the subgraph held only 1-hop neighbours, so `conv2` had nothing new
-    to aggregate, and padding repeated the *centre node's own index*. Because
-    the adjacency carries a self-loop, every pair of centre copies was connected,
-    and at Cora's median degree of 3 the 46 padding copies took 94% of the
-    centre's normalised incoming weight against 6% for its true neighbours — the
-    GCN was effectively an MLP on the centre's own bag-of-words. Which nodes
-    are labelled is now the Planetoid split (20 per class / 500 / 1000) rather
-    than a 70/15/15 draw — see the comparability note below.
+  - Cora is **transductive and unbatched**: one forward pass over the whole
+    `CORA_NODES = 2708` graph, from which each split selects its own node rows.
+    `_CoraTransductiveDataset` has length 1 and yields
+    `(x_all, adjacency, node_indices, labels)`; the three splits share one graph
+    and differ only in indices; `_BATCH_SIZES["gcn"] = 1`. This is the mechanism
+    Kipf & Welling's 81.5% is measured with, and replaced an inductive ego-graph
+    setup (`CORA_EGO_NODES = 64`, 2-hop, padded with a virtual node) that scored
+    76.4% and was not comparable to it whatever its label budget.
+  - Two things about that graph are load-bearing. `GraphConv` computes
+    `Â(XW) + b`, **not** `(ÂX)W` — mathematically identical, 0.72 GFLOP against
+    10.5, which is the difference between full-graph training being free and
+    being the most expensive model in the suite. And moving the bias out of
+    `nn.Linear` to get that form means PerforatedAI cannot track the owning
+    `GraphConv` (its child `.linear` is perforated), which it reports as
+    `Parameter does not have parameter_type attribute in n mode`; the biases are
+    registered explicitly through `append_parameter_ids_to_track`, and those ids
+    need a leading dot (`".conv1.bias"`) because PAI validates them with the
+    same checker it uses for module ids.
+  - Which nodes are labelled is the Planetoid split (20 per class / 500 / 1000)
+    rather than a 70/15/15 draw.
 - Target standardisation:
   - The two molecular regression sets (ESOL, FreeSolv) z-score their targets
     using training-split statistics only. `TaskBundle.target_offset` /
     `target_scale` carry the transform, and `_compute_all_metrics` maps
     predictions back through it, so reported RMSE/MAE stay in log-solubility and
     kcal/mol respectively and remain comparable to MoleculeNet.
-- The three "RL" models are behaviour cloning, not reinforcement learning:
-  - `actor_critic`, `dqn_lunarlander` and `ppo_bipedalwalker` train on a fixed
-    cache of observations labelled by a heuristic policy. The training metric is
-    named for what it computes: **Action Accuracy** (fraction of held-out states
-    where the network picks the heuristic's discrete action) for `actor_critic`
-    and `dqn_lunarlander`, and **Neg. Action MAE** for `ppo_bipedalwalker`
-    (negated so `maximize` still holds). Neither is a return, and neither should
-    be read against published CartPole / LunarLander / BipedalWalker numbers.
-  - **An episodic return is now measured** once per run, after the best weights
-    are restored, by rolling the policy out in its gym environment for 20 seeded
-    episodes (`_evaluate_episodic_return` in `training.py`). It is recorded in
-    `test_metrics` as `episodic_return_mean` / `_std` / `_min` / `_max` and is
-    *never* the selection metric — rollout return is stochastic, and promoting it
-    would put a different objective in front of the dendritic arm than the loss
-    it actually minimises. This is the number that is comparable to published
-    results.
+- Two of the three "RL" models are behaviour cloning, not reinforcement learning:
+  - `actor_critic` and `dqn_lunarlander` train on a fixed cache of observations
+    labelled by a heuristic policy. Their training metric is named for what it
+    computes — **Action Accuracy**, the fraction of held-out states where the
+    network picks the heuristic's discrete action. It is not a return and should
+    not be read against published CartPole / LunarLander numbers.
+    `ppo_bipedalwalker` is no longer one of these; see the block after this one.
+  - **An episodic return is measured** for both, once per run, after the best
+    weights are restored, by rolling the policy out in its gym environment for
+    20 seeded episodes (`_evaluate_episodic_return` in `training.py`). It is
+    recorded in `test_metrics` as `episodic_return_mean` / `_std` / `_min` /
+    `_max` and is *never* their selection metric — rollout return is stochastic,
+    and promoting it would put a different objective in front of the dendritic
+    arm than the loss it actually minimises. This is the number that is
+    comparable to published results.
   - Adding that measurement immediately exposed the label sources as broken. The
     hand-written LunarLander heuristic returned **-519** (it crashed on nearly
     every episode) and the BipedalWalker one **-120** (it held both knees at a
@@ -134,13 +141,53 @@ For each model below, this document captures:
     | `dqn_lunarlander` | 0.9882 → 0.9845 | −522.9 → **+245.3** | 230.5 | 200 = solved |
     | `ppo_bipedalwalker` | −0.0004 → −0.0308 | −119.5 → **−79.6** | 89.2 | 300 = solved |
 
-  - `ppo_bipedalwalker` stays below its own label source and will not close that
-    gap by training longer: `BipedalWalkerHeuristics` is a state machine carrying
-    the swing leg and gait phase between steps, so one observation maps to
-    different actions depending on hidden state a feedforward policy cannot
-    observe. Matching it needs a recurrent policy or a real RL loop.
+    (`ppo_bipedalwalker`'s row is history — it has since been converted to real
+    PPO and no longer clones anything.)
   - `HEURISTIC_ROLLOUTS_FILENAME` is versioned, so changing a labelling policy
     invalidates the cached rollouts instead of silently reusing old labels.
+- `ppo_bipedalwalker` is real, on-policy PPO:
+  - It is the only model in the suite whose **training data is a function of its
+    own weights**. There is no cached split. One "epoch" is one PPO iteration:
+    `PPORolloutSource.collect` runs 2048 steps of the live policy, computes
+    GAE(λ) advantages against the critic's own value estimates, and returns a
+    fresh `DataLoader` over `(observation, action, old_log_prob, advantage,
+    return)`, which `_refresh_on_policy_batches` installs as
+    `bundle.train_loader` at the top of the epoch. Ten passes over that buffer
+    follow, folded into one loader iteration by `_RepeatedPermutationSampler`.
+  - **The metric is the mean episodic return**, and for this model it *is* the
+    selection metric — the objective and the reported number are the same thing,
+    and a rollout cannot overlap a split, so it is leak-free by construction.
+    Validation and test are rollouts rather than loader passes
+    (`_rollout_evaluation`), on disjoint seeds, so the return reported for a
+    checkpoint is not the return it was selected on. Read it against
+    BipedalWalker-v3's 300-point solved threshold; the previous **Neg. Action
+    MAE** had no published counterpart at all.
+  - Why it replaced behaviour cloning: `BipedalWalkerHeuristics` is a state
+    machine carrying the swing leg and gait phase between steps, so one
+    observation maps to different actions depending on hidden state a
+    feedforward policy cannot observe. The clone was fitting an ill-posed
+    function — it reached −80 against the heuristic's +90 and could not have
+    closed that gap by training longer.
+  - Hyperparameters are Stable-Baselines3 RL Zoo's tuned BipedalWalker-v3 entry
+    (n_steps 2048, batch 64, γ 0.999, GAE λ 0.95, 10 passes, clip 0.18,
+    ent_coef 0.001, lr 3e-4, max_grad_norm 0.5), with observation normalisation
+    and reward scaling by the running std of the discounted return. The
+    **budget** is not the Zoo's: 800 iterations (~1.6M steps) against its 5M.
+    That is a wall-clock concession, and it is chosen rather than merely
+    truncated — an untrained policy stands still for ≈ −9 while one that has
+    started moving and still falls scores ≈ −100, so a run that stops inside
+    that trough would select its own first epoch as the best checkpoint.
+  - Two implementation details that are easy to get wrong and hard to notice:
+    observation statistics are folded forward from the *previous* iteration, so
+    that within an iteration they are frozen and the importance ratio starts at
+    exactly 1; and PerforatedAI's candidate graph is disabled during collection,
+    which is 2048 batch-of-one forward passes that no optimizer step ever
+    backpropagates through.
+  - Dendrites go on the shared `.backbone` only; `.actor_mean` and `.critic` are
+    track-only. A dendrite switching in changes its module's output as a step
+    change — on the policy head that moves the action distribution outside the
+    clip range against the log-probs the live buffer holds, and on the value
+    head it changes the baseline those advantages were computed against.
 - Perforation registration:
   - The benchmark registers tensor-returning `nn.Linear`, `nn.Conv1d`, and `nn.Conv2d` modules for PerforatedAI perforation.
   - Recurrent, graph-attention, capsule, and tabular-attention models expose their gates/projections as explicit Linear/Conv modules, rather than handing tuple-returning `nn.LSTM`, `nn.GRU`, or `nn.MultiheadAttention` modules directly to PerforatedAI.
@@ -168,8 +215,32 @@ For each model below, this document captures:
       window counts reproduce Informer's dataloader exactly (8521/2857/2857).
       `lstm_forecaster` now predicts the whole horizon rather than one step.
     - **`gcn`** trained on a 70/15/15 random split of Cora — 1895 labelled nodes
-      against the 140 that Kipf & Welling's 81.5% is measured with. It now uses
-      the Planetoid split sizes (20 per class / 500 / 1000).
+      against the 140 that Kipf & Welling's 81.5% is measured with — and then,
+      after that was corrected, still measured a different *mechanism*:
+      inductive classification of 64-node 2-hop ego graphs, 32 per step, where
+      Kipf propagate over the whole 2708-node graph in one step. Both are now
+      fixed. Cora is transductive and unbatched, and the measured result is
+      **0.7990 ± 0.005 over 4 seeds** against the published 81.5% (the ego-graph
+      setup scored 76.4%).
+    - **`distilbert`** carved its validation set out of GLUE SST-2's *train*
+      split, which is phrase-level: Stanford labelled every constituency subtree,
+      so a random 10% put phrases in validation whose parent sentences were in
+      training. Validation read 95.19% against a test of 90.48%. Training now
+      uses the full 67349-row train split, and validation is a stratified 30%
+      holdout of the 872-row GLUE dev set (261 val / 611 test). The test number
+      was never the wrong one — the reason this mattered is that PerforatedAI's
+      switch logic reads *validation*, and a signal inflated by 4.7 points is a
+      poor plateau detector.
+    - **`pointnet_modelnet40`** was fed the OFF files' vertex lists rather than
+      their surfaces: faces were ignored entirely and 1024 evenly spaced vertex
+      *indices* were taken, which samples CAD authoring order, not geometry. 24%
+      of ModelNet40 meshes have fewer than 1024 vertices and were padded by
+      repeating the same corner points. Clouds are now sampled uniformly over
+      the mesh faces (area-weighted triangle choice, barycentric point), which
+      is what Qi et al.'s released `modelnet40_ply_hdf5_2048` clouds are. The
+      training augmentation also rotated about Y; the raw OFF meshes are Z-up,
+      so that was tipping objects onto their sides during training while the
+      evaluation splits stayed upright.
     - **`mobilenetv2_cifar10`** adapted only the stem stride for 32×32 input,
       leaving 16× downsampling and a 2×2 final feature map. It now matches the
       reference CIFAR stage table (8×, 4×4), worth roughly 2.5 points.
@@ -183,12 +254,19 @@ For each model below, this document captures:
       were left unlabelled. Ring perception is now exact (bridge detection) and a
       dense edge-feature tensor reaches the message and attention functions.
   - Numbers that remain **not** comparable, by construction:
-    - `gcn`'s setup is inductive ego-graph classification, not the transductive
-      full-graph propagation Kipf & Welling measure. The label budget now
-      matches; the mechanism still does not.
+    - `actor_critic` and `dqn_lunarlander` report action agreement with a
+      scripted policy. Their `episodic_return_*` columns are comparable; their
+      headline metric is not.
+    - `distilbert`'s test set is 611 rows of the GLUE dev set, not all 872 — the
+      other 261 are the validation split. Same protocol, ~1.2× wider confidence
+      interval.
     - The three forecasters run on three different datasets, so their MAEs are
       not comparable *to each other* — only to that dataset's published numbers.
     - `lstm_autoencoder` (MIT-BIH AUC) has no single standard protocol to cite.
+  - Budgets that are deliberately short of the published recipe, so a shortfall
+    is expected rather than a defect: `ppo_bipedalwalker` trains 1.6M
+    environment steps against the RL Zoo's 5M, and `pointnet_modelnet40` 200
+    epochs against Qi et al.'s 250.
 - Reproducibility note:
   - Model definitions are part of the experimental condition. After architecture changes, rerun affected keys with `--ignore-saved-models` or use a fresh `--results-directory` to avoid comparing old checkpoints against new implementations.
 
@@ -334,7 +412,7 @@ flowchart TD
 - Factory key: `gcn`
 - Model kwargs: `num_classes=7`
 - Training recipe:
-  - `batch_size=32`
+  - `batch_size=1` (one full graph; there is nothing to batch)
   - `max_epochs=200`
   - `learning_rate=1.0e-2`
   - `optimizer_name=adam`
@@ -342,19 +420,24 @@ flowchart TD
   - `weight_decay=5.0e-4`
   - `lr_schedule=cosine`
   - `lr_min_factor=0.05`
-- Perforation registration: default
+- Perforation registration: default, plus `.conv1.bias` / `.conv2.bias` via
+  `append_parameter_ids_to_track` — the biases live on `GraphConv` rather than
+  inside its `nn.Linear`, and PAI cannot track a module whose child is
+  perforated.
 - Special dendritic note:
   - The pipeline adjusts the GCN `GraphConv` linears to `set_this_output_dimensions([-1, -1, 0])` when available.
 - PQAT epoch budget: `10`
+- Measured: test 0.7990 ± 0.005 over 4 seeds; 200 epochs in 3.3 s. Read against
+  Kipf & Welling's 81.5%.
 - Architecture diagram:
 
 ```mermaid
 flowchart TD
-    feats["Node features X (B,N,1433)"] --> gc1["GraphConv: D^-½ A D^-½ X · Linear 1433→64"]
-    adj["Adjacency A (B,N,N)"] --> gc1
-    gc1 --> r["ReLU + Dropout"] --> gc2["GraphConv: norm(A) · Linear 64→num_classes"]
+    feats["Node features X (1,2708,1433)"] --> gc1["GraphConv: Â·(X·W) + b, 1433→64"]
+    adj["Adjacency Â = A + I (1,2708,2708)"] --> gc1
+    gc1 --> r["ReLU + Dropout"] --> gc2["GraphConv: Â·(H·W) + b, 64→num_classes"]
     adj --> gc2
-    gc2 --> sel["Take node 0 (target paper)"] --> out["Logits"]
+    gc2 --> sel["index_select(split's node indices)"] --> out["Logits"]
 ```
 
 ## 6. `tabnet` — TabNet
@@ -499,6 +582,12 @@ flowchart TD
 - Factory key: `distilbert`
 - Model kwargs: `num_classes=2`
 - Architecture: `distilbert-base-uncased` loaded via `transformers.AutoModelForSequenceClassification`. 6-layer Transformer encoder (66M parameters) fine-tuned for binary sentiment classification. Input batches are 3-tuples `(input_ids, attention_mask, label)` produced by the matching HuggingFace tokenizer with `max_length=128`.
+- Splits: train is the full 67349-row GLUE `train` split. Validation and test are
+  a stratified 30/70 split of the 872-row GLUE `dev` set — 261 val / 611 test
+  (`SST2_DEV_VALIDATION_RATIO`, `_stratified_holdout`). Validation is **not**
+  carved out of train, because train is phrase-level: Stanford labelled every
+  constituency subtree, so a row-wise split puts a phrase in validation whose
+  parent sentence is in training. That read 95.19% val against 90.48% test.
 - Training recipe:
   - `batch_size=32`
   - `max_epochs=3`
@@ -553,34 +642,61 @@ flowchart TD
 
 ## 12. `ppo_bipedalwalker` — PPO Policy Network
 
-- Domain: Reinforcement Learning
-- Dataset: BipedalWalker-v3
-- Primary metric: Neg. Action MAE
+- Domain: Reinforcement Learning (the only on-policy model in the suite)
+- Dataset: none — training data is generated by the current policy
+- Primary metric: Episodic Return
 - Metric direction: maximize
 - Factory key: `ppo_bipedalwalker`
 - Model kwargs: none
-- Architecture: PPO-style continuous-action policy MLP with tanh actor mean, learnable log standard deviation, and critic head. Supervised benchmark training uses the actor output against heuristic actions.
+- Architecture: actor-critic MLP with a diagonal Gaussian policy. `forward`
+  returns `(mean, log_std, value)`; all three are trained. No tanh on the mean —
+  actions are sampled from `N(mean, exp log_std)` and clipped only when the
+  environment is stepped, with the log-probability taken on the *unclipped*
+  sample (Stable-Baselines3's `squash_output=False`). `log_std` is a single
+  state-independent learnable vector. Observations pass through a
+  `RunningObsNorm` whose statistics are frozen within an iteration. Orthogonal
+  init: √2 through the backbone, 0.01 on the policy mean, 1.0 on the value head.
 - Architecture diagram:
 
 ```mermaid
 flowchart TD
-    obs["Observation (B,24)"] --> b1["Linear 24→128"] --> t1["Tanh"]
+    obs["Observation (B,24)"] --> n["RunningObsNorm (clip ±10)"]
+    n --> b1["Linear 24→128"] --> t1["Tanh"]
     t1 --> b2["Linear 128→128"] --> t2["Tanh"] --> h["hidden"]
-    h --> mean["Linear 128→action_dim (4)"] --> tan["Tanh → action mean"]
+    h --> mean["Linear 128→action_dim (4) → action mean"]
     h --> v["Linear 128→1 → value"]
-    logstd["log_std (param)"] --> dist["Gaussian(action_mean, exp log_std)"]
+    logstd["log_std (param)"] --> dist["Gaussian(mean, exp log_std)"]
+    mean --> dist
 ```
+- Training loop: one epoch = one PPO iteration. 2048 environment steps collected
+  by `PPORolloutSource` (persistent env across iterations, GAE(λ), reward scaled
+  by the running std of the discounted return), then 10 shuffled passes over
+  that buffer at minibatch 64, folded into a single loader iteration by
+  `_RepeatedPermutationSampler`. Loss is the clipped surrogate + 0.5·value loss −
+  0.001·entropy.
 - Training recipe:
-  - `batch_size=64`
-  - `max_epochs=120`
+  - `batch_size=64` (PPO minibatch)
+  - `max_epochs=800` (PPO iterations; ~1.6M environment steps)
   - `learning_rate=3.0e-4`
   - `optimizer_name=adam`
   - `momentum=0.9`
   - `weight_decay=0.0`
   - `lr_schedule=cosine`
   - `lr_min_factor=0.05`
-- Perforation registration: default (`nn.Linear`, `nn.Conv1d`, `nn.Conv2d`). The `.critic` head is registered as track-only; dendrite insertion applies to the shared backbone and actor head only.
+  - `grad_clip_norm=0.5`
+  - rollout constants: γ 0.999, GAE λ 0.95, clip 0.18, 10 passes
+- Evaluation: deterministic rollouts, not loader passes. 5 seeded episodes for
+  validation each epoch (seed 4242), 20 for test (seed 12345) — disjoint, so the
+  reported return is not the one the checkpoint was selected on.
+- Perforation registration: default (`nn.Linear`, `nn.Conv1d`, `nn.Conv2d`), with
+  `.actor_mean` **and** `.critic` track-only. Dendrites land on the shared
+  `.backbone` only (verified: 20361 → 60041 params, insertions on `.backbone.0`
+  and `.backbone.2`).
 - PQAT epoch budget: `10`
+- Read against: BipedalWalker-v3's 300-point solved threshold. Reference points
+  on the same environment — Gymnasium's `BipedalWalkerHeuristics` scores ≈ +90,
+  the behaviour-cloning setup this replaced reached ≈ −80, and an untrained
+  policy that simply stands still scores ≈ −9.
 
 ## 13. `attentivefp_freesolv` — AttentiveFP
 
@@ -752,9 +868,19 @@ flowchart TD
     h1 --> h2["Linear 512→256 + BN+ReLU+Dropout"]
     h2 --> head["Linear 256→num_classes"]
 ```
+- Input pipeline: point clouds are sampled uniformly over the **mesh surface**,
+  not read off the vertex list — triangles chosen with probability proportional
+  to area, then a uniform barycentric point in each, matching what Qi et al.'s
+  released `modelnet40_ply_hdf5_2048` clouds are. 2048 points are sampled once
+  per mesh and cached to
+  `data/modelnet40/surface_points_v1_{split}_2048.pt` (~300 MB, ~4 min to build,
+  `MODELNET40_CACHE_VERSION` invalidates it); training draws a random 1024 of
+  them each epoch, evaluation takes a fixed 1024-point prefix. Augmentation is
+  a random rotation about **Z** (the raw OFF meshes are Z-up) plus clipped
+  Gaussian jitter, training split only.
 - Training recipe:
   - `batch_size=32`
-  - `max_epochs=100`
+  - `max_epochs=200`
   - `learning_rate=1.0e-3`
   - `optimizer_name=adam`
   - `momentum=0.9`
@@ -762,8 +888,18 @@ flowchart TD
   - `lr_schedule=step`
   - `lr_decay_every=20`
   - `lr_decay_gamma=0.7`
+- Loss: cross-entropy + 0.001 × the feature-transform orthogonality penalty from
+  Qi et al. §3.4, applied to the 64×64 transform only.
 - Perforation registration: default
 - PQAT epoch budget: `10`
+- Cost: ~36 s/epoch. It was ~200 s before the clouds were cached, of which ~190 s
+  was re-parsing OFF text — the dataloader, not the network, was this model's
+  dominant cost.
+- Read against Qi et al.'s 89.2%. The 100-epoch vertex-sampling run reached
+  0.7937 validation accuracy; with surface samples the same 9th epoch scores
+  0.7337 against 0.6128, so expect the full-budget number to land higher.
+  Ignore `DYNAMIC_DENDRITIC_MIGRATION.md` §8's "13.4%, the base model is broken"
+  — that predates the corrupted-eval fix and the orthogonality penalty.
 
 ## 18. `vae_mnist` — VAE
 

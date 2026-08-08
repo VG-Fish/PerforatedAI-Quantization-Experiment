@@ -43,6 +43,9 @@ _PAI_CONFIG_LIST_SETTERS: tuple[str, ...] = (
     "set_module_names_with_processing",
     "set_module_by_name_processing_classes",
     "set_module_names_to_not_save",
+    # Cleared with the rest: parameter ids are per-model, so one model's entries
+    # must not survive into the next model's perforation in the same process.
+    "set_parameter_ids_to_track",
 )
 
 
@@ -95,6 +98,16 @@ class PAIModuleSelection:
     module_ids_to_perforate: list[str] | None = None
     track_only_module_ids: list[str] | None = None
     module_names_to_not_save: list[str] | None = None
+    # Fully-qualified parameter names, as `model.named_parameters()` reports
+    # them and with no leading dot ("conv1.bias"). PAI assigns every parameter a
+    # parameter_type from the module that owns it, so a parameter held directly
+    # by a module whose *child* is perforated belongs to neither list and gets
+    # "Parameter does not have parameter_type attribute" on every p-phase step.
+    # Tracking the owning module is not the fix there — that module must stay
+    # unwrapped precisely because its child is perforated — so PAI's own remedy
+    # is to name the parameter. See GraphConv, whose bias sits beside a
+    # perforated Linear.
+    parameter_ids_to_track: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +157,9 @@ def _append_pai_module_selection(pc: Any, selection: PAIModuleSelection) -> None
     )
     _append_if_configured(
         pc, "append_module_names_to_not_save", selection.module_names_to_not_save
+    )
+    _append_if_configured(
+        pc, "append_parameter_ids_to_track", selection.parameter_ids_to_track
     )
 
 

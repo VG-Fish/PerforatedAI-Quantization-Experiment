@@ -51,7 +51,7 @@ Six changes. First four are configuration tightening for the dynamic path. Fifth
 | 3 | [compat.py:618](../src/dendritic_benchmark/compat.py#L618) | Flip `making_graphs=False` → `True` |
 | 4 | [pipeline.py:842](../src/dendritic_benchmark/pipeline.py#L842) | Stop force-zeroing `weight_decay` for dendrite runs |
 | 5 | [training.py](../src/dendritic_benchmark/training.py) | Copy PAI-generated graphs from `PAI/{save_name}/` into `results/{model}/dendrites_fp32/pai_plots/` at end of run |
-| 6 | CLI invocation | Exclude `pointnet_modelnet40` and `distilbert` from the first dynamic sweep |
+| 6 | CLI invocation | Exclude `distilbert` from the first dynamic sweep (`pointnet_modelnet40` no longer needs excluding — see §8) |
 
 ---
 
@@ -245,6 +245,15 @@ If a specific model regresses on the dynamic run because of this, isolate it via
 
 ## 8. Change 6 — exclude broken baselines from the first dynamic sweep
 
+> **Resolved for `pointnet_modelnet40` (2026-08-07).** The paragraph below is
+> kept for the record but its premise is gone. The 13.4% predated the
+> corrupted-eval fix in `_move_batch_to_device`, the feature-transform
+> orthogonality penalty, and the step schedule; by 2026-08-07 the baseline
+> reached **0.7937** validation accuracy. The remaining gap to Qi et al.'s 89.2%
+> was in the dataloader, not the model — it read the OFF files' vertex lists and
+> ignored their faces — and that has since been fixed too (see
+> `REMAINING_FIXES.md` §3.5). **Include it in the dynamic sweep.**
+
 Two models cannot benefit from dynamic dendrites in their current form:
 
 - **`pointnet_modelnet40`** — baseline accuracy is **13.4%** on ModelNet40 (10-class random ≈ 10%, 40-class random ≈ 2.5%). The base model is broken. Dendrites made it worse (−66%) because they're amplifying a non-signal. Fix the baseline first — investigate `models.py`'s pointnet definition and the modelnet40 dataloader — before including it in a dendritic sweep.
@@ -257,11 +266,16 @@ uv run dqb run \
   --dynamic-dendritic-training \
   --models actor_critic attentivefp_freesolv capsnet_mnist dqn_lunarlander gcn \
            gin_imdbb gru_forecaster lenet5 lstm_autoencoder lstm_forecaster m5 \
-           mobilenetv2_cifar10 mpnn ppo_bipedalwalker resnet18_cifar10 saint_adult \
-           snn_nmnist tabnet tcn_forecaster textcnn vae_mnist \
+           mobilenetv2_cifar10 mpnn pointnet_modelnet40 ppo_bipedalwalker \
+           resnet18_cifar10 saint_adult snn_nmnist tabnet tcn_forecaster \
+           textcnn vae_mnist \
   --conditions dendrites_fp32 \
   --ignore-saved-models
 ```
+
+One caveat for `ppo_bipedalwalker` in a dynamic sweep: it is now on-policy, so
+PAI's plateau detector is reading a **stochastic episodic return** rather than a
+smooth validation loss. Watch for dendrites being added on rollout noise.
 
 `--conditions dendrites_fp32` scopes the sweep to only the condition that benefits from dynamic mode. Quantized dendritic conditions can be regenerated in a follow-up pass from the new dendrites_fp32 checkpoints.
 

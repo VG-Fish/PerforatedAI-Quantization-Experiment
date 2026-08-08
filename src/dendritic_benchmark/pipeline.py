@@ -407,11 +407,18 @@ class BenchmarkRunner:
     def _perforation_track_only_module_ids(self, model_key: str) -> list[str]:
         return {
             "actor_critic": [".value"],
-            # .backbone's two Linear layers cleared 0.65 Best-PBScore on the
-            # 2026-08-03 dynamic run; .actor_mean only reached 0.10, and
-            # perforating it left the policy worse than the un-dendrited
-            # baseline (-0.000458 vs -0.000439 mean reward). Track the action
-            # output instead of spending dendrite budget directly on it.
+            # Dendrites go on the shared .backbone only. The two heads are held
+            # out for a reason specific to on-policy training, not for the old
+            # PBScore reason (which measured a behaviour-cloning run in which
+            # .critic received no gradient at all and is therefore void):
+            # inserting a dendrite mid-run changes a module's output the moment
+            # it switches in, and both heads sit at a point where a step change
+            # invalidates data already collected. A jump in .actor_mean moves
+            # the policy outside PPO's clip range (0.18) against the log-probs
+            # the current buffer was recorded under, so the surrogate saturates
+            # and stops producing gradient; a jump in .critic changes the value
+            # baseline the buffer's advantages were computed against. Behind
+            # them, the backbone can absorb capacity without either effect.
             "ppo_bipedalwalker": [".critic", ".actor_mean"],
             # Recurrent gates run per-timestep; perforating them dominates wallclock
             # on long sequences. Marking .cells as track-only (not perforated)
@@ -455,6 +462,24 @@ class BenchmarkRunner:
         # PAI requires one of the duplicate pointers be excluded from saving.
         return {
             "distilbert": [".model.base_model"],
+        }.get(model_key, [])
+
+    def _perforation_parameter_ids_to_track(self, model_key: str) -> list[str]:
+        """Parameters PAI must type explicitly because no wrapper owns them.
+
+        Named as ``model.named_parameters()`` reports them but with a leading
+        dot, matching the module-id convention: PAI validates these through the
+        same checker and rejects ``conv1.bias`` with "Module ID 'conv1.bias'
+        must start with '.'".
+        """
+        return {
+            # GraphConv holds its bias itself so that the propagation can be
+            # applied to `x @ W` alone and the bias added afterwards, which is
+            # Kipf & Welling's formulation and 15x cheaper on the full graph.
+            # The child `.linear` is perforated, so GraphConv itself cannot be
+            # tracked, which leaves these two biases untyped and warning on
+            # every p-phase step. See PAIModuleSelection.parameter_ids_to_track.
+            "gcn": [".conv1.bias", ".conv2.bias"],
         }.get(model_key, [])
 
     def _use_pai_runtime_guard(self) -> bool:
@@ -520,6 +545,7 @@ class BenchmarkRunner:
             module_ids_to_perforate=module_ids_to_perforate,
             track_only_module_ids=self._perforation_track_only_module_ids(model_key),
             module_names_to_not_save=self._perforation_module_names_to_not_save(model_key),
+            parameter_ids_to_track=self._perforation_parameter_ids_to_track(model_key),
         )
         module_output_dimensions = infer_module_output_dimensions(
             model,
@@ -653,13 +679,14 @@ class BenchmarkRunner:
             ),
             # Kipf & Welling: Adam 1e-2, wd 5e-4, dropout 0.5, 200 epochs of
             # full-batch descent over 140 labelled nodes — 200 optimiser steps.
-            # GraphDatasets.cora now supplies that Planetoid-sized split, so at
-            # batch 32 an epoch is 5 steps and 200 epochs lands at 1000, the same
-            # order as the reference. The budget had been halved to 100 to escape
-            # a memorisation tail that came from training on 1895 labels; with
-            # 140 that pressure is gone and the anneal handles the rest.
+            # GraphDatasets.cora is now transductive, so batch_size=1 means one
+            # whole-graph step per epoch and this recipe reproduces those 200
+            # steps exactly rather than landing at 1000 mini-batch steps over
+            # independent ego graphs. Kipf uses a constant rate with early
+            # stopping on a 10-epoch window; the cosine floor does the same job
+            # inside a fixed budget and keeps both arms on one schedule.
             "gcn": ModelTrainingRecipe(
-                32, 200, 1.0e-2, "adam", 0.9, 5.0e-4,
+                1, 200, 1.0e-2, "adam", 0.9, 5.0e-4,
                 lr_schedule="cosine", lr_min_factor=0.05,
             ),
             # TabNet (Arik & Pfister) reports 85.7% on Adult. Still improving at
@@ -701,8 +728,26 @@ class BenchmarkRunner:
             "dqn_lunarlander": ModelTrainingRecipe(
                 128, 120, 6.3e-4, lr_schedule="cosine", lr_min_factor=0.05
             ),
+            # On-policy: one "epoch" is one PPO iteration — 2048 fresh
+            # environment steps, then 10 passes over that buffer in minibatches
+            # of 64. Everything but the budget is Stable-Baselines3 RL Zoo's
+            # tuned BipedalWalker-v3 entry (lr 3e-4, batch 64, max_grad_norm
+            # 0.5, plus gamma/GAE/clip/entropy set at the rollout and loss).
+            #
+            # The budget is not: the Zoo trains 5M steps for its reported ~213,
+            # which is many hours per condition here. 800 iterations is ~1.6M
+            # steps, roughly 2h, and matters for a specific reason — an
+            # untrained BipedalWalker policy stands still and scores about -9,
+            # while a policy that has started moving and still falls scores
+            # about -100. A run cut off inside that trough would select the
+            # do-nothing first epoch as its best checkpoint and compare two
+            # arms' untrained weights. ~1.6M steps clears the trough. It is
+            # still short of the 300-point solved threshold; the number is a
+            # real, published-comparable return either way, which is the point
+            # of the change, and both arms get the same budget.
             "ppo_bipedalwalker": ModelTrainingRecipe(
-                64, 120, 3.0e-4, lr_schedule="cosine", lr_min_factor=0.05
+                64, 800, 3.0e-4, lr_schedule="cosine", lr_min_factor=0.05,
+                grad_clip_norm=0.5,
             ),
             # FreeSolv's targets span roughly -25..+4 kcal/mol. Trained on raw
             # values the model spent its first 10 epochs sitting at the target
@@ -742,8 +787,15 @@ class BenchmarkRunner:
             # NB: this is a convergence improvement, not the fix for the run that
             # reported ~7% val accuracy — that was a corrupted-eval bug, see
             # _move_batch_to_device in training.py.
+            #
+            # 100 -> 200 epochs came free. An epoch used to cost ~200s, of which
+            # ~190s was re-parsing OFF meshes in the dataloader; caching the
+            # sampled clouds (see _ModelNet40Dataset) put it at ~36s, so 200
+            # epochs now runs in a third of the wall clock the old 100 did. The
+            # reference trains 250, and the 100-epoch run was still climbing
+            # (best val accuracy arrived at epoch 81 of 100).
             "pointnet_modelnet40": ModelTrainingRecipe(
-                32, 100, 1.0e-3, "adam", 0.9, 1.0e-4,
+                32, 200, 1.0e-3, "adam", 0.9, 1.0e-4,
                 lr_schedule="step", lr_decay_every=20, lr_decay_gamma=0.7,
             ),
             "vae_mnist": ModelTrainingRecipe(

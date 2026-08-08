@@ -32,6 +32,13 @@
 #
 # Ctrl-C stops the progress display only; training keeps running (each stream
 # ignores SIGINT/SIGHUP). Use `pkill -f 'dqb run'` to actually stop training.
+#
+# When the watcher sees the last stream exit it rebuilds manifest.csv and the
+# comparison reports (see rebuild_reports). Four concurrent `dqb run` processes
+# each write those files from their own records at exit, so without the rebuild
+# the sweep ends holding whichever quarter of the results finished last. Detached
+# and Ctrl-C'd runs never reach that point — rebuild them by hand:
+#   dqb compare --manifest --results-root results --results-directory updated_models
 set -uo pipefail
 
 cd "$(dirname "$0")"
@@ -59,8 +66,12 @@ while [[ $# -gt 0 ]]; do
     -i|--interval) INTERVAL="${2:-60}"; shift 2 ;;
     -l|--log-dir)  LOG_ROOT="${2:?--log-dir needs a directory}"; shift 2 ;;
     # Anchored on the comment text rather than line numbers so editing the
-    # header above cannot silently make --help print the wrong block.
-    -h|--help)  sed -n '/^# Usage:/,/^# ignores SIGINT/p' "$0" | sed 's/^#\{1,\} \{0,1\}//'; exit 0 ;;
+    # header above cannot silently make --help print the wrong block. The second
+    # sed only prints lines it could strip a '#' from, so the `set` line that
+    # ends the range is dropped and any paragraph added to the header before it
+    # is picked up automatically.
+    -h|--help)  sed -n '/^# Usage:/,/^set -uo pipefail/p' "$0" \
+                  | sed -n 's/^#\{1,\} \{0,1\}//p'; exit 0 ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *)  LOG_ROOT="$1"; shift ;;
   esac
@@ -164,11 +175,40 @@ report_block() {
   } | emit
 }
 
+# Each `dqb run` writes manifest.csv and the comparison reports from *its own*
+# records when it exits, so with four concurrent streams the last one to finish
+# overwrites the other three. The per-model record.json files are never touched
+# by that race, so a single rebuild across all of them restores the correct
+# manifest and reports. Only reached when the watcher saw every stream exit —
+# --detach and --status leave this to the operator, since neither knows when (or
+# whether) training finished.
+rebuild_reports() {
+  {
+    echo
+    echo "rebuilding manifest.csv and comparison reports from all per-model records"
+    echo "  (each stream had overwritten them with only its own share)"
+  } | emit
+  if dqb compare --manifest \
+       --results-root results \
+       --results-directory "$RESULTS_DIR" \
+       --logging-dir "$LOG_ROOT" 2>&1 | emit
+  then
+    echo "  rebuilt -> results/$RESULTS_DIR/manifest.csv" | emit
+  else
+    # Non-fatal on purpose: training results are already on disk, and a failed
+    # rebuild must not make the sweep look like it lost them.
+    {
+      echo "  WARNING: rebuild failed. Results are intact; rerun by hand with:"
+      echo "    dqb compare --manifest --results-root results --results-directory $RESULTS_DIR"
+    } | emit
+  fi
+}
+
 watch_loop() {
   trap 'echo; echo "detached — training continues. stop with: pkill -f \"dqb run\""; exit 0' INT
   while :; do
     report_block
-    running || { { echo; echo "all streams finished."; } | emit; break; }
+    running || { { echo; echo "all streams finished."; } | emit; rebuild_reports; break; }
     sleep "$INTERVAL"
   done
 }
@@ -263,6 +303,11 @@ stop:     pkill -f 'dqb run'
 EOF
 
 if [[ "$MODE" == "detach" ]]; then
+  cat <<EOF | emit
+rebuild:  dqb compare --manifest --results-root results --results-directory $RESULTS_DIR
+          (run once every stream has exited — detached runs skip the automatic
+           rebuild, so manifest.csv holds only the last stream's records)
+EOF
   exit 0
 fi
 
