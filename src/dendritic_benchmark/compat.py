@@ -508,30 +508,34 @@ def _consume_pai_config_message(text: str) -> bool:
 
 
 def _consume_pai_debugger_message(text: str) -> bool:
+    """Swallow PerforatedAI's "parameter_type" warning and its explanatory lines.
+
+    2026-08-10: this used to match the trigger and every follow-up line by
+    exact wording (``"WARNING: Parameter does not have..."``, ``"You can find
+    this param"``, ``"Ensure that model is either converted or tracked"``,
+    ``"Instructions in customization.md"``, plus a pdb "(Pdb)"/"--Call--"
+    prompt). None of that text exists in perforatedai==3.2.3 any more — it now
+    prints ``"Perforated WARNING: Parameter does not have parameter_type
+    attribute in n/p mode"`` followed by exactly 5 reworded explanatory lines
+    ending in "...debugging.md", and never actually drops into pdb (that's
+    still neutralized unconditionally by ``_suppress_pai_debugger``, which
+    doesn't depend on text matching) — so every line of the old filter missed,
+    and this warning has been flooding stream_*.log uncaught. Counting a fixed
+    number of follow-up lines instead of matching their wording survives the
+    next time PerforatedAI rewords the explanation, as long as the line count
+    doesn't change. See PAIModuleSelection.parameter_ids_to_track for what
+    actually causes the underlying warning.
+    """
     global _PAI_DEBUGGER_SUPPRESS_REMAINING
     stripped = text.strip()
     if not stripped:
         return False
-    if stripped.startswith("WARNING: Parameter does not have parameter_type attribute"):
-        _PAI_DEBUGGER_SUPPRESS_REMAINING = 8
-        return True
-    if stripped.startswith(
-        (
-            "(Pdb)",
-            "--Call--",
-            "You can find this param",
-            "UPA.find_param_name_by_id(",
-            "Ensure that model is either converted or tracked",
-            "Instructions in customization.md",
-        )
-    ):
-        _PAI_DEBUGGER_SUPPRESS_REMAINING = max(_PAI_DEBUGGER_SUPPRESS_REMAINING - 1, 0)
+    if "Parameter does not have parameter_type attribute" in stripped:
+        _PAI_DEBUGGER_SUPPRESS_REMAINING = 5
         return True
     if _PAI_DEBUGGER_SUPPRESS_REMAINING:
-        if stripped.startswith((">", "->")):
-            _PAI_DEBUGGER_SUPPRESS_REMAINING -= 1
-            return True
-        _PAI_DEBUGGER_SUPPRESS_REMAINING = 0
+        _PAI_DEBUGGER_SUPPRESS_REMAINING -= 1
+        return True
     return False
 
 
