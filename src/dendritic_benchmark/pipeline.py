@@ -2,8 +2,10 @@ import functools
 import gc
 import json
 import math
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -1560,9 +1562,23 @@ def _build_final_reports(
     emit(f"  {len(records)} record(s) -> {results_root / 'manifest.csv'}")
 
 
+# 2026-08-10: three of four workers were SIGKILLed within a few seconds of each
+# other (no traceback in any stream log — almost certainly an MPS/Metal crash
+# that never reached Python's exception handling) and this loop kept waiting on
+# them for ~7 hours, re-printing their last-known epoch forever, because it
+# only ever checked whether *every* worker had exited. A worker is now given a
+# bounded number of chances to be respawned before it's treated as failed.
+_MAX_WORKER_RESTARTS = 5
+_RESTART_BACKOFF_SECONDS = 30
+
+
 def _watch(
     procs: list[subprocess.Popen[bytes]],
     *,
+    streams: list[list[str]],
+    dqb_cmd: list[str],
+    passthrough: list[str],
+    condition_keys: list[str] | None,
     emit: _Emitter,
     log_dir: Path,
     results_root: Path,
@@ -1571,12 +1587,60 @@ def _watch(
     stop_pattern: str,
     on_finish: Callable[[], None],
 ) -> None:
+    """Poll workers, respawning any that die before finishing their queue.
+
+    A worker that exits with code 0 worked through every model/condition it
+    was given. Anything else — a nonzero code, or death by signal — is treated
+    as a crash and respawned with the same model list. `_launch_worker` picks
+    up any leftover ``epoch_checkpoint.pt`` automatically (see
+    ``clear_epoch_checkpoints``), so the respawn resumes mid-epoch rather than
+    losing the run. Each stream gets at most ``_MAX_WORKER_RESTARTS`` attempts
+    so a model that crashes deterministically (a bad checkpoint, not a
+    transient fault) doesn't spin forever — it's reported and left stopped
+    instead of silently retried, and everything else keeps going.
+    """
+    restarts = [0] * len(procs)
+    given_up = [False] * len(procs)
+
+    def _settled(i: int) -> bool:
+        return given_up[i] or procs[i].poll() == 0
+
     try:
         while True:
             _emit_progress(emit, log_dir, results_root, total_pairs)
-            # poll() also reaps, which keeps exited workers from lingering as
-            # zombies for the lifetime of the run.
-            if all(proc.poll() is not None for proc in procs):
+
+            for i, proc in enumerate(procs):
+                # poll() also reaps, which keeps exited workers from lingering
+                # as zombies for the lifetime of the run.
+                code = proc.poll()
+                if code is None or code == 0 or given_up[i]:
+                    continue
+                if restarts[i] >= _MAX_WORKER_RESTARTS:
+                    given_up[i] = True
+                    emit(
+                        f"stream_{i + 1} crashed {restarts[i]} time(s) (last exit {code}) "
+                        f"and hit the restart limit — giving up on: {' '.join(streams[i])}",
+                        stderr=True,
+                    )
+                    continue
+                restarts[i] += 1
+                emit(
+                    f"stream_{i + 1} (pid {proc.pid}) exited with code {code} — restarting "
+                    f"(attempt {restarts[i]}/{_MAX_WORKER_RESTARTS}) in "
+                    f"{_RESTART_BACKOFF_SECONDS}s: {' '.join(streams[i])}",
+                    stderr=True,
+                )
+                time.sleep(_RESTART_BACKOFF_SECONDS)
+                procs[i] = _launch_worker(
+                    i + 1,
+                    streams[i],
+                    dqb_cmd=dqb_cmd,
+                    passthrough=passthrough,
+                    condition_keys=condition_keys,
+                    log_dir=log_dir,
+                )
+
+            if all(_settled(i) for i in range(len(procs))):
                 emit()
                 emit("all workers finished.")
                 on_finish()
@@ -1584,7 +1648,39 @@ def _watch(
             time.sleep(interval)
     except KeyboardInterrupt:
         print()
-        print(f'detached — training continues. stop with: pkill -f "{stop_pattern}"')
+        print("Ctrl-C — stopping all workers…")
+        _terminate_all(procs)
+        print("stopped. resume later with the same `dqb run` command.")
+
+
+def _terminate_all(procs: list[subprocess.Popen[bytes]], *, grace_seconds: float = 10.0) -> None:
+    """SIGTERM every worker's process group, then SIGKILL whatever is still alive.
+
+    Workers are launched with ``start_new_session=True`` (so an unrelated Ctrl-C
+    in this terminal wouldn't reach them via normal job control), which makes
+    each one the leader of its own process group. Signalling ``proc.pid``
+    directly would hit only that leader and orphan the DataLoader worker
+    subprocesses it spawned — signalling the group via ``os.killpg`` reaches
+    those too.
+    """
+    for proc in procs:
+        if proc.poll() is not None:
+            continue
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    deadline = time.monotonic() + grace_seconds
+    for proc in procs:
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
 
 
 def run_parallel(
@@ -1677,10 +1773,14 @@ def run_parallel(
         return
 
     print()
-    print(f"progress every {interval}s — Ctrl-C detaches without stopping training")
+    print(f"progress every {interval}s — Ctrl-C stops all workers (use --detach to keep them running)")
     print(f"(also appended to {progress_log})")
     _watch(
         procs,
+        streams=streams,
+        dqb_cmd=dqb_cmd,
+        passthrough=passthrough,
+        condition_keys=condition_keys,
         emit=emit,
         log_dir=log_dir,
         results_root=results_root,

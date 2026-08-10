@@ -268,8 +268,9 @@ def build_parser() -> argparse.ArgumentParser:
             "output goes to <logging-dir>/streams/stream_N.log, and every progress "
             "table is appended to <logging-dir>/run_progress.log. Use --jobs 1 to "
             "train in this process and print straight to the terminal instead.\n\n"
-            "Ctrl-C stops the progress display only; training keeps running. Use "
-            "\"pkill -f 'dqb run'\" to actually stop it.\n\n"
+            "Ctrl-C stops every worker (each is SIGTERMed, then SIGKILLed after a "
+            "10s grace period) and exits. Use --detach beforehand if you want "
+            "training to keep running after your terminal disconnects.\n\n"
             f"Available model keys:\n  {_MODEL_KEYS}\n\n"
             f"Available condition keys:\n  {_CONDITION_KEYS}"
         ),
