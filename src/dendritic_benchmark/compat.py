@@ -895,6 +895,19 @@ def latest_pai_switch_checkpoint(save_name: str) -> str | None:
     return f"switch_{latest_switch}"
 
 
+def _installed_pai_versions() -> str:
+    """Return the installed perforatedai/perforatedbp versions for diagnostics."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    parts = []
+    for pkg in ("perforatedai", "perforatedbp"):
+        try:
+            parts.append(f"{pkg}=={version(pkg)}")
+        except PackageNotFoundError:
+            parts.append(f"{pkg}=<not installed>")
+    return ", ".join(parts)
+
+
 def load_pai_system_checkpoint(
     model: Any,
     save_name: str,
@@ -922,6 +935,31 @@ def load_pai_system_checkpoint(
             f"{pai_save_path(save_name)}/{checkpoint_name}.pt: {exc}"
         )
         raise
+    except AttributeError as exc:
+        # ``load_system`` -> ``simulate_cycles`` -> ``create_new_dendrite_module``
+        # reconstructs the dendrite tracker state by replaying it internally.
+        # When the checkpoint was written by an older perforatedai/perforatedbp
+        # release than the one currently installed, that replay can find
+        # attributes on ``DendriteValueTracker``/``PAIDendriteModule`` that the
+        # new library expects to already be populated (e.g. ``.shape``) but the
+        # older checkpoint never recorded. That surfaces as a generic
+        # AttributeError deep in vendor code, which looks like corruption but
+        # is actually a checkpoint/library version mismatch.
+        installed = _installed_pai_versions()
+        raise RuntimeError(
+            "PerforatedAI system checkpoint at "
+            f"{pai_save_path(save_name)}/{checkpoint_name}.pt could not be "
+            f"replayed by the installed library ({installed}): {exc!r}. This "
+            "is the signature of a checkpoint written by an older "
+            "perforatedai/perforatedbp release than what's installed now — "
+            "the on-disk dendrite state doesn't match what the current "
+            "library expects to rebuild from it. Fix by either (a) "
+            "retraining the source condition (e.g. dendrites_fp32) under "
+            "the currently installed perforatedai/perforatedbp so its PAI "
+            "checkpoint is rewritten in the current format, or (b) "
+            "reinstalling the perforatedai/perforatedbp versions that "
+            "originally produced this checkpoint."
+        ) from exc
     except Exception as exc:
         raise RuntimeError(
             "PerforatedAI system checkpoint could not be loaded from "

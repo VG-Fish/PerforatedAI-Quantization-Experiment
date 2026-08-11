@@ -1428,7 +1428,20 @@ def _render_progress(log_dir: Path, results_root: Path, total_pairs: int | None)
         for model, condition, metric, value in done:
             lines.append(f"  {'':<9} ✓ {model:<21} {condition:<16} {metric}: {value}")
 
-    completed = f"{total_done}/{total_pairs}" if total_pairs else str(total_done)
+    # total_done only counts [done] lines in *this launch's* (truncated)
+    # stream logs, so on a resumed run it silently omits every pair that was
+    # already complete before this run started and got [skip]ped instead of
+    # retrained. The summary line means "how much of the whole plan is done",
+    # so prefer counting record.json on disk against the full planned set —
+    # that's accurate across restarts. Only fall back to the log-derived count
+    # when the plan file isn't readable (e.g. a bare --status with no prior
+    # launch in this log dir).
+    planned_pairs = _planned_pairs_list(log_dir.parent)
+    on_disk = _count_complete_on_disk(results_root, planned_pairs)
+    if on_disk is not None and planned_pairs is not None:
+        completed = f"{on_disk}/{len(planned_pairs)}"
+    else:
+        completed = f"{total_done}/{total_pairs}" if total_pairs else str(total_done)
     lines.append("")
     lines.append(
         f"  {completed} model/condition pairs complete   "
@@ -1452,6 +1465,27 @@ def _planned_pairs(log_root: Path) -> int | None:
         return len(payload["models"]) * len(payload["conditions"])
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+def _planned_pairs_list(log_root: Path) -> list[tuple[str, str]] | None:
+    """Every (model, condition) pair in the launching run's plan, in order."""
+    try:
+        payload = json.loads((log_root / _PLAN_NAME).read_text(encoding="utf-8"))
+        return [(model, condition) for model in payload["models"] for condition in payload["conditions"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _count_complete_on_disk(
+    results_root: Path, pairs: list[tuple[str, str]] | None
+) -> int | None:
+    """How many planned pairs already have a record.json, regardless of which run wrote it."""
+    if pairs is None:
+        return None
+    return sum(
+        1 for model, condition in pairs
+        if (results_root / model / condition / _RECORD_JSON).is_file()
+    )
 
 
 def _emit_progress(emit: _Emitter, log_dir: Path, results_root: Path, total_pairs: int | None) -> None:
