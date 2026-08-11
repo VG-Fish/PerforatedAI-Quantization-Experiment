@@ -1163,27 +1163,120 @@ def _tensor_shape(value: Any) -> tuple[int, ...] | None:
         return None
 
 
+def _quantize_tensor(tensor: Any, bit_width: int, mode: str | None) -> Any:
+    """Dispatch to the right quantization kernel, on CPU.
+
+    Running these kernels on MPS triggered a malloc double-free for PointNet
+    post-training ternary quantization, so the math stays off-device; the
+    caller streams the result back with ``.to(param.device)``.
+    """
+    cpu_tensor = tensor.detach().cpu()
+    if mode == "binary" or bit_width == 1:
+        return binary_quantize_tensor(cpu_tensor)
+    if mode == "ternary":
+        return ternary_quantize_tensor(cpu_tensor)
+    return symmetric_quantize_tensor(cpu_tensor, bit_width)
+
+
 def _make_quantized_copy(
     model: Any, bit_width: int | None, mode: str | None = None
 ) -> Any:
     if bit_width is None or bit_width >= 32:
         return model
-    # Quantize on CPU and stream results back to each parameter.  Running the
-    # quantization kernels on MPS triggered a malloc double-free for PointNet
-    # post-training ternary quantization, so we keep the math off-device.
     with torch.no_grad():
         for param in model.parameters():
             if param.numel() == 0:
                 continue
-            cpu_param = param.detach().cpu()
-            if mode == "binary" or bit_width == 1:
-                quantized = binary_quantize_tensor(cpu_param)
-            elif mode == "ternary":
-                quantized = ternary_quantize_tensor(cpu_param)
-            else:
-                quantized = symmetric_quantize_tensor(cpu_param, bit_width)
+            quantized = _quantize_tensor(param, bit_width, mode)
             param.copy_(quantized.to(param.device))
     return model
+
+
+# Attribute name used to stash each quantized parameter's full-precision
+# "shadow" value across a PQAT fine-tune. See _qat_init_shadow for why this
+# exists: without it, PQAT fine-tuning does nothing.
+_QAT_SHADOW_ATTR = "_pai_qat_shadow"
+
+
+def _qat_init_shadow(model: Any) -> None:
+    """Snapshot full-precision weights before PQAT fine-tuning quantizes them.
+
+    Every low-bit PQAT run (any base_q*/dendrites_q* condition trained with
+    ``--allow-PQAT``) used to report a validation score frozen bit-for-bit for
+    its entire fine-tune budget (best_epoch == 1, loss identical to 10
+    decimal places epoch over epoch). The cause: _run_training_batch used to
+    call optimizer.step() and then immediately hard-requantize the weights
+    back onto the quantization grid every batch. binary_quantize_tensor is a
+    sign() projection, so unless a single Adam step (~1e-3 in magnitude) was
+    big enough to push a weight all the way past zero, that snap silently
+    erased the step — nothing ever accumulated, and effectively zero learning
+    happened for the whole fine-tune. Ternary/int quantization have the same
+    failure mode at a finer grid spacing.
+
+    The fix is the standard BinaryConnect/XNOR-Net pattern: keep a
+    full-precision "shadow" copy of each parameter that the optimizer
+    actually updates, and only ever quantize a projected copy of it into
+    ``.data`` for the forward/backward pass. See _qat_project_for_forward /
+    _qat_restore_shadow_for_step / _qat_sync_shadow_after_step.
+    """
+    for param in model.parameters():
+        if param.numel() == 0:
+            continue
+        setattr(param, _QAT_SHADOW_ATTR, param.detach().clone())
+
+
+def _qat_shadow_for(param: Any) -> Any:
+    """Return this parameter's full-precision shadow, self-healing from the
+    current .data if one was never stashed (e.g. a mid-PQAT resume reloaded
+    a state_dict, which does not carry the plain Python attribute). .data is
+    always left on the quantization grid between batches, so re-deriving from
+    it loses only the fractional progress since that snap, not the shadow's
+    whole history."""
+    shadow = getattr(param, _QAT_SHADOW_ATTR, None)
+    if shadow is None:
+        shadow = param.detach().clone()
+        setattr(param, _QAT_SHADOW_ATTR, shadow)
+    return shadow
+
+
+def _qat_project_for_forward(model: Any, config: "TrainingConfig") -> None:
+    """Write quantize(shadow) into .data so the forward pass sees the
+    deployment-realistic quantized weights (matches eval and the next
+    batch's starting point)."""
+    if not _should_quantize_for_training(config):
+        return
+    with torch.no_grad():
+        for param in model.parameters():
+            if param.numel() == 0:
+                continue
+            shadow = _qat_shadow_for(param)
+            quantized = _quantize_tensor(shadow, config.bit_width, config.quantization_mode)
+            param.data.copy_(quantized.to(param.device))
+
+
+def _qat_restore_shadow_for_step(model: Any, config: "TrainingConfig") -> None:
+    """Swap .data back to the continuous shadow right before optimizer.step()
+    so the update accumulates in full precision instead of being erased by
+    the next hard re-quantization."""
+    if not _should_quantize_for_training(config):
+        return
+    with torch.no_grad():
+        for param in model.parameters():
+            if param.numel() == 0:
+                continue
+            param.data.copy_(_qat_shadow_for(param))
+
+
+def _qat_sync_shadow_after_step(model: Any, config: "TrainingConfig") -> None:
+    """Persist the optimizer's update (applied to the restored full-precision
+    .data) back into the shadow."""
+    if not _should_quantize_for_training(config):
+        return
+    with torch.no_grad():
+        for param in model.parameters():
+            if param.numel() == 0:
+                continue
+            _qat_shadow_for(param).copy_(param.data)
 
 
 def _artifact_path(output_dir: Path, use_dendrites: bool) -> Path:
@@ -1200,8 +1293,16 @@ def _artifact_path(output_dir: Path, use_dendrites: bool) -> Path:
 
 
 def _count_parameters(model: Any) -> tuple[int, int]:
-    param_count = sum(p.numel() for p in model.parameters())
-    nonzero_params = sum((p != 0).sum().item() for p in model.parameters())
+    # Materialize model.parameters() once and derive both counts from that
+    # single snapshot. Calling model.parameters() twice (once per sum())
+    # let capsnet_mnist/dendrites_q1 report nonzero_params (24,453,036)
+    # greater than param_count (22,795,776): PerforatedAI's dendrite wrapper
+    # can lazily materialize/mutate its module tree on traversal, so the two
+    # generator calls silently walked different parameter sets. Nonzero can
+    # never exceed total when both are summed from the same list.
+    params = list(model.parameters())
+    param_count = sum(p.numel() for p in params)
+    nonzero_params = sum((p != 0).sum().item() for p in params)
     return param_count, nonzero_params
 
 
@@ -1895,6 +1996,7 @@ def _backward_and_step(
     retain_graph_for_optimizer_step: bool,
     model: Any = None,
     grad_clip_norm: float | None = None,
+    qat_config: "TrainingConfig | None" = None,
 ) -> None:
     # PerforatedAI's optimizer step may run its own backward pass after the
     # benchmark's loss backward. Standard torch optimizers do not need the
@@ -1904,7 +2006,16 @@ def _backward_and_step(
         # Clipped before the step so PerforatedAI's own step (which may run a
         # second backward) still sees the clipped gradients on the first pass.
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+    if model is not None and qat_config is not None:
+        # PQAT fine-tune: the gradient above was computed against the
+        # quantized .data written by _qat_project_for_forward. Swap in the
+        # full-precision shadow before stepping so the update accumulates
+        # there instead of on the discrete quantized value (which the very
+        # next projection would just overwrite anyway).
+        _qat_restore_shadow_for_step(model, qat_config)
     optimizer.step()
+    if model is not None and qat_config is not None:
+        _qat_sync_shadow_after_step(model, qat_config)
 
 
 def _record_training_batch_metrics(
@@ -1928,11 +2039,6 @@ def _record_training_batch_metrics(
     accumulator.targets.append(det_tgt)
     if det_mt is not None:
         accumulator.metric_targets.append(det_mt)
-
-
-def _maybe_apply_qat_projection(model: Any, config: "TrainingConfig") -> None:
-    if config.bit_width is not None and config.bit_width < 32 and config.use_qat:
-        _make_quantized_copy(model, config.bit_width, config.quantization_mode)
 
 
 def _memory_cleanup_due(batch_index: int, config: "TrainingConfig") -> bool:
@@ -1967,6 +2073,10 @@ def _run_training_batch(
     optimizer.zero_grad(set_to_none=True)
     if clear_pai_buffers:
         clear_pai_processor_buffers(model)
+    # PQAT fine-tune: project the full-precision shadow onto the quantization
+    # grid so forward/backward see the same weights that will actually ship.
+    # No-op for every other condition (_should_quantize_for_training is False).
+    _qat_project_for_forward(model, config)
     outputs, targets, metric_targets = _forward(model_key, model, batch)
     loss = _compute_loss(model_key, criterion, outputs, targets, model=model)
     _backward_and_step(
@@ -1975,10 +2085,14 @@ def _run_training_batch(
         retain_graph_for_optimizer_step=retain_graph_for_optimizer_step,
         model=model,
         grad_clip_norm=config.grad_clip_norm,
+        qat_config=config if _should_quantize_for_training(config) else None,
     )
+    # Leave .data on the quantization grid: matches what mid-epoch validation
+    # and the next batch's forward pass should see. Cheap and idempotent when
+    # not PQAT fine-tuning (_qat_project_for_forward no-ops).
+    _qat_project_for_forward(model, config)
     if clear_pai_buffers:
         clear_pai_processor_buffers(model)
-    _maybe_apply_qat_projection(model, config)
     return outputs, targets, metric_targets, loss
 
 
@@ -3332,6 +3446,9 @@ def _prepare_model_for_training(
     if config.use_pruning:
         _apply_pruning(model, torch, config.prune_amount)
     if _should_quantize_for_training(config):
+        # Snapshot full precision *before* the first hard quantization below —
+        # this is the shadow PQAT fine-tuning trains, see _qat_init_shadow.
+        _qat_init_shadow(model)
         model = _make_quantized_copy(model, config.bit_width, config.quantization_mode)
     if config.max_epochs <= 0:
         return model
