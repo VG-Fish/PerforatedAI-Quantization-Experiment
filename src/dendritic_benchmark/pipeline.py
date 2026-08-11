@@ -1232,6 +1232,45 @@ class BenchmarkRunner:
 # model and all of its conditions must stay in one worker to keep that order.
 
 _STREAM_LOG_DIRNAME = "streams"
+
+
+def _log_root_variant(base: Path, n: int) -> Path:
+    """The nth candidate log root: base itself for n == 1, else base2, base3, ..."""
+    return base if n == 1 else base.parent / f"{base.name}{n}"
+
+
+def _log_root_has_stream_logs(log_root: Path) -> bool:
+    stream_dir = log_root / _STREAM_LOG_DIRNAME
+    return stream_dir.exists() and any(stream_dir.glob("stream_*.log"))
+
+
+def _next_log_root(base: Path) -> Path:
+    """The first ``base``/``base2``/``base3``/... whose streams/ has no worker
+    logs yet, so launching a new run never truncates a previous run's.
+
+    ``_launch_worker`` opens each stream_N.log with ``"wb"`` (truncating) on
+    purpose, so the reporter never double-counts a prior run's ``[done]``
+    lines — that only stays safe if a fresh launch always lands in a log root
+    that has never had workers write to it.
+    """
+    n = 1
+    while _log_root_has_stream_logs(_log_root_variant(base, n)):
+        n += 1
+    return _log_root_variant(base, n)
+
+
+def _latest_log_root(base: Path) -> Path:
+    """The most recently created ``base``/``base2``/``base3``/... that exists,
+    for read-only callers (``--status``) that want the active run's logs
+    without minting a new directory."""
+    n = 1
+    latest = base
+    while _log_root_variant(base, n).exists():
+        latest = _log_root_variant(base, n)
+        n += 1
+    return latest
+
+
 _PROGRESS_LOG_NAME = "run_progress.log"
 # What the launching invocation selected, so that a later --status against this
 # log directory reports progress against that run's workload rather than against
@@ -1739,19 +1778,17 @@ def run_parallel(
     unset, while ``expanded_condition_keys`` is the resolved set used for
     counting work and clearing stale checkpoints.
     """
-    log_dir = log_root / _STREAM_LOG_DIRNAME
-    # Deliberately a level above log_dir: every stream_*.log inside log_dir is a
-    # worker log to the reporter, and a progress file sitting there would be
-    # reported as an extra worker stuck at "starting…".
-    progress_log = log_root / _PROGRESS_LOG_NAME
-    log_dir.mkdir(parents=True, exist_ok=True)
-    emit = _Emitter(progress_log)
-
     if mode == "status":
-        # The launching run's plan, not this invocation's: --status is normally
-        # typed without --models/--conditions, which would otherwise measure a
-        # two-model run against all 276 pairs.
-        _emit_progress(emit, log_dir, results_root, _planned_pairs(log_root))
+        # Read-only: report on whatever log root the most recent launch used,
+        # without minting a new one. The launching run's plan, not this
+        # invocation's — --status is normally typed without --models/
+        # --conditions, which would otherwise measure a two-model run against
+        # all 276 pairs.
+        active_log_root = _latest_log_root(log_root)
+        log_dir = active_log_root / _STREAM_LOG_DIRNAME
+        progress_log = active_log_root / _PROGRESS_LOG_NAME
+        emit = _Emitter(progress_log)
+        _emit_progress(emit, log_dir, results_root, _planned_pairs(active_log_root))
         if not _workers_running():
             emit("  (no dqb run processes active)")
         return
@@ -1768,6 +1805,18 @@ def run_parallel(
             file=sys.stderr,
         )
         raise SystemExit(1)
+
+    # A fresh base/base2/base3/... whose streams/ has never had a worker write
+    # to it, so this launch can never truncate a previous run's stream logs
+    # (_launch_worker opens each stream_N.log with "wb" on purpose — see there).
+    log_root = _next_log_root(log_root)
+    log_dir = log_root / _STREAM_LOG_DIRNAME
+    # Deliberately a level above log_dir: every stream_*.log inside log_dir is a
+    # worker log to the reporter, and a progress file sitting there would be
+    # reported as an extra worker stuck at "starting…".
+    progress_log = log_root / _PROGRESS_LOG_NAME
+    log_dir.mkdir(parents=True, exist_ok=True)
+    emit = _Emitter(progress_log)
 
     dqb_cmd = _dqb_command()
     clear_epoch_checkpoints(

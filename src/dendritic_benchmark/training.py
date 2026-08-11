@@ -1245,12 +1245,14 @@ def _qat_project_for_forward(model: Any, config: "TrainingConfig") -> None:
     batch's starting point)."""
     if not _should_quantize_for_training(config):
         return
+    bit_width = config.bit_width
+    assert bit_width is not None  # guaranteed by _should_quantize_for_training
     with torch.no_grad():
         for param in model.parameters():
             if param.numel() == 0:
                 continue
             shadow = _qat_shadow_for(param)
-            quantized = _quantize_tensor(shadow, config.bit_width, config.quantization_mode)
+            quantized = _quantize_tensor(shadow, bit_width, config.quantization_mode)
             param.data.copy_(quantized.to(param.device))
 
 

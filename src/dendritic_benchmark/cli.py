@@ -223,8 +223,11 @@ def _add_common_options(parser: argparse.ArgumentParser, *, is_subcommand: bool)
             "Directory where timestamped log files are written. Each invocation "
             "creates a new file named <command>_YYYYMMDD_HHMMSS.txt. "
             "All stdout and stderr are teed to this file. A parallel 'run' also "
-            "writes <dir>/streams/stream_N.log and <dir>/run_progress.log here. "
-            "(default: logs)" + position_note
+            "writes <dir>/streams/stream_N.log and <dir>/run_progress.log here — "
+            "if <dir>/streams already holds worker logs from an earlier launch, "
+            "that launch goes to <dir>2, <dir>3, ... instead, so a new run never "
+            "truncates a previous one's stream logs. --status auto-detects the "
+            "most recent of these. (default: logs)" + position_note
         ),
     )
 
@@ -266,8 +269,11 @@ def build_parser() -> argparse.ArgumentParser:
             "wall-clock close to linearly. Each model keeps all of its conditions "
             "in one worker, so the dependency order above still holds. Worker "
             "output goes to <logging-dir>/streams/stream_N.log, and every progress "
-            "table is appended to <logging-dir>/run_progress.log. Use --jobs 1 to "
-            "train in this process and print straight to the terminal instead.\n\n"
+            "table is appended to <logging-dir>/run_progress.log — a launch whose "
+            "<logging-dir>/streams already has logs from an earlier run uses "
+            "<logging-dir>2 (then 3, ...) instead, so it never truncates them. "
+            "Use --jobs 1 to train in this process and print straight to the "
+            "terminal instead.\n\n"
             "Ctrl-C stops every worker (each is SIGTERMed, then SIGKILLed after a "
             "10s grace period) and exits. Use --detach beforehand if you want "
             "training to keep running after your terminal disconnects.\n\n"
