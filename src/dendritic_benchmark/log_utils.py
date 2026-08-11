@@ -16,6 +16,77 @@ from io import TextIOWrapper
 from pathlib import Path
 from typing import IO
 
+# Directories a `--logging-dir` / `--results-root` / `--comparison-root` value
+# must never resolve into or under. This tool is routinely invoked by coding
+# agents with CLI arguments that are not typed by a human, so a malformed or
+# adversarial value (e.g. `--logging-dir /` or `--logging-dir /etc`) should
+# fail loudly here rather than silently create directories or write files
+# outside the project. This is deliberately a narrow denylist of OS-critical
+# roots rather than a "must stay under cwd" jail: legitimate runs already
+# point these flags at arbitrary scratch directories (e.g. under /tmp), and
+# blocking that would break real usage for no security benefit.
+#
+# Entries are resolved lazily (not at import time) and compared against the
+# *resolved* candidate path, because several of these are themselves symlinks
+# on macOS (`/etc` -> `/private/etc`, `/tmp` -> `/private/tmp`) — comparing
+# raw strings would silently miss the traversal this exists to catch.
+_DENIED_OUTPUT_ROOT_NAMES = (
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/lib",
+    "/lib64",
+    "/proc",
+    "/root",
+    "/sbin",
+    "/sys",
+    "/usr",
+    "/System",
+    "/Library",
+)
+_DENIED_WINDOWS_OUTPUT_ROOT_NAMES = (
+    "C:\\Windows",
+    "C:\\Program Files",
+    "C:\\Program Files (x86)",
+)
+
+
+def validate_output_path(path: Path, *, label: str) -> Path:
+    """
+    Resolve ``path`` and reject it if it lands on or under an OS-critical
+    directory.
+
+    Called before any ``mkdir()``/``open()`` on a path built from CLI
+    arguments (``--logging-dir``, ``--results-root``, ``--comparison-root``,
+    ...), which this codebase treats as untrusted input precisely because
+    those arguments are as likely to come from an automated agent as from a
+    human typing at a terminal. ``label`` is only used to make the error
+    message identify which argument was rejected.
+    """
+    resolved = path.resolve()
+    root = Path(resolved.anchor)  # "/" on POSIX, "C:\\" on Windows
+    if resolved == root:
+        raise ValueError(
+            f"{label} resolves to the filesystem root ({resolved!r}). "
+            "Refusing to create or write files there — pass a project-scoped path instead."
+        )
+    for name in (*_DENIED_OUTPUT_ROOT_NAMES, *_DENIED_WINDOWS_OUTPUT_ROOT_NAMES):
+        denied = Path(name)
+        if not denied.is_absolute():
+            continue
+        try:
+            denied_resolved = denied.resolve()
+        except OSError:
+            continue  # doesn't exist on this OS (e.g. Windows roots on macOS)
+        if resolved == denied_resolved or denied_resolved in resolved.parents:
+            raise ValueError(
+                f"{label} resolves to {resolved!r}, under the OS-critical "
+                f"directory {denied_resolved!r}. Refusing to create or write "
+                "files there — pass a project-scoped path instead."
+            )
+    return resolved
+
 
 class TeeStream:
     """A stream wrapper that writes to both the original stream and a log file."""
@@ -71,9 +142,9 @@ def setup_logging(
     global _log_file_handle
 
     if log_file is not None:
-        log_path = Path(log_file)
+        log_path = validate_output_path(Path(log_file), label="log_file")
     else:
-        log_dir = Path(output_dir)
+        log_dir = validate_output_path(Path(output_dir), label="output_dir")
         log_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_path = log_dir / f"{script_name}_{timestamp}.txt"

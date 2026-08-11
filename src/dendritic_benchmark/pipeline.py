@@ -32,6 +32,7 @@ from .compat import (
     set_pai_root,
 )
 from .data import build_task_bundle
+from .log_utils import validate_output_path
 from .models import ADULT_CATEGORICAL_CARDINALITIES, build_model
 from .results import (
     load_training_records,
@@ -194,8 +195,8 @@ class BenchmarkRunner:
         results_root: Path | str = "results",
         comparison_root: Path | str = "comparison",
     ):
-        self.results_root = Path(results_root)
-        self.comparison_root = Path(comparison_root)
+        self.results_root = validate_output_path(Path(results_root), label="results_root")
+        self.comparison_root = validate_output_path(Path(comparison_root), label="comparison_root")
         self.results_root.mkdir(parents=True, exist_ok=True)
         self.comparison_root.mkdir(parents=True, exist_ok=True)
         # Keep PAI artifacts with the results they belong to. The CLI already
@@ -233,7 +234,11 @@ class BenchmarkRunner:
         self, model: Any, checkpoint_path: Path, *, strict: bool = True
     ) -> Any:
         if checkpoint_path.exists():
-            state = torch.load(checkpoint_path, map_location=choose_device())
+            # weights_only=True: this file only ever holds a plain
+            # state_dict() of tensors (written in training._persist_stage_artifacts),
+            # so the restricted unpickler is safe here and closes off arbitrary
+            # code execution from a malicious/corrupted checkpoint.
+            state = torch.load(checkpoint_path, map_location=choose_device(), weights_only=True)
             if strict:
                 model.load_state_dict(state, strict=True)
             else:

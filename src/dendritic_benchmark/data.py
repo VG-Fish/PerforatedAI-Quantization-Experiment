@@ -1683,7 +1683,11 @@ def _collect_heuristic_rollouts(
     gymnasium = _require_dependency("gymnasium", package_hint)
     numpy = _require_dependency("numpy")
     if cache.exists():
-        payload = torch.load(cache, map_location="cpu")
+        # weights_only=True: this cache only ever holds the {"x", "y", "episode"}
+        # tensor dict saved a few lines below, so the restricted unpickler is
+        # safe here and closes off arbitrary code execution from a malicious
+        # or corrupted cache file.
+        payload = torch.load(cache, map_location="cpu", weights_only=True)
         return payload["x"], payload["y"], payload["episode"]
 
     cache.parent.mkdir(parents=True, exist_ok=True)
@@ -2387,7 +2391,9 @@ class _ModelNet40Dataset:
     def _load_or_build_cache(self, split: str) -> tuple[Any, Any]:
         cache = _modelnet40_cache_path(self.root, split)
         if cache.exists():
-            payload = torch.load(cache)
+            # weights_only=True: same rationale as the cache load above — this
+            # file only ever holds a {"points", "labels"} tensor dict.
+            payload = torch.load(cache, weights_only=True)
             if len(payload["points"]) == len(self.samples):
                 return payload["points"], payload["labels"]
         print(
