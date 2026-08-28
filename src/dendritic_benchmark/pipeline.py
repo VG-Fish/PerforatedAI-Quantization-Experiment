@@ -31,6 +31,7 @@ from .compat import (
     load_pai_system_checkpoint,
     pai_system_checkpoint_exists,
     perforate_model,
+    seed_everything,
     set_module_output_dimensions,
     set_pai_root,
 )
@@ -205,6 +206,9 @@ class BenchmarkRunner:
         # Keep PAI artifacts with the results they belong to. The CLI already
         # does this; repeating it here covers programmatic callers.
         set_pai_root(self.results_root / PAI_DIRECTORY_NAME)
+        # Overwritten by run(); defined here so _train_pending_condition can be
+        # called directly by programmatic callers that never went through run().
+        self._seed: int | None = None
 
     def _split_compatible_state(
         self, state: dict[str, Any], current_state: dict[str, Any]
@@ -1087,6 +1091,10 @@ class BenchmarkRunner:
             newly_trained = False
         else:
             _log(f"[train] {model_spec.key} / {condition.key} — starting…", before=True)
+            # Re-seed per condition so a model's base_* and dendrites_* arms
+            # draw the same initial weights, making them a paired comparison.
+            if self._seed is not None:
+                seed_everything(self._seed)
             record = self._run_condition(
                 model_spec.key,
                 model_spec.metric_name,
@@ -1154,6 +1162,11 @@ class BenchmarkRunner:
                 recipe = self._training_hyperparameters(model_spec.key, condition)
                 bundle = bundles_by_batch_size.get(recipe.batch_size)
                 if bundle is None:
+                    # Seed before the bundle too: dataset splits and shuffle
+                    # order are drawn here, and a different train/val split is
+                    # just as much a different experiment as a different init.
+                    if self._seed is not None:
+                        seed_everything(self._seed)
                     bundle = build_task_bundle(
                         model_spec.key, batch_size=recipe.batch_size
                     )
@@ -1181,8 +1194,13 @@ class BenchmarkRunner:
         allow_pqat: bool = False,
         dynamic_dendritic_training: bool = False,
         write_reports: bool = True,
+        seed: int | None = None,
     ) -> list[dict[str, Any]]:
         """Train the selected models sequentially in this process.
+
+        ``seed`` is re-applied before every (model, condition) — see
+        :func:`compat.seed_everything` for why per-condition and not per-process.
+        ``None`` leaves every RNG unseeded, which is the historical behaviour.
 
         ``write_reports=False`` suppresses the manifest and the cross-model
         comparison reports, which are built from *this* runner's records and so
@@ -1198,6 +1216,9 @@ class BenchmarkRunner:
         selected_condition_keys = self._expand_condition_keys(condition_keys)
         selected_conditions = [condition_by_key(key) for key in selected_condition_keys]
         all_records: list[dict[str, Any]] = []
+        self._seed = seed
+        if seed is not None:
+            _log(f"[seed] every model/condition seeded with {seed}")
 
         for model_spec in selected_models:
             newly_trained = self._process_one_model_spec(

@@ -416,6 +416,22 @@ def build_parser() -> argparse.ArgumentParser:
             "would silently continue an old-architecture run."
         ),
     )
+    run_parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Seed Python, NumPy and torch RNGs before every model/condition. "
+            "Omit to leave them unseeded (the historical behaviour). Without a "
+            "seed, run-to-run variance can exceed the effect being measured: "
+            "gcn's base_fp32 moved 3.4pp between two runs of the identical "
+            "command, against a dendrite effect of 0.30pp. Re-seeding per "
+            "condition also makes a model's base_* and dendrites_* arms start "
+            "from the same weights, so the two are a paired comparison. Vary "
+            "this across runs to get the error bars that variance demands."
+        ),
+    )
     run_mode = run_parser.add_mutually_exclusive_group()
     run_mode.add_argument(
         "--detach",
@@ -677,6 +693,7 @@ def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
             allow_pqat=args.allow_pqat,
             dynamic_dendritic_training=args.dynamic_dendritic_training,
             write_reports=False,
+            seed=args.seed,
         )
         return
 
@@ -687,6 +704,7 @@ def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
             ignore_saved=args.ignore_saved_models,
             allow_pqat=args.allow_pqat,
             dynamic_dendritic_training=args.dynamic_dendritic_training,
+            seed=args.seed,
         )
         return
 
@@ -725,6 +743,8 @@ def _run_passthrough(args: Any, comparison_root: Path) -> list[str]:
         flags.append("--allow-PQAT")
     if args.dynamic_dendritic_training:
         flags.append("--dynamic-dendritic-training")
+    if args.seed is not None:
+        flags += ["--seed", str(args.seed)]
     return flags
 
 

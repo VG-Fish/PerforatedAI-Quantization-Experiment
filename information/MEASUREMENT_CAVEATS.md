@@ -17,6 +17,7 @@ Status at a glance:
 | 4 | `gcn/dendrites_q8` transient checkpoint-reconstruction crash | partial — mechanism guarded, exact race not confirmed | **yes, via §5** — the "transient" framing was wrong, see §5 |
 | 5 | `actor_critic`/`m5` ship a phantom randomly-initialized dendrite in every `dendrites_q*` arm | yes — `_split_compatible_state` only checks one direction | **yes** — see §5 |
 | 6 | `q1`/`q1_58` had **no scale factor at all**; `q4`/`q8` calibrated on outliers | yes — `compat.py` kernel math | **yes** — see §6 |
+| 7 | run-to-run variance (3.4pp) exceeds the effect being measured (0.3pp) | yes — nothing was seeded | **partly** — `--seed` added, but error bars still need multiple seeds, see §7 |
 
 **Anything measured at `q1`, `q1_58`, `q2`, or `q4` before 2026-08-28 is invalid**
 (§6), and every `dendrites_q*` number for `actor_critic` and `m5` in `dynamic7` is
@@ -727,8 +728,32 @@ same architecture (3 dendrites vs 4). On Cora's 1000-node test set, +0.30pp is
 three nodes.
 
 `lenet5`'s +0.15pp is fifteen MNIST images against a 99.1% ceiling; `saint_adult`
-and `m5` are the same order. There is currently no `--seed` flag in `dqb run`, so
-these cannot be separated from variance as the harness stands. **`actor_critic`'s
-+9.07pp is the only effect in the table large enough to survive a single seed.**
-Any rerun that intends to support a claim about dendrites needs either multi-seed
-support or models whose effects clear this noise floor.
+and `m5` are the same order. **`actor_critic`'s +9.07pp is the only effect in the
+table large enough to survive a single seed.**
+
+### `--seed` (added 2026-08-28)
+
+`dqb run --seed N` now exists, and `compat.seed_everything` is applied at two
+points: before `build_task_bundle` (dataset splits and shuffle order are drawn
+there) and before every individual condition. The second placement is the one
+that matters most — it makes a model's `base_*` and `dendrites_*` arms draw the
+**same initial weights**, so the two arms become a paired comparison and a
+difference between them is attributable to the dendrites rather than to a
+different lottery ticket. The flag passes through `_run_passthrough`, so parallel
+workers inherit it instead of each running unseeded.
+
+Verified end to end, not just at the RNG: `gcn base_fp32` run twice as two
+separate process launches with `--seed 4242` returned
+`metric=0.814000, best=0.776000, best_epoch=48` both times, bit-identical. The
+two unseeded runs of the same condition returned 0.7960 and 0.7620.
+
+`torch.use_deterministic_algorithms` is deliberately **not** enabled: MPS has no
+deterministic implementation for several ops these models use, so it would fail
+outright rather than silently disagree. Seeding removes the large run-to-run
+swings; what remains is nondeterministic reduction order, worth far less than the
+3.4pp that was the actual problem.
+
+**A seed makes a run reproducible; it does not make an effect real.** A single
+seeded run still cannot tell you whether `lenet5`'s +0.15pp is signal. Error bars
+need several seeds — `config/run_dynamic7.sh` reads `SEED` from the environment
+for exactly this, at ~28 min per replicate for the 5-model set.

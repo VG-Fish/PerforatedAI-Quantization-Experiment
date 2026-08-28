@@ -3,6 +3,7 @@ import importlib
 import math
 import os
 import pdb
+import random
 import re
 import shutil
 import sys
@@ -979,6 +980,48 @@ def load_pai_system_checkpoint(
             "source architecture is required before loading the benchmark "
             "checkpoint."
         ) from exc
+
+
+def seed_everything(seed: int) -> None:
+    """Seed every RNG that can move a benchmark result.
+
+    Without this, two runs of the same config are two different experiments.
+    Measured on `gcn`: `base_fp32` moved 0.7960 -> 0.7620 between two runs of
+    the identical command -- 3.4pp with no quantization involved, against a
+    dendrite effect of +0.30pp -- and PAI settled on 4 dendrites one run and 3
+    the other. See information/MEASUREMENT_CAVEATS.md #7.
+
+    Called once per (model, condition) rather than once per process, so each
+    condition is reproducible on its own and, more importantly, so a model's
+    `base_*` and `dendrites_*` arms draw the *same* initial weights. That makes
+    the arms a paired comparison: a difference between them is the dendrites,
+    not a different lottery ticket.
+
+    Note this does not force deterministic kernels
+    (`torch.use_deterministic_algorithms`). MPS has no deterministic mode for
+    several of the ops these models use, so it would fail outright rather than
+    silently disagree; seeding removes the large run-to-run swings while
+    leaving nondeterministic reduction order, which is worth far less than
+    3.4pp.
+    """
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    try:
+        import numpy as np
+
+        np.random.seed(seed % (2**32))
+    except Exception:
+        pass
+    torch.manual_seed(seed)
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
+    try:
+        torch.mps.manual_seed(seed)
+    except Exception:
+        pass
 
 
 def choose_device() -> Any:
