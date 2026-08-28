@@ -975,3 +975,77 @@ Two reading rules follow:
 `mpnn`, `vae_mnist`, `saint_adult`, and `tcn_forecaster` did not show the
 mismatch simply because §8's collapse guard killed them *before* their
 budgets, so they never had over-budget rows to split off.
+
+## 10. PAI's zero-seeded running average corrupts best-model tracking for every non-positive-maximize metric (FOUND + FIXED 2026-08-28)
+
+**Symptom that exposed it:** in dynamic8, `vae_mnist dendrites_fp32` finished
+with val ELBO −92.71 (better than base's −92.85 val) yet *tested* at −94.15
+(worse than base's −92.16) — a 1.4-nat val→test inversion where base shows a
++0.7-nat val→test gain.
+
+**Mechanism.** PAI's score tracking (`running_average_pb=True`) is an EMA
+seeded at zero with weight `1/history_lookback` (=1/8; verified exactly:
+vae's first running score −11.8696 = −94.9572/8, tcn's 0.04089 = 0.32713/8,
+mpnn's 0.10351 = 0.82810/8). Zero is a *better-than-anything-real* score for
+every metric that is not positive-maximize:
+
+- ELBO under maximize: real scores ≈ −92; the EMA descends from ~0 toward
+  −92, i.e. PAI sees the score "worsen" every epoch of the entire run.
+- MAE/RMSE under minimize: real scores ≈ 0.3–0.9; the EMA ascends from ~0
+  toward them — again perpetual "worsening".
+
+Consequences, all observed in dynamic8's PAI artifacts:
+
+1. **Best model pinned at epoch ~1.** The EMA peak is during warm-up, so the
+   gated best-model save never fires again. Final `best_arch_scores.csv` for
+   vae/tcn/mpnn lists *only the base architecture* at its epoch-0/1 raw score
+   (−94.827 / 0.32713 / 0.82810).
+2. **`find_best_lr` no-improvement restarts** (the archived
+   `*noImprove_lr_0*` snapshots).
+3. **Restore-best-on-complete hands back a barely-trained network.** At the
+   completion switch PAI restored its "best" — the epoch~1-era state — and
+   rewound its own score history (final `Scores.csv` for vae/tcn/mpnn contains
+   only epochs 0–1). The harness's own best-state restore then correctly
+   *declined* (structure mismatch, §3's no-hybrid rule) for vae and tcn, so
+   the PAI-restored early state is what got tested and shipped.
+
+Accuracy-style metrics (positive, maximize) sit in the one benign quadrant:
+the warm-up EMA looks *worse* than real scores, so best-tracking stays sane —
+that is why `gcn` and `actor_critic` (full-length rising `Scores.csv`, three
+architectures in `best_arch_scores.csv`) were unaffected. The same warm-up
+shape is, however, exactly the mode-`n` rising-EMA switch-blocking trap that
+kept `lenet5`/`distilbert` from ever switching (memory:
+pai-running-average-blocks-switch) — one root mechanism, two failure modes.
+
+**What this invalidates in dynamic8:**
+
+- `vae_mnist dendrites_fp32` (and all `dendrites_q*` derived from its
+  checkpoint): tested model is an epoch~1-era restore (test −94.15 ≈ epoch-1
+  val −94.83 + the +0.7 val→test offset). The genuinely trained dendritic
+  model (val −92.71, *better* than base) was never tested. The "dendrites
+  hurt the VAE" reading is an artifact.
+- `tcn_forecaster dendrites_*`: tested model is a PAI-restored **pre-dendrite**
+  base-arch early state; the 0.3013-vs-0.3094 "win" is an early-model/test-
+  period accident, not dendrites. (Separately real: tcn's dendritic run never
+  improved val at any point — best 0.3269@21 vs 0.3271@1.)
+- `mpnn dendrites_*`: harness best_epoch=3 — before any dendrite existed —
+  restored cleanly onto PAI's rewound base structure; the 0.6976 "win"
+  contains zero trained dendrites. (Its recorded param_count=713668 still
+  reflects dendrite tensors physically present in the artifact — do not read
+  dynamic8 mpnn/vae/tcn dendritic param or latency numbers as dendritic.)
+- `gcn` and `actor_critic` dendritic numbers **stand** (benign quadrant,
+  best-state restores succeeded on matching structures).
+
+**Fix (2026-08-28, compat.py):** `set_running_average_pb: False` in both
+`_configure_dynamic_pai_schedule` and `_configure_bounded_pai_schedule` — PAI
+then tracks raw validation scores, which are direction- and sign-correct for
+every model. Verified live: gcn's switch checks now log raw-score comparisons
+("global_best=0.7364, current_best=0.7344"). Predicted side-benefit: the
+lenet5/distilbert rising-EMA switch blocker disappears (flat raw scores DO
+plateau), making lenet5 addable without a fixed-switch entry.
+
+**Reading rule:** for any stored run, check
+`results/PAI/<model>_<cond>/<...>best_arch_scores.csv` — if it lists only the
+base architecture at an epoch-0/1 score while the harness history shows later
+improvement, that condition's final model is a warm-up-era restore and its
+test metric measures the wrong network.
