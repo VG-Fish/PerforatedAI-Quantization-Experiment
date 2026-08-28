@@ -54,22 +54,24 @@ edge case:
 **Fix chosen and implemented** (user chose "fix it properly" — both of the two
 options below, applied together, `bit_width == 2` only):
 
-- **(a) Make it actually 2-bit.** `qmax = 1`, `qmin = -2` — the standard signed
-  integer range (`{-2,-1,0,1}`, matching two's-complement int2). Real 4 levels
+- **(a) Make it actually 2-bit.** `qmin = -2`, `qmax = 1` — the standard signed
+  integer range (`{-2,-1,0,1}`, matching two's-complement int2). Real 4 codes
   instead of 3.
 - **(b) Base the scale on a robust statistic instead of the true max.** Scale is now
-  `tensor.abs().float().quantile(0.999) / qmax` — the 99.9th percentile of `|w|`, not
-  `tensor.abs().max()`. A single outlier weight can still get clamped to the extreme
-  level, but it can no longer set the scale for the entire tensor.
+  `tensor.abs().float().quantile(0.999) / 2` — the 99.9th percentile of `|w|`,
+  divided by the largest signed-code magnitude, not `tensor.abs().max()`. A single
+  outlier weight can still get clamped to the extreme code, but it can no longer set
+  the scale for the entire tensor.
 
 ```python
 if bit_width == 2:
+    qmin = -2
     qmax = 1
     robust_max = tensor.abs().float().quantile(0.999)
     if robust_max == 0:
         return tensor.clone()
-    scale = robust_max / qmax
-    return torch.clamp(torch.round(tensor / scale), -2, qmax) * scale
+    scale = robust_max / max(abs(qmin), abs(qmax))
+    return torch.clamp(torch.round(tensor / scale), qmin, qmax) * scale
 ```
 
 `bit_width` 4 and 8 are **untouched** — same formula, verified byte-identical output
@@ -79,13 +81,15 @@ changing them would have broken comparability with every stored `q4`/`q8` result
 no measured benefit.
 
 **Verified** (synthetic tensors, not yet against a re-run model):
-- Level count: up to 4 distinct outputs at `bit_width=2` (was ≤3).
+- Level count: 4 distinct outputs at `bit_width=2` on ordinary symmetric random tensors
+  (was ≤3).
 - Outlier robustness: two "statistically identical" distributions differing only in
   their single largest weight (replicating the `top10`/`dynamic5` `lenet5`
   `max|w|=0.4799` vs `0.3487` case) now produce **identical** survival fractions
   (ratio 1.00×, was ~3.5×).
-- A true outlier (5.0, vs. a background std of 0.02) now gets clamped to the `-2`
-  level instead of setting `scale = 5.0` and crushing the rest of the tensor to 0.
+- A true outlier (`+5.0` or `-5.0`, vs. a background std of 0.02) now gets clamped
+  to the nearest extreme code instead of setting `scale = 5.0` and crushing the rest
+  of the tensor to 0.
 - Edge cases (all-zero, single-element, all-negative, 4-element bias tensor) all
   still return finite, correctly-shaped output.
 - `q4`/`q8` outputs unchanged (`torch.equal` true against the pre-fix formula).

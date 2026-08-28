@@ -995,21 +995,20 @@ def symmetric_quantize_tensor(tensor: Any, bit_width: int) -> Any:
         # statistically identical weight distributions measured retained-
         # weight fractions of 2.83% vs 9.92% and scores of 0.9588 vs 0.2916
         # purely from that one weight moving. See
-        # information/MEASUREMENT_CAVEATS.md #1. Use a real signed 4-level
+        # information/MEASUREMENT_CAVEATS.md #1. Use a real signed 4-code
         # grid ({-2,-1,0,1}, matching the standard qmin=-2**(b-1),
         # qmax=2**(b-1)-1 integer scheme) and scale off the 99.9th percentile
         # of |w| rather than the true max, so one outlier can no longer set
-        # the whole grid. bit_width 4 and 8 are untouched (odd level counts of
-        # 15/255 are already both real level counts and stable against
-        # outliers, so this branch is intentionally 2-bit-only -- changing it
-        # for 4/8-bit would break comparability with every stored q4/q8
-        # result for no measured benefit).
+        # the whole grid. The denominator is the largest code magnitude (2),
+        # not qmax (1); using qmax would leave ordinary symmetric tensors on
+        # only {-scale, 0, +scale}, recreating the three-level q2 bug.
+        qmin = -2
         qmax = 1
         robust_max = tensor.abs().float().quantile(0.999)
         if robust_max == 0:
             return tensor.clone()
-        scale = robust_max / qmax
-        return torch.clamp(torch.round(tensor / scale), -2, qmax) * scale
+        scale = robust_max / max(abs(qmin), abs(qmax))
+        return torch.clamp(torch.round(tensor / scale), qmin, qmax) * scale
     levels = 2**bit_width - 1
     max_abs = tensor.abs().max()
     if max_abs == 0:
