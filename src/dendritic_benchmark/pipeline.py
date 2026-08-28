@@ -219,16 +219,37 @@ class BenchmarkRunner:
         return compatible_state, skipped
 
     def _load_compatible_state(self, model: Any, state: dict[str, Any]) -> None:
+        """Load a dendritic source checkpoint's weights onto a model whose
+        structure was independently reconstructed from PAI's *latest* switch
+        checkpoint (see ``_load_source_checkpoint`` below).
+
+        Those two things should always agree: with the fix in
+        ``training.py::_load_compatible_best_state``, ``state`` (loaded from
+        ``model.pt``) is always self-consistent -- it is either the true
+        best-epoch model or the true final-epoch model, never a shape-filtered
+        hybrid. If reconstructing from the latest switch checkpoint still
+        doesn't match it, that means the two independent checkpointing systems
+        (this benchmark's own best-epoch tracking vs. PAI's own switch
+        checkpoints) have genuinely diverged -- see
+        information/MEASUREMENT_CAVEATS.md #3. Previously this was a silent
+        partial load, which produced a `dendrites_q*` record with a different
+        (and wrong) param_count than its own `dendrites_fp32` record. Failing
+        loudly here instead surfaces the mismatch at the point it happens,
+        rather than downstream in a comparison table.
+        """
         compatible_state, skipped = self._split_compatible_state(
             state, model.state_dict()
         )
-        model.load_state_dict(compatible_state, strict=False)
         if skipped:
-            print(
-                "[state] skipped incompatible source-checkpoint tensors: "
+            raise RuntimeError(
+                "[state] source-checkpoint structure does not match the "
+                "PAI switch-checkpoint-reconstructed model -- refusing a "
+                "partial load. Mismatched tensors: "
                 + ", ".join(sorted(skipped)[:5])
                 + ("..." if len(skipped) > 5 else "")
+                + ". See information/MEASUREMENT_CAVEATS.md #3."
             )
+        model.load_state_dict(compatible_state, strict=False)
 
     def _load_state(
         self, model: Any, checkpoint_path: Path, *, strict: bool = True

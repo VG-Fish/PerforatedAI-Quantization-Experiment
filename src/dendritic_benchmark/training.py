@@ -2663,9 +2663,30 @@ def _adopt_missing_pai_dendrite_buffers(
     return adopted
 
 
-def _load_compatible_best_state(model: Any, best_state: dict[str, Any]) -> None:
+def _load_compatible_best_state(model: Any, best_state: dict[str, Any]) -> bool:
+    """Restore ``best_state`` onto ``model`` if, and only if, doing so would not
+    silently paper over a dendrite-structure change since the best epoch.
+
+    A plateau-triggered dendrite switch can add a dendrite *after* the best
+    validation epoch was recorded, without ever beating that score again before
+    training ends — normal, expected behaviour. ``best_state`` (a value-only
+    snapshot taken at the best epoch) then has no tensor, or a differently
+    shaped one, for the new dendrite's parameters. The previous behaviour here
+    was to silently skip just those tensors and load everything else: the
+    "restored best model" ended up a hybrid of best-epoch values (for anything
+    shape-compatible) and leftover post-best-epoch training values (for
+    anything that wasn't) — a state that was never actually validated at any
+    epoch, matching neither ``best_metric`` nor the true final-epoch metric.
+    See information/MEASUREMENT_CAVEATS.md #3 for the measured symptom (a test
+    metric that regresses even though the validation curve improved).
+
+    Returns True if the restore was applied (``model`` now holds the
+    best-epoch weights). Returns False, leaving ``model`` completely
+    untouched, if the structures diverge — the caller should then evaluate and
+    persist the live, final-epoch model instead, which is self-consistent by
+    construction.
+    """
     plain_model = _unwrap_compiled(model)
-    adopted = _adopt_missing_pai_dendrite_buffers(plain_model, best_state)
     current_state = plain_model.state_dict()
     compatible_state: dict[str, Any] = {}
     skipped: list[str] = []
@@ -2673,12 +2694,34 @@ def _load_compatible_best_state(model: Any, best_state: dict[str, Any]) -> None:
         if _is_ignorable_state_key(key):
             continue
         current_value = current_state.get(key)
+        if current_value is None and _is_pai_lazy_dendrite_buffer_key(key):
+            # Registered lazily inside create_new_dendrite_module, so a freshly
+            # perforated model doesn't have it yet -- adopted below if we
+            # proceed, not a sign of a real structural mismatch.
+            compatible_state[key] = value
+            continue
         current_shape = _tensor_shape(current_value)
         source_shape = _tensor_shape(value)
         if current_shape is None or source_shape is None or current_shape != source_shape:
             skipped.append(key)
             continue
         compatible_state[key] = value
+    supplied = set(compatible_state.keys())
+    missing_before = [
+        key for key in current_state
+        if key not in supplied and not _is_ignorable_state_key(key)
+    ]
+    if skipped or missing_before:
+        mismatched = sorted(set(skipped) | set(missing_before))
+        print(
+            "[state] best-epoch structure does not match the final trained "
+            "structure (a dendrite was likely added after the best epoch) -- "
+            "keeping the final model instead of a partial restore. "
+            "Mismatched tensors: " + ", ".join(mismatched[:5])
+            + ("..." if len(mismatched) > 5 else "")
+        )
+        return False
+    adopted = _adopt_missing_pai_dendrite_buffers(plain_model, best_state)
     missing, unexpected = plain_model.load_state_dict(compatible_state, strict=False)
     if adopted:
         print(
@@ -2686,17 +2729,12 @@ def _load_compatible_best_state(model: Any, best_state: dict[str, Any]) -> None:
             + ", ".join(adopted[:5])
             + ("..." if len(adopted) > 5 else "")
         )
-    if skipped:
-        print(
-            "[state] skipped incompatible best-state tensors: "
-            + ", ".join(skipped[:5])
-            + ("..." if len(skipped) > 5 else "")
-        )
     if unexpected:
         print(f"[state] ignored unexpected best-state tensors: {unexpected[:5]}")
     real_missing = [key for key in missing if not _is_ignorable_state_key(key)]
     if real_missing:
         print(f"[state] retained current values for missing tensors: {real_missing[:5]}")
+    return True
 
 
 def _pai_dendrite_phase_epochs(pai_tracker: Any) -> int | None:
@@ -3586,6 +3624,12 @@ def train_and_evaluate(
     if best_state is not None:
         # Load into the underlying module; the compiled wrapper's forward graph
         # reads parameters in-place from the same tensors, so it stays in sync.
+        # If the dendrite structure changed after the best epoch, this is a
+        # deliberate no-op -- `model` stays the self-consistent final-epoch
+        # model rather than becoming a best/final hybrid. best_metric_value and
+        # best_epoch below still describe the true validation peak either way;
+        # metric_value below describes whichever model was actually kept. See
+        # information/MEASUREMENT_CAVEATS.md #3.
         _load_compatible_best_state(model, best_state)
 
     if _should_quantize_for_eval(config):
