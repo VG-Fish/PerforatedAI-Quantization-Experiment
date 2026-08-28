@@ -17,7 +17,7 @@ from .compat import (
     set_pai_root,
 )
 from .data import DATA_ROOT_ENV, DEFAULT_DATA_ROOT, build_task_bundle, dataset_exists
-from .log_utils import setup_logging
+from .log_utils import setup_logging, validate_output_path
 from .pipeline import (
     DEFAULT_JOBS,
     DEFAULT_PROGRESS_INTERVAL,
@@ -38,7 +38,7 @@ argcomplete: Optional[Any] = None
 try:
     import argcomplete
 except Exception:  # pragma: no cover - optional runtime enhancement
-    pass
+    argcomplete = None
 
 
 def _log(msg: str) -> None:
@@ -137,7 +137,7 @@ def _record_clean_config(args: Any, results_root: Path, comparison_root: Path, b
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "results_root": str(results_root.expanduser().resolve()),
             "results_directory": args.results_directory,
-            "logging_dir": str(Path(args.logging_dir).expanduser().resolve()),
+            "logging_dir": str(args.logging_dir),
             "comparison_root": str(comparison_root.expanduser().resolve()),
             "benchmark_root": str(benchmark_root.expanduser().resolve()),
             "data_root": str(Path(os.environ.get(DATA_ROOT_ENV, DEFAULT_DATA_ROOT)).expanduser().resolve()),
@@ -182,6 +182,47 @@ def _remove_clean_target(path: Path) -> str:
         path.unlink()
         return "file"
     return "missing"
+
+
+def _validated_results_directory(value: str | None) -> Path | None:
+    if value is None:
+        return None
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(
+            "--results-directory must be a relative directory name that stays under --results-root."
+        )
+    cleaned_parts = [part for part in path.parts if part not in ("", ".")]
+    if not cleaned_parts:
+        raise ValueError("--results-directory must not be empty.")
+    return Path(*cleaned_parts)
+
+
+def _normalize_output_args(args: Any) -> tuple[Path, Path, Path]:
+    args.logging_dir = validate_output_path(Path(args.logging_dir), label="logging_dir")
+    results_root = validate_output_path(Path(args.results_root), label="results_root")
+    args.results_root = results_root
+    results_directory = _validated_results_directory(args.results_directory)
+    if results_directory is not None:
+        args.results_directory = str(results_directory)
+        results_root = validate_output_path(
+            results_root / results_directory,
+            label="results_root/results_directory",
+        )
+
+    comparison_root = validate_output_path(
+        Path(getattr(args, "comparison_root", "comparison")),
+        label="comparison_root",
+    )
+    if hasattr(args, "comparison_root"):
+        args.comparison_root = comparison_root
+    benchmark_root = validate_output_path(
+        Path(getattr(args, "benchmark_root", "benchmarks")),
+        label="benchmark_root",
+    )
+    if hasattr(args, "benchmark_root"):
+        args.benchmark_root = benchmark_root
+    return results_root, comparison_root, benchmark_root
 
 
 def _add_common_options(parser: argparse.ArgumentParser, *, is_subcommand: bool) -> None:
@@ -479,6 +520,20 @@ def build_parser() -> argparse.ArgumentParser:
             "latency comparison plots in --comparison-root. (default: benchmarks)"
         ),
     )
+    compare_parser.add_argument(
+        "--models",
+        nargs="*",
+        metavar="KEY",
+        help=(
+            "Space-separated list of model keys to restrict the aggregate "
+            "comparison plots (heatmaps, dendrite delta, summary.csv) to — "
+            "e.g. so a heatmap over a handful of trained models doesn't carry "
+            "blank rows for every model that was never run. Per-model reports "
+            "are unaffected; they are always written for whichever models have "
+            "records. Omit to include every model in the roster. "
+            f"Valid keys: {_MODEL_KEYS}"
+        ),
+    )
 
     generate_graphs_parser: argparse.ArgumentParser = subparsers.add_parser(
         "generate_graphs",
@@ -641,7 +696,7 @@ def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
         model_keys=selected_models,
         condition_keys=args.conditions,
         expanded_condition_keys=runner._expand_condition_keys(args.conditions),
-        log_root=Path(args.logging_dir),
+        log_root=args.logging_dir,
         passthrough=_run_passthrough(args, comparison_root),
         jobs=args.jobs,
         mode=args.mode,
@@ -721,7 +776,7 @@ def _handle_compare(args: Any, results_root: Path, comparison_root: Path) -> Non
         model_records = [record for record in records if record["model_key"] == model_spec.key]
         if model_records:
             write_model_reports(model_spec.display_name, model_records, results_root / model_spec.key)
-    write_comparison_reports(records, comparison_root)
+    write_comparison_reports(records, comparison_root, model_keys=getattr(args, "models", None))
     write_per_model_benchmark_plots(Path(getattr(args, "benchmark_root", "benchmarks")), comparison_root)
 
 
@@ -779,20 +834,22 @@ def main() -> None:
     if argcomplete is not None:
         argcomplete.autocomplete(parser)
     args = parser.parse_args()
-    results_root = Path(args.results_root)
-    if args.results_directory:
-        results_root = results_root / args.results_directory
-    comparison_root = Path(getattr(args, "comparison_root", "comparison"))
-    benchmark_root = Path(getattr(args, "benchmark_root", "benchmarks"))
+    if args.command == "clean":
+        _handle_clean(args)
+        return
+
+    try:
+        results_root, comparison_root, benchmark_root = _normalize_output_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     # PerforatedAI's artifact tree belongs to the result set it was produced
     # for, so it is scoped to --results-root rather than the working directory.
     set_pai_root(results_root / PAI_DIRECTORY_NAME)
 
     _record_clean_config(args, results_root, comparison_root, benchmark_root)
-    if args.command != "clean":
-        setup_logging(output_dir=args.logging_dir, script_name=args.command)
+    setup_logging(output_dir=str(args.logging_dir), script_name=args.command)
 
-    if args.command != "clean" and perforatedai_credentials_present():
+    if perforatedai_credentials_present():
         _log("PerforatedAI credentials detected in environment; beta-capable features can be used if installed.")
 
     if args.command == "run":
@@ -805,8 +862,6 @@ def main() -> None:
         generate_training_graphs(results_root, regenerate=args.regenerate_graphs)
     elif args.command == "benchmark_models":
         _handle_bench(args, results_root, benchmark_root, comparison_root)
-    elif args.command == "clean":
-        _handle_clean(args)
     else:
         parser.print_help()
 

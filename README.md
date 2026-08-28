@@ -81,6 +81,10 @@ uv run dqb compare --results-root results_archive
 
 If a flag is given in both positions, the one after the subcommand wins.
 
+Generated output paths must resolve under the current working directory or the
+system temp directory. To use another scratch root explicitly, set
+`DQB_ALLOWED_OUTPUT_ROOTS=/path/to/scratch` before running `dqb`.
+
 Dendritic runs pass PerforatedAI save names under `PAI/`, so library-created
 checkpoints and sidecars stay in the `PAI/` tree. They also snapshot the
 active PerforatedAI config to

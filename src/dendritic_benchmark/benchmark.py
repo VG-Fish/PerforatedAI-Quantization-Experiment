@@ -256,7 +256,7 @@ class BenchmarkOrchestrator:
             return False
 
         try:
-            state = torch.load(model_path, map_location="cpu", weights_only=False)
+            state = torch.load(model_path, map_location="cpu", weights_only=True)
             model_state = model.state_dict()
             compatible_state = {
                 key: value

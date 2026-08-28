@@ -282,10 +282,26 @@ def _process_model_comparison(
     return retention_row, quant_row, other_quant_row, winner_row, summary_rows, tradeoff_points
 
 
-def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) -> None:
+def write_comparison_reports(
+    records: list[dict[str, Any]],
+    output_dir: Path,
+    model_keys: list[str] | None = None,
+) -> None:
+    """Write cross-model comparison plots and summary.csv to ``output_dir``.
+
+    ``model_keys``, when given, restricts every plot's model axis to that
+    subset (in ``MODEL_SPECS`` order) instead of the full roster — e.g. so a
+    heatmap over a handful of trained models doesn't carry blank rows for
+    every model that was never run.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     baselines = _baseline_lookup(records)
-    model_order = [spec.key for spec in MODEL_SPECS]
+    model_specs = (
+        [spec for spec in MODEL_SPECS if spec.key in set(model_keys)]
+        if model_keys is not None
+        else MODEL_SPECS
+    )
+    model_order = [spec.key for spec in model_specs]
     condition_order = [spec.key for spec in CONDITION_SPECS]
     quantization_groups = [
         ["base_fp32", "dendrites_fp32"],
@@ -332,7 +348,7 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
     heatmap(
         output_dir / "accuracy_retention_heatmap.svg",
         "Accuracy Retention Heatmap",
-        [spec.display_name for spec in MODEL_SPECS],
+        [spec.display_name for spec in model_specs],
         [spec.display_name for spec in CONDITION_SPECS],
         retention_rows,
         subtitle=retention_subtitle,
@@ -348,7 +364,7 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
     grouped_bar_chart(
         output_dir / "dendrite_delta.svg",
         "Dendrite Delta",
-        [spec.display_name for spec in MODEL_SPECS],
+        [spec.display_name for spec in model_specs],
         [
             ("Base FP32", [row[0] for row in retention_rows], "#2b6cb0"),
             ("+Dendrites FP32", [row[6] for row in retention_rows], "#2f855a"),
@@ -358,12 +374,12 @@ def write_comparison_reports(records: list[dict[str, Any]], output_dir: Path) ->
     winner_heatmap(
         output_dir / "best_quantization_heatmap.svg",
         "Best Quantization Level per Domain",
-        [spec.display_name for spec in MODEL_SPECS],
+        [spec.display_name for spec in model_specs],
         ["FP32", "Q8", "Q4", "Q2", "Q1.58", "Q1"],
         best_quant_winners,
         best_quant_rows,
         subtitle="Which variant achieves the best retention per quantization level (%)",
-        metric_labels=[spec.metric_name for spec in MODEL_SPECS],
+        metric_labels=[spec.metric_name for spec in model_specs],
         other_score_matrix=other_quant_rows,
     )
     with (output_dir / "summary.csv").open("w", newline="") as fh:

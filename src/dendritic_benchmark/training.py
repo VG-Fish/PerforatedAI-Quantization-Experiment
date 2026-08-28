@@ -2460,7 +2460,7 @@ def _load_epoch_checkpoint(
     if not path.exists():
         return None
     try:
-        return torch.load(path, map_location="cpu", weights_only=False)
+        return torch.load(path, map_location="cpu", weights_only=True)
     except Exception as exc:
         print(f"[checkpoint] failed to load epoch checkpoint ({exc}); starting from scratch.")
         return None

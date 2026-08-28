@@ -10,26 +10,20 @@ Usage in any script:
 All subsequent print() calls automatically write to both console and log file.
 """
 
-import sys
 from datetime import datetime
 from io import TextIOWrapper
+import os
 from pathlib import Path
+import re
+import sys
+import tempfile
 from typing import IO
 
+OUTPUT_ROOTS_ENV = "DQB_ALLOWED_OUTPUT_ROOTS"
 # Directories a `--logging-dir` / `--results-root` / `--comparison-root` value
-# must never resolve into or under. This tool is routinely invoked by coding
-# agents with CLI arguments that are not typed by a human, so a malformed or
-# adversarial value (e.g. `--logging-dir /` or `--logging-dir /etc`) should
-# fail loudly here rather than silently create directories or write files
-# outside the project. This is deliberately a narrow denylist of OS-critical
-# roots rather than a "must stay under cwd" jail: legitimate runs already
-# point these flags at arbitrary scratch directories (e.g. under /tmp), and
-# blocking that would break real usage for no security benefit.
-#
-# Entries are resolved lazily (not at import time) and compared against the
-# *resolved* candidate path, because several of these are themselves symlinks
-# on macOS (`/etc` -> `/private/etc`, `/tmp` -> `/private/tmp`) — comparing
-# raw strings would silently miss the traversal this exists to catch.
+# must never resolve into or under, even when explicitly listed in
+# DQB_ALLOWED_OUTPUT_ROOTS. Entries are resolved lazily because several are
+# symlinks on macOS (`/etc` -> `/private/etc`, `/tmp` -> `/private/tmp`).
 _DENIED_OUTPUT_ROOT_NAMES = (
     "/bin",
     "/boot",
@@ -50,12 +44,57 @@ _DENIED_WINDOWS_OUTPUT_ROOT_NAMES = (
     "C:\\Program Files",
     "C:\\Program Files (x86)",
 )
+_SAFE_LOG_STEM_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _path_contains(root: Path, candidate: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_denied_output_path(resolved: Path) -> bool:
+    root = Path(resolved.anchor)  # "/" on POSIX, "C:\\" on Windows
+    if resolved == root:
+        return True
+    for name in (*_DENIED_OUTPUT_ROOT_NAMES, *_DENIED_WINDOWS_OUTPUT_ROOT_NAMES):
+        denied = Path(name)
+        if not denied.is_absolute():
+            continue
+        try:
+            denied_resolved = denied.expanduser().resolve(strict=False)
+        except OSError:
+            continue
+        if _path_contains(denied_resolved, resolved):
+            return True
+    return False
+
+
+def _allowed_output_roots() -> tuple[Path, ...]:
+    raw_roots = [Path.cwd(), Path(tempfile.gettempdir())]
+    extra_roots = os.environ.get(OUTPUT_ROOTS_ENV, "")
+    raw_roots.extend(Path(part) for part in extra_roots.split(os.pathsep) if part)
+
+    roots: list[Path] = []
+    for root in raw_roots:
+        resolved = root.expanduser().resolve(strict=False)
+        if _is_denied_output_path(resolved):
+            continue
+        if resolved not in roots:
+            roots.append(resolved)
+    return tuple(roots)
+
+
+def _safe_log_stem(script_name: str) -> str:
+    stem = _SAFE_LOG_STEM_RE.sub("_", script_name).strip("._-")
+    return stem[:80] or "script"
 
 
 def validate_output_path(path: Path, *, label: str) -> Path:
     """
-    Resolve ``path`` and reject it if it lands on or under an OS-critical
-    directory.
+    Resolve ``path`` and reject it if it escapes the configured output roots.
 
     Called before any ``mkdir()``/``open()`` on a path built from CLI
     arguments (``--logging-dir``, ``--results-root``, ``--comparison-root``,
@@ -64,27 +103,20 @@ def validate_output_path(path: Path, *, label: str) -> Path:
     human typing at a terminal. ``label`` is only used to make the error
     message identify which argument was rejected.
     """
-    resolved = path.resolve()
-    root = Path(resolved.anchor)  # "/" on POSIX, "C:\\" on Windows
-    if resolved == root:
+    resolved = path.expanduser().resolve(strict=False)
+    if _is_denied_output_path(resolved):
         raise ValueError(
-            f"{label} resolves to the filesystem root ({resolved!r}). "
-            "Refusing to create or write files there — pass a project-scoped path instead."
+            f"{label} resolves to {resolved!r}, which is not a safe output location. "
+            "Pass a project-scoped path or an explicitly allowed scratch path instead."
         )
-    for name in (*_DENIED_OUTPUT_ROOT_NAMES, *_DENIED_WINDOWS_OUTPUT_ROOT_NAMES):
-        denied = Path(name)
-        if not denied.is_absolute():
-            continue
-        try:
-            denied_resolved = denied.resolve()
-        except OSError:
-            continue  # doesn't exist on this OS (e.g. Windows roots on macOS)
-        if resolved == denied_resolved or denied_resolved in resolved.parents:
-            raise ValueError(
-                f"{label} resolves to {resolved!r}, under the OS-critical "
-                f"directory {denied_resolved!r}. Refusing to create or write "
-                "files there — pass a project-scoped path instead."
-            )
+    allowed_roots = _allowed_output_roots()
+    if not any(_path_contains(root, resolved) for root in allowed_roots):
+        roots = ", ".join(str(root) for root in allowed_roots)
+        raise ValueError(
+            f"{label} resolves to {resolved!r}, outside the allowed output roots "
+            f"({roots}). Use a relative path, a path under the system temp "
+            f"directory, or set {OUTPUT_ROOTS_ENV} to opt in another root."
+        )
     return resolved
 
 
@@ -147,7 +179,7 @@ def setup_logging(
         log_dir = validate_output_path(Path(output_dir), label="output_dir")
         log_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = log_dir / f"{script_name}_{timestamp}.txt"
+        log_path = log_dir / f"{_safe_log_stem(script_name)}_{timestamp}.txt"
 
     # Never overwrite: add numeric suffix if file exists
     if log_path.exists():
@@ -160,12 +192,14 @@ def setup_logging(
             counter += 1
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    _log_file_handle = open(log_path, "w")
+    _log_file_handle = log_path.open("w", encoding="utf-8")
 
-    assert sys.__stdout__ is not None
-    assert sys.__stderr__ is not None
-    sys.stdout = TeeStream(sys.__stdout__, _log_file_handle)  # type: ignore[assignment]
-    sys.stderr = TeeStream(sys.__stderr__, _log_file_handle)  # type: ignore[assignment]
+    original_stdout = sys.__stdout__
+    original_stderr = sys.__stderr__
+    if original_stdout is None or original_stderr is None:
+        raise RuntimeError("Original stdout/stderr streams are unavailable.")
+    sys.stdout = TeeStream(original_stdout, _log_file_handle)  # type: ignore[assignment]
+    sys.stderr = TeeStream(original_stderr, _log_file_handle)  # type: ignore[assignment]
 
     print(f"Log file: {log_path.resolve()}")
 
