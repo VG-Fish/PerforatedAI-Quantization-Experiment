@@ -1067,9 +1067,19 @@ def _calibrate_scale(tensor: Any, qmin: int, qmax: int) -> float:
     flat = tensor.detach().flatten().float()
     sample = flat
     if sample.numel() > _QUANT_CALIBRATION_SAMPLE:
-        idx = torch.randperm(sample.numel(), device=sample.device)
-        sample = sample[idx[:_QUANT_CALIBRATION_SAMPLE]]
-    max_abs = float(sample.abs().max())
+        # Strided, not random. A torch.randperm subsample here draws from the
+        # global RNG, which would make quantization itself nondeterministic --
+        # two runs of the same seeded config could quantize the same weights to
+        # different grids. That was measurable: gcn's q2 moved by one test node
+        # between the recorded value and a recomputation from the same
+        # checkpoint. A fixed stride is reproducible, costs nothing, and for
+        # picking a clip ratio is as representative as a random draw, since
+        # weight order within a flattened tensor carries no relevant structure.
+        step = (sample.numel() + _QUANT_CALIBRATION_SAMPLE - 1) // _QUANT_CALIBRATION_SAMPLE
+        sample = flat[::step]
+    # The clip search runs on the sample, but the grid must still cover the
+    # tensor's true range, so the largest magnitude comes from the full tensor.
+    max_abs = float(flat.abs().max())
     if max_abs == 0:
         return 0.0
     best_scale = max_abs / abs(qmin)

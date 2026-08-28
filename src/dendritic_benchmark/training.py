@@ -107,10 +107,21 @@ class TrainingConfig:
     # 27 of 52 in neuron mode where the counter behaves.  Left alone the phase
     # runs unbounded — 207+ epochs on lstm_autoencoder without ever adding a
     # dendrite, and 198/175/169 on mpnn/tabnet/lstm_forecaster.  Raising PAI's
-    # own pai_improvement_threshold(_raw) does not help (see compat.py).  The
-    # longest healthy phase measured is 37 epochs (textcnn), so 50 clears every
-    # real one while capping the stalls.  0 disables the guard.
-    max_dendrite_phase_epochs: int = 50
+    # own pai_improvement_threshold(_raw) does not help (see compat.py).
+    #
+    # Lowered 50 -> 8 on 2026-08-28.  At 50 this guard could never fire at all:
+    # a dendrite phase freezes validation bit-for-bit by construction (the parent
+    # net is frozen and the candidates are not wired into the output yet), so
+    # _training_collapsed tripped at _COLLAPSE_GUARD_EPOCHS = 12 and killed the
+    # run 38 epochs before the ceiling was reached.  Across the 2026-08-28 seed-0
+    # run that cost six of seven models their entire dendrite schedule -- mpnn
+    # stopped at 24 epochs against its base arm's 200, having never switched a
+    # single dendrite in -- and "Forcing the switch" has never once appeared in
+    # any log.  8 sits above the longest phase that has ever ended on its own
+    # (3 epochs, gcn, the one model that did complete) and below the collapse
+    # guard, so the forced switch happens while the run is still alive.
+    # 0 disables the guard.
+    max_dendrite_phase_epochs: int = 8
 
 
 @dataclass
@@ -3009,6 +3020,7 @@ def _record_epoch_result(
     history_row["pai_dendrite_updates_frozen"] = pai_status.frozen
     history_row["pai_restructured"] = False
     history_row["pai_training_complete"] = False
+    history_row["pai_dendrite_phase"] = False
     return history_row, val_metric
 
 
@@ -3041,6 +3053,12 @@ def _apply_pai_epoch_update(
 ) -> tuple[Any, Any | None, bool]:
     if not pai_status.active:
         return optimizer, pai_tracker, False
+    # Read before add_validation_score, so the flag describes the phase this
+    # epoch's train and validation passes actually ran under rather than the one
+    # the tracker moves to as a result of them.  _training_collapsed keys off it.
+    history_row["pai_dendrite_phase"] = (
+        _pai_dendrite_phase_epochs(pai_tracker) is not None
+    )
     optimizer, pai_tracker, restructured, training_complete = _run_active_pai_update(
         context=context, optimizer=optimizer, pai_tracker=pai_tracker,
         val_metric=val_metric,
@@ -3100,12 +3118,22 @@ def _training_collapsed(state: EpochTrainingState, metric_direction: str) -> boo
 
     Requiring the frozen value to be *worse* than ``best_metric`` keeps a
     genuinely converged run, whose frozen value is its best, from tripping this.
+
+    Epochs inside a PAI dendrite ("p") phase are exempt.  During that phase the
+    parent network is frozen and the candidate dendrites are not yet wired into
+    the output, so identical validation is the *expected* signature, not a dead
+    network -- the two are indistinguishable from the metric alone.  Without
+    this exemption the guard fired on six of seven models in the 2026-08-28
+    run and truncated every one of them mid-phase.  ``max_dendrite_phase_epochs``
+    (8) bounds the phase well inside this window, so exempting these epochs
+    cannot let a genuinely stuck run train forever.
     """
     if len(state.history) < _COLLAPSE_GUARD_EPOCHS:
         return False
-    recent = [
-        float(row["val_metric"]) for row in state.history[-_COLLAPSE_GUARD_EPOCHS:]
-    ]
+    window = state.history[-_COLLAPSE_GUARD_EPOCHS:]
+    if any(row.get("pai_dendrite_phase") for row in window):
+        return False
+    recent = [float(row["val_metric"]) for row in window]
     frozen_metric = recent[0]
     if any(metric != frozen_metric for metric in recent[1:]):
         return False

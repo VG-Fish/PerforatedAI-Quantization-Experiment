@@ -18,10 +18,16 @@ Status at a glance:
 | 5 | `actor_critic`/`m5` ship a phantom randomly-initialized dendrite in every `dendrites_q*` arm | yes — `_split_compatible_state` only checks one direction | **yes** — see §5 |
 | 6 | `q1`/`q1_58` had **no scale factor at all**; `q4`/`q8` calibrated on outliers | yes — `compat.py` kernel math | **yes** — see §6 |
 | 7 | run-to-run variance (3.4pp) exceeds the effect being measured (0.3pp) | yes — nothing was seeded | **partly** — `--seed` added, but error bars still need multiple seeds, see §7 |
+| 8 | the collapse guard killed 6 of 7 dendritic runs mid-dendrite-phase; **no model ever added a dendrite** | yes — a dendrite phase freezes validation by construction, and the rescue path was unreachable | **yes** — see §8 |
 
 **Anything measured at `q1`, `q1_58`, `q2`, or `q4` before 2026-08-28 is invalid**
 (§6), and every `dendrites_q*` number for `actor_critic` and `m5` in `dynamic7` is
 invalid independently of that (§5). A full rerun is required; see §7.
+
+**Superseding all of the above: every `dendrites_*` number produced before the §8
+fix is invalid**, at every bit width. Those arms trained for a fraction of their
+base arm's epochs and never received a working dendrite, so they do not measure
+dendrites at all. `base_*` columns are unaffected. See §8.
 
 ---
 
@@ -757,3 +763,194 @@ swings; what remains is nondeterministic reduction order, worth far less than th
 seeded run still cannot tell you whether `lenet5`'s +0.15pp is signal. Error bars
 need several seeds — `config/run_dynamic7.sh` reads `SEED` from the environment
 for exactly this, at ~28 min per replicate for the 5-model set.
+
+---
+
+## 8. The collapse guard killed six of seven dendritic runs mid-dendrite-phase
+
+**Found:** 2026-08-28, investigating why `mpnn`'s dendritic arm was *worse* than its
+base arm at fp32 (RMSE 0.7921 vs 0.7162, and RMSE is minimize — so the dendrites
+genuinely lost).
+
+**Where:** `src/dendritic_benchmark/training.py` — `_training_collapsed`
+(`_COLLAPSE_GUARD_EPOCHS = 12`) and `TrainingConfig.max_dendrite_phase_epochs`.
+
+### The observation
+
+`mpnn`'s two arms did not get the same amount of training:
+
+| arm | epochs | best epoch | test RMSE ↓ |
+|---|---|---|---|
+| `base_fp32` | **200** | 180 | **0.7162** |
+| `dendrites_fp32` | **24** | 3 | 0.7921 |
+
+The dendritic arm stopped after 24 epochs. Epochs 13–24 have a validation metric
+that is *bit-identical* — `0.8645049929618835`, twelve times, across **every**
+`val_*` column (loss, MAE, MAPE, R², max_error, …) — while every `train_*` column
+kept moving. And the frozen value is exactly epoch 2's.
+
+### Root cause
+
+PAI switched to dendrite mode at epoch 12 (`Returning True - History and last
+improved is hit`, then `Module … calling set mode p` for all 21 wrapped modules).
+**In mode `p` the parent network is frozen and the candidate dendrites are not yet
+wired into the output**, so the network's predictions cannot change: a bit-frozen
+validation metric is the *expected, healthy* signature of a dendrite phase, not a
+symptom of anything.
+
+`_training_collapsed` cannot tell that apart from a dead network. It was written for
+the 2026-07-29 DistilBERT divergence (constant majority-class output for 39 epochs)
+and fires on any 12 consecutive identical validation values that are worse than the
+best seen. A dendrite phase is exactly that. So at epoch 24 it fired:
+
+```
+[collapse] mpnn | dendrites_fp32: validation RMSE frozen at 0.864505 for 12 epochs,
+worse than the best 0.751856 from epoch 4 — stopping this condition rather than
+training a dead network.
+```
+
+The guard against this already existed and **could never fire**:
+`max_dendrite_phase_epochs = 50` forces a switch once a phase overruns, but the
+collapse guard trips at 12. 12 < 50, so the run was always killed 38 epochs before
+the rescue. `grep -c "Forcing the switch"` across every log in the repo returns
+**0** — the path had never once executed.
+
+### Why PAI never left mode `p` on its own
+
+PAI leaves the phase when no node's correlation has improved for
+`p_epochs_to_switch` (2) epochs. With `running_average_pb = True` and
+`history_lookback = 8`, the comparison is against an EMA. Feeding an EMA a constant
+makes it converge *asymptotically* — improving by a smaller but always non-zero
+amount every epoch — so the patience counter resets forever. The logs show it
+directly: `last improved epoch` equals `epoch` on every single mode-`p` check.
+This is the same mechanism already recorded for HISTORY mode in `compat.py`
+(~line 257) and measured there at 91 of 92 dendrite-mode switch checks.
+
+### Scope — this is not an `mpnn` bug
+
+Counting restructure events in each run's own `history.csv` (the per-run record;
+the `results/PAI/*/…param_counts.csv` and `…switch_epochs.csv` files are **not**
+usable for this — PAI's save directory is never cleared between runs, so those
+files carry switch epochs from earlier launches that contradict the current one):
+
+| model | base epochs | dendrite epochs | restructures | frozen tail | outcome |
+|---|---|---|---|---|---|
+| `mpnn` | 200 | **24** | 1 (ep 12) | 12 | collapse-killed in first phase |
+| `vae_mnist` | 50 | **24** | 1 (ep 12) | 12 | collapse-killed in first phase |
+| `tcn_forecaster` | 80 | **24** | 1 (ep 12) | 12 | collapse-killed in first phase |
+| `saint_adult` | 200 | **61** | 1 (ep 49) | 12 | collapse-killed in first phase |
+| `actor_critic` | 60 | 60 | 1 (ep 58) | 4 | ran out of epochs mid-phase |
+| `gcn` | 200 | 121 | 9 | 2 | **completed** — 4 full cycles, `pai_training_complete` |
+| `lenet5` | 40 | 40 | 0 | 12 | collapse-killed, but **not** in a dendrite phase |
+
+Five of seven entered their first dendrite phase and never escaped it, so they
+never completed a single dendrite cycle. `gcn` is the only model that escaped mode
+`p` unaided, and its phases lasted 3 epochs each (switches at 50→53, 72→75, 93→96,
+107→110) — the only measurement of a self-terminating dendrite phase in the suite.
+
+`lenet5` is a different case and the fix does not address it: it never switched at
+all in 40 epochs, so its frozen validation (0.9912 accuracy, 12 epochs) is an
+ordinary plateau on a small validation split, which is what the guard is *for*.
+
+**Do not read `results/<model>/<cond>/paramCounts.csv` as a growth curve.** It is
+written after training by repeating the single final `param_count` once per history
+row (`training.py` ~line 1455), so it is flat by construction and says nothing about
+when dendrites were added. An earlier draft of this section drew the wrong
+conclusion from it.
+
+### Fix
+
+1. **`max_dendrite_phase_epochs: 50 → 8`.** Above the longest phase that has ever
+   ended on its own (3, `gcn`) and below `_COLLAPSE_GUARD_EPOCHS`, so the forced
+   switch now happens while the run is still alive.
+2. **`_training_collapsed` exempts dendrite-phase epochs.** A new per-epoch
+   `pai_dendrite_phase` flag is recorded in `history_row` (read from the tracker
+   *before* `add_validation_score`, so it describes the phase the epoch actually ran
+   under) and written to `history.csv`. The guard skips any window containing one.
+
+The two together are what makes this safe. Dynamic runs iterate `itertools.count()`
+— **unbounded** — and until now the collapse guard was the only thing stopping a
+stuck run, so exempting those epochs on its own would have traded a truncated run
+for an infinite one. Fix 1 bounds the phase, which restores termination; fix 2 then
+stops the guard misfiring during the bounded phase.
+
+### Verified
+
+`mpnn dendrites_fp32` re-run from scratch at `--seed 0` with the fix
+(`results/_fixverify`):
+
+| | epochs | restructures | forced switches | collapses | test RMSE ↓ |
+|---|---|---|---|---|---|
+| before | 24 | 1 | 0 | 1 | 0.7921 |
+| after | **50** | **5** (ep 12, 20, 31, 39, 50) | **2** (both at the 8-epoch limit) | **0** | **0.6976** |
+| `base_fp32` | 200 | — | — | — | 0.7162 |
+
+The phase structure is now visible in `history.csv`: epochs 13–20 and 32–39 carry
+`pai_dendrite_phase=True` with validation frozen at 0.8645 (exempted, as intended),
+and validation resumes moving at epochs 21 and 40 once the dendrite is switched in.
+PAI reached `pai_training_complete` at epoch 50 instead of never.
+
+**This does not mean dendrites help `mpnn`.** Its best validation epoch is still
+epoch 3 — before any dendrite existed — across all 50 epochs, and PAI's own stop
+reason is `noImprove`. The kept model's `num_cycles` is 0 with all
+`dendrite_values.*.initialized` at zero, i.e. PAI tried two dendrites, neither
+improved validation, and it discarded both (`retain_all_dendrites=False`). The
+0.6976 is a 50-epoch network whose dendrites were rejected, beating a 200-epoch
+base arm — which is a variance result, not a dendrite result. What the fix buys is
+that the question can now be *asked*; the answer for `mpnn` is still "no".
+
+Note also that the two arms are compared at different epoch counts by design
+(`train_dendrites_until_complete` runs the dendritic arm until PAI finishes, 50
+epochs here, versus the base arm's fixed 200). For a model like `mpnn`, whose base
+arm's best epoch is 180, that asymmetry is a real confound independent of this bug.
+
+### What this invalidates
+
+**Every `dendrites_*` number in the 2026-08-28 seed-0 run except `gcn`'s.** Not
+because they are mismeasured, but because they do not measure what the column
+claims: five of the seven dendritic arms trained for a fraction of their base arm's
+epochs and never completed a single dendrite cycle, and `actor_critic` was cut off
+mid-phase. `mpnn`'s "dendrites are worse" is 24 epochs versus 200. `lenet5`'s
+"+26pp at q2" is a 40-epoch model that never switched at all. Since the `q*` arms
+all load the `dendrites_fp32` checkpoint, the whole dendritic half of the grid
+inherits this. It is a larger invalidation than §5 or §6 and requires a rerun of
+all dendritic conditions.
+
+`gcn` is the one dendritic arm whose mechanism ran to completion, and it is the one
+the model-selection notes in `experiments/dynamic7/config/run_dynamic7.sh` demoted
+to a smoke test for its 3.4pp noise floor (§7).
+
+`base_*` columns are unaffected — they never enter this path.
+
+---
+
+## 9. `actor_critic dendrites_fp32` — `history.csv` undercounts the real run (open)
+
+**Found:** 2026-08-28, while re-checking each stuck model's raw log against §8's table.
+
+`results/actor_critic/dendrites_fp32/history.csv` has exactly 60 rows, one
+`pai_restructured=True` at epoch 58, and no collapse — read at face value this
+looked like "ran out of its epoch budget 2 epochs into the dendrite phase," and
+that is what got reported. It's wrong. The worker log for the same run
+(`logs2/streams/stream_4.log`, `13:11:03`–`13:18:21`) shows continuous epoch
+numbering to at least 101 (`Checking PAI switch ... total epochs 100, ... num_cycles:
+4`), i.e. the run added dendrites across (at least) 4 cycles and kept training
+well past epoch 60. `record.json`'s `best_epoch=117` is consistent with the log,
+not the CSV. There is no `[collapse]` message for this run anywhere in the logs —
+it ended in a plain `[done]`, so it was not cut short by §8's bug.
+
+File mtimes rule out a stale leftover file: `history.csv`, `record.json`, and
+`model.pt` all carry the same timestamp as the `[done]` line. So something in the
+write path is handed (or builds) a `history` list shorter than what
+`_run_training_epochs` actually accumulated, while the model/metrics values used
+for `record.json` come from the live final model and are unaffected. `60` matches
+`TrainingConfig.max_epochs` for actor_critic's *base* recipe, which is suspicious —
+possibly the dendritic write path is (somewhere) capped at the recipe's nominal
+epoch budget even though the run itself is unbounded
+(`train_dendrites_until_complete=True`, `itertools.count()`).
+
+**Not yet root-caused.** Flagging so it isn't mistaken for §8 (this run never
+collapsed) and so `history.csv` isn't trusted for epoch-count diagnosis on this
+model until it's fixed. `mpnn`, `vae_mnist`, `saint_adult`, and `tcn_forecaster`
+were individually checked against their raw logs and do not show this — their
+`history.csv` row counts match the collapse point exactly.
