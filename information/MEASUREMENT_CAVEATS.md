@@ -10,7 +10,7 @@ Status at a glance:
 
 | # | caveat | root cause found | fix applied |
 |---|---|---|---|
-| 1 | `q2` collapses to 3 knife-edge levels | yes — `compat.py` kernel math | **not yet** — semantic decision, see §1 |
+| 1 | `q2` collapses to 3 knife-edge levels | yes — `compat.py` kernel math | **yes** — user chose "fix it properly", see §1 |
 | 2 | `tcn_forecaster` `q1`/`q1_58` overflow to ~1e9–1e10 | yes — architecture-specific | **moot** — model is being dropped, see §2 |
 | 3 | `dendrites_fp32` vs `dendrites_q*` param-count mismatch | yes — two independent, unsynchronized checkpoint systems | **yes** — see §3 |
 
@@ -51,32 +51,51 @@ edge case:
   network actually is. `q4` doesn't have this problem: `levels // 2 = 7`, so the scale
   is `max_abs / 7`, an order of magnitude less sensitive to any one weight.
 
-**Fix options** (mutually compatible, can do both):
+**Fix chosen and implemented** (user chose "fix it properly" — both of the two
+options below, applied together, `bit_width == 2` only):
 
-- **(a) Make it actually 2-bit.** Use `levels = 2**bit_width` and the standard signed
-  mid-tread scheme: `qmax = 2**(bit_width-1) - 1`, `qmin = -2**(bit_width-1)`,
-  `scale = max_abs / qmax`. At `bit_width=2` this gives 4 real levels
-  `{-2,-1,0,1}·scale`. Changes `q2`'s bit-count claim from misleading to accurate, but
-  does **not** by itself fix the outlier sensitivity — `qmax` is still 1, so
-  `scale = max_abs` unchanged.
-- **(b) Base the scale on a robust statistic**, matching what `q1_58` already does:
-  replace `max_abs` with something like `tensor.std(unbiased=False) * k` (k tuned so
-  typical weight distributions don't clip too aggressively) or a high percentile
-  (e.g. 99.9th) of `|w|` instead of the true max. Fixes the knife-edge sensitivity
-  independent of level count.
-- **Recommended: do both.** Four real levels *and* a percentile/std-based scale. This
-  is what would need deciding: exact `k`/percentile, and whether to keep
-  `symmetric_quantize_tensor` as one function parameterized by bit width (risk:
-  quietly changes `q4`/`q8` if the refactor isn't careful) or split `q2` into its own
-  kernel (risk: another special case to maintain).
+- **(a) Make it actually 2-bit.** `qmax = 1`, `qmin = -2` — the standard signed
+  integer range (`{-2,-1,0,1}`, matching two's-complement int2). Real 4 levels
+  instead of 3.
+- **(b) Base the scale on a robust statistic instead of the true max.** Scale is now
+  `tensor.abs().float().quantile(0.999) / qmax` — the 99.9th percentile of `|w|`, not
+  `tensor.abs().max()`. A single outlier weight can still get clamped to the extreme
+  level, but it can no longer set the scale for the entire tensor.
 
-**Why not fixed here:** every stored `q2` result across `top10` and `dynamic5`
-was produced by the current kernel. Changing the formula makes `q2` numbers
-incomparable with every existing record — a semantic change, not a bugfix, since the
-kernel does exactly what it's written to do; it's just a bad quantizer design. This is
-the one open decision before the 7-model run — see the question asked in this
-session about whether to fix it now (new experiment = clean version boundary) or
-carry it forward unfixed like `dynamic5` did.
+```python
+if bit_width == 2:
+    qmax = 1
+    robust_max = tensor.abs().float().quantile(0.999)
+    if robust_max == 0:
+        return tensor.clone()
+    scale = robust_max / qmax
+    return torch.clamp(torch.round(tensor / scale), -2, qmax) * scale
+```
+
+`bit_width` 4 and 8 are **untouched** — same formula, verified byte-identical output
+(`torch.equal` on 10k-element random tensors). Their level counts (15, 255) were
+never knife-edge-fragile the way 3 was, so there was nothing to fix there, and
+changing them would have broken comparability with every stored `q4`/`q8` result for
+no measured benefit.
+
+**Verified** (synthetic tensors, not yet against a re-run model):
+- Level count: up to 4 distinct outputs at `bit_width=2` (was ≤3).
+- Outlier robustness: two "statistically identical" distributions differing only in
+  their single largest weight (replicating the `top10`/`dynamic5` `lenet5`
+  `max|w|=0.4799` vs `0.3487` case) now produce **identical** survival fractions
+  (ratio 1.00×, was ~3.5×).
+- A true outlier (5.0, vs. a background std of 0.02) now gets clamped to the `-2`
+  level instead of setting `scale = 5.0` and crushing the rest of the tensor to 0.
+- Edge cases (all-zero, single-element, all-negative, 4-element bias tensor) all
+  still return finite, correctly-shaped output.
+- `q4`/`q8` outputs unchanged (`torch.equal` true against the pre-fix formula).
+
+**Consequence, stated plainly:** every stored `q2` number in `top10` and `dynamic5`
+is now produced by a different kernel than the 7-model run will use. `q2` results
+from before this fix and after it are **not comparable** — this was the tradeoff the
+user explicitly accepted in choosing to fix it now, on the reasoning that a new
+7-model experiment is a clean version boundary to absorb that break rather than
+carrying the flawed kernel forward again.
 
 ---
 

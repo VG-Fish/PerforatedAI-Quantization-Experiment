@@ -986,6 +986,30 @@ def symmetric_quantize_tensor(tensor: Any, bit_width: int) -> Any:
         return tensor.clone()
     if bit_width <= 1:
         return tensor.sign().clamp(min=-1, max=1)
+    if bit_width == 2:
+        # The general scheme below (2**bit_width - 1 levels) degenerates here:
+        # levels = 3, levels // 2 == 1 (integer division), so scale == max_abs
+        # exactly and the kernel collapses to {-max_abs, 0, +max_abs} -- three
+        # levels (really ternary, not 2-bit) with the entire grid set by
+        # whichever single weight happens to be largest. Two runs with
+        # statistically identical weight distributions measured retained-
+        # weight fractions of 2.83% vs 9.92% and scores of 0.9588 vs 0.2916
+        # purely from that one weight moving. See
+        # information/MEASUREMENT_CAVEATS.md #1. Use a real signed 4-level
+        # grid ({-2,-1,0,1}, matching the standard qmin=-2**(b-1),
+        # qmax=2**(b-1)-1 integer scheme) and scale off the 99.9th percentile
+        # of |w| rather than the true max, so one outlier can no longer set
+        # the whole grid. bit_width 4 and 8 are untouched (odd level counts of
+        # 15/255 are already both real level counts and stable against
+        # outliers, so this branch is intentionally 2-bit-only -- changing it
+        # for 4/8-bit would break comparability with every stored q4/q8
+        # result for no measured benefit).
+        qmax = 1
+        robust_max = tensor.abs().float().quantile(0.999)
+        if robust_max == 0:
+            return tensor.clone()
+        scale = robust_max / qmax
+        return torch.clamp(torch.round(tensor / scale), -2, qmax) * scale
     levels = 2**bit_width - 1
     max_abs = tensor.abs().max()
     if max_abs == 0:
