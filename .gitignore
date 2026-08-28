@@ -26,3 +26,4 @@ PAI Skills/
 logs*/
 .ruff_cache/
 archive/
+experiments/
