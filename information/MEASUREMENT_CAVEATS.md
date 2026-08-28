@@ -4,17 +4,23 @@ Three measurement caveats were recorded (without being fixed) during the `dynami
 run — see `experiments/dynamic5/reference/BENCHMARKS.md` §"The quantization kernels"
 and `experiments/dynamic5/report.md` §6.6. This document traces each one to the
 exact code responsible and lays out fix options. Line numbers are current as of
-commit `675105a` (branch `dynamic5-baselines`). A 4th caveat (§4) was found live
+commit `675105a` (branch `dynamic5-baselines`). Caveats §4 and §5 were found live
 during the `dynamic7` run itself, on 2026-08-28.
 
 Status at a glance:
 
 | # | caveat | root cause found | fix applied |
 |---|---|---|---|
-| 1 | `q2` collapses to 3 knife-edge levels | yes — `compat.py` kernel math | **yes** — user chose "fix it properly", see §1 |
-| 2 | `tcn_forecaster` `q1`/`q1_58` overflow to ~1e9–1e10 | yes — architecture-specific | **moot** — model is being dropped, see §2 |
+| 1 | `q2` collapses to 3 knife-edge levels | yes — `compat.py` kernel math | **yes** — superseded by §6's MSE-optimal calibration, see §1 |
+| 2 | `tcn_forecaster` `q1`/`q1_58` overflow to ~1e9–1e10 | **superseded** — was blamed on architecture; the real cause was a missing scale factor, see §6 | **yes, via §6** — original diagnosis and prediction both corrected in §2 |
 | 3 | `dendrites_fp32` vs `dendrites_q*` param-count mismatch | yes — two independent, unsynchronized checkpoint systems | **yes** — see §3 |
-| 4 | `gcn/dendrites_q8` transient checkpoint-reconstruction crash | partial — mechanism guarded, exact race not confirmed | **no** — self-healed by a manual relaunch this run, see §4 |
+| 4 | `gcn/dendrites_q8` transient checkpoint-reconstruction crash | partial — mechanism guarded, exact race not confirmed | **yes, via §5** — the "transient" framing was wrong, see §5 |
+| 5 | `actor_critic`/`m5` ship a phantom randomly-initialized dendrite in every `dendrites_q*` arm | yes — `_split_compatible_state` only checks one direction | **yes** — see §5 |
+| 6 | `q1`/`q1_58` had **no scale factor at all**; `q4`/`q8` calibrated on outliers | yes — `compat.py` kernel math | **yes** — see §6 |
+
+**Anything measured at `q1`, `q1_58`, `q2`, or `q4` before 2026-08-28 is invalid**
+(§6), and every `dendrites_q*` number for `actor_critic` and `m5` in `dynamic7` is
+invalid independently of that (§5). A full rerun is required; see §7.
 
 ---
 
@@ -105,7 +111,38 @@ carrying the flawed kernel forward again.
 
 ---
 
-## 2. `tcn_forecaster` overflows at `q1`/`q1_58` — moot, model is being dropped
+## 2. `tcn_forecaster` overflows at `q1`/`q1_58` — ~~moot, model is being dropped~~
+
+> **CORRECTED 2026-08-28. Both the diagnosis and the prediction below are wrong.**
+>
+> The section reasons that binary/ternary quantization "pins every weight to
+> `±scale`", making the overflow an inherent consequence of `tcn_forecaster`'s
+> depth. It was not. `binary_quantize_tensor` and `ternary_quantize_tensor`
+> carried **no scale factor at all** — they returned a bare `{-1, 0, +1}`
+> indicator, so a layer trained to `std ≈ 0.005` came back with every surviving
+> weight at magnitude exactly `1.0`. The `sqrt(fan_in)` gain argument is real,
+> but it was compounding on top of a ~200x amplification that should never have
+> been there. Depth determined *which* model exploded first, not *whether* one
+> would. See §6 for the kernel and the fix.
+>
+> The prediction — "none of `textcnn`, `m5`, or `mpnn` have the specific
+> combination that broke `tcn_forecaster`, so this is not expected to recur" —
+> was falsified by the `dynamic7` data for two of those three models:
+>
+> | model | fp32 | `q1_58` | `q1` | |
+> |---|---|---|---|---|
+> | `mpnn` (RMSE ↓) | 0.7204 | **617.0** | **1030.7** | same overflow, ~7 orders smaller than `tcn_forecaster` only because it is 4 layers deep, not 10 |
+> | `m5` (Acc ↑) | 0.9360 | 0.1135 | 0.0822 | collapsed to 12-class chance (≈0.083) rather than overflowing |
+> | `textcnn` (Acc ↑) | 0.9162 | 0.8538 | 0.8445 | genuinely graceful — the one case the prediction got right |
+>
+> The section's closing instruction was right in spirit and wrong in remedy: it
+> proposed working *around* the blow-up (drop the conditions, clamp the output,
+> clip per layer). The correct remedy was to fix the kernel, which makes all
+> three workarounds unnecessary. Its final sentence — "it should be checked once
+> real `q1`/`q1_58` numbers come back, not assumed" — is the part that held up,
+> and is why this was caught.
+>
+> Original text preserved below for the record.
 
 **Where:** interaction between `TCNForecaster` (`models.py` ~line 947) and
 `binary_quantize_tensor`/`ternary_quantize_tensor` (`compat.py` ~line 990-1005).
@@ -371,3 +408,327 @@ reconstruction.
   run --detach` semantics, or a terminal that was closed) or crashed itself — if
   the latter, the watcher's own crash resilience needs the same kind of scrutiny
   applied to the workers it supervises.
+
+---
+
+## 5. `actor_critic` and `m5` shipped a phantom, randomly-initialized dendrite in every `dendrites_q*` arm
+
+**Found:** 2026-08-28, while analyzing the partial `dynamic7` results.
+**Status: fixed.** This also supersedes §4's "transient" framing — see the end of
+this section.
+
+### Symptom
+
+Six of the seven `dynamic7` models agree on `param_count` between their FP32
+dendritic arm and their five quantized dendritic arms. Two do not:
+
+| model | `dendrites_fp32` | `dendrites_q*` | |
+|---|---|---|---|
+| `gcn` | 369,066 | 369,066 | consistent |
+| `lenet5` | 185,354 | 185,354 | consistent |
+| `saint_adult` | 299,266 | 299,266 | consistent |
+| `mpnn` | 1,427,336 | 1,427,336 | consistent |
+| **`actor_critic`** | **52,617** | **71,059** | **+35%** |
+| **`m5`** | **50,456** | **75,696** | **+50%** |
+
+This is the same *symptom* as §3, but §3's fix does not cover it and its guard
+does not catch it. §3 fixed the case where the source checkpoint has tensors the
+target cannot accept. This is the mirror case: the target has tensors the source
+never supplies.
+
+### Root cause
+
+`pipeline.py::_split_compatible_state` iterated the **source** state dict only:
+
+```python
+for key, value in state.items():        # source keys only
+    current_value = current_state.get(key)
+    if not _is_compatible_state_value(current_value, value):
+        skipped.append(key)
+        continue
+    compatible_state[key] = value
+```
+
+A target parameter absent from `state` is never visited, so it is never reported.
+`_load_compatible_state` then calls `load_state_dict(compatible_state,
+strict=False)` — and `strict=False` is exactly the flag that makes missing keys
+silent. Those parameters keep whatever `perforate_model` / `load_pai_system`
+initialized them to. They are then quantized and scored as if trained.
+
+Dumping the actual tensors confirms it. `actor_critic`'s quantized arms carry a
+complete second dendrite that its FP32 arm does not have:
+
+```
+only in dendrites_q4, per perforated layer:
+  backbone.0.dendrite_module.layers.1.{weight,bias}      <- second dendrite
+  backbone.0.dendrite_module.dendrites_to_candidates.0   <- candidate wiring
+  backbone.0.dendrite_module.dendrites_to_dendrites.{0,1}
+  backbone.0.dendrites_to_top.1
+```
+
+and `layers.1.weight` has `std = 0.00501` against the trained `layers.0.weight`'s
+`std = 0.00491` — an untrained draw from the same initializer, not a trained
+weight. `m5`'s case is worse: its FP32 arm has the dendrite *bookkeeping buffers*
+(`dendrite_values.0.*`) but **no dendrite weights at all**, while its quantized
+arms have a full `layers.0` + `dendrites_to_top.0`. The two arms are not the same
+model with different precision; they are different architectures.
+
+### Why the structures diverged
+
+Two checkpoints are written at different points and were assumed to agree:
+
+- `model.pt` — written from the model as it stands after the best-epoch restore
+  decision (`training.py`, the `if best_state is not None:` block) and before
+  quantization. This is what supplies the **weights**.
+- the `PAI_RESUME_NAME` snapshot — written *inside* the epoch loop by
+  `_save_pai_resume_state`. This is what supplies the **structure**.
+
+If the final epoch added a candidate dendrite, or the best-state restore declined
+a structure change (which §3's Fix A makes it do deliberately), the two describe
+different architectures. Whichever way they differ decides the failure mode:
+
+- snapshot has **fewer** tensors than `model.pt` → §3's guard fires, the run
+  crashes loudly. This is what happened to `gcn` in §4.
+- snapshot has **more** tensors → nothing fires, the extras stay at init, and a
+  plausible-looking wrong number is written to `record.json`.
+
+So §4 and §5 are the same bug seen from opposite sides. **§4's "transient"
+framing was wrong**: the `gcn` crash was not a race, and the manual relaunch did
+not "self-heal" it — the relaunch simply resumed from a point where the two
+checkpoints happened to agree. Nothing about it was nondeterministic. The open
+question §4 recorded ("identical unmodified on-disk files failed once then
+succeeded once") is answered: the files were not the inputs that differed; the
+in-memory PAI structure at snapshot time was.
+
+### Fix implemented
+
+Pin the structure to the artifact rather than to the epoch loop.
+
+1. **`compat.py`** — new `PAI_ARTIFACT_NAME = "dqb_artifact"` snapshot name.
+2. **`training.py`** — immediately after the best-epoch restore decision and
+   before any quantization, i.e. at the one instant that is guaranteed to
+   describe `model.pt`:
+   ```python
+   if use_dendrites and config.pai_save_name:
+       save_pai_system(_unwrap_compiled(model), config.pai_save_name, PAI_ARTIFACT_NAME)
+   ```
+3. **`pipeline.py::_source_pai_checkpoint_name`** — prefer `PAI_ARTIFACT_NAME`
+   ahead of `PAI_RESUME_NAME`, `"latest"`, `"best_model"`, `"final_clean_pai"`,
+   and the `switch_N` fallback. Older results without the new snapshot fall
+   through to the existing chain unchanged.
+4. **`pipeline.py::_split_compatible_state`** — report mismatches in **both**
+   directions, so a target key the source never supplies is an error rather than
+   an invisible default:
+   ```python
+   for key in current_state:
+       if _is_ignorable_state_key(key) or key in state:
+           continue
+       skipped.append(key)
+   ```
+5. **`pipeline.py::_load_compatible_state`** — the raised error now separates the
+   two directions ("N target tensor(s) the source never supplies (would stay at
+   init: ...)" vs "N shape mismatch(es)"), because the remedies differ.
+
+(1)–(3) make the structures agree by construction; (4)–(5) are the guard for when
+something still gets them out of step. Both are needed: a guard alone would turn
+these two models from silently-wrong into loudly-failing, which is better but
+still not a result.
+
+### Verification
+
+A full 12-condition `gcn` run on the fixed code, in a scratch results root,
+happened to reproduce the exact triggering condition — the log contains:
+
+```
+[state] best-epoch structure does not match the final trained structure (a
+dendrite was likely added after the best epoch) -- keeping the final model
+instead of a partial restore.
+```
+
+That is §3's Fix A declining a hybrid restore, which is precisely what used to
+leave the PAI snapshot describing a structure `model.pt` never had. On the fixed
+code all six dendritic conditions came back at an identical **461,652**
+parameters, and `dqb_artifact.pt` was written for each. Under the old code this
+same sequence produced either §4's crash or §5's phantom dendrite.
+
+### Scope of invalidated data
+
+Every `dendrites_q8`/`q4`/`q2`/`q1_58`/`q1` record for **`actor_critic`** and
+**`m5`** in `dynamic7`, and any earlier run whose `dendrites_q*` `param_count`
+disagrees with its own `dendrites_fp32`. The FP32 dendritic arms are unaffected —
+`model.pt` was always self-consistent; only the reconstruction was wrong.
+
+This is not a rounding-level effect. It plausibly accounts for most of the
+"dendrites degrade worse under quantization" signal in the partial results: the
+two phantom-dendrite models are also the two with by far the worst quantization
+retention at `q4` (`actor_critic` −0.094, `m5` −0.231 relative to their own
+baselines), while the four structurally-consistent models sit within ±0.02 of
+zero. That correlation is exactly what this bug predicts, and it means the
+headline comparison could not be read off the current data even if §6 had not
+also been true.
+
+---
+
+## 6. `q1`/`q1_58` had no scale factor; `q4`/`q8` were calibrated on outliers
+
+**Found:** 2026-08-28. **Status: fixed.** This is the root cause behind §2 and
+subsumes §1.
+
+### The `q1`/`q1_58` defect
+
+```python
+def ternary_quantize_tensor(tensor):
+    threshold = tensor.std(unbiased=False) * 0.5
+    pos = (tensor > threshold).to(tensor.dtype)
+    neg = (tensor < -threshold).to(tensor.dtype)
+    return pos - neg                      # <- returns {-1, 0, +1}. No scale.
+
+def binary_quantize_tensor(tensor):
+    return torch.where(tensor >= 0, torch.ones_like(tensor), -torch.ones_like(tensor))
+                                          # <- returns {-1, +1}. No scale.
+```
+
+Both return bare sign indicators. A layer whose weights have `std ≈ 0.005` comes
+back with every weight at magnitude `1.0` — roughly 200x amplification, per
+layer, compounding multiplicatively with depth. This is not "aggressive
+quantization"; the quantized network is not an approximation of the trained one
+at all. Published binary/ternary schemes all carry a per-tensor scale precisely
+to prevent this: XNOR-Net uses `α = mean(|W|)`, BitNet b1.58 uses the same
+absmean scale.
+
+Two consequences beyond the magnitude blow-up:
+
+- **`sign(0) = +1`.** An all-zero parameter became an all-ones parameter. `m5`'s
+  `conv1.dendrites_to_top.0` is exactly that — a genuinely zeroed dendrite output
+  gate, which binarization turned fully on.
+- **PQAT inherited it.** `_qat_project_for_forward` calls the same kernels, so
+  every PQAT fine-tune optimized against these weights too.
+
+### The `q4`/`q8` defect
+
+`symmetric_quantize_tensor` calibrated on `tensor.abs().max()`. One outlier
+weight then sets the step size for the whole tensor: if the largest weight is 20x
+the next largest, every ordinary weight collapses onto one or two codes. §1
+identified this at `q2` and special-cased *only* `q2` with a `quantile(0.999)`
+scale, leaving `q4` and `q8` on the outlier-sensitive path. That is why `m5`'s
+`base_q4` fell 21pp (0.9360 → 0.7244) while every other model was fine at 4-bit:
+`m5`'s first conv has `absmax 1.90` against `std 0.29`.
+
+### Fix implemented
+
+All in `compat.py`:
+
+- **`ternary_quantize_tensor`** → BitNet b1.58 absmean:
+  `s = mean(|W|)`, return `clamp(round(W/s), -1, 1) * s`.
+- **`binary_quantize_tensor`** → XNOR-Net: `mean(|W|) * sign(W)`, and `s == 0`
+  now returns zeros instead of ones.
+- **`symmetric_quantize_tensor`** → one uniform signed-integer grid for every
+  width (`qmin = -2**(b-1)`, `qmax = 2**(b-1)-1`), so §1's `q2` special case
+  disappears into the general rule rather than sitting beside it. The scale
+  divides by `|qmin|`, not `qmax` — dividing by `qmax` is what produced §1's
+  three-level collapse.
+- **`_calibrate_scale`** → replaces both `abs().max()` and the fixed 0.999
+  percentile with an **MSE-optimal clip search**: try clip ratios from 1.00 down
+  to 0.40 and keep the scale minimizing `||q(W) − W||²`. A fixed percentile is
+  arbitrary in the other direction — at 8-bit there are 256 codes, the step is
+  already fine, and clipping a genuinely large weight costs more than it buys.
+  Searching per tensor *and* per bit width lands near 1.0 where codes are
+  plentiful and clips hard at 2-bit where they are not, so no constant has to be
+  right for every layer in the suite. Tensors above 65,536 elements are
+  subsampled for the search; the chosen scale applies to the full tensor.
+
+### Verification: both kernels, identical trained weights
+
+Run-to-run variance is large enough here to swamp a kernel comparison across two
+training runs (see §7), so both kernels were applied to the *same* stored
+`base_fp32` checkpoint and evaluated on the same test set.
+
+`mpnn`, RMSE ↓ — the regression case, where a missing scale cannot hide:
+
+| | `fp32` | `q8` | `q4` | `q2` | `q1_58` | `q1` |
+|---|---|---|---|---|---|---|
+| old kernels | 0.3453 | 0.3464 | 0.4100 | 1.7367 | **295.71** | **493.97** |
+| new kernels | — | 0.3456 | 0.3902 | **0.6774** | **0.9877** | **0.9867** |
+
+The blow-up is gone: `q1`/`q1_58` land at ~0.99 RMSE — clearly degraded from
+0.345, which is what a 1-bit model *should* look like — instead of 300–500x the
+FP32 error. `q2` improves 2.6x. (Absolute values differ from `record.json`
+because this harness scores raw model output without the pipeline's target
+denormalization; both kernels are scored identically, so the comparison holds.)
+
+`gcn`, Accuracy ↑ — the classification case:
+
+| | `fp32` | `q8` | `q4` | `q2` | `q1_58` | `q1` |
+|---|---|---|---|---|---|---|
+| old kernels | 0.7960 | 0.7960 | 0.8040 | 0.7830 | 0.4170 | 0.5350 |
+| new kernels | — | 0.7960 | 0.7930 | 0.7770 | **0.6290** | 0.4960 |
+
+`q1_58` gains 21pp; `q4`/`q2` move by about 1pp in the other direction, which is
+inside this model's noise (§7 measures `gcn`'s run-to-run `fp32` spread at
+3.4pp). Note that the missing scale was *less* catastrophic for `gcn` than for
+`mpnn`: a classifier's `argmax` is invariant to a uniform rescaling of the
+logits, so a sign-only network can still rank classes correctly. That invariance
+is why the defect survived this long — it is nearly invisible on accuracy
+metrics and fatal on regression metrics.
+
+Per-tensor sanity: on `m5`'s real `conv1.main_module.weight` (`std 0.282`,
+`absmax 1.904`), relative reconstruction error `||q(W)−W|| / ||W||` is 0.013 /
+0.186 / 0.500 / 0.728 / 0.811 at `q8`/`q4`/`q2`/`q1_58`/`q1` — monotone in bit
+width, with scale preserved at every width (`q1` returns `±0.165 = mean(|W|)`,
+not `±1.0`). All-zero tensors return zeros at every width.
+
+### Scope of invalidated data
+
+**Every `q1`, `q1_58`, `q2`, and `q4` number ever recorded by this benchmark**,
+across `top10`, `dynamic5`, and `dynamic7`. `q8` numbers are affected in
+principle but were near-lossless under both kernels (all seven `dynamic7` models
+sit within 0.002 of their FP32 score at `q8`), so `q8` and `fp32` conclusions
+stand.
+
+---
+
+## 7. What has to be re-run
+
+§5 invalidates `actor_critic` and `m5`'s dendritic quantized arms; §6 invalidates
+every `q4`/`q2`/`q1_58`/`q1` cell for every model and both arms. Between them,
+the only `dynamic7` numbers that survive are the `fp32` and `q8` columns — which
+is most of the *models'* cost but almost none of the *experiment's* claim, since
+the claim is about low-bit behaviour.
+
+The `fp32` and `q8` results that do survive:
+
+| model | metric | `base_fp32` | `dendrites_fp32` | dendrite advantage |
+|---|---|---|---|---|
+| `actor_critic` | Action Acc ↑ | 0.9000 | 0.9907 | **+9.07pp** |
+| `gcn` | Acc ↑ | 0.7960 | 0.7990 | +0.30pp |
+| `saint_adult` | Acc ↑ | 0.8585 | 0.8601 | +0.16pp |
+| `lenet5` | Acc ↑ | 0.9910 | 0.9925 | +0.15pp |
+| `m5` | Acc ↑ | 0.9360 | 0.9327 | −0.33pp |
+| `mpnn` | RMSE ↓ | 0.7204 | 0.7989 | −10.9% (worse) |
+| `textcnn` | Acc ↑ | 0.9162 | (still training) | — |
+
+A caution for the rerun that is independent of any bug: **four of these effects
+are smaller than run-to-run noise, and this is now measured rather than
+suspected.** The `gcn` verification run above is a second independent sample of
+the same model under the same config:
+
+| | first `dynamic7` run | verification run | swing |
+|---|---|---|---|
+| `gcn base_fp32` | 0.7960 | 0.7620 | **3.4pp** |
+| `gcn dendrites_fp32` | 0.7990 | 0.7890 | 1.0pp |
+| implied dendrite advantage | +0.30pp | +2.70pp | **2.4pp** |
+| dendrites added by PAI | 3 (369,066 params) | 4 (461,652 params) | — |
+
+No quantization is involved in any of those numbers. The `fp32` baseline alone
+moves 3.4pp between runs — **eleven times the +0.30pp dendrite advantage the
+first run reported** — and the advantage itself swings by 2.4pp, because
+`DOING_HISTORY` is plateau-triggered and the two runs did not even settle on the
+same architecture (3 dendrites vs 4). On Cora's 1000-node test set, +0.30pp is
+three nodes.
+
+`lenet5`'s +0.15pp is fifteen MNIST images against a 99.1% ceiling; `saint_adult`
+and `m5` are the same order. There is currently no `--seed` flag in `dqb run`, so
+these cannot be separated from variance as the harness stands. **`actor_critic`'s
++9.07pp is the only effect in the table large enough to survive a single seed.**
+Any rerun that intends to support a claim about dendrites needs either multi-seed
+support or models whose effects clear this noise floor.

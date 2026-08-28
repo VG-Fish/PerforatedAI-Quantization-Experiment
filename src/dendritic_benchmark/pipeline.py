@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 
 from .compat import (
+    PAI_ARTIFACT_NAME,
     PAI_DIRECTORY_NAME,
     PAI_RESUME_NAME,
     PAIModuleSelection,
@@ -208,6 +209,18 @@ class BenchmarkRunner:
     def _split_compatible_state(
         self, state: dict[str, Any], current_state: dict[str, Any]
     ) -> tuple[dict[str, Any], list[str]]:
+        """Split a source ``state_dict`` into the part that fits ``current_state``
+        and the keys that do not.
+
+        Mismatches are reported in *both* directions. Iterating only over
+        ``state`` catches source tensors the target has no slot for, but is
+        blind to the opposite and more damaging case: target parameters the
+        source never supplies. Those survive ``load_state_dict(strict=False)``
+        at whatever ``perforate_model`` initialized them to, so an untrained,
+        randomly-initialized dendrite gets quantized and scored as though it
+        were part of the trained model. ``actor_critic`` and ``m5`` shipped a
+        whole phantom dendrite this way. See MEASUREMENT_CAVEATS.md #5.
+        """
         compatible_state: dict[str, Any] = {}
         skipped: list[str] = []
         for key, value in state.items():
@@ -218,6 +231,10 @@ class BenchmarkRunner:
                 skipped.append(key)
                 continue
             compatible_state[key] = value
+        for key in current_state:
+            if _is_ignorable_state_key(key) or key in state:
+                continue
+            skipped.append(key)
         return compatible_state, skipped
 
     def _load_compatible_state(self, model: Any, state: dict[str, Any]) -> None:
@@ -239,17 +256,31 @@ class BenchmarkRunner:
         loudly here instead surfaces the mismatch at the point it happens,
         rather than downstream in a comparison table.
         """
-        compatible_state, skipped = self._split_compatible_state(
-            state, model.state_dict()
-        )
+        current_state = model.state_dict()
+        compatible_state, skipped = self._split_compatible_state(state, current_state)
         if skipped:
+            unfilled = sorted(k for k in skipped if k not in state)
+            mismatched = sorted(k for k in skipped if k in state)
+            detail = []
+            if unfilled:
+                detail.append(
+                    f"{len(unfilled)} target tensor(s) the source never supplies "
+                    f"(would stay at init: {', '.join(unfilled[:3])}"
+                    + ("..." if len(unfilled) > 3 else "")
+                    + ")"
+                )
+            if mismatched:
+                detail.append(
+                    f"{len(mismatched)} shape mismatch(es) "
+                    f"({', '.join(mismatched[:3])}"
+                    + ("..." if len(mismatched) > 3 else "")
+                    + ")"
+                )
             raise RuntimeError(
                 "[state] source-checkpoint structure does not match the "
-                "PAI switch-checkpoint-reconstructed model -- refusing a "
-                "partial load. Mismatched tensors: "
-                + ", ".join(sorted(skipped)[:5])
-                + ("..." if len(skipped) > 5 else "")
-                + ". See information/MEASUREMENT_CAVEATS.md #3."
+                "PAI-reconstructed model -- refusing a partial load. "
+                + "; ".join(detail)
+                + ". See information/MEASUREMENT_CAVEATS.md #3 and #5."
             )
         model.load_state_dict(compatible_state, strict=False)
 
@@ -372,8 +403,19 @@ class BenchmarkRunner:
         exits; the final/resume snapshot is the one saved alongside the final
         benchmark checkpoint and should therefore be tried first. ``switch_N``
         remains the fallback for older results that predate final snapshots.
+
+        ``PAI_ARTIFACT_NAME`` is preferred over all of them: it is written at
+        the one instant that is guaranteed to describe ``model.pt``, whereas
+        ``PAI_RESUME_NAME`` is written inside the epoch loop and can describe a
+        structure the artifact never had. See MEASUREMENT_CAVEATS.md #5.
         """
-        for checkpoint_name in (PAI_RESUME_NAME, "latest", "best_model", "final_clean_pai"):
+        for checkpoint_name in (
+            PAI_ARTIFACT_NAME,
+            PAI_RESUME_NAME,
+            "latest",
+            "best_model",
+            "final_clean_pai",
+        ):
             if pai_system_checkpoint_exists(source_save_name, checkpoint_name):
                 return checkpoint_name
         return latest_pai_switch_checkpoint(source_save_name)

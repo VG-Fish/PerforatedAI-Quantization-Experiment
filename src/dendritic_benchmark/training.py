@@ -18,6 +18,7 @@ from tqdm.auto import tqdm
 
 from .compat import (
     MODULE_OUTPUT_DIMENSIONS_ATTR,
+    PAI_ARTIFACT_NAME,
     attach_module_output_dimensions,
     binary_quantize_tensor,
     choose_device,
@@ -3631,6 +3632,28 @@ def train_and_evaluate(
         # metric_value below describes whichever model was actually kept. See
         # information/MEASUREMENT_CAVEATS.md #3.
         _load_compatible_best_state(model, best_state)
+
+    if use_dendrites and config.pai_save_name:
+        # Pin the PAI structure to the artifact, not to the epoch loop.
+        #
+        # model.pt is written from `model` as it stands right here: after the
+        # best-epoch restore decision above, before the quantization below.
+        # The PAI_RESUME_NAME snapshot, by contrast, is written inside the
+        # epoch loop, so if the final epoch added a candidate dendrite (or the
+        # best-state restore above declined a structure change) the two
+        # disagree -- and every dendrites_q* condition rebuilds its skeleton
+        # from the PAI snapshot but takes its weights from model.pt. When the
+        # snapshot had *fewer* tensors the load raised (caveat #4); when it had
+        # *more*, the extras were silently left at random init, quantized, and
+        # scored. That is how actor_critic reported 52,617 params in fp32 and
+        # 71,059 in every quantized arm, and m5 50,456 vs 75,696.
+        #
+        # Snapshotting here makes structure and weights come from the same
+        # instant by construction, which is the only way the two independent
+        # checkpoint systems can be kept in agreement.
+        save_pai_system(
+            _unwrap_compiled(model), config.pai_save_name, PAI_ARTIFACT_NAME
+        )
 
     if _should_quantize_for_eval(config):
         model = _make_quantized_copy(model, bit_width, quantization_mode)

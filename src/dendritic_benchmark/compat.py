@@ -30,6 +30,13 @@ _PAI_WORKING_DIRECTORY_DEPTH = 0
 # checkpoint. Distinct from PAI's internal "latest", which is written mid-way
 # through add_validation_score and so can disagree with the epoch checkpoint.
 PAI_RESUME_NAME = "dqb_resume"
+# Name of the PAI system snapshot taken at the *exact* moment the contents of
+# model.pt are decided -- after the best-epoch restore decision and before any
+# quantization. PAI_RESUME_NAME above is written inside the epoch loop and so
+# can still describe a different dendrite structure than the artifact that
+# training finally persists; downstream quantized conditions rebuild their
+# skeleton from this one instead. See MEASUREMENT_CAVEATS.md #5.
+PAI_ARTIFACT_NAME = "dqb_artifact"
 _PAI_CONFIG_LIST_SETTERS: tuple[str, ...] = (
     "set_modules_to_track",
     "set_module_names_to_track",
@@ -986,48 +993,111 @@ def choose_device() -> Any:
     return torch.device("cpu")
 
 
+# Clip ratios searched when calibrating the integer grid. 1.0 is plain
+# max-based scaling; lower values trade saturation of the largest weights for
+# a finer step over the bulk of the distribution.
+_QUANT_CLIP_RATIOS = tuple(round(1.0 - 0.05 * i, 4) for i in range(13))  # 1.00 -> 0.40
+
+# Calibration searches a subsample of very large tensors; the chosen scale is
+# then applied to the full tensor.
+_QUANT_CALIBRATION_SAMPLE = 1 << 16
+
+
+def _calibrate_scale(tensor: Any, qmin: int, qmax: int) -> float:
+    """Pick the quantization scale that minimizes ``||q(W) - W||^2``.
+
+    Calibrating on ``abs().max()`` lets one outlier weight define the whole
+    grid: the step becomes ``max_abs / codes``, so if that weight is 20x the
+    next largest, every ordinary weight collapses onto one or two codes. That
+    is the mechanism behind information/MEASUREMENT_CAVEATS.md #1, and the
+    reason ``m5``'s 4-bit scores fell 21pp while every other model was fine
+    at 4-bit -- its first conv has ``absmax 1.90`` against ``std 0.29``.
+
+    A fixed percentile would fix that but is arbitrary in the other
+    direction: at 8-bit there are 256 codes, the step is already fine, and
+    clipping a genuinely large weight costs more than it buys. Searching clip
+    ratios for the lowest reconstruction error picks per tensor *and* per bit
+    width -- it lands on ~1.0 where codes are plentiful and clips hard at
+    2-bit where they are not -- so no magic constant has to be right for
+    every layer in the suite.
+    """
+    flat = tensor.detach().flatten().float()
+    sample = flat
+    if sample.numel() > _QUANT_CALIBRATION_SAMPLE:
+        idx = torch.randperm(sample.numel(), device=sample.device)
+        sample = sample[idx[:_QUANT_CALIBRATION_SAMPLE]]
+    max_abs = float(sample.abs().max())
+    if max_abs == 0:
+        return 0.0
+    best_scale = max_abs / abs(qmin)
+    best_error = None
+    for ratio in _QUANT_CLIP_RATIOS:
+        scale = max_abs * ratio / abs(qmin)
+        if scale <= 0:
+            continue
+        approx = torch.clamp(torch.round(sample / scale), qmin, qmax) * scale
+        error = float(torch.sum((approx - sample) ** 2))
+        if best_error is None or error < best_error:
+            best_error = error
+            best_scale = scale
+    return best_scale
+
+
 def symmetric_quantize_tensor(tensor: Any, bit_width: int) -> Any:
+    """Uniform symmetric integer quantization onto the standard signed grid.
+
+    ``qmin = -2**(b-1)``, ``qmax = 2**(b-1)-1`` -- e.g. {-2..1} at 2-bit,
+    {-8..7} at 4-bit, {-128..127} at 8-bit. The scale divides by the largest
+    code *magnitude* (``|qmin|``), not ``qmax``; dividing by ``qmax`` would
+    leave an ordinary symmetric tensor on only {-scale, 0, +scale} at 2-bit,
+    which is the three-level collapse of caveat #1.
+    """
     if bit_width >= 16:
         return tensor.clone()
     if bit_width <= 1:
-        return tensor.sign().clamp(min=-1, max=1)
-    if bit_width == 2:
-        # The general scheme below (2**bit_width - 1 levels) degenerates here:
-        # levels = 3, levels // 2 == 1 (integer division), so scale == max_abs
-        # exactly and the kernel collapses to {-max_abs, 0, +max_abs} -- three
-        # levels (really ternary, not 2-bit) with the entire grid set by
-        # whichever single weight happens to be largest. Two runs with
-        # statistically identical weight distributions measured retained-
-        # weight fractions of 2.83% vs 9.92% and scores of 0.9588 vs 0.2916
-        # purely from that one weight moving. See
-        # information/MEASUREMENT_CAVEATS.md #1. Use a real signed 4-code
-        # grid ({-2,-1,0,1}, matching the standard qmin=-2**(b-1),
-        # qmax=2**(b-1)-1 integer scheme) and scale off the 99.9th percentile
-        # of |w| rather than the true max, so one outlier can no longer set
-        # the whole grid. The denominator is the largest code magnitude (2),
-        # not qmax (1); using qmax would leave ordinary symmetric tensors on
-        # only {-scale, 0, +scale}, recreating the three-level q2 bug.
-        qmin = -2
-        qmax = 1
-        robust_max = tensor.abs().float().quantile(0.999)
-        if robust_max == 0:
-            return tensor.clone()
-        scale = robust_max / max(abs(qmin), abs(qmax))
-        return torch.clamp(torch.round(tensor / scale), qmin, qmax) * scale
-    levels = 2**bit_width - 1
-    max_abs = tensor.abs().max()
-    if max_abs == 0:
-        return tensor.clone()
-    scale = max_abs / (levels // 2)
-    return torch.round(tensor / scale).clamp(-(levels // 2), levels // 2) * scale
+        return binary_quantize_tensor(tensor)
+    qmin = -(2 ** (bit_width - 1))
+    qmax = 2 ** (bit_width - 1) - 1
+    scale = _calibrate_scale(tensor, qmin, qmax)
+    if scale <= 0:
+        return torch.zeros_like(tensor)
+    return torch.clamp(torch.round(tensor / scale), qmin, qmax) * scale
 
 
 def ternary_quantize_tensor(tensor: Any) -> Any:
-    threshold = tensor.std(unbiased=False) * 0.5
-    pos = (tensor > threshold).to(tensor.dtype)
-    neg = (tensor < -threshold).to(tensor.dtype)
-    return pos - neg
+    """BitNet b1.58 absmean ternarization: ``round(clamp(W/s, -1, 1)) * s``.
+
+    The previous kernel returned a bare ``{-1, 0, +1}`` indicator with **no
+    scale factor**, so a layer whose weights had ``std ~ 0.005`` came back
+    with every surviving weight at magnitude 1.0 -- a ~200x amplification
+    that compounds multiplicatively through depth. That is why ``mpnn``
+    scored 617.0 RMSE at q1.58 against 0.72 in fp32, and why several models
+    collapsed to chance rather than degrading. b1.58 keeps the ternary
+    *codes* but restores the per-tensor scale ``s = mean(|W|)``, which is the
+    published formulation and the only thing that makes the arm comparable to
+    its own fp32 baseline.
+    """
+    scale = tensor.detach().abs().mean()
+    if scale == 0:
+        return torch.zeros_like(tensor)
+    return torch.clamp(torch.round(tensor / scale), -1, 1) * scale
 
 
 def binary_quantize_tensor(tensor: Any) -> Any:
-    return torch.where(tensor >= 0, torch.ones_like(tensor), -torch.ones_like(tensor))
+    """XNOR-Net binarization: ``mean(|W|) * sign(W)``.
+
+    Same missing-scale defect as :func:`ternary_quantize_tensor` (``mpnn``
+    reached 1030.7 RMSE at q1), plus a second failure the scale also fixes:
+    the old kernel mapped ``0 -> +1``, so an all-zero parameter became an
+    all-ones parameter. ``m5``'s ``dendrites_to_top.0`` is exactly that -- a
+    genuinely zeroed dendrite output gate that binarization turned fully on.
+    With ``scale == 0`` such a tensor now stays zero.
+    """
+    scale = tensor.detach().abs().mean()
+    if scale == 0:
+        return torch.zeros_like(tensor)
+    return torch.where(
+        tensor >= 0,
+        torch.full_like(tensor, float(scale)),
+        torch.full_like(tensor, -float(scale)),
+    )
