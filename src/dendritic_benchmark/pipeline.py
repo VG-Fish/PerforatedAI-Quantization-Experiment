@@ -20,6 +20,7 @@ import torch.nn as nn
 
 from .compat import (
     PAI_DIRECTORY_NAME,
+    PAI_RESUME_NAME,
     PAIModuleSelection,
     PAIRuntimeOptions,
     attach_module_output_dimensions,
@@ -27,6 +28,7 @@ from .compat import (
     configure_pai_candidate_graph,
     latest_pai_switch_checkpoint,
     load_pai_system_checkpoint,
+    pai_system_checkpoint_exists,
     perforate_model,
     set_module_output_dimensions,
     set_pai_root,
@@ -314,7 +316,7 @@ class BenchmarkRunner:
                 model, load_config.module_output_dimensions
             )
             source_save_name = self._pai_save_name(model_key, source_key)
-            pai_checkpoint_name = latest_pai_switch_checkpoint(source_save_name)
+            pai_checkpoint_name = self._source_pai_checkpoint_name(source_save_name)
             if pai_checkpoint_name is not None:
                 model = load_pai_system_checkpoint(
                     model,
@@ -360,6 +362,21 @@ class BenchmarkRunner:
             )
             configure_pai_candidate_graph(load_config.candidate_graph_enabled)
         return model
+
+    def _source_pai_checkpoint_name(self, source_save_name: str) -> str | None:
+        """Return the PAI checkpoint that should reconstruct a source artifact.
+
+        Post-training quantized dendritic conditions load the benchmark's
+        ``model.pt`` from their FP32 source. For dynamic PAI runs, the latest
+        ``switch_N`` checkpoint can be structurally stale by the time training
+        exits; the final/resume snapshot is the one saved alongside the final
+        benchmark checkpoint and should therefore be tried first. ``switch_N``
+        remains the fallback for older results that predate final snapshots.
+        """
+        for checkpoint_name in (PAI_RESUME_NAME, "latest", "best_model", "final_clean_pai"):
+            if pai_system_checkpoint_exists(source_save_name, checkpoint_name):
+                return checkpoint_name
+        return latest_pai_switch_checkpoint(source_save_name)
 
     def _artifact_path(
         self, condition_dir: Path, prefer_dendritic: bool = False

@@ -806,6 +806,11 @@ def pai_resume_state_exists(save_name: str, name: str = PAI_RESUME_NAME) -> bool
     return (pai_save_path(save_name) / f"{name}.pt").exists()
 
 
+def pai_system_checkpoint_exists(save_name: str, name: str) -> bool:
+    """Report whether a named PAI system checkpoint exists for ``save_name``."""
+    return (pai_save_path(save_name) / f"{name}.pt").exists()
+
+
 def save_pai_system(
     model: Any, save_name: str, name: str = PAI_RESUME_NAME
 ) -> bool:
