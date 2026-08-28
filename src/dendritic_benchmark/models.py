@@ -59,26 +59,36 @@ ADULT_CATEGORICAL_CARDINALITIES: dict[int, int] = {
 }
 
 
+def _scaled_width(value: int, model_scale: float, minimum: int) -> int:
+    if not 0 < model_scale <= 1:
+        raise ValueError("model_scale must be greater than zero and at most one")
+    return max(minimum, int(math.ceil(value * model_scale)))
+
+
 class LeNet5(nn.Module):
     """LeNet-5 style CNN for MNIST-sized grayscale images."""
 
-    def __init__(self, num_classes: int = 10):
+    def __init__(self, num_classes: int = 10, width_multiplier: float = 1.0):
         super().__init__()
+        conv1_channels = _scaled_width(6, width_multiplier, 2)
+        conv2_channels = _scaled_width(16, width_multiplier, 4)
+        classifier_1 = _scaled_width(120, width_multiplier, 16)
+        classifier_2 = _scaled_width(84, width_multiplier, 16)
         self.features = nn.Sequential(
-            nn.Conv2d(1, 6, kernel_size=5, stride=1, padding=2),
+            nn.Conv2d(1, conv1_channels, kernel_size=5, stride=1, padding=2),
             nn.Tanh(),
             nn.AvgPool2d(2),
-            nn.Conv2d(6, 16, kernel_size=5),
+            nn.Conv2d(conv1_channels, conv2_channels, kernel_size=5),
             nn.Tanh(),
             nn.AvgPool2d(2),
         )
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(16 * 5 * 5, 120),
+            nn.Linear(conv2_channels * 5 * 5, classifier_1),
             nn.Tanh(),
-            nn.Linear(120, 84),
+            nn.Linear(classifier_1, classifier_2),
             nn.Tanh(),
-            nn.Linear(84, num_classes),
+            nn.Linear(classifier_2, num_classes),
         )
 
     def forward(self, x: Any) -> Any:
@@ -1112,23 +1122,25 @@ class PointNet(nn.Module):
 
 
 class VAE(nn.Module):
-    def __init__(self, latent_dim: int = 32):
+    def __init__(self, latent_dim: int = 32, width_multiplier: float = 1.0):
         super().__init__()
+        encoder_width = _scaled_width(512, width_multiplier, 64)
+        latent_width = _scaled_width(256, width_multiplier, 32)
         self.encoder = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(784, 512),
+            nn.Linear(784, encoder_width),
             nn.ReLU(),
-            nn.Linear(512, 256),
+            nn.Linear(encoder_width, latent_width),
             nn.ReLU(),
         )
-        self.mu = nn.Linear(256, latent_dim)
-        self.logvar = nn.Linear(256, latent_dim)
+        self.mu = nn.Linear(latent_width, latent_dim)
+        self.logvar = nn.Linear(latent_width, latent_dim)
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 256),
+            nn.Linear(latent_dim, latent_width),
             nn.ReLU(),
-            nn.Linear(256, 512),
+            nn.Linear(latent_width, encoder_width),
             nn.ReLU(),
-            nn.Linear(512, 784),
+            nn.Linear(encoder_width, 784),
             nn.Sigmoid(),
         )
 
@@ -1434,28 +1446,46 @@ def _construct(model_class: Any, **kwargs: Any) -> Any:
 
 
 MODEL_FACTORIES: dict[str, Callable[..., Any]] = {
-    "lenet5": lambda num_classes=10, **_: _construct(LeNet5, num_classes=num_classes),
+    "lenet5": lambda num_classes=10, model_scale=1.0, **_: _construct(
+        LeNet5, num_classes=num_classes, width_multiplier=model_scale
+    ),
     "m5": lambda num_classes=12, **_: _construct(M5, num_classes=num_classes),
     "lstm_forecaster": lambda **_: LSTMForecaster(),
     "textcnn": lambda num_classes=4, **_: _construct(TextCNN, num_classes=num_classes),
-    "gcn": lambda num_classes=7, **_: _construct(GCN, num_classes=num_classes),
+    "gcn": lambda num_classes=7, model_scale=1.0, **_: _construct(
+        GCN,
+        num_classes=num_classes,
+        hidden=_scaled_width(64, model_scale, 8),
+    ),
     "tabnet": lambda num_classes=2, categorical_cardinalities=None, **_: _construct(
         TabNet,
         num_classes=num_classes,
         categorical_cardinalities=categorical_cardinalities,
     ),
-    "mpnn": lambda **_: MPNN(),
-    "actor_critic": lambda **_: ActorCritic(),
+    "mpnn": lambda model_scale=1.0, **_: MPNN(
+        hidden=_scaled_width(96, model_scale, 16)
+    ),
+    "actor_critic": lambda model_scale=1.0, **_: ActorCritic(
+        hidden=_scaled_width(128, model_scale, 16)
+    ),
     "lstm_autoencoder": lambda **_: LSTMAutoencoder(),
     "distilbert": lambda num_classes=2, **_: _construct(DistilBertClassifier, num_classes=num_classes),
     "dqn_lunarlander": lambda **_: DQN(),
     "ppo_bipedalwalker": lambda **_: PPOPolicy(),
     "attentivefp_freesolv": lambda **_: AttentiveFP(),
     "gin_imdbb": lambda num_classes=2, **_: _construct(GIN, num_classes=num_classes),
-    "tcn_forecaster": lambda **_: _construct(TCNForecaster, input_size=7),
-    "gru_forecaster": lambda **_: _construct(GRUForecaster, input_size=21),
+    "tcn_forecaster": lambda model_scale=1.0, **_: _construct(
+        TCNForecaster,
+        input_size=7,
+        hidden=_scaled_width(64, model_scale, 16),
+    ),
+    "gru_forecaster": lambda model_scale=1.0, **_: _construct(
+        GRUForecaster,
+        input_size=21,
+        hidden=_scaled_width(64, model_scale, 16),
+    ),
     "pointnet_modelnet40": lambda num_classes=40, **_: _construct(PointNet, num_classes=num_classes),
-    "vae_mnist": lambda **_: VAE(),
+    "vae_mnist": lambda model_scale=1.0, **_: VAE(width_multiplier=model_scale),
     "snn_nmnist": lambda num_classes=10, **_: _construct(SpikingConvNet, num_classes=num_classes),
     "unet_isic": lambda **_: TinyUNet(),
     "resnet18_cifar10": _build_resnet18_cifar10,

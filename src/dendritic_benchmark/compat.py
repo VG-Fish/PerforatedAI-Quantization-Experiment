@@ -119,12 +119,52 @@ class PAIModuleSelection:
 
 
 @dataclass(frozen=True)
+class PAIDynamicSchedule:
+    """Optional per-model overrides for the dynamic PAI schedule.
+
+    The defaults remain deliberately centralized in
+    :func:`_configure_dynamic_pai_schedule`.  A benchmark should override only
+    the knobs supported by measured behavior, rather than fork the whole PAI
+    configuration for every model.
+    """
+
+    max_dendrites: int | None = None
+    n_epochs_to_switch: int | None = None
+    history_lookback: int | None = None
+    initial_history_after_switches: int | None = None
+    p_epochs_to_switch: int | None = None
+    improvement_threshold: tuple[float, ...] | None = None
+    candidate_weight_initialization_multiplier: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return only explicit overrides for artifact metadata."""
+        return {
+            key: value
+            for key, value in {
+                "max_dendrites": self.max_dendrites,
+                "n_epochs_to_switch": self.n_epochs_to_switch,
+                "history_lookback": self.history_lookback,
+                "initial_history_after_switches": self.initial_history_after_switches,
+                "p_epochs_to_switch": self.p_epochs_to_switch,
+                "improvement_threshold": list(self.improvement_threshold)
+                if self.improvement_threshold is not None
+                else None,
+                "candidate_weight_initialization_multiplier": (
+                    self.candidate_weight_initialization_multiplier
+                ),
+            }.items()
+            if value is not None
+        }
+
+
+@dataclass(frozen=True)
 class PAIRuntimeOptions:
     use_runtime_guard: bool = False
     no_backward_workaround: bool = False
     candidate_graph_enabled: bool = True
     initial_correlation_batches_limit: int | None = None
     fixed_switch_interval: int | None = None
+    dynamic_schedule: PAIDynamicSchedule | None = None
 
 
 def _call_if_available(target: Any, method_name: str, *args: Any) -> None:
@@ -277,12 +317,45 @@ def _configure_interval_pai_schedule(pc: Any, *, switch_interval: int) -> None:
     )
 
 
+def _default_dynamic_improvement_thresholds(max_dendrites: int) -> list[float]:
+    """Return one positive plateau threshold for every possible dendrite count."""
+    if max_dendrites < 1:
+        raise ValueError("max_dendrites must be at least one")
+    defaults = [0.005, 0.002, 0.001, 0.001]
+    required = max_dendrites + 1
+    if required <= len(defaults):
+        return defaults[:required]
+    return [*defaults, *([defaults[-1]] * (required - len(defaults)))]
+
+
+def _schedule_value(
+    schedule: PAIDynamicSchedule | None, field: str, default: Any
+) -> Any:
+    if schedule is None:
+        return default
+    value = getattr(schedule, field)
+    return default if value is None else value
+
+
 def _configure_dynamic_pai_schedule(
     pc: Any,
     batches_per_epoch: int | None = None,
     initial_correlation_batches_limit: int | None = None,
     fixed_switch_interval: int | None = None,
+    schedule: PAIDynamicSchedule | None = None,
 ) -> None:
+    max_dendrites = _schedule_value(schedule, "max_dendrites", 3)
+    if not isinstance(max_dendrites, int) or max_dendrites < 1:
+        raise ValueError("PAI dynamic max_dendrites must be a positive integer")
+    thresholds = _schedule_value(
+        schedule,
+        "improvement_threshold",
+        tuple(_default_dynamic_improvement_thresholds(max_dendrites)),
+    )
+    if len(thresholds) < max_dendrites + 1:
+        raise ValueError(
+            "PAI dynamic improvement_threshold needs max_dendrites + 1 entries"
+        )
     if fixed_switch_interval is not None:
         _configure_interval_pai_schedule(pc, switch_interval=fixed_switch_interval)
     else:
@@ -290,10 +363,14 @@ def _configure_dynamic_pai_schedule(
         _apply_pai_schedule_values(
             pc,
             {
-                "set_n_epochs_to_switch": 10,
+                "set_n_epochs_to_switch": _schedule_value(
+                    schedule, "n_epochs_to_switch", 10
+                ),
                 # PAI names the plateau-detection window "history_lookback"; the
                 # default of 1 switches on transient noise.
-                "set_history_lookback": 8,
+                "set_history_lookback": _schedule_value(
+                    schedule, "history_lookback", 8
+                ),
                 # MUST accompany any history_lookback > 1. PAI's running
                 # average only seeds from the first real score while
                 # epochs_since_cycle_switch < initial_history_after_switches;
@@ -306,30 +383,36 @@ def _configure_dynamic_pai_schedule(
                 # vae/tcn/mpnn dendritic arms). Matching the lookback gives a
                 # cumulative-mean warm-up over the same window after every
                 # switch.
-                "set_initial_history_after_switches": 8,
+                "set_initial_history_after_switches": _schedule_value(
+                    schedule, "initial_history_after_switches", 8
+                ),
                 # Indexed by dendrites added (globals_perforatedai getter_val), so
                 # this needs max_dendrites + 1 entries. The final entry must stay
                 # above zero: at a threshold of 0 only improvement_threshold_raw
                 # (1e-5) separates a real gain from validation jitter, and the
                 # plateau detector never sees n_epochs_to_switch quiet epochs.
-                "set_improvement_threshold": [0.005, 0.002, 0.001, 0.001],
+                "set_improvement_threshold": list(thresholds),
             },
         )
     _apply_pai_schedule_values(
         pc,
         {
-            "set_p_epochs_to_switch": 2,
+            "set_p_epochs_to_switch": _schedule_value(
+                schedule, "p_epochs_to_switch", 2
+            ),
             # Dendrites stopped paying for themselves well before the sixth on
             # every model measured so far, and each extra one costs ~100 epochs
             # at a steadily worse seconds-per-epoch.
-            "set_max_dendrites": 3,
+            "set_max_dendrites": max_dendrites,
             # Zeroing the best score on switch also zeroes running_accuracy,
             # which is an EMA over history_lookback epochs. Climbing back from
             # 0 to a ~0.99 metric takes ~70 epochs, and every one of them
             # registers as an improvement, so epoch_last_improved is refreshed
             # continuously and the switch trigger cannot fire.
             "set_reset_best_score_on_switch": False,
-            "set_candidate_weight_initialization_multiplier": 0.005,
+            "set_candidate_weight_initialization_multiplier": _schedule_value(
+                schedule, "candidate_weight_initialization_multiplier", 0.005
+            ),
             # Not set here: pai_improvement_threshold / _raw, which gate how much
             # a node's correlation must gain in one epoch to keep the dendrite
             # phase alive.  Raising them from the (0.1, 1e-4) defaults to
@@ -385,6 +468,7 @@ def _configure_pai_training_schedule(
     batches_per_epoch: int | None = None,
     initial_correlation_batches_limit: int | None = None,
     fixed_switch_interval: int | None = None,
+    dynamic_schedule: PAIDynamicSchedule | None = None,
 ) -> None:
     pc = gpa.pc
     if dynamic_dendritic_training:
@@ -393,6 +477,7 @@ def _configure_pai_training_schedule(
             batches_per_epoch=batches_per_epoch,
             initial_correlation_batches_limit=initial_correlation_batches_limit,
             fixed_switch_interval=fixed_switch_interval,
+            schedule=dynamic_schedule,
         )
         return
 
@@ -769,6 +854,7 @@ def perforate_model(
                         runtime_options.initial_correlation_batches_limit
                     ),
                     fixed_switch_interval=runtime_options.fixed_switch_interval,
+                    dynamic_schedule=runtime_options.dynamic_schedule,
                 )
             with pai_working_directory():
                 perforated = upa_perforate_model(

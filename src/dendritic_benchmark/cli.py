@@ -383,6 +383,28 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run_parser.add_argument(
+        "--model-scale",
+        type=float,
+        default=1.0,
+        metavar="FACTOR",
+        help=(
+            "Scale the width of the compact-capable benchmark models before "
+            "training. Use a value in (0, 1]; 0.75 is the recommended "
+            "parameter-efficiency follow-up. (default: 1.0)"
+        ),
+    )
+    run_parser.add_argument(
+        "--pai-variant",
+        choices=("default", "vae_latent", "mpnn_capacity"),
+        default="default",
+        help=(
+            "Select a measured PAI targeting ablation. `default` uses the "
+            "Dynamic9 follow-up settings; `vae_latent` perforates only VAE "
+            "latent heads; `mpnn_capacity` permits a fourth targeted MPNN "
+            "dendrite. (default: default)"
+        ),
+    )
+    run_parser.add_argument(
         "-j",
         "--jobs",
         type=int,
@@ -679,7 +701,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
-    runner = BenchmarkRunner(results_root=results_root, comparison_root=comparison_root)
+    runner = BenchmarkRunner(
+        results_root=results_root,
+        comparison_root=comparison_root,
+        model_scale=args.model_scale,
+        pai_variant=args.pai_variant,
+    )
     selected_models = args.models or [spec.key for spec in MODEL_SPECS]
 
     # A worker is one of the processes a parallel run spawned. It trains its
@@ -743,6 +770,10 @@ def _run_passthrough(args: Any, comparison_root: Path) -> list[str]:
         flags.append("--allow-PQAT")
     if args.dynamic_dendritic_training:
         flags.append("--dynamic-dendritic-training")
+    if args.model_scale != 1.0:
+        flags += ["--model-scale", str(args.model_scale)]
+    if args.pai_variant != "default":
+        flags += ["--pai-variant", args.pai_variant]
     if args.seed is not None:
         flags += ["--seed", str(args.seed)]
     return flags

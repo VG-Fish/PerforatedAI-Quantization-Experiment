@@ -22,6 +22,7 @@ from .compat import (
     PAI_ARTIFACT_NAME,
     PAI_DIRECTORY_NAME,
     PAI_RESUME_NAME,
+    PAIDynamicSchedule,
     PAIModuleSelection,
     PAIRuntimeOptions,
     attach_module_output_dimensions,
@@ -76,6 +77,28 @@ _MODEL_DENDRITIC_MEMORY_CLEANUP_INTERVALS = {
 # interval instead, sized to the epochs their baseline recipe needs to converge.
 _MODEL_DENDRITIC_FIXED_SWITCH_INTERVALS = {
     "distilbert": 3,
+}
+_PAI_VARIANTS = frozenset({"default", "vae_latent", "mpnn_capacity"})
+# Dynamic9 showed that the global three-dendrite schedule adds unnecessary
+# capacity to several models. These are deliberately sparse overrides; fields
+# omitted here keep the well-tested global defaults in compat.py.
+_MODEL_DYNAMIC_PAI_SCHEDULES = {
+    "gcn": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=6),
+    "actor_critic": PAIDynamicSchedule(max_dendrites=2, p_epochs_to_switch=6),
+    "lenet5": PAIDynamicSchedule(max_dendrites=1),
+    "tcn_forecaster": PAIDynamicSchedule(max_dendrites=1),
+    "mpnn": PAIDynamicSchedule(max_dendrites=3),
+    "vae_mnist": PAIDynamicSchedule(max_dendrites=1),
+    "gru_forecaster": PAIDynamicSchedule(
+        max_dendrites=1,
+        n_epochs_to_switch=24,
+        candidate_weight_initialization_multiplier=0.001,
+    ),
+}
+_PAI_VARIANT_SCHEDULES = {
+    "mpnn_capacity": {
+        "mpnn": PAIDynamicSchedule(max_dendrites=4),
+    },
 }
 # Full-transformer PAI wrapping makes DistilBERT's candidate forward exceed
 # Apple Silicon MPS memory. Keep dendrite search on the task-specific head.
@@ -147,6 +170,7 @@ class SourceCheckpointLoadConfig:
     candidate_graph_enabled: bool = True
     initial_correlation_batches_limit: int | None = None
     fixed_switch_interval: int | None = None
+    dynamic_schedule: PAIDynamicSchedule | None = None
 
 
 def _log(msg: str, *, before: bool = False, after: bool = False) -> None:
@@ -198,7 +222,15 @@ class BenchmarkRunner:
         self,
         results_root: Path | str = "results",
         comparison_root: Path | str = "comparison",
+        *,
+        model_scale: float = 1.0,
+        pai_variant: str = "default",
     ):
+        if not 0 < model_scale <= 1:
+            raise ValueError("model_scale must be greater than zero and at most one")
+        if pai_variant not in _PAI_VARIANTS:
+            choices = ", ".join(sorted(_PAI_VARIANTS))
+            raise ValueError(f"Unknown PAI variant {pai_variant!r}; choose one of {choices}")
         self.results_root = validate_output_path(Path(results_root), label="results_root")
         self.comparison_root = validate_output_path(Path(comparison_root), label="comparison_root")
         self.results_root.mkdir(parents=True, exist_ok=True)
@@ -209,6 +241,8 @@ class BenchmarkRunner:
         # Overwritten by run(); defined here so _train_pending_condition can be
         # called directly by programmatic callers that never went through run().
         self._seed: int | None = None
+        self._model_scale = model_scale
+        self._pai_variant = pai_variant
 
     def _split_compatible_state(
         self, state: dict[str, Any], current_state: dict[str, Any]
@@ -345,6 +379,7 @@ class BenchmarkRunner:
                         load_config.initial_correlation_batches_limit
                     ),
                     fixed_switch_interval=load_config.fixed_switch_interval,
+                    dynamic_schedule=load_config.dynamic_schedule,
                 ),
             )
             model = self._configure_perforated_model(
@@ -390,6 +425,7 @@ class BenchmarkRunner:
                         load_config.initial_correlation_batches_limit
                     ),
                     fixed_switch_interval=load_config.fixed_switch_interval,
+                    dynamic_schedule=load_config.dynamic_schedule,
                 ),
             )
             model = self._configure_perforated_model(
@@ -460,29 +496,32 @@ class BenchmarkRunner:
         return [key for key in [spec.key for spec in CONDITION_SPECS] if key in ordered]
 
     def _model_kwargs(self, model_key: str) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"model_scale": self._model_scale}
         if model_key in {"lenet5", "snn_nmnist", "capsnet_mnist"}:
-            return {"num_classes": 10}
-        if model_key == "m5":
-            return {"num_classes": 12}
-        if model_key == "textcnn":
-            return {"num_classes": 4}
-        if model_key == "gcn":
-            return {"num_classes": 7}
-        if model_key in {"tabnet", "saint_adult"}:
+            kwargs["num_classes"] = 10
+        elif model_key == "m5":
+            kwargs["num_classes"] = 12
+        elif model_key == "textcnn":
+            kwargs["num_classes"] = 4
+        elif model_key == "gcn":
+            kwargs["num_classes"] = 7
+        elif model_key in {"tabnet", "saint_adult"}:
             # Adult's 8 nominal columns reach the models as integer codes; both
             # size embedding tables from this schema rather than treating a code
             # as a number. See TabularColumnEmbedding.
-            return {
-                "num_classes": 2,
-                "categorical_cardinalities": ADULT_CATEGORICAL_CARDINALITIES,
-            }
-        if model_key == "gin_imdbb":
-            return {"num_classes": 2}
-        if model_key == "pointnet_modelnet40":
-            return {"num_classes": 40}
-        if model_key == "distilbert":
-            return {"num_classes": 2}
-        return {}
+            kwargs.update(
+                {
+                    "num_classes": 2,
+                    "categorical_cardinalities": ADULT_CATEGORICAL_CARDINALITIES,
+                }
+            )
+        elif model_key == "gin_imdbb":
+            kwargs["num_classes"] = 2
+        elif model_key == "pointnet_modelnet40":
+            kwargs["num_classes"] = 40
+        elif model_key == "distilbert":
+            kwargs["num_classes"] = 2
+        return kwargs
 
     def _perforation_track_modules(self) -> list[Any]:
         if nn is None:
@@ -494,18 +533,38 @@ class BenchmarkRunner:
         return [nn.Linear, nn.Conv1d, nn.Conv2d]
 
     def _perforation_modules_to_perforate(self, model_key: str) -> list[Any]:
-        if model_key == "distilbert":
+        if self._perforation_module_ids_to_perforate(model_key):
             return []
         return list(self._perforation_track_modules())
 
     def _perforation_module_ids_to_perforate(self, model_key: str) -> list[str]:
         if model_key == "distilbert":
             return list(_DISTILBERT_PAI_CLASSIFICATION_HEAD)
+        if model_key == "mpnn":
+            return [
+                ".readout.0",
+                ".readout_gate",
+                ".layers.2.update.hidden_gates",
+                ".layers.2.update.input_gates",
+                ".layers.3.update.hidden_gates",
+                ".layers.3.update.input_gates",
+            ]
+        if model_key == "vae_mnist":
+            if self._pai_variant == "vae_latent":
+                return [".mu", ".logvar"]
+            return [".decoder.4"]
         return []
 
     def _perforation_track_only_module_ids(self, model_key: str) -> list[str]:
         return {
-            "actor_critic": [".value"],
+            # Dynamic9's only clearly efficient actor-critic candidate was the
+            # second shared-backbone projection. Holding the policy/value heads
+            # out also avoids changing outputs represented in an active buffer.
+            "actor_critic": [".value", ".backbone.0", ".policy"],
+            # Dynamic9's useful LeNet signal came from the classifier. Keeping
+            # both convolutions tracked-only turns this into a classifier-only
+            # dendrite experiment rather than spending capacity on early maps.
+            "lenet5": [".features.0", ".features.3"],
             # Dendrites go on the shared .backbone only. The two heads are held
             # out for a reason specific to on-policy training, not for the old
             # PBScore reason (which measured a behaviour-cloning run in which
@@ -614,6 +673,15 @@ class BenchmarkRunner:
     def _pai_fixed_switch_interval(self, model_key: str) -> int | None:
         return _MODEL_DENDRITIC_FIXED_SWITCH_INTERVALS.get(model_key)
 
+    def _pai_dynamic_schedule(self, model_key: str) -> PAIDynamicSchedule | None:
+        """Return the measured schedule for a model and optional ablation variant."""
+        variant_schedule = _PAI_VARIANT_SCHEDULES.get(self._pai_variant, {}).get(
+            model_key
+        )
+        if variant_schedule is not None:
+            return variant_schedule
+        return _MODEL_DYNAMIC_PAI_SCHEDULES.get(model_key)
+
     def _configure_perforated_model(
         self,
         model: Any,
@@ -707,6 +775,11 @@ class BenchmarkRunner:
             if training_plan.update_dendrites_during_training
             else None
         )
+        dynamic_schedule = (
+            self._pai_dynamic_schedule(model_key)
+            if training_plan.update_dendrites_during_training
+            else None
+        )
         if condition.source_key in saved_dirs:
             checkpoint = self._artifact_path(
                 saved_dirs[condition.source_key],
@@ -733,6 +806,7 @@ class BenchmarkRunner:
                         initial_correlation_batches_limit
                     ),
                     fixed_switch_interval=fixed_switch_interval,
+                    dynamic_schedule=dynamic_schedule,
                 ),
             )
         if not condition.use_dendrites:
@@ -753,6 +827,7 @@ class BenchmarkRunner:
                 candidate_graph_enabled=training_plan.update_dendrites_during_training,
                 initial_correlation_batches_limit=initial_correlation_batches_limit,
                 fixed_switch_interval=fixed_switch_interval,
+                dynamic_schedule=dynamic_schedule,
             ),
         )
         configure_pai_candidate_graph(training_plan.update_dendrites_during_training)
@@ -972,6 +1047,12 @@ class BenchmarkRunner:
             model_key,
             ModelTrainingRecipe(64, 4 * EPOCH_MULTIPLIER, 1.0e-3),
         )
+        if model_key == "tcn_forecaster" and self._model_scale < 1.0:
+            # The compact TCN follow-up has less base capacity but the same
+            # chronological validation gap seen in Dynamic9. Keep the measured
+            # dropout=0.2 architecture and modestly raise L2 for both paired
+            # arms before asking a dendrite to recover capacity.
+            recipe = replace(recipe, weight_decay=2.0e-4)
         dendritic_batch_size = _MODEL_DENDRITIC_BATCH_SIZES.get(model_key)
         if condition.use_dendrites and dendritic_batch_size is not None:
             return recipe.with_batch_size(dendritic_batch_size)
@@ -1046,6 +1127,37 @@ class BenchmarkRunner:
             )
         )
 
+    def _condition_metadata_current(
+        self, model_key: str, condition: ConditionSpec, condition_dir: Path
+    ) -> bool:
+        """Reject saved artifacts built with a different compact/PAI profile."""
+        metrics_path = condition_dir / "metrics.json"
+        if not metrics_path.exists():
+            return False
+        try:
+            metadata = json.loads(metrics_path.read_text())
+        except json.JSONDecodeError:
+            return False
+        try:
+            recorded_scale = float(metadata.get("model_scale", 1.0))
+        except (TypeError, ValueError):
+            return False
+        if recorded_scale != self._model_scale:
+            return False
+        if not condition.use_dendrites:
+            return True
+        if metadata.get("pai_variant") != self._pai_variant:
+            return False
+        expected_schedule = self._pai_dynamic_schedule(model_key)
+        recorded_schedule = metadata.get("pai_dynamic_schedule")
+        if (
+            recorded_schedule is not None
+            and expected_schedule is not None
+            and recorded_schedule != expected_schedule.to_dict()
+        ):
+            return False
+        return True
+
     def _condition_record_usable(
         self,
         model_key: str,
@@ -1057,6 +1169,12 @@ class BenchmarkRunner:
             return False
         condition_dir = self.results_root / model_key / condition.key
         if not (condition_dir / _RECORD_JSON).exists():
+            return False
+        if not self._condition_metadata_current(model_key, condition, condition_dir):
+            _log(
+                f"[stale] {model_key} / {condition.key} — model scale or PAI "
+                "targeting profile changed; retraining."
+            )
             return False
         if (
             model_key == "distilbert"
@@ -1302,6 +1420,11 @@ class BenchmarkRunner:
         memory_cleanup_interval_batches = self._memory_cleanup_interval_batches(
             model_key, condition, batches_per_epoch
         )
+        dynamic_schedule = (
+            self._pai_dynamic_schedule(model_key)
+            if training_plan.update_dendrites_during_training
+            else None
+        )
         training_config = TrainingConfig(
             bit_width=condition.bit_width,
             quantization_mode=condition.quantization_mode,
@@ -1333,6 +1456,11 @@ class BenchmarkRunner:
             pai_candidate_graph_batch_limit=pai_candidate_graph_batch_limit,
             memory_cleanup_interval_batches=memory_cleanup_interval_batches,
             pai_save_name=self._pai_save_name(model_key, condition.key),
+            model_scale=self._model_scale,
+            pai_variant=self._pai_variant,
+            pai_dynamic_schedule=(
+                dynamic_schedule.to_dict() if dynamic_schedule is not None else None
+            ),
         )
         return train_and_evaluate(
             model_key=model_key,

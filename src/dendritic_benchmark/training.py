@@ -26,6 +26,7 @@ from .compat import (
     clear_pai_tracker_state,
     configure_pai_candidate_graph,
     load_pai_system,
+    pai_save_path,
     pai_resume_state_exists,
     pai_runtime_guard,
     pai_save_path,
@@ -99,6 +100,11 @@ class TrainingConfig:
     pai_candidate_graph_batch_limit: int | None = None
     memory_cleanup_interval_batches: int | None = None
     pai_save_name: str | None = None
+    # Stored with every artifact so a compact-base or PAI-targeting run can be
+    # reproduced without inferring intent from its output directory name.
+    model_scale: float = 1.0
+    pai_variant: str = "default"
+    pai_dynamic_schedule: dict[str, Any] | None = None
     # Ceiling on a single dendrite ("p") phase in dynamic mode, and the only
     # thing that bounds one.  PAI leaves the phase once no node's correlation
     # has improved for p_epochs_to_switch epochs, but those scores keep drifting
@@ -166,6 +172,10 @@ class ArtifactMetadata:
     freeze_dendrite_updates_fraction: float
     pai_candidate_graph_batch_limit: int | None
     memory_cleanup_interval_batches: int | None
+    model_scale: float
+    pai_variant: str
+    pai_dynamic_schedule: dict[str, Any] | None
+    pai_save_name: str | None
 
 
 @dataclass(frozen=True)
@@ -1359,6 +1369,10 @@ def _write_metrics_and_history(
                 "memory_cleanup_interval_batches": (
                     metadata.memory_cleanup_interval_batches
                 ),
+                "model_scale": metadata.model_scale,
+                "pai_variant": metadata.pai_variant,
+                "pai_dynamic_schedule": metadata.pai_dynamic_schedule,
+                "pai_save_name": metadata.pai_save_name,
                 "artifact_path": str(stats.artifact_path),
                 "training_skipped": payload.training_skipped,
                 "skip_reason": payload.skip_reason,
@@ -1397,6 +1411,13 @@ def _persist_stage_artifacts(
             nonzero_params=nonzero_params,
             metric_name=metadata.metric_name,
             metric_direction=metadata.metric_direction,
+        )
+        _write_pai_summary(
+            output_dir=output_dir,
+            history=payload.history,
+            metadata=metadata,
+            param_count=param_count,
+            nonzero_params=nonzero_params,
         )
     stats = ArtifactStats(
         param_count=param_count,
@@ -1465,6 +1486,157 @@ def _write_dendritic_sidecars(
                     "nonzero_params": nonzero_params,
                 }
             )
+
+
+def _history_flag(row: dict[str, Any], field: str) -> bool:
+    value = row.get(field, False)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def _load_continued_history(output_dir: Path) -> list[dict[str, Any]]:
+    """Load the over-budget PAI phase retained beside the canonical artifact."""
+    path = output_dir / "continued_until_complete" / "history.csv"
+    if not path.exists():
+        return []
+    try:
+        with path.open(newline="") as fh:
+            return list(csv.DictReader(fh))
+    except (OSError, csv.Error):
+        return []
+
+
+def _read_pai_architecture_log(save_name: str | None) -> dict[str, Any]:
+    """Read the PAI-owned architecture CSV without treating it as ground truth."""
+    if not save_name:
+        return {"status": "not_configured"}
+    folder = pai_save_path(save_name)
+    path = folder / f"{folder.name}_best_arch_scores.csv"
+    if not path.exists():
+        return {"status": "missing", "path": str(path)}
+    try:
+        with path.open(newline="") as fh:
+            rows = list(csv.DictReader(fh))
+    except (OSError, csv.Error):
+        return {"status": "unreadable", "path": str(path)}
+    if not rows:
+        return {"status": "empty", "path": str(path), "row_count": 0}
+    param_column = next(
+        (name for name in rows[0] if "param" in name.lower()), None
+    )
+    counts: list[int] = []
+    if param_column is not None:
+        for row in rows:
+            try:
+                counts.append(int(float(row[param_column])))
+            except (TypeError, ValueError):
+                continue
+    return {
+        "status": "available",
+        "path": str(path),
+        "row_count": len(rows),
+        "max_param_count": max(counts) if counts else None,
+    }
+
+
+def _read_pai_switch_log(save_name: str | None) -> dict[str, Any]:
+    if not save_name:
+        return {"status": "not_configured"}
+    folder = pai_save_path(save_name)
+    path = folder / f"{folder.name}switch_epochs.csv"
+    if not path.exists():
+        return {"status": "missing", "path": str(path)}
+    try:
+        with path.open(newline="") as fh:
+            rows = list(csv.DictReader(fh))
+    except (OSError, csv.Error):
+        return {"status": "unreadable", "path": str(path)}
+    epoch_column = next(
+        (name for name in (rows[0] if rows else {}) if "epoch" in name.lower()),
+        None,
+    )
+    epochs: list[int] = []
+    if epoch_column is not None:
+        for row in rows:
+            try:
+                epochs.append(int(float(row[epoch_column])))
+            except (TypeError, ValueError):
+                continue
+    return {
+        "status": "available",
+        "path": str(path),
+        "row_count": len(rows),
+        "switch_epochs": epochs,
+    }
+
+
+def _write_pai_summary(
+    *,
+    output_dir: Path,
+    history: list[dict[str, Any]],
+    metadata: ArtifactMetadata,
+    param_count: int,
+    nonzero_params: int,
+) -> None:
+    """Persist a condition-local, final-checkpoint PAI summary.
+
+    PAI's own CSVs may stop before the final continuation phase. The benchmark
+    history and the final model checkpoint are therefore authoritative here;
+    the PAI CSVs are included only as auditable raw telemetry.
+    """
+    continued_history = _load_continued_history(output_dir)
+    all_history = [*history, *continued_history]
+    restructured_epochs = [
+        int(row["epoch"])
+        for row in all_history
+        if _history_flag(row, "pai_restructured") and str(row.get("epoch", "")).isdigit()
+    ]
+    complete_epochs = [
+        int(row["epoch"])
+        for row in all_history
+        if _history_flag(row, "pai_training_complete")
+        and str(row.get("epoch", "")).isdigit()
+    ]
+    raw_architecture = _read_pai_architecture_log(metadata.pai_save_name)
+    raw_switches = _read_pai_switch_log(metadata.pai_save_name)
+    raw_param_count = raw_architecture.get("max_param_count")
+    if raw_param_count is None:
+        consistency = "unavailable"
+    elif raw_param_count == param_count:
+        consistency = "match"
+    elif raw_param_count < param_count:
+        consistency = "stale"
+    else:
+        consistency = "inconsistent"
+    (output_dir / "pai_summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "authoritative_source": "benchmark_history_and_final_checkpoint",
+                "model_key": metadata.model_key,
+                "condition_key": metadata.condition_key,
+                "pai_variant": metadata.pai_variant,
+                "dynamic_schedule": metadata.pai_dynamic_schedule,
+                "final_model": {
+                    "param_count": param_count,
+                    "nonzero_params": nonzero_params,
+                },
+                "history": {
+                    "canonical_epoch_count": len(history),
+                    "continued_epoch_count": len(continued_history),
+                    "restructured_epochs": restructured_epochs,
+                    "training_complete_epochs": complete_epochs,
+                },
+                "raw_pai_logs": {
+                    "architecture": raw_architecture,
+                    "switches": raw_switches,
+                },
+                "architecture_log_consistency": consistency,
+            },
+            indent=2,
+        )
+    )
 
 
 def _apply_pruning(model: Any, torch: Any, prune_amount: float) -> None:
@@ -3289,6 +3461,10 @@ def _build_artifact_metadata(
         freeze_dendrite_updates_fraction=config.freeze_dendrite_updates_fraction,
         pai_candidate_graph_batch_limit=config.pai_candidate_graph_batch_limit,
         memory_cleanup_interval_batches=config.memory_cleanup_interval_batches,
+        model_scale=config.model_scale,
+        pai_variant=config.pai_variant,
+        pai_dynamic_schedule=config.pai_dynamic_schedule,
+        pai_save_name=config.pai_save_name,
     )
 
 
@@ -3319,6 +3495,10 @@ def _metadata_for_stage(
         freeze_dendrite_updates_fraction=metadata.freeze_dendrite_updates_fraction,
         pai_candidate_graph_batch_limit=metadata.pai_candidate_graph_batch_limit,
         memory_cleanup_interval_batches=metadata.memory_cleanup_interval_batches,
+        model_scale=metadata.model_scale,
+        pai_variant=metadata.pai_variant,
+        pai_dynamic_schedule=metadata.pai_dynamic_schedule,
+        pai_save_name=metadata.pai_save_name,
     )
 
 
