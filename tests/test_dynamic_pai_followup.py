@@ -1,12 +1,21 @@
 import json
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
+from unittest.mock import patch
+
+import torch
 
 from dendritic_benchmark.compat import PAIDynamicSchedule, _configure_dynamic_pai_schedule, set_pai_root
+from dendritic_benchmark.data import _make_loader
 from dendritic_benchmark.models import build_model
 from dendritic_benchmark.pipeline import BenchmarkRunner
-from dendritic_benchmark.training import ArtifactMetadata, _write_pai_summary
+from dendritic_benchmark.training import (
+    ArtifactMetadata,
+    _final_clean_pai_parameter_stats,
+    _write_pai_summary,
+)
 
 
 class _RecordingPC:
@@ -26,6 +35,33 @@ class _RecordingPC:
 
 
 class DynamicPAIFollowupTests(unittest.TestCase):
+    def test_dendritic_parameter_stats_use_final_clean_pai_model(self) -> None:
+        wrapped = torch.nn.Linear(2, 2, bias=False)
+        clean = torch.nn.Linear(2, 1, bias=False)
+        with torch.no_grad():
+            clean.weight.copy_(torch.tensor([[1.0, 0.0]]))
+
+        class _PAIUtils:
+            @staticmethod
+            def prepare_final_model(model: torch.nn.Module) -> torch.nn.Module:
+                self.assertIs(model, wrapped)
+                return clean
+
+        with patch("dendritic_benchmark.training.pai_runtime_guard", nullcontext):
+            with patch(
+                "dendritic_benchmark.training.importlib.import_module",
+                return_value=_PAIUtils,
+            ):
+                self.assertEqual(_final_clean_pai_parameter_stats(wrapped), (2, 1))
+
+    def test_data_worker_override_disables_multiprocessing(self) -> None:
+        dataset = torch.utils.data.TensorDataset(torch.arange(4))
+        with patch.dict("os.environ", {"DQB_DATA_NUM_WORKERS": "0"}):
+            loader = _make_loader(dataset, batch_size=2, num_workers=2)
+
+        self.assertEqual(loader.num_workers, 0)
+        self.assertFalse(loader.persistent_workers)
+
     def test_schedule_override_scales_thresholds_with_dendrite_cap(self) -> None:
         pc = _RecordingPC()
         _configure_dynamic_pai_schedule(

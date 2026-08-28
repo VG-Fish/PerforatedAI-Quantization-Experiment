@@ -250,6 +250,20 @@ def _make_loader(
     ``persistent_workers`` keeps worker processes alive between epochs so the
     spawn cost is paid only once per training run.
     """
+    # CI and restricted execution environments can prohibit PyTorch's shared
+    # memory helper. An explicit override keeps those runs single-process
+    # without changing the normal local default.
+    workers_override: str | None = os.environ.get("DQB_DATA_NUM_WORKERS")
+    if workers_override is not None:
+        try:
+            num_workers = int(workers_override)
+        except ValueError as exc:
+            raise ValueError(
+                "DQB_DATA_NUM_WORKERS must be a non-negative integer"
+            ) from exc
+        if num_workers < 0:
+            raise ValueError("DQB_DATA_NUM_WORKERS must be a non-negative integer")
+
     loader_kwargs: dict[str, Any] = {
         "batch_size": batch_size,
         "shuffle": shuffle,

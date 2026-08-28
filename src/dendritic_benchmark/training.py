@@ -1330,6 +1330,36 @@ def _count_parameters(model: Any) -> tuple[int, int]:
     return param_count, nonzero_params
 
 
+def _final_clean_pai_parameter_stats(model: Any) -> tuple[int, int]:
+    """Count the inference model PAI writes as ``final_clean_pai.pt``.
+
+    A live PAI wrapper retains the next candidate dendrite and its training
+    bookkeeping. Those tensors are not part of the final inference topology,
+    but ``model.parameters()`` includes them. PAI's own final export calls
+    ``prepare_final_model`` to deep-copy, blockwise-convert, and strip that
+    scaffolding, so use the same representation for benchmark parameter
+    reporting. This must run only after all training and evaluation complete:
+    PAI clears processor state while constructing the copy.
+    """
+    try:
+        UPA = importlib.import_module("perforatedai.utils_perforatedai")
+        prepare_final_model = getattr(UPA, "prepare_final_model")
+    except Exception as exc:
+        raise RuntimeError(
+            "PerforatedAI's final-clean export is required to count a dendritic "
+            "model accurately."
+        ) from exc
+    try:
+        with pai_runtime_guard():
+            final_clean_model = prepare_final_model(model)
+    except Exception as exc:
+        raise RuntimeError(
+            "PerforatedAI could not prepare the final-clean inference model for "
+            "parameter accounting."
+        ) from exc
+    return _count_parameters(final_clean_model)
+
+
 def _write_metrics_and_history(
     *,
     output_dir: Path,
@@ -1394,13 +1424,14 @@ def _persist_stage_artifacts(
     plain_model: Any,
     metadata: ArtifactMetadata,
     payload: ArtifactPayload,
+    parameter_stats: tuple[int, int] | None = None,
 ) -> tuple[Path, float, int, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / _MODEL_PT
     torch.save(plain_model.state_dict(), checkpoint_path)
     artifact_path = _artifact_path(output_dir, metadata.use_dendrites)
     file_size_mb = artifact_path.stat().st_size / (1024 * 1024)
-    param_count, nonzero_params = _count_parameters(plain_model)
+    param_count, nonzero_params = parameter_stats or _count_parameters(plain_model)
     if metadata.use_dendrites:
         _write_dendritic_sidecars(
             output_dir=output_dir,
@@ -3586,6 +3617,7 @@ def _persist_post_pqat_snapshot(
     plain_model: Any,
     metadata: ArtifactMetadata,
     payload: ArtifactPayload,
+    parameter_stats: tuple[int, int] | None = None,
 ) -> None:
     if not enabled:
         return
@@ -3594,6 +3626,7 @@ def _persist_post_pqat_snapshot(
         plain_model=plain_model,
         metadata=metadata,
         payload=payload,
+        parameter_stats=parameter_stats,
     )
 
 
@@ -3605,6 +3638,7 @@ def _persist_over_budget_snapshot(
     metadata: ArtifactMetadata,
     payload: ArtifactPayload,
     max_epochs: int,
+    parameter_stats: tuple[int, int] | None = None,
 ) -> ArtifactPayload:
     if not enabled:
         return payload
@@ -3639,6 +3673,7 @@ def _persist_over_budget_snapshot(
         plain_model=plain_model,
         metadata=metadata,
         payload=over_payload,
+        parameter_stats=parameter_stats,
     )
     return ArtifactPayload(
         best_metric=payload.best_metric,
@@ -3918,12 +3953,16 @@ def train_and_evaluate(
         skip_reason=skip_reason,
         stage_name="after_pqat" if pqat_enabled else None,
     )
+    final_parameter_stats = (
+        _final_clean_pai_parameter_stats(_plain_model) if use_dendrites else None
+    )
     _persist_post_pqat_snapshot(
         enabled=pqat_enabled,
         output_dir=output_dir,
         plain_model=_plain_model,
         metadata=metadata,
         payload=payload,
+        parameter_stats=final_parameter_stats,
     )
     payload = _persist_over_budget_snapshot(
         enabled=use_dendrites and config.train_dendrites_until_complete,
@@ -3932,6 +3971,7 @@ def train_and_evaluate(
         metadata=metadata,
         payload=payload,
         max_epochs=max_epochs,
+        parameter_stats=final_parameter_stats,
     )
 
     _, file_size_mb, param_count, nonzero_params = _persist_stage_artifacts(
@@ -3939,6 +3979,7 @@ def train_and_evaluate(
         plain_model=_plain_model,
         metadata=metadata,
         payload=payload,
+        parameter_stats=final_parameter_stats,
     )
 
     record = TrainingRecord(
