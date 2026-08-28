@@ -1058,14 +1058,17 @@ log still showed the EMA warm-up value as global best
 average. Lesson recorded because the "fix" initially looked verified from
 gcn's raw-looking switch-log values, which a late-stage EMA also produces.
 
-The real fix was verified two ways before dynamic9: mechanically (upstream
+The real fix was verified three ways: mechanically (upstream
 `update_running_accuracy` source: the first-score seeding branch runs iff
-`epochs_since_cycle_switch < initial_history_after_switches`) and
-empirically (fresh vae_mnist re-run — see the dynamic9 record). Predicted
-side-benefit either way: the lenet5/distilbert rising-EMA switch blocker is
-softened (post-switch warm-up no longer manufactures a monotone rise from
-zero), which is why lenet5 rejoins the next run without a fixed-switch
-entry.
+`epochs_since_cycle_switch < initial_history_after_switches`); empirically
+in a pre-launch verification re-run (vae_mnist dendrites_fp32 tested ELBO
+−91.55, up from the broken run's −94.15 and beating base's −92.49); and
+again inside dynamic9's own production numbers (mpnn raw 0.876 → running
+0.839 at epoch 2; old bug would have given ≈0.11). Predicted side-benefit
+confirmed: lenet5 entered its first-ever dendrite phase under dynamic9 (4
+switch events, first dendrite by epoch 9) — the rising-EMA switch blocker
+no longer manufactures a monotone rise from zero. Full record:
+`information/DYNAMIC9_RUN_2026-08-28.md`.
 
 **Reading rule:** for any stored run, check
 `results/PAI/<model>_<cond>/<...>best_arch_scores.csv` — if it lists only the
