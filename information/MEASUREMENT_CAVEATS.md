@@ -18,16 +18,19 @@ Status at a glance:
 | 5 | `actor_critic`/`m5` ship a phantom randomly-initialized dendrite in every `dendrites_q*` arm | yes — `_split_compatible_state` only checks one direction | **yes** — see §5 |
 | 6 | `q1`/`q1_58` had **no scale factor at all**; `q4`/`q8` calibrated on outliers | yes — `compat.py` kernel math | **yes** — see §6 |
 | 7 | run-to-run variance (3.4pp) exceeds the effect being measured (0.3pp) | yes — nothing was seeded | **partly** — `--seed` added, but error bars still need multiple seeds, see §7 |
-| 8 | the collapse guard killed 6 of 7 dendritic runs mid-dendrite-phase; **no model ever added a dendrite** | yes — a dendrite phase freezes validation by construction, and the rescue path was unreachable | **yes** — see §8 |
+| 8 | the collapse guard killed 4 of 7 dendritic runs mid-dendrite-phase (plus `lenet5` in an ordinary plateau); only `gcn` and `actor_critic` completed their schedules | yes — a dendrite phase freezes validation by construction, and the rescue path was unreachable | **yes** — see §8 (counts corrected after §9) |
+| 9 | `actor_critic dendrites_fp32` `history.csv` shows 60 of 145 real epochs | yes — `_persist_over_budget_snapshot` splits over-budget rows into `continued_until_complete/` **by design** | **n/a** — reading rule documented, see §9 |
 
 **Anything measured at `q1`, `q1_58`, `q2`, or `q4` before 2026-08-28 is invalid**
 (§6), and every `dendrites_q*` number for `actor_critic` and `m5` in `dynamic7` is
 invalid independently of that (§5). A full rerun is required; see §7.
 
 **Superseding all of the above: every `dendrites_*` number produced before the §8
-fix is invalid**, at every bit width. Those arms trained for a fraction of their
-base arm's epochs and never received a working dendrite, so they do not measure
-dendrites at all. `base_*` columns are unaffected. See §8.
+fix is invalid except `gcn`'s and `actor_critic`'s**, at every bit width. The
+invalidated arms trained for a fraction of their base arm's epochs and never
+received a working dendrite, so they do not measure dendrites at all. `gcn` and
+`actor_critic` completed their full dendrite schedules (§8, §9) and their numbers
+stand. `base_*` columns are unaffected. See §8.
 
 ---
 
@@ -766,7 +769,10 @@ for exactly this, at ~28 min per replicate for the 5-model set.
 
 ---
 
-## 8. The collapse guard killed six of seven dendritic runs mid-dendrite-phase
+## 8. The collapse guard killed four of seven dendritic runs mid-dendrite-phase
+*(originally reported as "six of seven"; corrected after §9 reclassified
+`actor_critic` as a completed run and the table below reclassified `lenet5`'s
+kill as an ordinary plateau outside any dendrite phase)*
 
 **Found:** 2026-08-28, investigating why `mpnn`'s dendritic arm was *worse* than its
 base arm at fp32 (RMSE 0.7921 vs 0.7162, and RMSE is minimize — so the dendrites
@@ -839,14 +845,15 @@ files carry switch epochs from earlier launches that contradict the current one)
 | `vae_mnist` | 50 | **24** | 1 (ep 12) | 12 | collapse-killed in first phase |
 | `tcn_forecaster` | 80 | **24** | 1 (ep 12) | 12 | collapse-killed in first phase |
 | `saint_adult` | 200 | **61** | 1 (ep 49) | 12 | collapse-killed in first phase |
-| `actor_critic` | 60 | 60 | 1 (ep 58) | 4 | ran out of epochs mid-phase |
+| `actor_critic` | 60 | **145** (60 + 85 in `continued_until_complete/`) | 4 cycles | — | **completed** — see §9; the 60-row `history.csv` is a by-design split, not a truncation |
 | `gcn` | 200 | 121 | 9 | 2 | **completed** — 4 full cycles, `pai_training_complete` |
 | `lenet5` | 40 | 40 | 0 | 12 | collapse-killed, but **not** in a dendrite phase |
 
-Five of seven entered their first dendrite phase and never escaped it, so they
-never completed a single dendrite cycle. `gcn` is the only model that escaped mode
-`p` unaided, and its phases lasted 3 epochs each (switches at 50→53, 72→75, 93→96,
-107→110) — the only measurement of a self-terminating dendrite phase in the suite.
+Four of seven (`mpnn`, `vae_mnist`, `tcn_forecaster`, `saint_adult`) entered
+their first dendrite phase and never escaped it, so they never completed a single
+dendrite cycle. `gcn` and `actor_critic` both escaped mode `p` unaided and
+completed multi-cycle schedules; `gcn`'s phases lasted 3 epochs each (switches at
+50→53, 72→75, 93→96, 107→110).
 
 `lenet5` is a different case and the fix does not address it: it never switched at
 all in 40 epochs, so its frozen validation (0.9912 accuracy, 12 epochs) is an
@@ -906,27 +913,31 @@ arm's best epoch is 180, that asymmetry is a real confound independent of this b
 
 ### What this invalidates
 
-**Every `dendrites_*` number in the 2026-08-28 seed-0 run except `gcn`'s.** Not
-because they are mismeasured, but because they do not measure what the column
-claims: five of the seven dendritic arms trained for a fraction of their base arm's
-epochs and never completed a single dendrite cycle, and `actor_critic` was cut off
-mid-phase. `mpnn`'s "dendrites are worse" is 24 epochs versus 200. `lenet5`'s
-"+26pp at q2" is a 40-epoch model that never switched at all. Since the `q*` arms
-all load the `dendrites_fp32` checkpoint, the whole dendritic half of the grid
+**Every `dendrites_*` number in the 2026-08-28 seed-0 run except `gcn`'s and
+`actor_critic`'s.** Not because they are mismeasured, but because they do not
+measure what the column claims: four of the seven dendritic arms trained for a
+fraction of their base arm's epochs and never completed a single dendrite cycle.
+`mpnn`'s "dendrites are worse" is 24 epochs versus 200. `lenet5`'s "+26pp at q2"
+is a 40-epoch model that never switched at all. Since the `q*` arms all load the
+`dendrites_fp32` checkpoint, the dendritic half of the grid for those five models
 inherits this. It is a larger invalidation than §5 or §6 and requires a rerun of
-all dendritic conditions.
+their dendritic conditions.
 
-`gcn` is the one dendritic arm whose mechanism ran to completion, and it is the one
-the model-selection notes in `experiments/dynamic7/config/run_dynamic7.sh` demoted
-to a smoke test for its 3.4pp noise floor (§7).
+`gcn` and `actor_critic` are the two dendritic arms whose mechanism ran to
+completion (§9 initially hid `actor_critic`'s). `gcn` is the one the
+model-selection notes in `experiments/dynamic7/config/run_dynamic7.sh` demoted
+to a smoke test for its 3.4pp noise floor (§7) — but note that was an
+*unseeded, cross-run* noise floor; the seeded paired-arm design measures the
+within-run delta, which three paired runs put at +1.9/+2.9/+2.2pp.
 
 `base_*` columns are unaffected — they never enter this path.
 
 ---
 
-## 9. `actor_critic dendrites_fp32` — `history.csv` undercounts the real run (open)
+## 9. `actor_critic dendrites_fp32` — `history.csv` undercounts the real run (RESOLVED — by design, not a bug)
 
 **Found:** 2026-08-28, while re-checking each stuck model's raw log against §8's table.
+**Root-caused:** 2026-08-28, during the full-code review.
 
 `results/actor_critic/dendrites_fp32/history.csv` has exactly 60 rows, one
 `pai_restructured=True` at epoch 58, and no collapse — read at face value this
@@ -939,18 +950,28 @@ well past epoch 60. `record.json`'s `best_epoch=117` is consistent with the log,
 not the CSV. There is no `[collapse]` message for this run anywhere in the logs —
 it ended in a plain `[done]`, so it was not cut short by §8's bug.
 
-File mtimes rule out a stale leftover file: `history.csv`, `record.json`, and
-`model.pt` all carry the same timestamp as the `[done]` line. So something in the
-write path is handed (or builds) a `history` list shorter than what
-`_run_training_epochs` actually accumulated, while the model/metrics values used
-for `record.json` come from the live final model and are unaffected. `60` matches
-`TrainingConfig.max_epochs` for actor_critic's *base* recipe, which is suspicious —
-possibly the dendritic write path is (somewhere) capped at the recipe's nominal
-epoch budget even though the run itself is unbounded
-(`train_dendrites_until_complete=True`, `itertools.count()`).
+**Root cause — `_persist_over_budget_snapshot` (training.py), and it is
+deliberate.** For dynamic dendritic runs (`train_dendrites_until_complete`),
+the epoch history is split at the recipe's nominal `max_epochs` on save:
+rows `1..max_epochs` become the canonical `history.csv`, and every row past
+the budget is written to `continued_until_complete/history.csv` in the same
+condition directory. Verified on disk: actor_critic's canonical file holds
+epochs 1–60 (60 = the recipe budget) and
+`continued_until_complete/history.csv` holds epochs 61–145 — 145 total,
+consistent with the log and with `best_epoch=117`. Nothing was lost; the
+"missing" rows were always one directory down.
 
-**Not yet root-caused.** Flagging so it isn't mistaken for §8 (this run never
-collapsed) and so `history.csv` isn't trusted for epoch-count diagnosis on this
-model until it's fixed. `mpnn`, `vae_mnist`, `saint_adult`, and `tcn_forecaster`
-were individually checked against their raw logs and do not show this — their
-`history.csv` row counts match the collapse point exactly.
+Two reading rules follow:
+
+1. **Epoch-count diagnosis on a dynamic dendritic run must concatenate
+   `history.csv` + `continued_until_complete/history.csv`.** The canonical
+   file alone understates any run that outlived its budget.
+2. **`record.json`/`metrics.json` can name a `best_epoch` that is not in
+   the canonical `history.csv` at all** (117 > 60 here) — that is the same
+   split, not corruption. It also means the canonical record's test metric
+   was produced by a model trained *past* the budget, which is one more face
+   of the base-vs-dendritic epoch-budget asymmetry already flagged in §8.
+
+`mpnn`, `vae_mnist`, `saint_adult`, and `tcn_forecaster` did not show the
+mismatch simply because §8's collapse guard killed them *before* their
+budgets, so they never had over-budget rows to split off.

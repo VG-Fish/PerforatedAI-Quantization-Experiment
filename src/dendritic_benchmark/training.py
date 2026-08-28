@@ -3249,7 +3249,9 @@ def _run_training_epochs(
                 f"[collapse] {context.run_label}: validation "
                 f"{context.metric_name} frozen at {val_metric:.6f} for "
                 f"{_COLLAPSE_GUARD_EPOCHS} epochs, worse than the best "
-                f"{state.best_metric:.6f} from epoch {state.best_epoch + 1} — "
+                # best_epoch is already 1-indexed (_record_best_epoch stores
+                # epoch + 1), so no further offset here.
+                f"{state.best_metric:.6f} from epoch {state.best_epoch} — "
                 "stopping this condition rather than training a dead network."
             )
             break
