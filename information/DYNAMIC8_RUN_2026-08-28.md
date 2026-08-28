@@ -110,8 +110,11 @@ best-model tracking for every metric that is not positive-maximize. This
 
 The headline "dendrites don't add quantization robustness" therefore now
 rests only on gcn and actor_critic. Fixed in compat.py
-(`set_running_average_pb: False`); vae and gcn verification re-runs were
-launched the same day (results recorded below when complete). lenet5 and
+(`set_initial_history_after_switches: 8` to match `history_lookback: 8`;
+a first attempt with `set_running_average_pb: False` reproduced the broken
+vae result bit-for-bit and was reverted — §10 has the full story); vae and
+gcn verification re-runs were launched the same day (results recorded below
+when complete). lenet5 and
 gru_forecaster selected as the two additions for the next run — one tests the
 fix's switch-unblocking prediction (maximize regime), one the repaired
 minimize regime.

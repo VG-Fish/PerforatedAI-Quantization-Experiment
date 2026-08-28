@@ -294,6 +294,19 @@ def _configure_dynamic_pai_schedule(
                 # PAI names the plateau-detection window "history_lookback"; the
                 # default of 1 switches on transient noise.
                 "set_history_lookback": 8,
+                # MUST accompany any history_lookback > 1. PAI's running
+                # average only seeds from the first real score while
+                # epochs_since_cycle_switch < initial_history_after_switches;
+                # at the default 0 that branch never runs and the EMA warms up
+                # from ZERO — a better-than-anything-real score for every
+                # metric that is not positive-maximize (ELBO ~ -92 under
+                # maximize, MAE/RMSE under minimize), so PAI pins its best
+                # model at epoch ~1 and restore-on-complete ships a
+                # barely-trained network (MEASUREMENT_CAVEATS §10; dynamic8's
+                # vae/tcn/mpnn dendritic arms). Matching the lookback gives a
+                # cumulative-mean warm-up over the same window after every
+                # switch.
+                "set_initial_history_after_switches": 8,
                 # Indexed by dendrites added (globals_perforatedai getter_val), so
                 # this needs max_dendrites + 1 entries. The final entry must stay
                 # above zero: at a threshold of 0 only improvement_threshold_raw
@@ -305,17 +318,6 @@ def _configure_dynamic_pai_schedule(
     _apply_pai_schedule_values(
         pc,
         {
-            # PAI's running average is an EMA seeded at zero. Zero is a
-            # *better-than-anything-real* score for every metric that is not a
-            # positive maximize one (ELBO ~ -92 under maximize, MAE/RMSE under
-            # minimize), so the warm-up values beat every genuine score
-            # forever: PAI sees perpetual no-improvement, pins its best model
-            # at epoch ~1, and its restore-best-on-complete hands back a
-            # barely-trained network (dynamic8: vae_mnist, tcn_forecaster,
-            # mpnn all shipped epoch~1-era states as their "dendritic" model).
-            # Raw scores make best-tracking and plateau detection follow the
-            # actual validation metric for every direction/sign.
-            "set_running_average_pb": False,
             "set_p_epochs_to_switch": 2,
             # Dendrites stopped paying for themselves well before the sixth on
             # every model measured so far, and each extra one costs ~100 epochs
@@ -365,9 +367,6 @@ def _configure_bounded_pai_schedule(
             "set_n_epochs_to_switch": switch_interval,
             "set_p_epochs_to_switch": p_epochs,
             "set_max_dendrites": target_switches,
-            # Same zero-seeded-EMA hazard as the dynamic schedule: fixed
-            # switching ignores scores, but restore-best-on-complete does not.
-            "set_running_average_pb": False,
         },
     )
     correlation_batches = _initial_correlation_batches(

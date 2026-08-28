@@ -983,11 +983,18 @@ with val ELBO −92.71 (better than base's −92.85 val) yet *tested* at −94.1
 (worse than base's −92.16) — a 1.4-nat val→test inversion where base shows a
 +0.7-nat val→test gain.
 
-**Mechanism.** PAI's score tracking (`running_average_pb=True`) is an EMA
+**Mechanism.** PAI's score tracking is an EMA that, in our configuration, is
 seeded at zero with weight `1/history_lookback` (=1/8; verified exactly:
 vae's first running score −11.8696 = −94.9572/8, tcn's 0.04089 = 0.32713/8,
-mpnn's 0.10351 = 0.82810/8). Zero is a *better-than-anything-real* score for
-every metric that is not positive-maximize:
+mpnn's 0.10351 = 0.82810/8). The upstream source
+(`update_running_accuracy`) only seeds the running average from the first
+*real* score while `epochs_since_cycle_switch <
+initial_history_after_switches` — and that config defaults to **0**, so the
+seeding branch never runs. At PAI's default `history_lookback=1` this is
+harmless (the EMA weight is 1.0, running = raw); it was *our own override*
+of `history_lookback` to 8 (added to stop switching on transient noise)
+that armed the zero-seeded warm-up. Zero is a *better-than-anything-real*
+score for every metric that is not positive-maximize:
 
 - ELBO under maximize: real scores ≈ −92; the EMA descends from ~0 toward
   −92, i.e. PAI sees the score "worsen" every epoch of the entire run.
@@ -1036,13 +1043,29 @@ pai-running-average-blocks-switch) — one root mechanism, two failure modes.
 - `gcn` and `actor_critic` dendritic numbers **stand** (benign quadrant,
   best-state restores succeeded on matching structures).
 
-**Fix (2026-08-28, compat.py):** `set_running_average_pb: False` in both
-`_configure_dynamic_pai_schedule` and `_configure_bounded_pai_schedule` — PAI
-then tracks raw validation scores, which are direction- and sign-correct for
-every model. Verified live: gcn's switch checks now log raw-score comparisons
-("global_best=0.7364, current_best=0.7344"). Predicted side-benefit: the
-lenet5/distilbert rising-EMA switch blocker disappears (flat raw scores DO
-plateau), making lenet5 addable without a fixed-switch entry.
+**Fix (2026-08-28, compat.py):** `set_initial_history_after_switches: 8`
+(matching `set_history_lookback: 8`) in `_configure_dynamic_pai_schedule` —
+PAI then seeds the running average from the first real score and warms up
+with a cumulative mean over the first 8 epochs after every cycle switch,
+before transitioning to the EMA. The bounded/fixed-switch path needs no
+change (it leaves `history_lookback` at 1, where running = raw).
+
+A first fix attempt — `set_running_average_pb: False` — was **wrong and is
+reverted**: a fresh vae_mnist verification run under it reproduced the
+broken result bit-for-bit (test −94.15, best val −92.71@50), and its switch
+log still showed the EMA warm-up value as global best
+(`global_best=-22.2394`). That flag does not gate the validation running
+average. Lesson recorded because the "fix" initially looked verified from
+gcn's raw-looking switch-log values, which a late-stage EMA also produces.
+
+The real fix was verified two ways before dynamic9: mechanically (upstream
+`update_running_accuracy` source: the first-score seeding branch runs iff
+`epochs_since_cycle_switch < initial_history_after_switches`) and
+empirically (fresh vae_mnist re-run — see the dynamic9 record). Predicted
+side-benefit either way: the lenet5/distilbert rising-EMA switch blocker is
+softened (post-switch warm-up no longer manufactures a monotone rise from
+zero), which is why lenet5 rejoins the next run without a fixed-switch
+entry.
 
 **Reading rule:** for any stored run, check
 `results/PAI/<model>_<cond>/<...>best_arch_scores.csv` — if it lists only the
