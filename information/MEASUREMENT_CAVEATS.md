@@ -4,7 +4,8 @@ Three measurement caveats were recorded (without being fixed) during the `dynami
 run — see `experiments/dynamic5/reference/BENCHMARKS.md` §"The quantization kernels"
 and `experiments/dynamic5/report.md` §6.6. This document traces each one to the
 exact code responsible and lays out fix options. Line numbers are current as of
-commit `675105a` (branch `dynamic5-baselines`).
+commit `675105a` (branch `dynamic5-baselines`). A 4th caveat (§4) was found live
+during the `dynamic7` run itself, on 2026-08-28.
 
 Status at a glance:
 
@@ -13,6 +14,7 @@ Status at a glance:
 | 1 | `q2` collapses to 3 knife-edge levels | yes — `compat.py` kernel math | **yes** — user chose "fix it properly", see §1 |
 | 2 | `tcn_forecaster` `q1`/`q1_58` overflow to ~1e9–1e10 | yes — architecture-specific | **moot** — model is being dropped, see §2 |
 | 3 | `dendrites_fp32` vs `dendrites_q*` param-count mismatch | yes — two independent, unsynchronized checkpoint systems | **yes** — see §3 |
+| 4 | `gcn/dendrites_q8` transient checkpoint-reconstruction crash | partial — mechanism guarded, exact race not confirmed | **no** — self-healed by a manual relaunch this run, see §4 |
 
 ---
 
@@ -268,3 +270,104 @@ i.e. these four models' dendritic gain may currently be **understated**, not
 overstated. `mpnn` is one of the three models chosen for the new 7-model run
 (see `MODEL_SELECTION.md`), which makes it a natural test case: its `top10` numbers
 disagree with this prediction only if the fix turns out not to fire for it.
+
+---
+
+## 4. `gcn / dendrites_q8` — Fix B fired correctly, but the crash it caught was
+transient, and the auto-restart safety net wasn't watching
+
+Observed live during the `dynamic7` launch, 2026-08-28. **Not a data-quality
+problem** — the stored `gcn` numbers are fine (see below) — but a real gap in how
+this kind of crash gets recovered from, worth recording before it's forgotten.
+
+**What happened.** `gcn`'s `dendrites_fp32` training (stream_3) hit a `DOING_HISTORY`
+switch trigger at epoch 117 that added a new candidate dendrite, and in that same
+epoch PAI's own scoring immediately judged the candidate not to have helped and
+declared training complete:
+
+```
+Returning True - History and last improved is hit
+The newest added dendrites did not improve system and 2 > 2 so returning training_complete.
+```
+
+The condition finished and reported `dendrites_fp32 — Accuracy: 0.7990` at
+`10:42:17`. The very next condition, `dendrites_q8`, needs to reconstruct the
+dendrite structure from PAI's own checkpoint system before it can quantize
+`gcn`'s trained weights (`pipeline.py::_load_source_checkpoint`), and that
+reconstruction disagreed with the raw final state saved to `model.pt` — exactly
+the mismatch Fix B (§3) was written to catch:
+
+```
+RuntimeError: [state] source-checkpoint structure does not match the PAI
+switch-checkpoint-reconstructed model -- refusing a partial load. Mismatched
+tensors: conv1.linear.dendrite_module.dendrites_to_candidates.0,
+conv2.linear.dendrite_module.dendrites_to_candidates.0.
+```
+
+The worker process for stream_3 exited on this uncaught exception, 4 of `gcn`'s
+12 conditions still unrun.
+
+**Fix B behaved exactly as intended.** This is not a case where the fix was wrong
+to fire — a genuine structural disagreement existed between the two checkpoint
+systems (§3's root cause, applied here to a newly-created, never-tested candidate
+dendrite rather than a stale best-epoch snapshot), and refusing the partial load
+instead of silently producing a `dendrites_q8` record with the wrong `param_count`
+is the whole point of that fix.
+
+**How it actually got recovered — manually, not automatically.** `run_20260828_104616.txt`
+shows a *separate* `dqb run --models gcn --dynamic-dendritic-training …` invocation
+launched at `10:46:16`, about 4 minutes after the crash, which skipped the 7
+already-recorded conditions and successfully trained/quantized the remaining 5 —
+`dendrites_q8` through `dendrites_q1` all completed within about 10 seconds
+(`10:46:16`–`10:46:26`), with no error. This was Codex noticing the dead stream and
+relaunching it, not this codebase's own recovery path.
+
+**Why the built-in auto-restart didn't catch it.** `pipeline.py::_watch` (~line
+1709) already has exactly this kind of recovery — up to `_MAX_WORKER_RESTARTS = 5`
+automatic respawns per stream, 30s apart, added 2026-08-10 for a different failure
+mode (silent SIGKILLs). It didn't fire here: `run_progress.log` has no
+`"restarting"`/`"crashed"`/`"exited with code"` line anywhere in it, and as of this
+check the top-level `dqb run --jobs 7` watcher process isn't running at all — both
+surviving workers (`m5`, `textcnn`) have `PPID 1` (reparented to `launchd`), meaning
+their original parent already exited. `run_progress.log`'s last entry is frozen at
+`11:44:56` while the workers keep training well past that timestamp. So the restart
+safety net exists in the code but wasn't an active supervisor for this launch by
+the time (or possibly before) the crash happened — **if `m5` or `textcnn` crash
+before finishing, nothing will restart them either; each would need the same kind
+of manual single-model relaunch `gcn` got.**
+
+**Open question — why did the identical on-disk files fail once and then
+succeed once, unmodified?** `dendrites_fp32`'s `record.json`/`model.pt` were not
+regenerated between the two attempts (same `10:42:17` mtime both times), so the
+retry reconstructed from and loaded exactly the same bytes that had just failed.
+A deterministic structural incompatibility baked into those files would have
+failed again identically; it didn't. The mismatch was therefore tied to something
+about reconstructing the structure *within the same long-lived worker process that
+had just finished writing it*, not to the files themselves — a fresh process
+reading them cold, four minutes later, worked immediately. That "identical run,
+different outcome" signature is the same one already on record for
+[[mps-nonblocking-eval-race]] (PointNet's corrupted eval input): a leading but
+**unconfirmed** hypothesis is an async write/materialization race in the
+checkpoint round-trip (MPS tensor data, or a buffered file write, not fully durable
+by the time the same process reads it back), not a bug in the comparison logic
+itself. This wasn't investigated further this session — root-causing it would mean
+instrumenting `save_pai_system`/`load_pai_system_checkpoint` (`compat.py`) around
+this exact epoch boundary on a reproduction run, which didn't happen here.
+
+**Is the stored `gcn` data trustworthy?** Yes. The successful retry went through
+the identical Fix B compatibility check and passed it cleanly — no partial load
+occurred, so `gcn`'s `dendrites_q8`–`dendrites_q1` records reflect the same
+structure `dendrites_fp32` actually reported, not a silently-degraded
+reconstruction.
+
+**Follow-up worth doing, not done here:**
+- If this recurs, wrap `_load_source_checkpoint`'s checkpoint-reconstruction step
+  in a small in-process retry (a few attempts, short backoff) before letting the
+  exception propagate — turns a manual-relaunch recovery into a self-healing one,
+  consistent with the philosophy `_watch`'s stream-level restart already uses one
+  level up.
+- Separately: `_watch`'s auto-restart is only a safety net while its parent process
+  is alive. Confirm whether this launch's watcher exited intentionally (e.g. `dqb
+  run --detach` semantics, or a terminal that was closed) or crashed itself — if
+  the latter, the watcher's own crash resilience needs the same kind of scrutiny
+  applied to the workers it supervises.
