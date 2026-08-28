@@ -449,6 +449,28 @@ class BenchmarkRunner:
             # budget across near-noise candidates instead of the layer that
             # actually correlates with the learning signal.
             "tcn_forecaster": [".net"],
+            # gcn is deliberately absent, and it is worth recording why so nobody adds
+            # it back on the same reasoning that failed here.
+            #
+            # .conv1 holds 91,776 of GCN's 92,231 parameters (99.5%) yet scored the
+            # *lower* Best-PBScore on the 2026-08-03 dynamic run -- 0.0635 against
+            # .conv2's 0.0925. Both the perforatedai-analyze PBScore guidance and the
+            # "convert only top layers" advice in the perforatedai skill therefore say
+            # to hold .conv1 out and let dendrites go to the 455-parameter .conv2.
+            #
+            # Measured, that is wrong. Three paired dqb runs per arm, dynamic mode,
+            # comparing dendrites_fp32 against the same run's own base_fp32:
+            #
+            #   .conv1 track-only   +0.0030 +0.0050 +0.0040  -> +0.40pp, 1.01x params
+            #   .conv1 perforated   +0.0190 +0.0290 +0.0220  -> +2.33pp, 3.67x params
+            #
+            # Welch t ~ 6.4 on ~2 dof against a 4.30 critical value. Excluding .conv1
+            # cuts the parameter cost 3.6x but keeps only 17% of the accuracy gain, so
+            # nearly all of the dendritic benefit comes from the layer PBScore ranked
+            # *lower*. PBScore ranks candidates within a layer's own signal; it does not
+            # predict how much headroom a layer has to absorb new capacity, and on a
+            # 1433-input bag-of-words first layer that headroom is where the gain is.
+            # See experiments/dynamic5/config/PERFORATION.md.
             # Only .head.1 (0.229) and the row_blocks attn.qkv layers (0.10-0.15)
             # cleared the >0.02 PBScore bar the perforatedai-analyze guidance
             # treats as "efficient dendrite user" on the 2026-08-03 dynamic run;
