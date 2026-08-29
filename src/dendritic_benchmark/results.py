@@ -13,7 +13,7 @@ from .plots import (
     winner_heatmap,
 )
 from .specs import CONDITION_SPECS, MODEL_SPECS, condition_by_key
-from .training import TrainingRecord
+from .training import QUANTIZATION_EVALUATION_REVISION, TrainingRecord
 
 _BEST_MODEL_STATS_CSV = "best_model_stats.csv"
 _RECORD_JSON = "record.json"
@@ -21,6 +21,12 @@ _COERCE_INT_KEYS = {"best_epoch", "param_count", "nonzero_params"}
 _COERCE_FLOAT_KEYS = {"metric_value", "best_metric_value", "file_size_mb", "train_seconds"}
 _COERCE_BOOL_KEYS = {"training_skipped"}
 _BENCHMARK_MANIFEST_FIELDS = {"model_key", "condition_key", "batch_size", "mean_latency_ms", "median_latency_ms"}
+_NON_REPORTABLE_DENDRITE_STATUSES = {
+    "no_retained_insertion",
+    "inherited_no_retained_insertion",
+    "unverified",
+    "inherited_unverified",
+}
 
 
 def _iter_condition_dirs(results_root: Path):
@@ -146,15 +152,121 @@ def write_manifest(records: list[dict[str, Any]], output_path: Path) -> None:
         if not records:
             fh.write("")
             return
-        writer = csv.DictWriter(fh, fieldnames=list(records[0].keys()))
+        # Results can combine a prior merged run with a newer schema (for
+        # example, Dynamic12's dendrite-audit fields). Preserve every record
+        # instead of letting the first legacy row reject newer columns.
+        fieldnames = list(dict.fromkeys(key for record in records for key in record))
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(records)
+
+
+def _legacy_dendrite_audit_status(record: dict[str, Any]) -> str | None:
+    """Infer an invalid legacy result from its source FP32 PAI summary.
+
+    New records carry an explicit status. Dynamic12's already-written records
+    predate that field, so the comparison report reads the raw switch evidence
+    rather than continuing to plot a no-insertion TCN run as a dendrite result.
+    """
+    condition_key = str(record.get("condition_key", ""))
+    if not condition_key.startswith("dendrites_"):
+        return None
+    artifact_dir = record.get("artifact_dir")
+    if not artifact_dir:
+        return None
+    condition_dir = Path(str(artifact_dir))
+    source_dir = (
+        condition_dir
+        if condition_key == "dendrites_fp32"
+        else condition_dir.parent / "dendrites_fp32"
+    )
+    summary_path = source_dir / "pai_summary.json"
+    try:
+        summary = json.loads(summary_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    explicit = summary.get("dendrite_audit", {}).get("status")
+    if explicit:
+        return str(explicit)
+    switches = summary.get("raw_pai_logs", {}).get("switches", {})
+    if switches.get("status") == "available" and int(switches.get("row_count", 0)) < 2:
+        return "no_retained_insertion"
+    raw_architecture = summary.get("raw_pai_logs", {}).get("architecture", {})
+    source_record = _load_condition_record(source_dir)
+    dense_record = _load_condition_record(source_dir.parent / "base_fp32")
+    try:
+        final_params = int((source_record or {}).get("param_count"))
+        dense_params = int((dense_record or {}).get("param_count"))
+        raw_params = int(raw_architecture.get("max_param_count"))
+    except (TypeError, ValueError):
+        return None
+    if (
+        switches.get("status") == "available"
+        and int(switches.get("row_count", 0)) >= 2
+        and raw_architecture.get("status") == "available"
+        and final_params > dense_params
+        and raw_params == final_params
+    ):
+        return "verified_retained"
+    return None
+
+
+def _dendrite_audit_status(record: dict[str, Any]) -> str:
+    explicit = record.get("dendrite_audit_status")
+    if explicit:
+        return str(explicit)
+    return _legacy_dendrite_audit_status(record) or "legacy_unchecked"
+
+
+def _quantization_evaluation_status(record: dict[str, Any]) -> str:
+    artifact_dir = record.get("artifact_dir")
+    if not artifact_dir:
+        return "legacy_unchecked"
+    try:
+        metrics = json.loads((Path(str(artifact_dir)) / "metrics.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return "legacy_unchecked"
+    if not metrics.get("use_qat"):
+        return "not_applicable"
+    if metrics.get("quantization_evaluation_revision") == QUANTIZATION_EVALUATION_REVISION:
+        return "current"
+    return "stale_double_projection"
+
+
+def _record_is_reportable(record: dict[str, Any]) -> bool:
+    return (
+        _dendrite_audit_status(record) not in _NON_REPORTABLE_DENDRITE_STATUSES
+        and _quantization_evaluation_status(record) != "stale_double_projection"
+    )
+
+
+def _write_dendrite_audit(records: list[dict[str, Any]], output_dir: Path) -> None:
+    rows = [
+        {
+            "model_key": record.get("model_key", ""),
+            "condition_key": record.get("condition_key", ""),
+            "dendrite_audit_status": _dendrite_audit_status(record),
+            "dendrite_audit_reason": record.get("dendrite_audit_reason", ""),
+            "quantization_evaluation_status": _quantization_evaluation_status(record),
+            "reportable": _record_is_reportable(record),
+        }
+        for record in records
+        if str(record.get("condition_key", "")).startswith("dendrites_")
+    ]
+    with (output_dir / "dendrite_audit.csv").open("w", newline="") as fh:
+        if not rows:
+            fh.write("")
+            return
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def write_model_reports(
     model_display_name: str, records: list[dict[str, Any]], output_dir: Path
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+    records = [record for record in records if _record_is_reportable(record)]
     condition_order = [spec.key for spec in CONDITION_SPECS]
     by_condition = {record["condition_key"]: record for record in records}
     metric_values = [
@@ -295,6 +407,8 @@ def write_comparison_reports(
     every model that was never run.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+    _write_dendrite_audit(records, output_dir)
+    records = [record for record in records if _record_is_reportable(record)]
     baselines = _baseline_lookup(records)
     model_specs = (
         [spec for spec in MODEL_SPECS if spec.key in set(model_keys)]

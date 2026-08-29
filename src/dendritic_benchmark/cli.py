@@ -395,13 +395,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "--pai-variant",
-        choices=("default", "vae_latent", "mpnn_capacity"),
+        choices=(
+            "default",
+            "gru_gate_ablation",
+            "mpnn_capacity",
+            "tcn_head_both",
+            "tcn_head_output",
+            "vae_latent",
+        ),
         default="default",
         help=(
             "Select a measured PAI targeting ablation. `default` uses the "
-            "Dynamic9 follow-up settings; `vae_latent` perforates only VAE "
-            "latent heads; `mpnn_capacity` permits a fourth targeted MPNN "
-            "dendrite. (default: default)"
+            "current targeted settings; `tcn_head_output`/`tcn_head_both` "
+            "screen alternate TCN head targets; `gru_gate_ablation` restores "
+            "the prior gate search; `vae_latent` perforates VAE latent heads; "
+            "`mpnn_capacity` permits a fourth targeted MPNN dendrite. "
+            "(default: default)"
         ),
     )
     run_parser.add_argument(

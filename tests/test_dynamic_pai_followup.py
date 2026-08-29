@@ -1,13 +1,20 @@
 import json
 import tempfile
 import unittest
+from copy import deepcopy
 from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
 import torch
 
-from dendritic_benchmark.compat import PAIDynamicSchedule, _configure_dynamic_pai_schedule, set_pai_root
+from dendritic_benchmark.compat import (
+    PAIDynamicSchedule,
+    _configure_dynamic_pai_schedule,
+    set_pai_root,
+    ternary_quantize_tensor,
+    ternary_quantize_tensor_per_channel,
+)
 from dendritic_benchmark.data import _make_loader
 from dendritic_benchmark.models import GRUForecaster, TCNForecaster, build_model
 from dendritic_benchmark.pipeline import BenchmarkRunner
@@ -16,7 +23,11 @@ from dendritic_benchmark.training import (
     ArtifactMetadata,
     TrainingConfig,
     _binary_or_multi_loss,
+    _dendrite_audit,
+    _finalize_quantized_model_for_eval,
     _final_clean_pai_parameter_stats,
+    _make_quantized_copy,
+    _scheduled_learning_rate,
     _write_pai_summary,
 )
 
@@ -38,6 +49,73 @@ class _RecordingPC:
 
 
 class DynamicPAIFollowupTests(unittest.TestCase):
+    def test_qat_final_evaluation_does_not_project_twice(self) -> None:
+        model = torch.nn.Linear(3, 2, bias=False)
+        with torch.no_grad():
+            model.weight.copy_(torch.tensor([[0.15, -0.55, 0.9], [0.2, 0.3, -0.1]]))
+        projected = _make_quantized_copy(
+            deepcopy(model), bit_width=2, mode="ternary", granularity="channel"
+        )
+        before = {name: value.detach().clone() for name, value in projected.state_dict().items()}
+        config = TrainingConfig(
+            bit_width=2,
+            quantization_mode="ternary",
+            quantization_granularity="channel",
+            use_qat=True,
+        )
+        with patch(
+            "dendritic_benchmark.training._make_quantized_copy",
+            side_effect=AssertionError("QAT model must not be projected a second time"),
+        ):
+            finalized = _finalize_quantized_model_for_eval(projected, config)
+
+        self.assertIs(finalized, projected)
+        self.assertEqual(set(before), set(finalized.state_dict()))
+        for name, value in finalized.state_dict().items():
+            self.assertTrue(torch.equal(before[name], value), name)
+
+    def test_dendrite_audit_requires_switch_and_parameter_evidence(self) -> None:
+        metadata = ArtifactMetadata(
+            model_key="tcn_forecaster",
+            condition_key="dendrites_fp32",
+            display_name="+Dendrites",
+            metric_name="MAE",
+            metric_direction="minimize",
+            primary_metric_key="mae",
+            use_dendrites=True,
+            use_pruning=False,
+            bit_width=32,
+            use_qat=False,
+            fine_tune_epochs=0,
+            regression_loss="smooth_l1",
+            enable_pai_dendrite_updates=True,
+            train_dendrites_until_complete=True,
+            freeze_dendrite_updates_fraction=0.2,
+            pai_candidate_graph_batch_limit=None,
+            memory_cleanup_interval_batches=None,
+            model_scale=0.75,
+            pai_variant="default",
+            pai_fixed_switch_interval=6,
+            pai_dynamic_schedule={"max_dendrites": 1},
+            pai_save_name="tcn_forecaster_dendrites_fp32",
+            dense_param_count=100,
+        )
+        no_insertion = _dendrite_audit(
+            metadata=metadata,
+            param_count=100,
+            raw_architecture={"status": "available", "max_param_count": 100},
+            raw_switches={"status": "available", "row_count": 0, "switch_epochs": []},
+        )
+        self.assertEqual(no_insertion["status"], "no_retained_insertion")
+
+        verified = _dendrite_audit(
+            metadata=metadata,
+            param_count=120,
+            raw_architecture={"status": "available", "max_param_count": 120},
+            raw_switches={"status": "available", "row_count": 2, "switch_epochs": [1, 9]},
+        )
+        self.assertEqual(verified["status"], "verified_retained")
+
     def test_dendritic_parameter_stats_use_final_clean_pai_model(self) -> None:
         wrapped = torch.nn.Linear(2, 2, bias=False)
         clean = torch.nn.Linear(2, 1, bias=False)
@@ -133,24 +211,24 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                 "tcn_forecaster", ternary, recipe, allow_pqat=True
             )
             self.assertEqual(recipe.learning_rate, 3.0e-4)
-            self.assertEqual(plan.max_epochs, 24)
+            self.assertEqual(plan.max_epochs, 36)
 
-    def test_gru_hoisted_input_projection_is_equivalent(self) -> None:
+    def test_gru_uses_multiscale_decoder_projection(self) -> None:
         torch.manual_seed(0)
         model = GRUForecaster(hidden=16, use_revin=False)
         inputs = torch.randn(3, 12, 21)
+        outputs = model(inputs)
 
-        states = [inputs.new_zeros(inputs.shape[0], model.hidden) for _ in model.cells]
-        for timestep in range(inputs.shape[1]):
-            step = inputs[:, timestep]
-            for index, cell in enumerate(model.cells):
-                states[index] = cell(step, states[index])
-                step = states[index]
-        original = model.head(states[-1]).view(-1, model.horizon, model.input_size)
-
-        # Batched matrix multiplication changes floating-point accumulation
-        # order relative to 96 independent vector projections.
-        torch.testing.assert_close(model(inputs), original, rtol=1.0e-5, atol=1.0e-6)
+        self.assertEqual(outputs.shape, (3, model.horizon, model.input_size))
+        self.assertEqual(model.readout_windows, (8, 16, 32))
+        self.assertIsInstance(model.head[1], torch.nn.Linear)
+        self.assertIsInstance(model.head[4], torch.nn.Linear)
+        wider = GRUForecaster(hidden=16, decoder_hidden=24)
+        self.assertEqual(wider.decoder_hidden, 24)
+        self.assertGreater(
+            sum(parameter.numel() for parameter in wider.parameters()),
+            sum(parameter.numel() for parameter in model.parameters()),
+        )
 
     def test_gru_revin_is_on_by_default_and_free(self) -> None:
         torch.manual_seed(0)
@@ -192,20 +270,106 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             sorted(set(mask.flatten().tolist())), [0.0, 2.0]
         )
 
-    def test_gru_pai_targets_hoisted_input_gates(self) -> None:
+    def test_gru_pai_targets_decoder_and_keeps_gate_run_as_ablation(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             runner = BenchmarkRunner(results_root=Path(root) / "results")
             self.assertEqual(
                 runner._perforation_module_ids_to_perforate("gru_forecaster"),
-                [".cells.0.input_gates", ".cells.1.input_gates"],
+                [".head.1"],
             )
             self.assertEqual(
                 runner._perforation_track_only_module_ids("gru_forecaster"),
-                [".cells.0.hidden_gates", ".cells.1.hidden_gates", ".head"],
+                [
+                    ".cells.0.input_gates",
+                    ".cells.0.hidden_gates",
+                    ".cells.1.input_gates",
+                    ".cells.1.hidden_gates",
+                    ".head.4",
+                ],
             )
             self.assertEqual(
-                runner._pai_dynamic_schedule("gru_forecaster").n_epochs_to_switch,
+                runner._pai_fixed_switch_interval("gru_forecaster"),
                 8,
+            )
+            gate_runner = BenchmarkRunner(
+                results_root=Path(root) / "gate-results",
+                pai_variant="gru_gate_ablation",
+            )
+            self.assertEqual(
+                gate_runner._perforation_module_ids_to_perforate("gru_forecaster"),
+                [".cells.0.input_gates", ".cells.1.input_gates"],
+            )
+            self.assertIsNone(gate_runner._pai_fixed_switch_interval("gru_forecaster"))
+
+    def test_tcn_targets_best_scoring_head_projection_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            runner = BenchmarkRunner(results_root=Path(root) / "results")
+            self.assertEqual(
+                runner._perforation_module_ids_to_perforate("tcn_forecaster"),
+                [".head.0"],
+            )
+            self.assertEqual(
+                runner._perforation_track_only_module_ids("tcn_forecaster"),
+                [".net", ".head.3"],
+            )
+
+    def test_vae_uses_fair_horizon_and_channelwise_ternary_pqat(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            runner = BenchmarkRunner(results_root=Path(root) / "results")
+            recipe = runner._training_hyperparameters(
+                "vae_mnist", condition_by_key("base_fp32")
+            )
+            ternary = condition_by_key("base_q1_58")
+            ternary_recipe = runner._training_hyperparameters("vae_mnist", ternary)
+            self.assertEqual(recipe.max_epochs, 150)
+            self.assertEqual(recipe.lr_schedule_epochs, 150)
+            self.assertEqual(ternary_recipe.learning_rate, 2.0e-4)
+            self.assertEqual(runner._pqat_epoch_budget("vae_mnist", ternary), 40)
+            self.assertEqual(
+                runner._quantization_granularity("vae_mnist", ternary), "channel"
+            )
+
+    def test_channelwise_ternary_preserves_small_output_rows(self) -> None:
+        weights = torch.tensor([[0.10, -0.10], [10.0, -10.0]])
+        per_tensor = ternary_quantize_tensor(weights)
+        per_channel = ternary_quantize_tensor_per_channel(weights)
+
+        self.assertEqual(per_tensor[0].abs().sum().item(), 0.0)
+        torch.testing.assert_close(per_channel[0].abs(), torch.tensor([0.10, 0.10]))
+        torch.testing.assert_close(per_channel[1].abs(), torch.tensor([10.0, 10.0]))
+
+    def test_learning_rate_horizon_survives_dynamic_overrun(self) -> None:
+        config = TrainingConfig(
+            learning_rate=1.0e-3,
+            lr_schedule="cosine",
+            lr_min_factor=0.02,
+            lr_schedule_epochs=150,
+        )
+        self.assertGreater(
+            _scheduled_learning_rate(config, 86, 50) or 0.0,
+            2.0e-5,
+        )
+
+    def test_changed_model_revision_invalidates_prior_dynamic11_record(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            runner = BenchmarkRunner(results_root=root_path / "results")
+            condition_dir = root_path / "results" / "gru_forecaster" / "base_fp32"
+            condition_dir.mkdir(parents=True)
+            (condition_dir / "metrics.json").write_text(
+                json.dumps(
+                    {
+                        "model_scale": 1.0,
+                        "model_revision": None,
+                        "lr_schedule_epochs": None,
+                        "quantization_granularity": "tensor",
+                    }
+                )
+            )
+            self.assertFalse(
+                runner._condition_metadata_current(
+                    "gru_forecaster", condition_by_key("base_fp32"), condition_dir
+                )
             )
 
     def test_summary_marks_stale_raw_architecture_log(self) -> None:

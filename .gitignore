@@ -27,3 +27,23 @@ logs*/
 .ruff_cache/
 archive/
 experiments/
+# Dynamic12's results stay local, while its reproducible smoke-test entrypoints
+# and short usage note belong with the source tree.
+!experiments/
+experiments/*
+!experiments/dynamic12/
+experiments/dynamic12/*
+!experiments/dynamic12/README.md
+!experiments/dynamic12/config/
+experiments/dynamic12/config/*
+!experiments/dynamic12/config/run_smoke_tests.sh
+!experiments/dynamic12/config/run_tcn_audited_variants.sh
+!experiments/dynamic12/config/run_validated_replications.sh
+!experiments/dynamic12/scripts/
+experiments/dynamic12/scripts/*
+!experiments/dynamic12/scripts/smoke_models.py
+!experiments/dynamic12/scripts/smoke_pai_targets.py
+!experiments/dynamic12/tuning/
+experiments/dynamic12/tuning/*
+!experiments/dynamic12/tuning/tune_gru_capacity.py
+!experiments/dynamic12/tuning/tune_vae_capacity.py

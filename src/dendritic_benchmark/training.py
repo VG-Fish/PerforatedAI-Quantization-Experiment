@@ -29,12 +29,12 @@ from .compat import (
     pai_save_path,
     pai_resume_state_exists,
     pai_runtime_guard,
-    pai_save_path,
     pai_working_directory,
     save_pai_system,
     set_module_output_dimensions,
     symmetric_quantize_tensor,
     ternary_quantize_tensor,
+    ternary_quantize_tensor_per_channel,
 )
 from .data import _explained_variance
 
@@ -47,6 +47,8 @@ _MEMORY_GUARD_CHECK_INTERVAL_BATCHES = 16
 # collapsed run rather than a plateau (see _training_collapsed). Generous enough
 # that a coarse metric on a small validation split can sit still without tripping.
 _COLLAPSE_GUARD_EPOCHS = 12
+QUANTIZATION_EVALUATION_REVISION = "single_projection_v1"
+DENDRITE_AUDIT_REVISION = "retained_dendrite_v1"
 _FALLBACK_MODULE_OUTPUT_DIMENSIONS: dict[str, dict[str, list[int]]] = {
     "gcn": {
         ".conv1.linear": [-1, -1, 0],
@@ -71,6 +73,10 @@ LRScheduleName = Literal["constant", "step", "cosine", "linear"]
 class TrainingConfig:
     bit_width: int | None = None
     quantization_mode: str | None = None
+    # ``channel`` keeps ternary codes but gives every Linear/Conv output row
+    # its own scale.  It is reserved for the low-bit TCN/VAE follow-ups where
+    # one global scale erased small decoder channels.
+    quantization_granularity: Literal["tensor", "channel"] = "tensor"
     use_dendrites: bool = False
     use_pruning: bool = False
     prune_amount: float = 0.4
@@ -89,6 +95,10 @@ class TrainingConfig:
     lr_decay_gamma: float = 1.0
     # Floor for "cosine"/"linear", as a fraction of the base learning rate.
     lr_min_factor: float = 0.0
+    # Optional planned horizon for an annealing schedule. Dynamic PAI can run
+    # beyond ``max_epochs``; without this it reaches the LR floor before a
+    # late candidate has a chance to adapt.
+    lr_schedule_epochs: int | None = None
     # Linear ramp from 0 to learning_rate over this many epochs, applied under
     # every schedule. Fractional epochs are not supported; the ramp is per-epoch.
     warmup_epochs: int = 0
@@ -108,6 +118,9 @@ class TrainingConfig:
     # reproduced without inferring intent from its output directory name.
     model_scale: float = 1.0
     pai_variant: str = "default"
+    # Explicitly invalidates artifacts when a model architecture or its
+    # experiment-critical training plan changes without a model-scale change.
+    model_revision: str | None = None
     pai_fixed_switch_interval: int | None = None
     pai_dynamic_schedule: dict[str, Any] | None = None
     # Ceiling on a single dendrite ("p") phase in dynamic mode, and the only
@@ -133,6 +146,20 @@ class TrainingConfig:
     # guard, so the forced switch happens while the run is still alive.
     # 0 disables the guard.
     max_dendrite_phase_epochs: int = 8
+    # Open-ended PAI completion is useful only while it remains close to the
+    # paired dense budget.  A no-improvement tracker can otherwise keep an
+    # already-degraded architecture training forever.  ``None`` retains the
+    # legacy behavior; Dynamic12 supplies an explicit cap per model.
+    max_dynamic_training_epochs: int | None = None
+    # Stored only for quantized artifacts. QAT validation already evaluates the
+    # projected weights; final evaluation must not quantize them a second time.
+    quantization_evaluation_revision: str | None = None
+    # A dendritic result is reportable only after its final topology is backed
+    # by raw PAI switch evidence. The source status is inherited by quantized
+    # descendants, which do not run their own candidate-search phase.
+    dendrite_audit_revision: str | None = None
+    dense_param_count: int | None = None
+    source_dendrite_audit_status: str | None = None
 
 
 @dataclass
@@ -154,6 +181,8 @@ class TrainingRecord:
     training_skipped: bool = False
     # Human-readable explanation of why training was skipped (empty string when training ran).
     skip_reason: str = ""
+    dendrite_audit_status: str = "not_applicable"
+    dendrite_audit_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -183,6 +212,14 @@ class ArtifactMetadata:
     pai_fixed_switch_interval: int | None
     pai_dynamic_schedule: dict[str, Any] | None
     pai_save_name: str | None
+    quantization_granularity: str = "tensor"
+    lr_schedule_epochs: int | None = None
+    model_revision: str | None = None
+    max_dynamic_training_epochs: int | None = None
+    quantization_evaluation_revision: str | None = None
+    dendrite_audit_revision: str | None = None
+    dense_param_count: int | None = None
+    source_dendrite_audit_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1205,7 +1242,12 @@ def _tensor_shape(value: Any) -> tuple[int, ...] | None:
         return None
 
 
-def _quantize_tensor(tensor: Any, bit_width: int, mode: str | None) -> Any:
+def _quantize_tensor(
+    tensor: Any,
+    bit_width: int,
+    mode: str | None,
+    granularity: str = "tensor",
+) -> Any:
     """Dispatch to the right quantization kernel, on CPU.
 
     Running these kernels on MPS triggered a malloc double-free for PointNet
@@ -1216,12 +1258,17 @@ def _quantize_tensor(tensor: Any, bit_width: int, mode: str | None) -> Any:
     if mode == "binary" or bit_width == 1:
         return binary_quantize_tensor(cpu_tensor)
     if mode == "ternary":
+        if granularity == "channel":
+            return ternary_quantize_tensor_per_channel(cpu_tensor)
         return ternary_quantize_tensor(cpu_tensor)
     return symmetric_quantize_tensor(cpu_tensor, bit_width)
 
 
 def _make_quantized_copy(
-    model: Any, bit_width: int | None, mode: str | None = None
+    model: Any,
+    bit_width: int | None,
+    mode: str | None = None,
+    granularity: str = "tensor",
 ) -> Any:
     if bit_width is None or bit_width >= 32:
         return model
@@ -1229,9 +1276,31 @@ def _make_quantized_copy(
         for param in model.parameters():
             if param.numel() == 0:
                 continue
-            quantized = _quantize_tensor(param, bit_width, mode)
+            quantized = _quantize_tensor(param, bit_width, mode, granularity)
             param.copy_(quantized.to(param.device))
     return model
+
+
+def _finalize_quantized_model_for_eval(model: Any, config: "TrainingConfig") -> Any:
+    """Return deployment weights without accidentally re-quantizing a QAT model.
+
+    A QAT batch ends by projecting the full-precision shadow into ``.data`` so
+    validation, checkpoint selection, and the next batch all observe precisely
+    the deployment grid. Reapplying PTQ after restoring the selected state is a
+    *second* calibration/projection, which is not generally idempotent (most
+    visibly for ternary scales). PTQ-only conditions still need their one final
+    projection here.
+    """
+    if not _should_quantize_for_eval(config):
+        return model
+    if _should_quantize_for_training(config):
+        return model
+    return _make_quantized_copy(
+        model,
+        config.bit_width,
+        config.quantization_mode,
+        config.quantization_granularity,
+    )
 
 
 # Attribute name used to stash each quantized parameter's full-precision
@@ -1294,7 +1363,12 @@ def _qat_project_for_forward(model: Any, config: "TrainingConfig") -> None:
             if param.numel() == 0:
                 continue
             shadow = _qat_shadow_for(param)
-            quantized = _quantize_tensor(shadow, bit_width, config.quantization_mode)
+            quantized = _quantize_tensor(
+                shadow,
+                bit_width,
+                config.quantization_mode,
+                config.quantization_granularity,
+            )
             param.data.copy_(quantized.to(param.device))
 
 
@@ -1409,9 +1483,20 @@ def _write_metrics_and_history(
                 "use_dendrites": metadata.use_dendrites,
                 "use_pruning": metadata.use_pruning,
                 "bit_width": metadata.bit_width,
+                "quantization_granularity": metadata.quantization_granularity,
                 "use_qat": metadata.use_qat,
                 "fine_tune_epochs": metadata.fine_tune_epochs,
                 "regression_loss": metadata.regression_loss,
+                "lr_schedule_epochs": metadata.lr_schedule_epochs,
+                "max_dynamic_training_epochs": metadata.max_dynamic_training_epochs,
+                "quantization_evaluation_revision": (
+                    metadata.quantization_evaluation_revision
+                ),
+                "dendrite_audit_revision": metadata.dendrite_audit_revision,
+                "dense_param_count": metadata.dense_param_count,
+                "source_dendrite_audit_status": (
+                    metadata.source_dendrite_audit_status
+                ),
                 "enable_pai_dendrite_updates": metadata.enable_pai_dendrite_updates,
                 "train_dendrites_until_complete": metadata.train_dendrites_until_complete,
                 "freeze_dendrite_updates_fraction": (
@@ -1421,6 +1506,7 @@ def _write_metrics_and_history(
                     metadata.memory_cleanup_interval_batches
                 ),
                 "model_scale": metadata.model_scale,
+                "model_revision": metadata.model_revision,
                 "pai_variant": metadata.pai_variant,
                 "pai_fixed_switch_interval": metadata.pai_fixed_switch_interval,
                 "pai_dynamic_schedule": metadata.pai_dynamic_schedule,
@@ -1653,6 +1739,12 @@ def _write_pai_summary(
     ]
     raw_architecture = _read_pai_architecture_log(metadata.pai_save_name)
     raw_switches = _read_pai_switch_log(metadata.pai_save_name)
+    dendrite_audit = _dendrite_audit(
+        metadata=metadata,
+        param_count=param_count,
+        raw_architecture=raw_architecture,
+        raw_switches=raw_switches,
+    )
     raw_param_count = raw_architecture.get("max_param_count")
     if raw_param_count is None:
         consistency = "unavailable"
@@ -1687,10 +1779,113 @@ def _write_pai_summary(
                     "switches": raw_switches,
                 },
                 "architecture_log_consistency": consistency,
+                "dendrite_audit": dendrite_audit,
             },
             indent=2,
         )
     )
+
+
+def _dendrite_audit(
+    *,
+    metadata: ArtifactMetadata,
+    param_count: int,
+    raw_architecture: dict[str, Any] | None = None,
+    raw_switches: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the evidence-based status for a dendritic artifact.
+
+    ``pai_restructured`` is an implementation event, not proof that PAI kept a
+    dendrite in the final inference topology. A retained run needs all three:
+    a larger final model, PAI's initial-and-insertion switch records, and a raw
+    architecture count agreeing with the exported model. Quantized descendants
+    do not search again, so they inherit their source FP32 result's status.
+    """
+    if not metadata.use_dendrites:
+        return {
+            "revision": metadata.dendrite_audit_revision,
+            "status": "not_applicable",
+            "reason": "condition does not use dendrites",
+        }
+    if not metadata.enable_pai_dendrite_updates:
+        source_status = metadata.source_dendrite_audit_status
+        if source_status in {"verified_retained", "inherited_verified_retained"}:
+            return {
+                "revision": metadata.dendrite_audit_revision,
+                "status": "inherited_verified_retained",
+                "reason": "inherits verified retained topology from source FP32 artifact",
+                "source_status": source_status,
+            }
+        inherited_status = (
+            "inherited_no_retained_insertion"
+            if source_status == "no_retained_insertion"
+            else "inherited_unverified"
+        )
+        return {
+            "revision": metadata.dendrite_audit_revision,
+            "status": inherited_status,
+            "reason": "source FP32 artifact has no verified retained dendrite",
+            "source_status": source_status,
+        }
+
+    raw_architecture = raw_architecture or _read_pai_architecture_log(
+        metadata.pai_save_name
+    )
+    raw_switches = raw_switches or _read_pai_switch_log(metadata.pai_save_name)
+    switch_count = int(raw_switches.get("row_count", 0) or 0)
+    raw_param_count = raw_architecture.get("max_param_count")
+    dense_param_count = metadata.dense_param_count
+    audit = {
+        "revision": metadata.dendrite_audit_revision,
+        "dense_param_count": dense_param_count,
+        "final_param_count": param_count,
+        "raw_switch_count": switch_count,
+    }
+    if raw_switches.get("status") != "available":
+        return {
+            **audit,
+            "status": "unverified",
+            "reason": "raw PAI switch log is unavailable",
+        }
+    # The first row marks PAI's initial transition into candidate tracking; a
+    # second is required to show that a candidate was actually inserted.
+    if switch_count < 2:
+        return {
+            **audit,
+            "status": "no_retained_insertion",
+            "reason": "raw PAI switch log has no candidate-insertion switch",
+        }
+    if dense_param_count is None:
+        return {
+            **audit,
+            "status": "unverified",
+            "reason": "dense reference parameter count was not recorded",
+        }
+    if param_count <= dense_param_count:
+        return {
+            **audit,
+            "status": "no_retained_insertion",
+            "reason": "final model did not retain parameters beyond the dense reference",
+        }
+    if raw_architecture.get("status") != "available" or raw_param_count is None:
+        return {
+            **audit,
+            "status": "unverified",
+            "reason": "raw PAI architecture log is unavailable",
+        }
+    if int(raw_param_count) != param_count:
+        return {
+            **audit,
+            "status": "unverified",
+            "reason": "raw PAI architecture count disagrees with final exported model",
+            "raw_param_count": raw_param_count,
+        }
+    return {
+        **audit,
+        "status": "verified_retained",
+        "reason": "raw switch and architecture logs match a larger final topology",
+        "raw_param_count": raw_param_count,
+    }
 
 
 def _apply_pruning(model: Any, torch: Any, prune_amount: float) -> None:
@@ -3378,12 +3573,14 @@ def _scheduled_learning_rate(
     re-enters the loop mid-way) or PerforatedAI recreating the optimizer on
     dendrite restructuring (which resets param groups back to the base lr).
 
-    ``max_epochs`` is the recipe's budget, not the actual epoch count, so a
-    dynamic dendritic run that trains past the budget holds at the floor instead
-    of wrapping the cosine curve back up.
+    ``lr_schedule_epochs`` is the recipe's planned horizon when provided.  It
+    lets a dynamic dendritic run preserve useful learning rate through its
+    candidate phase while still holding at the floor after that horizon rather
+    than wrapping a cosine curve back up.
     """
     base = config.learning_rate
     warmup = max(0, config.warmup_epochs)
+    schedule_epochs = config.lr_schedule_epochs or max_epochs
     if warmup and epoch < warmup:
         # epoch 0 gets base/warmup rather than 0, which would be a dead epoch.
         return base * float(epoch + 1) / float(warmup)
@@ -3394,7 +3591,7 @@ def _scheduled_learning_rate(
     if config.lr_schedule not in {"cosine", "linear"}:
         return None
     floor = base * config.lr_min_factor
-    decay_span = max(1, max_epochs - warmup)
+    decay_span = max(1, schedule_epochs - warmup)
     progress = min(1.0, max(0.0, float(epoch - warmup) / float(decay_span)))
     if config.lr_schedule == "linear":
         return floor + (base - floor) * (1.0 - progress)
@@ -3481,7 +3678,26 @@ def _run_training_epochs(
                 "stopping this condition rather than training a dead network."
             )
             break
-        if pai_training_complete and run_until_pai_complete:
+        if (
+            run_until_pai_complete
+            and context.config.max_dynamic_training_epochs is not None
+            and epoch + 1 >= context.config.max_dynamic_training_epochs
+        ):
+            print(
+                f"[PAI cap] {context.run_label}: reached dynamic completion cap "
+                f"at epoch {epoch + 1}; retaining the best validation checkpoint."
+            )
+            break
+        # A dynamic condition used to stop the moment PAI finished, sometimes
+        # after only a handful of epochs while its dense control received the
+        # whole recipe.  Finish PAI when it can, but always give both paired
+        # arms at least the declared training budget; only an unfinished PAI
+        # schedule is allowed to extend beyond it.
+        if (
+            pai_training_complete
+            and run_until_pai_complete
+            and epoch + 1 >= context.max_epochs
+        ):
             break
     epoch_progress.close()
     _set_pai_candidate_graph_for_context(context, False)
@@ -3517,10 +3733,18 @@ def _build_artifact_metadata(
         pai_candidate_graph_batch_limit=config.pai_candidate_graph_batch_limit,
         memory_cleanup_interval_batches=config.memory_cleanup_interval_batches,
         model_scale=config.model_scale,
+        model_revision=config.model_revision,
         pai_variant=config.pai_variant,
         pai_fixed_switch_interval=config.pai_fixed_switch_interval,
         pai_dynamic_schedule=config.pai_dynamic_schedule,
         pai_save_name=config.pai_save_name,
+        quantization_granularity=config.quantization_granularity,
+        lr_schedule_epochs=config.lr_schedule_epochs,
+        max_dynamic_training_epochs=config.max_dynamic_training_epochs,
+        quantization_evaluation_revision=config.quantization_evaluation_revision,
+        dendrite_audit_revision=config.dendrite_audit_revision,
+        dense_param_count=config.dense_param_count,
+        source_dendrite_audit_status=config.source_dendrite_audit_status,
     )
 
 
@@ -3553,10 +3777,18 @@ def _metadata_for_stage(
         pai_candidate_graph_batch_limit=metadata.pai_candidate_graph_batch_limit,
         memory_cleanup_interval_batches=metadata.memory_cleanup_interval_batches,
         model_scale=metadata.model_scale,
+        model_revision=metadata.model_revision,
         pai_variant=metadata.pai_variant,
         pai_fixed_switch_interval=metadata.pai_fixed_switch_interval,
         pai_dynamic_schedule=metadata.pai_dynamic_schedule,
         pai_save_name=metadata.pai_save_name,
+        quantization_granularity=metadata.quantization_granularity,
+        lr_schedule_epochs=metadata.lr_schedule_epochs,
+        max_dynamic_training_epochs=metadata.max_dynamic_training_epochs,
+        quantization_evaluation_revision=metadata.quantization_evaluation_revision,
+        dendrite_audit_revision=metadata.dendrite_audit_revision,
+        dense_param_count=metadata.dense_param_count,
+        source_dendrite_audit_status=metadata.source_dendrite_audit_status,
     )
 
 
@@ -3762,7 +3994,12 @@ def _prepare_model_for_training(
         # Snapshot full precision *before* the first hard quantization below —
         # this is the shadow PQAT fine-tuning trains, see _qat_init_shadow.
         _qat_init_shadow(model)
-        model = _make_quantized_copy(model, config.bit_width, config.quantization_mode)
+        model = _make_quantized_copy(
+            model,
+            config.bit_width,
+            config.quantization_mode,
+            config.quantization_granularity,
+        )
     if config.max_epochs <= 0:
         return model
     return _apply_torch_compile(
@@ -3927,8 +4164,7 @@ def train_and_evaluate(
             _unwrap_compiled(model), config.pai_save_name, PAI_ARTIFACT_NAME
         )
 
-    if _should_quantize_for_eval(config):
-        model = _make_quantized_copy(model, bit_width, quantization_mode)
+    model = _finalize_quantized_model_for_eval(model, config)
 
     eval_device = device
     if (
@@ -3983,6 +4219,25 @@ def train_and_evaluate(
     final_parameter_stats = (
         _final_clean_pai_parameter_stats(_plain_model) if use_dendrites else None
     )
+    final_param_count = (
+        final_parameter_stats[0]
+        if final_parameter_stats is not None
+        else _count_parameters(_plain_model)[0]
+    )
+    dendrite_audit = _dendrite_audit(
+        metadata=metadata,
+        param_count=final_param_count,
+    )
+    if dendrite_audit["status"] in {
+        "no_retained_insertion",
+        "inherited_no_retained_insertion",
+        "unverified",
+        "inherited_unverified",
+    }:
+        print(
+            f"[audit] {run_label}: {dendrite_audit['status']} — "
+            f"{dendrite_audit['reason']}"
+        )
     _persist_post_pqat_snapshot(
         enabled=pqat_enabled,
         output_dir=output_dir,
@@ -4025,6 +4280,8 @@ def train_and_evaluate(
         artifact_dir=str(output_dir),
         training_skipped=training_skipped,
         skip_reason=skip_reason,
+        dendrite_audit_status=str(dendrite_audit["status"]),
+        dendrite_audit_reason=str(dendrite_audit["reason"]),
     )
     _write_best_model_stats_csv(output_dir, record)
     if use_dendrites and config.pai_save_name:

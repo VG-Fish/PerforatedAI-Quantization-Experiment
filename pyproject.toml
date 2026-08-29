@@ -32,6 +32,7 @@ dependencies = [
     "deadcode>=2.4.1",
     "perforatedai>=3.2.6",
     "perforatedbp>=3.2.6",
+    "pytest>=9.1.1",
 ]
 
 [project.scripts]

@@ -1235,6 +1235,25 @@ def ternary_quantize_tensor(tensor: Any) -> Any:
     return torch.clamp(torch.round(tensor / scale), -1, 1) * scale
 
 
+def ternary_quantize_tensor_per_channel(tensor: Any) -> Any:
+    """Ternarize each output channel of a weight tensor independently.
+
+    A single scale is needlessly destructive for a decoder/output projection:
+    each output row has a different activation and weight scale, while ternary
+    codes themselves are unchanged.  For matrices and convolution kernels the
+    first axis is the output-channel axis; scalar/vector parameters retain the
+    well-tested per-tensor formulation above.  The small vector of scales is
+    deployment metadata, not additional learned precision.
+    """
+    if getattr(tensor, "ndim", 0) < 2:
+        return ternary_quantize_tensor(tensor)
+    reduce_dims = tuple(range(1, tensor.ndim))
+    scale = tensor.detach().abs().mean(dim=reduce_dims, keepdim=True)
+    safe_scale = scale.clamp_min(torch.finfo(tensor.dtype).eps)
+    quantized = torch.clamp(torch.round(tensor / safe_scale), -1, 1) * safe_scale
+    return torch.where(scale == 0, torch.zeros_like(quantized), quantized)
+
+
 def binary_quantize_tensor(tensor: Any) -> Any:
     """XNOR-Net binarization: ``mean(|W|) * sign(W)``.
 

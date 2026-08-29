@@ -1111,6 +1111,13 @@ class GRUForecaster(nn.Module):
     gain came from training on the loss the benchmark actually reports; see
     ``regression_loss`` in ModelTrainingRecipe.
 
+    The forecast decoder pools the final layer over several recent windows,
+    then uses a small nonlinear bottleneck before expanding to the 24-step
+    horizon.  A direct last-state projection made every horizon step compete
+    for one state vector and offered PAI only a giant, once-per-window output
+    layer.  The first decoder projection is both a focused capacity target and
+    a useful place for one dendrite to remain in the final architecture.
+
     ``state_dropout`` is retained as a knob but defaults off on that evidence.
     It is variational (Gal & Ghahramani): one mask per sequence, reused at every
     timestep. Resampling per step injects noise the recurrence cannot average
@@ -1125,20 +1132,33 @@ class GRUForecaster(nn.Module):
         layers: int = 2,
         state_dropout: float = 0.0,
         use_revin: bool = True,
+        readout_windows: tuple[int, ...] = (8, 16, 32),
+        head_dropout: float = 0.05,
+        decoder_hidden: int | None = None,
     ):
         super().__init__()
+        if not readout_windows or any(window < 1 for window in readout_windows):
+            raise ValueError("GRU readout_windows must contain positive widths")
+        if decoder_hidden is not None and decoder_hidden < 1:
+            raise ValueError("GRU decoder_hidden must be positive when provided")
         self.horizon = horizon
         self.input_size = input_size
         self.hidden = hidden
         self.state_dropout = state_dropout
         self.use_revin = use_revin
+        self.readout_windows = tuple(readout_windows)
+        self.decoder_hidden = decoder_hidden or hidden
         self.cells = nn.ModuleList(
             DendriticGRUCell(input_size if layer == 0 else hidden, hidden)
             for layer in range(layers)
         )
+        readout_features = hidden * len(self.readout_windows)
         self.head = nn.Sequential(
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, horizon * input_size),
+            nn.LayerNorm(readout_features),
+            nn.Linear(readout_features, self.decoder_hidden),
+            nn.GELU(),
+            nn.Dropout(head_dropout),
+            nn.Linear(self.decoder_hidden, horizon * input_size),
         )
 
     def _state_mask(self, reference: Any) -> Any:
@@ -1163,23 +1183,27 @@ class GRUForecaster(nn.Module):
             std = x.std(1, keepdim=True).clamp_min(1e-5)
             x = (x - mean) / std
         sequence = x
-        last = len(self.cells) - 1
-        for index, cell in enumerate(self.cells):
+        for cell in self.cells:
             gates = cell.input_gates(sequence)
             state = sequence.new_zeros(sequence.shape[0], self.hidden)
-            # Only stack the full output sequence when a later layer reads it.
-            states = None if index == last else []
+            # Retain the final-layer trajectory too: the decoder pools several
+            # causal trailing windows instead of forcing all 24 forecast steps
+            # through the final recurrent state alone.
+            states = []
             for step_gates in gates.unbind(1):
                 state = cell.step(step_gates, state)
-                if states is not None:
-                    states.append(state)
-            sequence = state if states is None else torch.stack(states, dim=1)
+                states.append(state)
+            sequence = torch.stack(states, dim=1)
             mask = self._state_mask(sequence)
             if mask is not None:
                 # The final layer's output feeds the head, so the same mask
                 # regularises both the inter-layer path and the readout input.
-                sequence = sequence * (mask if states is None else mask[:, None, :])
-        out = self.head(sequence).view(-1, self.horizon, self.input_size)
+                sequence = sequence * mask[:, None, :]
+        pooled = [
+            sequence[:, -window:].mean(dim=1)
+            for window in self.readout_windows
+        ]
+        out = self.head(torch.cat(pooled, dim=1)).view(-1, self.horizon, self.input_size)
         if self.use_revin:
             # RevIN, part 2: predictions are in the normalised space; undo it.
             return out * std + mean
