@@ -137,7 +137,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
 
     def test_gru_hoisted_input_projection_is_equivalent(self) -> None:
         torch.manual_seed(0)
-        model = GRUForecaster(hidden=16)
+        model = GRUForecaster(hidden=16, use_revin=False)
         inputs = torch.randn(3, 12, 21)
 
         states = [inputs.new_zeros(inputs.shape[0], model.hidden) for _ in model.cells]
@@ -151,6 +151,46 @@ class DynamicPAIFollowupTests(unittest.TestCase):
         # Batched matrix multiplication changes floating-point accumulation
         # order relative to 96 independent vector projections.
         torch.testing.assert_close(model(inputs), original, rtol=1.0e-5, atol=1.0e-6)
+
+    def test_gru_revin_is_on_by_default_and_free(self) -> None:
+        torch.manual_seed(0)
+        plain = GRUForecaster(hidden=16, use_revin=False).eval()
+        torch.manual_seed(0)
+        revin = GRUForecaster(hidden=16).eval()
+        self.assertTrue(revin.use_revin)
+        # RevIN is stateless, so it costs no parameters and leaves PAI nothing
+        # extra to perforate.
+        self.assertEqual(
+            sum(p.numel() for p in plain.parameters()),
+            sum(p.numel() for p in revin.parameters()),
+        )
+
+        # A window shifted and scaled away from the training distribution is
+        # exactly the chronological-split case RevIN exists to absorb: the
+        # prediction should track the shift rather than ignore it.
+        base = torch.randn(2, 12, 21)
+        shifted = base * 3.0 + 7.0
+        self.assertGreater(
+            (plain(shifted) - plain(base)).abs().mean().item(),
+            0.0,
+        )
+        torch.testing.assert_close(
+            revin(shifted), revin(base) * 3.0 + 7.0, rtol=1.0e-4, atol=1.0e-4
+        )
+
+    def test_gru_state_dropout_is_variational_and_off_by_default(self) -> None:
+        torch.manual_seed(0)
+        model = GRUForecaster(hidden=16)
+        self.assertEqual(model.state_dropout, 0.0)
+        self.assertIsNone(model._state_mask(torch.zeros(2, 16)))
+
+        model = GRUForecaster(hidden=16, state_dropout=0.5).train()
+        mask = model._state_mask(torch.zeros(4, 16))
+        assert mask is not None
+        # Inverted dropout: kept units are scaled by 1/keep, dropped are zero.
+        self.assertEqual(
+            sorted(set(mask.flatten().tolist())), [0.0, 2.0]
+        )
 
     def test_gru_pai_targets_hoisted_input_gates(self) -> None:
         with tempfile.TemporaryDirectory() as root:

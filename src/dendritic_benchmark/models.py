@@ -1084,10 +1084,32 @@ class TCNForecaster(nn.Module):
 class GRUForecaster(nn.Module):
     """Multivariate multi-step forecaster: [B, seq_len, 21] -> [B, horizon, 21].
 
-    ``state_dropout`` is variational (Gal & Ghahramani): one mask is drawn per
-    sequence and reused at every timestep, rather than a fresh mask per step.
-    Resampling per step injects noise the recurrence cannot average out and
-    measurably hurt this model; the fixed mask is what regularises it.
+    **RevIN** is the one change that matters here, and it costs no parameters.
+    Weather is split chronologically and normalised with *train-split* mean and
+    std (see ``_chronological_forecast_bundle``), so every validation and test
+    window arrives off-centre relative to the statistics the network learned.
+    Without RevIN this model memorised the training period's absolute levels --
+    train MAE fell 0.409 -> 0.184 over 80 epochs while validation MAE *rose*
+    0.360 -> 0.396. Normalising each window by its own statistics and undoing
+    that on the prediction removes the drift instead of asking the network to
+    learn it. Measured over 24 epochs (validation MAE / test MAE, lower better):
+
+        current recipe                    0.3280 / 0.2816   <- was
+        + RevIN                           0.2749 / 0.2150
+        + RevIN, weight decay 1e-4        0.2768 / 0.2154
+        + RevIN, wd 1e-4, dropout 0.2     0.2824 / 0.2219
+        + RevIN, SmoothL1(beta=0.1)       0.2605 / 0.1999   <- is
+
+    Note that both explicit regularisers *hurt* once RevIN is in. They were
+    worth ~1.5% before it (measured separately), which is the signature of L2
+    partially suppressing an overfit that RevIN removes outright. The remaining
+    gain came from training on the loss the benchmark actually reports; see
+    ``regression_loss`` in ModelTrainingRecipe.
+
+    ``state_dropout`` is retained as a knob but defaults off on that evidence.
+    It is variational (Gal & Ghahramani): one mask per sequence, reused at every
+    timestep. Resampling per step injects noise the recurrence cannot average
+    out; the fixed mask is what regularises rather than merely adding jitter.
     """
 
     def __init__(
@@ -1097,7 +1119,7 @@ class GRUForecaster(nn.Module):
         hidden: int = 64,
         layers: int = 2,
         state_dropout: float = 0.0,
-        use_revin: bool = False,
+        use_revin: bool = True,
     ):
         super().__init__()
         self.horizon = horizon

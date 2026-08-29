@@ -988,12 +988,23 @@ class BenchmarkRunner:
                 regression_loss="smooth_l1",
             ),
             # Batch 24 -> 128 (see _BATCH_SIZES) cuts the step count per epoch by
-            # 5.3x, so the epoch budget goes up to keep the number of optimiser
-            # steps in the same range; the run still costs well under the 4.2h the
-            # old setting did. Weather now runs Autoformer's 96-step horizon.
+            # 5.3x. Weather runs Autoformer's 96-step horizon.
+            #
+            # 80 epochs at 1e-3 was wrong in a way the stored Dynamic10 history
+            # shows plainly: validation MAE bottomed at epoch 5 and then rose for
+            # 75 straight epochs (0.3305 -> 0.3957) while train MAE fell to
+            # 0.184. Cosine barely moves in that window -- the LR was still
+            # 9.9e-4 at the epoch the model was at its best -- so the entire
+            # budget was spent overfitting past the checkpoint that got reported.
+            # At 3e-4 over 24 epochs the model peaks at epoch 14 and *stays*
+            # there (best 0.2586, final 0.2587) instead of peaking early and
+            # decaying. The peak value itself is a wash; ending training at the
+            # optimum rather than 75 epochs beyond it is the point, and it is
+            # what lets the warm-started dendritic arm be scored against a
+            # converged baseline. See GRUForecaster for the RevIN measurements.
             "gru_forecaster": ModelTrainingRecipe(
-                128, 80, 1.0e-3, lr_schedule="cosine", lr_min_factor=0.01,
-                grad_clip_norm=1.0,
+                128, 24, 3.0e-4, lr_schedule="cosine", lr_min_factor=0.01,
+                grad_clip_norm=1.0, regression_loss="smooth_l1",
             ),
             # Decay by 0.7 every 20 epochs, matching the reference PointNet
             # implementation's schedule (Qi et al., provider.py). A constant 1e-3
