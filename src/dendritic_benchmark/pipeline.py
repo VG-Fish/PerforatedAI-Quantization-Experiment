@@ -1001,7 +1001,9 @@ class BenchmarkRunner:
             # decaying. The peak value itself is a wash; ending training at the
             # optimum rather than 75 epochs beyond it is the point, and it is
             # what lets the warm-started dendritic arm be scored against a
-            # converged baseline. See GRUForecaster for the RevIN measurements.
+            # converged baseline. In the full pipeline the best epoch moves
+            # 5 -> 16 of 24 and training drops 1716s -> 356s. See
+            # GRUForecaster for the RevIN measurements.
             "gru_forecaster": ModelTrainingRecipe(
                 128, 24, 3.0e-4, lr_schedule="cosine", lr_min_factor=0.01,
                 grad_clip_norm=1.0, regression_loss="smooth_l1",

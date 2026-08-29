@@ -1100,6 +1100,11 @@ class GRUForecaster(nn.Module):
         + RevIN, wd 1e-4, dropout 0.2     0.2824 / 0.2219
         + RevIN, SmoothL1(beta=0.1)       0.2605 / 0.1999   <- is
 
+    Confirmed end to end against Dynamic10's stored ``base_fp32`` at the same
+    model_scale=0.75 and an identical 122,928 parameters: test MAE 0.2538 ->
+    0.2004 (-21.0%), best validation 0.3305 -> 0.2582 (-21.9%), best epoch
+    5 -> 16, training 1716s -> 356s.
+
     Note that both explicit regularisers *hurt* once RevIN is in. They were
     worth ~1.5% before it (measured separately), which is the signature of L2
     partially suppressing an overfit that RevIN removes outright. The remaining
