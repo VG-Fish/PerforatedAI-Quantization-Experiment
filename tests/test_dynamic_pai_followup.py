@@ -9,10 +9,13 @@ import torch
 
 from dendritic_benchmark.compat import PAIDynamicSchedule, _configure_dynamic_pai_schedule, set_pai_root
 from dendritic_benchmark.data import _make_loader
-from dendritic_benchmark.models import build_model
+from dendritic_benchmark.models import GRUForecaster, TCNForecaster, build_model
 from dendritic_benchmark.pipeline import BenchmarkRunner
+from dendritic_benchmark.specs import condition_by_key
 from dendritic_benchmark.training import (
     ArtifactMetadata,
+    TrainingConfig,
+    _binary_or_multi_loss,
     _final_clean_pai_parameter_stats,
     _write_pai_summary,
 )
@@ -108,6 +111,63 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             sum(parameter.numel() for parameter in full.parameters()),
         )
 
+    def test_tcn_uses_multiscale_nonlinear_readout(self) -> None:
+        model = TCNForecaster(hidden=16)
+        output = model(torch.randn(3, 96, 7))
+
+        self.assertEqual(output.shape, (3, 24, 7))
+        self.assertEqual(model.readout_windows, (8, 16, 32))
+        self.assertIsInstance(model.head, torch.nn.Sequential)
+
+    def test_tcn_uses_smooth_l1_and_early_fixed_pai_switch(self) -> None:
+        config = TrainingConfig(regression_loss="smooth_l1")
+        self.assertIsInstance(
+            _binary_or_multi_loss("tcn_forecaster", config), torch.nn.SmoothL1Loss
+        )
+        with tempfile.TemporaryDirectory() as root:
+            runner = BenchmarkRunner(results_root=Path(root) / "results")
+            self.assertEqual(runner._pai_fixed_switch_interval("tcn_forecaster"), 6)
+            ternary = condition_by_key("base_q1_58")
+            recipe = runner._training_hyperparameters("tcn_forecaster", ternary)
+            plan = runner._condition_training_plan(
+                "tcn_forecaster", ternary, recipe, allow_pqat=True
+            )
+            self.assertEqual(recipe.learning_rate, 3.0e-4)
+            self.assertEqual(plan.max_epochs, 24)
+
+    def test_gru_hoisted_input_projection_is_equivalent(self) -> None:
+        torch.manual_seed(0)
+        model = GRUForecaster(hidden=16)
+        inputs = torch.randn(3, 12, 21)
+
+        states = [inputs.new_zeros(inputs.shape[0], model.hidden) for _ in model.cells]
+        for timestep in range(inputs.shape[1]):
+            step = inputs[:, timestep]
+            for index, cell in enumerate(model.cells):
+                states[index] = cell(step, states[index])
+                step = states[index]
+        original = model.head(states[-1]).view(-1, model.horizon, model.input_size)
+
+        # Batched matrix multiplication changes floating-point accumulation
+        # order relative to 96 independent vector projections.
+        torch.testing.assert_close(model(inputs), original, rtol=1.0e-5, atol=1.0e-6)
+
+    def test_gru_pai_targets_hoisted_input_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            runner = BenchmarkRunner(results_root=Path(root) / "results")
+            self.assertEqual(
+                runner._perforation_module_ids_to_perforate("gru_forecaster"),
+                [".cells.0.input_gates", ".cells.1.input_gates"],
+            )
+            self.assertEqual(
+                runner._perforation_track_only_module_ids("gru_forecaster"),
+                [".cells.0.hidden_gates", ".cells.1.hidden_gates", ".head"],
+            )
+            self.assertEqual(
+                runner._pai_dynamic_schedule("gru_forecaster").n_epochs_to_switch,
+                8,
+            )
+
     def test_summary_marks_stale_raw_architecture_log(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)
@@ -129,6 +189,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                 bit_width=None,
                 use_qat=False,
                 fine_tune_epochs=0,
+                regression_loss="mse",
                 enable_pai_dendrite_updates=True,
                 train_dendrites_until_complete=True,
                 freeze_dendrite_updates_fraction=0.2,
@@ -136,6 +197,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                 memory_cleanup_interval_batches=None,
                 model_scale=0.75,
                 pai_variant="default",
+                pai_fixed_switch_interval=None,
                 pai_dynamic_schedule={"max_dendrites": 1},
                 pai_save_name="gcn_dendrites_fp32",
             )
@@ -157,6 +219,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             self.assertEqual(summary["history"]["restructured_epochs"], [10])
             self.assertEqual(summary["history"]["training_complete_epochs"], [20])
             self.assertEqual(summary["architecture_log_consistency"], "stale")
+            self.assertIsNone(summary["fixed_switch_interval"])
 
 
 if __name__ == "__main__":

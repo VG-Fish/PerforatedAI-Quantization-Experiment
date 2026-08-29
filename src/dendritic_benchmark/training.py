@@ -58,6 +58,7 @@ _FALLBACK_MODULE_OUTPUT_DIMENSIONS: dict[str, dict[str, list[int]]] = {
     },
 }
 OptimizerName = Literal["adam", "adamw", "sgd"]
+RegressionLossName = Literal["mse", "mae", "smooth_l1"]
 # "constant" leaves the learning rate alone for the whole run.
 # "step"     multiplies it by lr_decay_gamma every lr_decay_every epochs.
 # "cosine"   anneals it from learning_rate down to learning_rate*lr_min_factor.
@@ -92,6 +93,9 @@ class TrainingConfig:
     # every schedule. Fractional epochs are not supported; the ramp is per-epoch.
     warmup_epochs: int = 0
     label_smoothing: float = 0.0
+    # Regression tasks default to MSE for backwards compatibility. Forecasting
+    # models may opt into a loss that matches their reported MAE metric.
+    regression_loss: RegressionLossName = "mse"
     grad_clip_norm: float | None = None
     source_condition_key: str | None = None
     enable_pai_dendrite_updates: bool = False
@@ -104,6 +108,7 @@ class TrainingConfig:
     # reproduced without inferring intent from its output directory name.
     model_scale: float = 1.0
     pai_variant: str = "default"
+    pai_fixed_switch_interval: int | None = None
     pai_dynamic_schedule: dict[str, Any] | None = None
     # Ceiling on a single dendrite ("p") phase in dynamic mode, and the only
     # thing that bounds one.  PAI leaves the phase once no node's correlation
@@ -167,6 +172,7 @@ class ArtifactMetadata:
     bit_width: int | None
     use_qat: bool
     fine_tune_epochs: int
+    regression_loss: RegressionLossName
     enable_pai_dendrite_updates: bool
     train_dendrites_until_complete: bool
     freeze_dendrite_updates_fraction: float
@@ -174,6 +180,7 @@ class ArtifactMetadata:
     memory_cleanup_interval_batches: int | None
     model_scale: float
     pai_variant: str
+    pai_fixed_switch_interval: int | None
     pai_dynamic_schedule: dict[str, Any] | None
     pai_save_name: str | None
 
@@ -474,7 +481,20 @@ class CapsuleMarginLoss(torch.nn.Module):
 
 
 def _binary_or_multi_loss(model_key: str, config: TrainingConfig | None = None) -> Any:
-    if model_key in {"lstm_forecaster", "mpnn", "attentivefp_freesolv", "tcn_forecaster", "gru_forecaster"}:
+    if model_key in {"tcn_forecaster", "gru_forecaster"}:
+        # Both forecasters report MAE, so the training loss is a recipe choice
+        # rather than a fixed property of the task.
+        regression_loss = config.regression_loss if config is not None else "mse"
+        if regression_loss == "mae":
+            return torch.nn.L1Loss()
+        if regression_loss == "smooth_l1":
+            return torch.nn.SmoothL1Loss(beta=0.1)
+        if regression_loss != "mse":
+            raise ValueError(
+                f"Unknown {model_key} regression loss {regression_loss!r}"
+            )
+        return torch.nn.MSELoss()
+    if model_key in {"lstm_forecaster", "mpnn", "attentivefp_freesolv"}:
         return torch.nn.MSELoss()
     if model_key in {"lstm_autoencoder"}:
         return torch.nn.MSELoss()
@@ -1391,6 +1411,7 @@ def _write_metrics_and_history(
                 "bit_width": metadata.bit_width,
                 "use_qat": metadata.use_qat,
                 "fine_tune_epochs": metadata.fine_tune_epochs,
+                "regression_loss": metadata.regression_loss,
                 "enable_pai_dendrite_updates": metadata.enable_pai_dendrite_updates,
                 "train_dendrites_until_complete": metadata.train_dendrites_until_complete,
                 "freeze_dendrite_updates_fraction": (
@@ -1401,6 +1422,7 @@ def _write_metrics_and_history(
                 ),
                 "model_scale": metadata.model_scale,
                 "pai_variant": metadata.pai_variant,
+                "pai_fixed_switch_interval": metadata.pai_fixed_switch_interval,
                 "pai_dynamic_schedule": metadata.pai_dynamic_schedule,
                 "pai_save_name": metadata.pai_save_name,
                 "artifact_path": str(stats.artifact_path),
@@ -1648,6 +1670,7 @@ def _write_pai_summary(
                 "model_key": metadata.model_key,
                 "condition_key": metadata.condition_key,
                 "pai_variant": metadata.pai_variant,
+                "fixed_switch_interval": metadata.pai_fixed_switch_interval,
                 "dynamic_schedule": metadata.pai_dynamic_schedule,
                 "final_model": {
                     "param_count": param_count,
@@ -3487,6 +3510,7 @@ def _build_artifact_metadata(
         bit_width=config.bit_width,
         use_qat=config.use_qat,
         fine_tune_epochs=config.fine_tune_epochs,
+        regression_loss=config.regression_loss,
         enable_pai_dendrite_updates=config.enable_pai_dendrite_updates,
         train_dendrites_until_complete=config.train_dendrites_until_complete,
         freeze_dendrite_updates_fraction=config.freeze_dendrite_updates_fraction,
@@ -3494,6 +3518,7 @@ def _build_artifact_metadata(
         memory_cleanup_interval_batches=config.memory_cleanup_interval_batches,
         model_scale=config.model_scale,
         pai_variant=config.pai_variant,
+        pai_fixed_switch_interval=config.pai_fixed_switch_interval,
         pai_dynamic_schedule=config.pai_dynamic_schedule,
         pai_save_name=config.pai_save_name,
     )
@@ -3521,6 +3546,7 @@ def _metadata_for_stage(
             if fine_tune_epochs is None
             else fine_tune_epochs
         ),
+        regression_loss=metadata.regression_loss,
         enable_pai_dendrite_updates=metadata.enable_pai_dendrite_updates,
         train_dendrites_until_complete=metadata.train_dendrites_until_complete,
         freeze_dendrite_updates_fraction=metadata.freeze_dendrite_updates_fraction,
@@ -3528,6 +3554,7 @@ def _metadata_for_stage(
         memory_cleanup_interval_batches=metadata.memory_cleanup_interval_batches,
         model_scale=metadata.model_scale,
         pai_variant=metadata.pai_variant,
+        pai_fixed_switch_interval=metadata.pai_fixed_switch_interval,
         pai_dynamic_schedule=metadata.pai_dynamic_schedule,
         pai_save_name=metadata.pai_save_name,
     )

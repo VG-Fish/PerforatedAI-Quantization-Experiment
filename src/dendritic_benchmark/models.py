@@ -144,7 +144,13 @@ class DendriticLSTMCell(nn.Module):
 
 
 class DendriticGRUCell(nn.Module):
-    """GRU cell built from Linear modules for dendritic gate perforation."""
+    """GRU cell built from Linear modules for dendritic gate perforation.
+
+    ``input_gates`` reads the current input only, never the recurrent state, so
+    a caller holding a whole sequence can project it in one call and hand the
+    per-timestep slices to :meth:`step`. ``GRUForecaster.forward`` does exactly
+    that; see the note there for why the benchmark cares.
+    """
 
     def __init__(self, input_size: int, hidden_size: int):
         super().__init__()
@@ -152,13 +158,17 @@ class DendriticGRUCell(nn.Module):
         self.input_gates = nn.Linear(input_size, 3 * hidden_size)
         self.hidden_gates = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
 
-    def forward(self, x: Any, h: Any) -> Any:
-        x_z, x_r, x_n = self.input_gates(x).chunk(3, dim=-1)
+    def step(self, input_gates: Any, h: Any) -> Any:
+        """Advance one timestep from an already-projected input."""
+        x_z, x_r, x_n = input_gates.chunk(3, dim=-1)
         h_z, h_r, h_n = self.hidden_gates(h).chunk(3, dim=-1)
         z = torch.sigmoid(x_z + h_z)
         r = torch.sigmoid(x_r + h_r)
         n = torch.tanh(x_n + r * h_n)
         return (1.0 - z) * n + z * h
+
+    def forward(self, x: Any, h: Any) -> Any:
+        return self.step(self.input_gates(x), h)
 
 
 class LSTMForecaster(nn.Module):
@@ -931,15 +941,30 @@ class Chomp1d(nn.Module):
 
 
 class TemporalBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, dilation: int, dropout: float = 0.1):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        dilation: int,
+        dropout: float = 0.1,
+        kernel_size: int = 3,
+    ):
         super().__init__()
-        padding = (3 - 1) * dilation
+        if kernel_size < 2:
+            raise ValueError("TemporalBlock kernel_size must be at least two")
+        padding = (kernel_size - 1) * dilation
         self.net = nn.Sequential(
-            nn.Conv1d(in_channels, out_channels, 3, padding=padding, dilation=dilation),
+            nn.Conv1d(
+                in_channels, out_channels, kernel_size,
+                padding=padding, dilation=dilation,
+            ),
             Chomp1d(padding),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Conv1d(out_channels, out_channels, 3, padding=padding, dilation=dilation),
+            nn.Conv1d(
+                out_channels, out_channels, kernel_size,
+                padding=padding, dilation=dilation,
+            ),
             Chomp1d(padding),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -987,6 +1012,17 @@ class TCNForecaster(nn.Module):
 
     For scale, Informer reports 0.369 MAE on this protocol. That is a cross-architecture
     reference, not a TCN parity target.
+
+    The forecast head pools the most recent 8, 16, and 32 hidden states before
+    predicting the complete horizon. A last-state-only head made all 24 output
+    steps depend on one representation, despite the TCN having computed a rich
+    causal trajectory. The small nonlinear head lets those time scales interact
+    without changing the temporal backbone or violating causality.
+
+    ``kernel_size``, ``readout_windows``, and ``use_nonlinear_head`` are public
+    to support the focused TCN sweep in ``experiments/dynamic11``. The default
+    remains deliberately conservative: it retains the measured five-block,
+    kernel-3 backbone and adds only readout capacity.
     """
 
     def __init__(
@@ -996,41 +1032,79 @@ class TCNForecaster(nn.Module):
         hidden: int = 64,
         dilations: tuple[int, ...] = (1, 2, 4, 8, 16),
         dropout: float = 0.2,
+        kernel_size: int = 3,
+        readout_windows: tuple[int, ...] = (8, 16, 32),
+        head_dropout: float = 0.1,
+        use_nonlinear_head: bool = True,
     ):
         super().__init__()
+        if not readout_windows or any(window < 1 for window in readout_windows):
+            raise ValueError("TCN readout_windows must contain positive widths")
         self.horizon = horizon
         self.input_size = input_size
+        self.readout_windows = tuple(readout_windows)
         channels: int = input_size
         blocks: list[nn.Module] = []
         for dilation in dilations:
-            blocks.append(TemporalBlock(channels, hidden, dilation, dropout=dropout))
+            blocks.append(
+                TemporalBlock(
+                    channels, hidden, dilation, dropout=dropout,
+                    kernel_size=kernel_size,
+                )
+            )
             channels = hidden
         self.net = nn.Sequential(*blocks)
-        self.head = nn.Linear(hidden, horizon * input_size)
+        readout_features = hidden * len(self.readout_windows)
+        if use_nonlinear_head:
+            self.head = nn.Sequential(
+                nn.Linear(readout_features, hidden),
+                nn.ReLU(),
+                nn.Dropout(head_dropout),
+                nn.Linear(hidden, horizon * input_size),
+            )
+        else:
+            self.head = nn.Linear(readout_features, horizon * input_size)
 
     def forward(self, x: Any) -> Any:
         # RevIN, part 1: normalise each window by its own statistics. Kept stateless (no
         # learned affine) so it adds no parameters and nothing for PAI to perforate.
         mean = x.mean(1, keepdim=True)
         std = x.std(1, keepdim=True).clamp_min(1e-5)
-        h = self.net(((x - mean) / std).transpose(1, 2))[..., -1]
+        features = self.net(((x - mean) / std).transpose(1, 2))
+        pooled = [
+            features[..., -window:].mean(dim=-1)
+            for window in self.readout_windows
+        ]
+        h = torch.cat(pooled, dim=1)
         out = self.head(h).view(-1, self.horizon, self.input_size)
         # RevIN, part 2: predictions come back in the normalised space, so undo it.
         return out * std + mean
 
 
 class GRUForecaster(nn.Module):
+    """Multivariate multi-step forecaster: [B, seq_len, 21] -> [B, horizon, 21].
+
+    ``state_dropout`` is variational (Gal & Ghahramani): one mask is drawn per
+    sequence and reused at every timestep, rather than a fresh mask per step.
+    Resampling per step injects noise the recurrence cannot average out and
+    measurably hurt this model; the fixed mask is what regularises it.
+    """
+
     def __init__(
         self,
         input_size: int = 21,
         horizon: int = WEATHER_FORECAST_HORIZON,
         hidden: int = 64,
         layers: int = 2,
+        state_dropout: float = 0.0,
+        use_revin: bool = False,
     ):
         super().__init__()
         self.horizon = horizon
         self.input_size = input_size
         self.hidden = hidden
+        self.state_dropout = state_dropout
+        self.use_revin = use_revin
         self.cells = nn.ModuleList(
             DendriticGRUCell(input_size if layer == 0 else hidden, hidden)
             for layer in range(layers)
@@ -1040,15 +1114,49 @@ class GRUForecaster(nn.Module):
             nn.Linear(hidden, horizon * input_size),
         )
 
+    def _state_mask(self, reference: Any) -> Any:
+        """Per-sequence keep mask, or None when dropout is off or evaluating."""
+        if not self.training or self.state_dropout <= 0.0:
+            return None
+        keep = 1.0 - self.state_dropout
+        mask = reference.new_empty(reference.shape[0], self.hidden)
+        return mask.bernoulli_(keep) / keep
+
     def forward(self, x: Any) -> Any:
-        batch = x.shape[0]
-        states = [x.new_zeros(batch, self.hidden) for _ in self.cells]
-        for timestep in range(x.shape[1]):
-            step = x[:, timestep]
-            for index, cell in enumerate(self.cells):
-                states[index] = cell(step, states[index])
-                step = states[index]
-        return self.head(states[-1]).view(-1, self.horizon, self.input_size)
+        # Layer-at-a-time rather than timestep-at-a-time. The two forms are
+        # numerically identical, but this one calls each cell's input_gates once
+        # for the whole sequence rather than once per timestep. PAI wrappers
+        # have per-call overhead; hoisting this projection keeps input-gate
+        # perforation viable for 96-step weather windows.
+        if self.use_revin:
+            # RevIN, part 1: normalise each window by its own statistics.
+            # Stateless (no learned affine), so it adds no parameters and
+            # nothing for PAI to perforate. See TCNForecaster.forward.
+            mean = x.mean(1, keepdim=True)
+            std = x.std(1, keepdim=True).clamp_min(1e-5)
+            x = (x - mean) / std
+        sequence = x
+        last = len(self.cells) - 1
+        for index, cell in enumerate(self.cells):
+            gates = cell.input_gates(sequence)
+            state = sequence.new_zeros(sequence.shape[0], self.hidden)
+            # Only stack the full output sequence when a later layer reads it.
+            states = None if index == last else []
+            for step_gates in gates.unbind(1):
+                state = cell.step(step_gates, state)
+                if states is not None:
+                    states.append(state)
+            sequence = state if states is None else torch.stack(states, dim=1)
+            mask = self._state_mask(sequence)
+            if mask is not None:
+                # The final layer's output feeds the head, so the same mask
+                # regularises both the inter-layer path and the readout input.
+                sequence = sequence * (mask if states is None else mask[:, None, :])
+        out = self.head(sequence).view(-1, self.horizon, self.input_size)
+        if self.use_revin:
+            # RevIN, part 2: predictions are in the normalised space; undo it.
+            return out * std + mean
+        return out
 
 
 class TransformNet(nn.Module):

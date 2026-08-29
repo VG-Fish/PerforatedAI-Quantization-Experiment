@@ -50,6 +50,7 @@ from .specs import CONDITION_SPECS, MODEL_SPECS, ConditionSpec, condition_by_key
 from .training import (
     LRScheduleName,
     OptimizerName,
+    RegressionLossName,
     TrainingConfig,
     TrainingRecord,
     infer_module_output_dimensions,
@@ -77,6 +78,10 @@ _MODEL_DENDRITIC_MEMORY_CLEANUP_INTERVALS = {
 # interval instead, sized to the epochs their baseline recipe needs to converge.
 _MODEL_DENDRITIC_FIXED_SWITCH_INTERVALS = {
     "distilbert": 3,
+    # Dynamic10's TCN reached its best validation epoch at 9, while HISTORY
+    # mode first restructured at epoch 20. Insert the single permitted
+    # dendrite early enough for it to affect the selected checkpoint.
+    "tcn_forecaster": 6,
 }
 _PAI_VARIANTS = frozenset({"default", "vae_latent", "mpnn_capacity"})
 # Dynamic9 showed that the global three-dendrite schedule adds unnecessary
@@ -89,11 +94,12 @@ _MODEL_DYNAMIC_PAI_SCHEDULES = {
     "tcn_forecaster": PAIDynamicSchedule(max_dendrites=1),
     "mpnn": PAIDynamicSchedule(max_dendrites=3),
     "vae_mnist": PAIDynamicSchedule(max_dendrites=1),
-    "gru_forecaster": PAIDynamicSchedule(
-        max_dendrites=1,
-        n_epochs_to_switch=24,
-        candidate_weight_initialization_multiplier=0.001,
-    ),
+    # Dynamic10's Weather validation MAE bottomed near epoch 5, but the first
+    # PAI switch landed at epoch 34. Eight epochs matches the history window,
+    # allowing the single candidate to be evaluated near the actual plateau.
+    # The old 0.001 candidate-weight multiplier belonged to the 2016-wide
+    # readout target; the new gate targets retain PAI's 0.005 default.
+    "gru_forecaster": PAIDynamicSchedule(max_dendrites=1, n_epochs_to_switch=8),
 }
 _PAI_VARIANT_SCHEDULES = {
     "mpnn_capacity": {
@@ -127,6 +133,7 @@ class ModelTrainingRecipe:
     # Linear warmup ramp, in epochs, applied under every schedule.
     warmup_epochs: int = 0
     label_smoothing: float = 0.0
+    regression_loss: RegressionLossName = "mse"
     grad_clip_norm: float | None = None
     nesterov: bool = False
 
@@ -553,6 +560,14 @@ class BenchmarkRunner:
             if self._pai_variant == "vae_latent":
                 return [".mu", ".logvar"]
             return [".decoder.4"]
+        if model_key == "gru_forecaster":
+            # Dynamic10 perforated the final readout, which holds 80% of the
+            # compact model's parameters and is applied only once. Perforating
+            # input_gates instead changes the recurrence at every timestep and
+            # costs only 8.3% of the base parameters. GRUForecaster hoists the
+            # input projections outside the timestep loop, keeping PAI's
+            # wrapper overhead manageable on 96-step sequences.
+            return [".cells.0.input_gates", ".cells.1.input_gates"]
         return []
 
     def _perforation_track_only_module_ids(self, model_key: str) -> list[str]:
@@ -578,10 +593,14 @@ class BenchmarkRunner:
             # baseline the buffer's advantages were computed against. Behind
             # them, the backbone can absorb capacity without either effect.
             "ppo_bipedalwalker": [".critic", ".actor_mean"],
-            # Recurrent gates run per-timestep; perforating them dominates wallclock
-            # on long sequences. Marking .cells as track-only (not perforated)
-            # confines dendrite insertion to the readout Linear in .head only.
-            "gru_forecaster": [".cells"],
+            # Perforation goes only on the hoisted input-gate projections. The
+            # hidden gates still run inside the recurrent loop, and the final
+            # readout was the oversized, ineffective Dynamic10 target.
+            "gru_forecaster": [
+                ".cells.0.hidden_gates",
+                ".cells.1.hidden_gates",
+                ".head",
+            ],
             # MobileNetV2's final classifier Linear sits inside nn.Sequential(Dropout, Linear),
             # and the initial Conv2d sits inside Conv2dNormActivation (also an nn.Sequential);
             # perforating either leaves DendriteValueTracker.shape uninitialized at the PA switch.
@@ -704,7 +723,7 @@ class BenchmarkRunner:
         fine_tune_epochs = condition.fine_tune_epochs
         if condition.quantized and condition.source_key != condition.key:
             if allow_pqat:
-                fine_tune_epochs = self._pqat_epoch_budget(model_key)
+                fine_tune_epochs = self._pqat_epoch_budget(model_key, condition)
                 max_epochs = fine_tune_epochs
                 use_qat = True
             else:
@@ -966,6 +985,7 @@ class BenchmarkRunner:
             "tcn_forecaster": ModelTrainingRecipe(
                 128, 80, 1.0e-3, "adam", 0.9, 1.0e-4,
                 lr_schedule="cosine", lr_min_factor=0.01, grad_clip_norm=1.0,
+                regression_loss="smooth_l1",
             ),
             # Batch 24 -> 128 (see _BATCH_SIZES) cuts the step count per epoch by
             # 5.3x, so the epoch budget goes up to keep the number of optimiser
@@ -1053,13 +1073,20 @@ class BenchmarkRunner:
             # dropout=0.2 architecture and modestly raise L2 for both paired
             # arms before asking a dendrite to recover capacity.
             recipe = replace(recipe, weight_decay=2.0e-4)
+        if model_key == "tcn_forecaster" and condition.key.endswith("q1_58"):
+            # Ternary QAT was still improving at the end of Dynamic10's
+            # ten-epoch phase. A lower step avoids repeatedly jumping between
+            # quantization bins while the longer phase can recover accuracy.
+            recipe = replace(recipe, learning_rate=3.0e-4)
         dendritic_batch_size = _MODEL_DENDRITIC_BATCH_SIZES.get(model_key)
         if condition.use_dendrites and dendritic_batch_size is not None:
             return recipe.with_batch_size(dendritic_batch_size)
         return recipe
 
-    def _pqat_epoch_budget(self, model_key: str) -> int:
+    def _pqat_epoch_budget(self, model_key: str, condition: ConditionSpec) -> int:
         """Allocate a short PQAT phase from the model's canonical epoch recipe."""
+        if model_key == "tcn_forecaster" and condition.key.endswith("q1_58"):
+            return 24
         recipe = self._training_hyperparameters(
             model_key, condition_by_key("base_fp32")
         )
@@ -1425,6 +1452,11 @@ class BenchmarkRunner:
             if training_plan.update_dendrites_during_training
             else None
         )
+        fixed_switch_interval = (
+            self._pai_fixed_switch_interval(model_key)
+            if training_plan.update_dendrites_during_training
+            else None
+        )
         training_config = TrainingConfig(
             bit_width=condition.bit_width,
             quantization_mode=condition.quantization_mode,
@@ -1445,6 +1477,7 @@ class BenchmarkRunner:
             lr_min_factor=training_hyperparameters.lr_min_factor,
             warmup_epochs=training_hyperparameters.warmup_epochs,
             label_smoothing=training_hyperparameters.label_smoothing,
+            regression_loss=training_hyperparameters.regression_loss,
             grad_clip_norm=training_hyperparameters.grad_clip_norm,
             source_condition_key=condition.source_key,
             enable_pai_dendrite_updates=training_plan.update_dendrites_during_training,
@@ -1458,6 +1491,7 @@ class BenchmarkRunner:
             pai_save_name=self._pai_save_name(model_key, condition.key),
             model_scale=self._model_scale,
             pai_variant=self._pai_variant,
+            pai_fixed_switch_interval=fixed_switch_interval,
             pai_dynamic_schedule=(
                 dynamic_schedule.to_dict() if dynamic_schedule is not None else None
             ),
