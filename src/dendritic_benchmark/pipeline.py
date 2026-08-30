@@ -1478,11 +1478,14 @@ class BenchmarkRunner:
             return False
         expected_schedule = self._pai_dynamic_schedule(model_key)
         recorded_schedule = metadata.get("pai_dynamic_schedule")
-        if (
-            recorded_schedule is not None
-            and expected_schedule is not None
-            and recorded_schedule != expected_schedule.to_dict()
-        ):
+        # Compare both directions of the None boundary too: adding or removing a
+        # _MODEL_DYNAMIC_PAI_SCHEDULES override is a None-to-dict transition, and
+        # for models absent from _MODEL_ARTIFACT_REVISIONS this is the only guard
+        # that would catch the artifact being trained under the other schedule.
+        expected_dict = (
+            expected_schedule.to_dict() if expected_schedule is not None else None
+        )
+        if recorded_schedule != expected_dict:
             return False
         return True
 

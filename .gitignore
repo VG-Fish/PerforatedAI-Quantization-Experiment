@@ -41,12 +41,14 @@ experiments/dynamic12/config/*
 !experiments/dynamic12/config/run_validated_replications.sh
 !experiments/dynamic12/config/queue_saint_head_mps.sh
 !experiments/dynamic12/config/queue_textcnn_mpnn_mps.sh
+!experiments/dynamic12/config/queue_nondendritic_resnet_mps.sh
 !experiments/dynamic12/scripts/
 experiments/dynamic12/scripts/*
 !experiments/dynamic12/scripts/smoke_models.py
 !experiments/dynamic12/scripts/smoke_pai_targets.py
 !experiments/dynamic12/scripts/plot_dynamic_seven.py
 !experiments/dynamic12/scripts/plot_quantization_heatmap.py
+!experiments/dynamic12/scripts/verify_pqat.py
 !experiments/dynamic12/tuning/
 experiments/dynamic12/tuning/*
 !experiments/dynamic12/tuning/tune_gru_capacity.py

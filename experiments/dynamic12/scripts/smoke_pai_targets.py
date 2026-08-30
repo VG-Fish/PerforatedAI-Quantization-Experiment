@@ -102,7 +102,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models",
         nargs="+",
-        choices=("resnet18_cifar10", "saint_adult", "pointnet_modelnet40"),
+        # The HF checkpoint ships already perforated, so it has no dynamic PAI
+        # target to smoke-test. Accept it anyway -- run_smoke_tests.sh forwards
+        # one --models list to both scripts, and _target_cases() filters it to
+        # an empty selection, which is the intended no-op.
+        choices=(
+            "resnet18_cifar10",
+            "saint_adult",
+            "pointnet_modelnet40",
+            "resnet18_hf_perforated_cifar10",
+        ),
         default=("resnet18_cifar10", "saint_adult", "pointnet_modelnet40"),
     )
     parser.add_argument("--model-scale", type=float, default=1.0)
