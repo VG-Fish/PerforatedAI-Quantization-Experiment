@@ -518,11 +518,48 @@ class MPNNLayer(nn.Module):
         )
         self.update = DendriticGRUCell(hidden, hidden)
 
-    def forward(self, h: Any, adjacency: Any, edge_features: Any) -> Any:
-        batch, nodes, hidden = h.shape
+    def _edge_messages(self, h: Any, edge_features: Any) -> Any:
+        """Compute pairwise messages without materialising a concatenated graph.
+
+        The first edge MLP projection is affine in the target state, source
+        state, and edge features. Applying its three weight slices separately
+        is exactly the same computation as ``Linear(cat(...))`` while avoiding
+        the transient ``[B, N, N, 2H + E]`` allocation.  That allocation is the
+        dominant MPS memory and bandwidth cost in MPNN's inner loop.
+
+        PAI does not currently perforate ``edge_mlp``, but retain the original
+        module call whenever an experiment wraps one of its children. This
+        keeps arbitrary future PAI registrations semantically authoritative.
+        """
+        first, activation, final = self.edge_mlp
+        hidden = h.shape[-1]
+        if (
+            type(first) is nn.Linear
+            and isinstance(activation, nn.ReLU)
+            and type(final) is nn.Linear
+            and first.in_features == hidden * 2 + edge_features.shape[-1]
+        ):
+            target_weight = first.weight[:, :hidden]
+            source_weight = first.weight[:, hidden : hidden * 2]
+            edge_weight = first.weight[:, hidden * 2 :]
+            # ``source[b, i, j]`` is h[b, i] and ``target[b, i, j]`` is
+            # h[b, j], matching the original concat order [target, source, e].
+            source_projection = F.linear(h, source_weight).unsqueeze(2)
+            target_projection = F.linear(h, target_weight).unsqueeze(1)
+            edge_projection = F.linear(edge_features, edge_weight, first.bias)
+            hidden_messages = activation(
+                edge_projection + source_projection + target_projection
+            )
+            return F.linear(hidden_messages, final.weight, final.bias)
+
+        batch, nodes, _ = h.shape
         source = h.unsqueeze(2).expand(batch, nodes, nodes, hidden)
         target = h.unsqueeze(1).expand(batch, nodes, nodes, hidden)
-        messages = self.edge_mlp(torch.cat([target, source, edge_features], dim=-1))
+        return self.edge_mlp(torch.cat([target, source, edge_features], dim=-1))
+
+    def forward(self, h: Any, adjacency: Any, edge_features: Any) -> Any:
+        batch, nodes, hidden = h.shape
+        messages = self._edge_messages(h, edge_features)
         messages = messages * adjacency.unsqueeze(-1)
         degree = adjacency.sum(dim=-1, keepdim=True).clamp_min(1.0)
         aggregated = messages.sum(dim=2) / degree

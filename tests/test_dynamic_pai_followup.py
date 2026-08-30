@@ -16,7 +16,7 @@ from dendritic_benchmark.compat import (
     ternary_quantize_tensor_per_channel,
 )
 from dendritic_benchmark.data import _make_loader
-from dendritic_benchmark.models import GRUForecaster, TCNForecaster, build_model
+from dendritic_benchmark.models import MPNNLayer, GRUForecaster, TCNForecaster, build_model
 from dendritic_benchmark.pipeline import BenchmarkRunner, ConditionTrainingPlan
 from dendritic_benchmark.specs import condition_by_key
 from dendritic_benchmark.training import (
@@ -56,6 +56,33 @@ class _RecordingPC:
 
 
 class DynamicPAIFollowupTests(unittest.TestCase):
+    def test_mpnn_edge_projection_avoids_concat_without_changing_messages(self) -> None:
+        torch.manual_seed(0)
+        layer = MPNNLayer(hidden=4, edge_features=3)
+        h = torch.randn(2, 5, 4, requires_grad=True)
+        edge_features = torch.randn(2, 5, 5, 3)
+        source = h.unsqueeze(2).expand(2, 5, 5, 4)
+        target = h.unsqueeze(1).expand(2, 5, 5, 4)
+        expected = layer.edge_mlp(torch.cat([target, source, edge_features], dim=-1))
+        expected.square().sum().backward()
+        expected_input_grad = h.grad.detach().clone()
+        expected_parameter_grads = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in layer.edge_mlp.named_parameters()
+        }
+
+        layer.zero_grad(set_to_none=True)
+        h = h.detach().clone().requires_grad_(True)
+        actual = layer._edge_messages(h, edge_features)
+        actual.square().sum().backward()
+
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(h.grad, expected_input_grad, rtol=1e-5, atol=1e-6)
+        for name, parameter in layer.edge_mlp.named_parameters():
+            torch.testing.assert_close(
+                parameter.grad, expected_parameter_grads[name], rtol=1e-5, atol=1e-6
+            )
+
     def test_qat_final_evaluation_does_not_project_twice(self) -> None:
         model = torch.nn.Linear(3, 2, bias=False)
         with torch.no_grad():
