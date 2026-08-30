@@ -929,10 +929,7 @@ class TimeSeriesDatasets:
 class TextDataSets:
     @staticmethod
     def _tokenize(text: str) -> list[str]:
-        return cast(
-            list[str],
-            "".join(char.lower() if char.isalnum() else " " for char in text).split(),
-        )
+        return "".join(char.lower() if char.isalnum() else " " for char in text).split()
 
     @staticmethod
     def _build_vocab(texts: Iterable[str], vocab_size: int) -> dict[str, int]:
