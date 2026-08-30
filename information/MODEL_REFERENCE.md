@@ -1059,6 +1059,9 @@ flowchart TD
   `.layer4` and `.fc` are track-only. This mirrors upstream PerforatedAI
   exactly — see the pre-FC note below.
 - PQAT epoch budget: `10`
+- Dynamic12 role: nondendritic control. The paired sweep uses
+  `base_fp32`, `base_q8`, `base_q4`, `base_q2`, `base_q1_58`, and `base_q1`
+  here; every quantized arm is PQAT-trained.
 - Parameters: **11,436,618** (11,173,962 backbone + 262,656 `pre_fc`), in both
   arms. One retained dendrite on `.pre_fc` adds a further 262,656 (+2.3%).
 - Architecture diagram:
@@ -1107,6 +1110,58 @@ Upstream's HF card reports 5 retained dendrites per pre-FC neuron
 This benchmark caps it at 1 (`_MODEL_DYNAMIC_PAI_SCHEDULES`) so a
 parameter-matched dense control stays practical — a deliberate divergence from
 the published configuration, not a match to it.
+
+## 21a. `resnet18_hf_perforated_cifar10` — HF Perforated ResNet-18
+
+- Domain: Image Classification
+- Dataset: CIFAR-10 transfer from the published ImageNet model
+- Primary metric: Accuracy
+- Metric direction: maximize
+- Factory key: `resnet18_hf_perforated_cifar10`
+- Source repository: `perforated-ai/resnet-18-perforated-gd`
+- Checkpoint SHA-256:
+  `f478d9034f1171847e6c16c74589397b7278e20b1f91b433351d5518a628fd3f`
+- Training recipe:
+  - `batch_size=128`
+  - `max_epochs=50`
+  - `learning_rate=1.0e-3`
+  - `optimizer_name=sgd`
+  - `momentum=0.9`
+  - `weight_decay=1.0e-4`
+  - `lr_schedule=cosine`
+  - `warmup_epochs=5`
+  - `label_smoothing=0.1`
+  - `nesterov=True`
+- PQAT epoch budget: `10`
+- Parameters after CIFAR adaptation: **12,492,362**
+- Published topology retained: `pre_fc.num_cycles == 8`, five entries in
+  `pre_fc.layer_array`, and four saved `skip_weights`.
+- CIFAR adaptation: the learned 7×7 ImageNet stem is center-cropped to 3×3,
+  stride is changed to 1, max-pooling becomes `Identity`, and only the 1000-way
+  classifier is replaced with a newly initialized 10-way classifier.
+- Loading: the checkpoint is reconstructed with PerforatedAI's official
+  `NPA.load_pai_model_from_dict` routine from an unconverted
+  `LPA.ResNetPAIPreFC`. With PerforatedAI 3.2.6, the higher-level
+  `UPA.from_hf_pretrained` path converts this older checkpoint twice and fails
+  strict state loading; using its documented lower-level reconstruction input
+  preserves every published tensor and avoids the duplicate wrapper.
+- Conditions: `base_fp32` is the already-perforated transfer model. All five
+  `base_q*` descendants run PQAT. `dendrites_*` is intentionally unsupported
+  for this key because it would stack a new PAI graph on the published one and
+  would not form a distinct or interpretable comparison.
+- Dynamic12 paired role: this model supplies the perforated/dendritic
+  counterpart to `resnet18_cifar10`. Its supported `base_*` records retain
+  their storage names so the condition dependency chain remains valid; the
+  comparison role is documented in `experiments/dynamic12/README.md`.
+
+```mermaid
+flowchart TD
+    in["Input (B,3,32,32)"] --> stem["Published Conv1 weights, center-cropped 7×7→3×3"]
+    stem --> body["Published ResNet-18 residual backbone"]
+    body --> gap["AdaptiveAvgPool"]
+    gap --> pre["Published perforated pre_fc: main + 4 retained paths"]
+    pre --> fc["New Linear 512→10"]
+```
 
 ## 22. `mobilenetv2_cifar10` — MobileNetV2
 

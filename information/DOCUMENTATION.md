@@ -7,7 +7,7 @@ This document consolidates all project documentation: the experiment plan, exten
 # Part 1: Benchmark Experiment Plan
 
 ## Overview
-This experiment investigates whether quantized dendritic models (created via Perforated Backpropagation) outperform non-dendritic counterparts across diverse fields. The current runnable suite contains **25 models** spanning complexities from ~25K to ~66M parameters. Each model is trained and evaluated under **12 experimental conditions**, yielding 300 total training/evaluation runs for a full sweep.
+This experiment investigates whether quantized dendritic models (created via Perforated Backpropagation) outperform non-dendritic counterparts across diverse fields. The current runnable suite contains **24 registered models** spanning complexities from ~25K to ~66M parameters. Models support up to **12 experimental conditions**; the published Hugging Face PerforatedAI ResNet is already dendritic, so its redundant `dendrites_*` aliases are intentionally skipped.
 
 The hardware target is an **Apple M3 Pro** chip using PyTorch's MPS backend, with a total budget of 12–48 hours. All quantization uses `torchao` (PyTorch-native), and dendrites are added via the `PerforatedAI` library.
 
@@ -52,7 +52,7 @@ fine-tuning after an initial PTQ snapshot is saved.
 
 ***
 ## Output Graphs (Per Model)
-For each of the 25 models, generate **3 comparison bar charts** — one for each metric — with all 12 conditions on the x-axis:
+For each registered model, generate **3 comparison bar charts** — one for each metric — with its supported conditions on the x-axis:
 
 ### Graph Set A: Accuracy (or Task Metric)
 - Y-axis: Accuracy % (classification), MAE/MSE (regression/forecasting), Action Accuracy (behaviour-cloned RL: `actor_critic`, `dqn_lunarlander`), Episodic Return (on-policy RL: `ppo_bipedalwalker`), AUC (anomaly), ELBO (VAE)
@@ -73,14 +73,14 @@ For each of the 25 models, generate **3 comparison bar charts** — one for each
 ## Cross-Model Comparison Graphs
 After all individual runs, produce the following **cross-domain comparison plots**:
 
-### Cross-Graph 1: Accuracy Retention Heatmap (25 × 12)
+### Cross-Graph 1: Accuracy Retention Heatmap (model × condition)
 - Rows = models/domains, Columns = conditions
 - Cell value = accuracy as % of the Base FP32 baseline (retention ratio)
 
 ### Cross-Graph 2: Size Reduction vs. Accuracy Tradeoff (scatter)
 - X-axis: File size reduction ratio vs. Base FP32
 - Y-axis: Accuracy retention (%)
-- One point per (model × condition) combination — 300 points total
+- One point per available (model × condition) combination
 
 ### Cross-Graph 3: "Dendrite Delta" Bar Chart (per domain)
 - For each domain: side-by-side bars of `Base FP32` vs `+Dendrites FP32` accuracy
@@ -592,6 +592,18 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 | **Dataset** | CIFAR-10 (50K/10K, 10 classes) |
 | **Architecture** | Standard ResNet-18 with modified first conv for 32×32 input |
 | **Metric** | Accuracy (%) |
+| **Dynamic12 role** | Nondendritic `base_fp32` control and `base_q*` PQAT arms |
+
+#### Model 21a — Published Perforated ResNet-18 (CIFAR-10 transfer)
+| Field | Value |
+|---|---|
+| **Key** | `resnet18_hf_perforated_cifar10` |
+| **Domain** | Image Classification — residual, already perforated |
+| **Dataset** | CIFAR-10 (transfer from ImageNet weights) |
+| **Architecture** | Hugging Face `perforated-ai/resnet-18-perforated-gd`; learned stem adapted to 32×32 and classifier replaced with 10 outputs |
+| **Metric** | Accuracy (%) |
+| **Dynamic12 role** | Already-perforated/dendritic counterpart to `resnet18_cifar10` |
+| **PAI Notes** | The published pre-FC graph has five branches. Its `base_fp32` and five `base_q*` records are the distinct perforated counterpart arms; a second PAI conversion is not performed. |
 
 #### Model 22 — MobileNetV2 (CIFAR-10)
 | Field | Value |
@@ -623,7 +635,7 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 | **Scientific Rationale** | Unique combination of routing-by-agreement and PAI's cascade-correlation dendrite addition |
 
 ***
-## Complete 25-Model Roster
+## Registered Model Roster
 | # | Key | Domain | Dataset | ~Params |
 |---|---|---|---|---|
 | 1 | `lenet5` | Image (tiny CNN) | MNIST | 62K |
@@ -647,6 +659,7 @@ The first 10-model round reveals three distinct behavioral clusters. **Dendrites
 | 19 | `snn_nmnist` | Neuromorphic SNN | N-MNIST | 60K |
 <!-- | 20 | `unet_isic` | Medical Seg. | ISIC 2018 | ~1.9M | -->
 | 21 | `resnet18_cifar10` | Image (ResNet) | CIFAR-10 | ~11.2M |
+| 21a | `resnet18_hf_perforated_cifar10` | Image (published perforated ResNet) | CIFAR-10 transfer | ~12.5M |
 | 22 | `mobilenetv2_cifar10` | Image (Efficient) | CIFAR-10 | ~2.2M |
 | 23 | `saint_adult` | Tabular (Xfmr) | Adult Income | 205K |
 | 24 | `capsnet_mnist` | Image (CapsNet) | MNIST | ~6.8M |
@@ -680,7 +693,7 @@ Once SAINT is trained in Round 2, plot a side-by-side comparison of all 12 condi
 
 ***
 ## Conclusion
-Round 1 produced three clean scientific findings: (1) dendritic models provide the largest gains in domains with strong temporal dynamics and continuous optimization landscapes (RL, molecular, audio); (2) dendrites rescue Q4 accuracy specifically in RNN-based time-series, suggesting recurrent hidden-state precision is the mechanism; (3) Q2 is a near-universal floor not addressable by dendrites alone, requiring QAT from the start. The 15 new models stress-test each of these findings across new architectures and domains. The complete 25-model suite with 12 conditions yields 300 training runs, providing strong statistical power for cross-domain claims about dendritic quantization robustness.
+Round 1 produced three clean scientific findings: (1) dendritic models provide the largest gains in domains with strong temporal dynamics and continuous optimization landscapes (RL, molecular, audio); (2) dendrites rescue Q4 accuracy specifically in RNN-based time-series, suggesting recurrent hidden-state precision is the mechanism; (3) Q2 is a near-universal floor not addressable by dendrites alone, requiring QAT from the start. The expanded registered suite stress-tests each of these findings across new architectures and domains, providing broad cross-domain evidence about dendritic quantization robustness.
 
 ---
 
@@ -738,7 +751,7 @@ Builds task bundles for each benchmark task and caches datasets under `data/` by
 ## Models
 
 ### `src/dendritic_benchmark/models.py`
-Defines PyTorch implementations for all benchmark models and exposes `build_model()` to construct each architecture by key. The recurrent models use explicit Linear-gated LSTM/GRU cells so PerforatedAI can operate on recurrent projections; TabNet, SAINT, AttentiveFP, PointNet, CapsNet, SNN, U-Net, ResNet-18, and MobileNetV2 are implemented as named architectures rather than placeholder fallbacks. ResNet-18 and MobileNetV2 use `torchvision.models` with CIFAR-10 adaptations.
+Defines PyTorch implementations for all benchmark models and exposes `build_model()` to construct each architecture by key. The recurrent models use explicit Linear-gated LSTM/GRU cells so PerforatedAI can operate on recurrent projections; TabNet, SAINT, AttentiveFP, PointNet, CapsNet, SNN, U-Net, ResNet-18, and MobileNetV2 are implemented as named architectures rather than placeholder fallbacks. The local ResNet-18 and MobileNetV2 use `torchvision.models` with CIFAR-10 adaptations. `resnet18_hf_perforated_cifar10` reconstructs PerforatedAI's published Hugging Face checkpoint, verifies its SHA-256 digest, adapts its learned stem, and preserves its saved pre-FC dendrite graph.
 
 ## Compatibility Helpers
 
@@ -968,7 +981,7 @@ comparison/
 ```
 
 ## Model Keys
-`lenet5`, `m5`, `lstm_forecaster`, `textcnn`, `gcn`, `tabnet`, `mpnn`, `actor_critic`, `lstm_autoencoder`, `distilbert`, `dqn_lunarlander`, `ppo_bipedalwalker`, `attentivefp_freesolv`, `gin_imdbb`, `tcn_forecaster`, `gru_forecaster`, `pointnet_modelnet40`, `vae_mnist`, `snn_nmnist`, <!-- `unet_isic`, --> `resnet18_cifar10`, `mobilenetv2_cifar10`, `saint_adult`, `capsnet_mnist`
+`lenet5`, `m5`, `lstm_forecaster`, `textcnn`, `gcn`, `tabnet`, `mpnn`, `actor_critic`, `lstm_autoencoder`, `distilbert`, `dqn_lunarlander`, `ppo_bipedalwalker`, `attentivefp_freesolv`, `gin_imdbb`, `tcn_forecaster`, `gru_forecaster`, `pointnet_modelnet40`, `vae_mnist`, `snn_nmnist`, <!-- `unet_isic`, --> `resnet18_cifar10`, `resnet18_hf_perforated_cifar10`, `mobilenetv2_cifar10`, `saint_adult`, `capsnet_mnist`
 
 ## Condition Keys
 `base_fp32`, `base_q8`, `base_q4`, `base_q2`, `base_q1_58`, `base_q1`, `dendrites_fp32`, `dendrites_q8`, `dendrites_q4`, `dendrites_q2`, `dendrites_q1_58`, `dendrites_q1`
@@ -1033,7 +1046,7 @@ uv run dqb benchmark_models --re-run
 |--------|---------|-------------|
 | `--benchmark-root DIR` | `benchmarks` | Output directory for benchmark results |
 | `--comparison-root DIR` | `comparison` | Root directory for per-model latency charts; a subdirectory is created for each model |
-| `--models KEY [KEY ...]` | all 25 | Space-separated model keys to benchmark |
+| `--models KEY [KEY ...]` | all registered | Space-separated model keys to benchmark |
 | `--conditions KEY [KEY ...]` | all 12 | Space-separated condition keys to benchmark |
 | `--batch-sizes SIZE [SIZE ...]` | `1 32` | Batch sizes to test |
 | `--num-runs N` | 5 | Number of independent timing runs per batch size; mean and median are computed across these runs |

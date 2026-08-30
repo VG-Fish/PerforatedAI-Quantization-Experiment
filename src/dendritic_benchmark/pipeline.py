@@ -47,13 +47,20 @@ from .results import (
     write_manifest,
     write_model_reports,
 )
-from .specs import CONDITION_SPECS, MODEL_SPECS, ConditionSpec, condition_by_key, model_by_key
+from .specs import (
+    CONDITION_SPECS,
+    MODEL_SPECS,
+    ConditionSpec,
+    condition_by_key,
+    condition_supported_by_model,
+    model_by_key,
+)
 from .training import (
     DENDRITE_AUDIT_REVISION,
     MAX_DENDRITE_PHASE_EPOCHS,
+    QUANTIZATION_EVALUATION_REVISION,
     LRScheduleName,
     OptimizerName,
-    QUANTIZATION_EVALUATION_REVISION,
     RegressionLossName,
     TrainingConfig,
     TrainingRecord,
@@ -113,6 +120,7 @@ _MODEL_ARTIFACT_REVISIONS = {
     "gru_forecaster": "dynamic11_multiscale_decoder_v2",
     "vae_mnist": "dynamic11_fair_ternary_v2",
     "resnet18_cifar10": "dynamic12_prefc_target_v1",
+    "resnet18_hf_perforated_cifar10": "dynamic12_hf_perforated_gd_cifar_v1",
     "saint_adult": "dynamic12_row_qkv_target_v1",
     "pointnet_modelnet40": "dynamic12_late_feature_target_v1",
 }
@@ -1229,6 +1237,15 @@ class BenchmarkRunner:
                 lr_schedule="cosine", warmup_epochs=5, label_smoothing=0.1,
                 nesterov=True, dendrite_lr_min_factor=0.1,
             ),
+            # Transfer PerforatedAI's published ImageNet checkpoint rather than
+            # asking PAI to rediscover its pre-FC dendrites from scratch on
+            # CIFAR-10.  Their transfer-learning example uses 50 epochs, SGD
+            # 1e-3, five warmup epochs, cosine decay, and label smoothing 0.1.
+            "resnet18_hf_perforated_cifar10": ModelTrainingRecipe(
+                128, 50, 1.0e-3, "sgd", 0.9, 1.0e-4,
+                lr_schedule="cosine", warmup_epochs=5, label_smoothing=0.1,
+                nesterov=True,
+            ),
             # Same story at 89.14% over 150 flat epochs; published MobileNetV2
             # CIFAR-10 runs reach ~94.1% with SGD 0.1 + cosine over 200 epochs.
             # Weight decay stays at 4e-5 (the MobileNetV2 paper's value) rather
@@ -1399,7 +1416,12 @@ class BenchmarkRunner:
         )
 
     def _condition_metadata_current(
-        self, model_key: str, condition: ConditionSpec, condition_dir: Path
+        self,
+        model_key: str,
+        condition: ConditionSpec,
+        condition_dir: Path,
+        *,
+        allow_pqat: bool = False,
     ) -> bool:
         """Reject saved artifacts built with a different compact/PAI profile."""
         metrics_path = condition_dir / "metrics.json"
@@ -1431,6 +1453,30 @@ class BenchmarkRunner:
             != QUANTIZATION_EVALUATION_REVISION
         ):
             return False
+        if condition.quantized:
+            expected_qat = bool(condition.use_qat or allow_pqat)
+            if bool(metadata.get("use_qat", False)) != expected_qat:
+                return False
+            if expected_qat:
+                try:
+                    recorded_fine_tune_epochs = int(
+                        metadata.get("fine_tune_epochs", 0)
+                    )
+                except (TypeError, ValueError):
+                    return False
+                if recorded_fine_tune_epochs <= 0:
+                    return False
+                for stage_name, stage_uses_qat in (
+                    ("before_pqat", False),
+                    ("after_pqat", True),
+                ):
+                    stage_path = condition_dir / stage_name / "metrics.json"
+                    try:
+                        stage_metadata = json.loads(stage_path.read_text())
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        return False
+                    if stage_metadata.get("use_qat") is not stage_uses_qat:
+                        return False
         if not condition.use_dendrites:
             return True
         if metadata.get("dendrite_audit_revision") != DENDRITE_AUDIT_REVISION:
@@ -1468,16 +1514,22 @@ class BenchmarkRunner:
         condition: ConditionSpec,
         *,
         ignore_saved: bool,
+        allow_pqat: bool,
     ) -> bool:
         if ignore_saved:
             return False
         condition_dir = self.results_root / model_key / condition.key
         if not (condition_dir / _RECORD_JSON).exists():
             return False
-        if not self._condition_metadata_current(model_key, condition, condition_dir):
+        if not self._condition_metadata_current(
+            model_key,
+            condition,
+            condition_dir,
+            allow_pqat=allow_pqat,
+        ):
             _log(
-                f"[stale] {model_key} / {condition.key} — model scale or PAI "
-                "targeting profile changed; retraining."
+                f"[stale] {model_key} / {condition.key} — model, PAI, "
+                "quantization, or PQAT metadata changed; retraining."
             )
             return False
         if (
@@ -1546,10 +1598,33 @@ class BenchmarkRunner:
         allow_pqat: bool,
         dynamic_dendritic_training: bool,
     ) -> bool:
+        unsupported_conditions = [
+            condition
+            for condition in selected_conditions
+            if not condition_supported_by_model(model_spec.key, condition.key)
+        ]
+        if unsupported_conditions:
+            # This checkpoint already contains the published pre-FC dendrites.
+            # Its base_q* arms are therefore the quantized perforated model;
+            # wrapping that static graph in another PAI search is unsupported
+            # and would no longer answer the requested transfer/PQAT question.
+            selected_conditions = [
+                condition
+                for condition in selected_conditions
+                if condition_supported_by_model(model_spec.key, condition.key)
+            ]
+            skipped = ", ".join(condition.key for condition in unsupported_conditions)
+            _log(
+                f"[conditions] {model_spec.key} already contains published "
+                f"dendrites; skipping non-distinct conditions: {skipped}"
+            )
         pending = [
             cond for cond in selected_conditions
             if not self._condition_record_usable(
-                model_spec.key, cond, ignore_saved=ignore_saved
+                model_spec.key,
+                cond,
+                ignore_saved=ignore_saved,
+                allow_pqat=allow_pqat,
             )
         ]
         already_done = [cond for cond in selected_conditions if cond not in pending]
@@ -1874,6 +1949,7 @@ DEFAULT_PROGRESS_INTERVAL = 60
 # _DEFAULT_COST_HOURS.
 _MODEL_COST_HOURS: dict[str, float] = {
     "resnet18_cifar10": 8.6,
+    "resnet18_hf_perforated_cifar10": 2.5,
     "mobilenetv2_cifar10": 8.0,
     "snn_nmnist": 4.4,
     "capsnet_mnist": 3.8,

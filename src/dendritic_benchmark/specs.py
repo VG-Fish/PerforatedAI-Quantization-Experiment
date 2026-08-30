@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from typing import Literal
 
-
 MetricDirection = Literal["maximize", "minimize"]
 
 
@@ -53,6 +52,13 @@ MODEL_SPECS: list[ModelSpec] = [
     ModelSpec("vae_mnist", "VAE", "MNIST", "ELBO", "maximize"),
     ModelSpec("snn_nmnist", "Spiking Neural Network", "N-MNIST", "Accuracy", "maximize"),
     ModelSpec("resnet18_cifar10", "ResNet-18", "CIFAR-10", "Accuracy", "maximize"),
+    ModelSpec(
+        "resnet18_hf_perforated_cifar10",
+        "HF Perforated ResNet-18",
+        "CIFAR-10",
+        "Accuracy",
+        "maximize",
+    ),
     ModelSpec("mobilenetv2_cifar10", "MobileNetV2", "CIFAR-10", "Accuracy", "maximize"),
     ModelSpec("saint_adult", "SAINT", "Adult Income", "Accuracy", "maximize"),
     ModelSpec("capsnet_mnist", "CapsNet", "MNIST", "Accuracy", "maximize"),
@@ -73,6 +79,23 @@ CONDITION_SPECS: list[ConditionSpec] = [
     ConditionSpec("dendrites_q1_58", "+Dendrites + Q1.58", "dendrites_fp32", 2, "ternary", True, False, False),
     ConditionSpec("dendrites_q1", "+Dendrites + Q1", "dendrites_fp32", 1, "binary", True, False, False),
 ]
+
+
+HF_PERFORATED_RESNET18_KEY = "resnet18_hf_perforated_cifar10"
+
+
+def condition_supported_by_model(model_key: str, condition_key: str) -> bool:
+    """Return whether a condition represents a distinct model comparison.
+
+    The Hugging Face ResNet checkpoint already contains its trained dendritic
+    graph.  Its ``base_*`` conditions are therefore the perforated model;
+    another ``dendrites_*`` conversion would stack a second search graph on
+    top and would not be a meaningful control.
+    """
+    return not (
+        model_key == HF_PERFORATED_RESNET18_KEY
+        and condition_key.startswith("dendrites_")
+    )
 
 
 def model_by_key(key: str) -> ModelSpec:

@@ -1,4 +1,7 @@
+import hashlib
 import math
+import os
+from pathlib import Path
 from typing import Any, Callable, cast
 
 import torch
@@ -1623,6 +1626,115 @@ def _build_resnet18_cifar10(**_: Any) -> Any:
     return ResNet18PreFC(model)
 
 
+HF_PERFORATED_RESNET18_REPO_ID = "perforated-ai/resnet-18-perforated-gd"
+HF_PERFORATED_RESNET18_SHA256 = (
+    "f478d9034f1171847e6c16c74589397b7278e20b1f91b433351d5518a628fd3f"
+)
+HF_PERFORATED_RESNET18_DIR_ENV = "DQB_HF_PERFORATED_RESNET18_DIR"
+
+
+def _hf_perforated_resnet18_checkpoint() -> Path:
+    """Return the verified Hugging Face safetensors checkpoint, downloading once.
+
+    The model card's high-level ``UPA.from_hf_pretrained`` helper currently
+    double-converts this older checkpoint with PerforatedAI 3.2.6.  That nests
+    the saved ``pre_fc`` graph and then fails strict state loading.  The
+    lower-level loader used below is the same official reconstruction routine,
+    but it correctly receives the unconverted ``ResNetPAIPreFC`` architecture
+    its own docstring requires.
+    """
+    configured = os.environ.get(HF_PERFORATED_RESNET18_DIR_ENV)
+    if configured:
+        checkpoint_dir = Path(configured).expanduser().resolve()
+    else:
+        checkpoint_dir = (
+            Path(__file__).resolve().parents[2]
+            / "data"
+            / "huggingface"
+            / "perforated-ai"
+            / "resnet-18-perforated-gd"
+        )
+    checkpoint = checkpoint_dir / "model.safetensors"
+    if not checkpoint.exists():
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as exc:  # pragma: no cover - dependency is declared
+            raise ImportError(
+                "huggingface_hub is required to download the PerforatedAI "
+                "ResNet-18 checkpoint"
+            ) from exc
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        downloaded = hf_hub_download(
+            repo_id=HF_PERFORATED_RESNET18_REPO_ID,
+            filename="model.safetensors",
+            local_dir=checkpoint_dir,
+        )
+        checkpoint = Path(downloaded)
+
+    with checkpoint.open("rb") as checkpoint_file:
+        digest = hashlib.file_digest(checkpoint_file, "sha256").hexdigest()
+    if digest != HF_PERFORATED_RESNET18_SHA256:
+        raise RuntimeError(
+            "Hugging Face PerforatedAI ResNet-18 checkpoint checksum mismatch: "
+            f"expected {HF_PERFORATED_RESNET18_SHA256}, got {digest}"
+        )
+    return checkpoint
+
+
+def _build_hf_perforated_resnet18_cifar10(
+    num_classes: int = 10,
+    model_scale: float = 1.0,
+    **_: Any,
+) -> Any:
+    """Load PerforatedAI's published ImageNet ResNet-18 for CIFAR transfer.
+
+    All published backbone and pre-FC dendrite weights are preserved.  The
+    ImageNet 7x7 stem is adapted to CIFAR by center-cropping its learned kernel
+    to 3x3, using stride 1, and removing max-pooling.  The 1000-way classifier
+    is replaced with a freshly initialized CIFAR classifier, matching
+    PerforatedAI's own transfer-learning example.
+    """
+    if model_scale != 1.0:
+        raise ValueError(
+            "resnet18_hf_perforated_cifar10 uses a fixed published checkpoint "
+            "and therefore requires model_scale=1.0"
+        )
+    torchvision_models = cast(Any, __import__("torchvision.models", fromlist=["models"]))
+    try:
+        from perforatedai import library_perforatedai as LPA
+        from perforatedai import network_perforatedai as NPA
+        from safetensors.torch import load_file
+    except ImportError as exc:  # pragma: no cover - dependencies are declared
+        raise ImportError(
+            "perforatedai and safetensors are required for the Hugging Face "
+            "PerforatedAI ResNet-18"
+        ) from exc
+
+    base = torchvision_models.resnet18(weights=None, num_classes=1000)
+    model = LPA.ResNetPAIPreFC(base)
+    model = NPA.load_pai_model_from_dict(
+        model,
+        load_file(str(_hf_perforated_resnet18_checkpoint()), device="cpu"),
+    )
+
+    source_conv = model.conv1
+    if tuple(source_conv.weight.shape[-2:]) != (7, 7):
+        raise RuntimeError(
+            "Published PerforatedAI ResNet-18 stem is no longer a 7x7 convolution"
+        )
+    cifar_conv = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    with torch.no_grad():
+        cifar_conv.weight.copy_(source_conv.weight[:, :, 2:5, 2:5])
+    model.conv1 = cifar_conv
+    model.maxpool = nn.Identity()
+
+    classifier_in = model.fc.in_features
+    model.fc = nn.Linear(classifier_in, num_classes)
+    model.hf_repo_id = HF_PERFORATED_RESNET18_REPO_ID
+    model.hf_checkpoint_sha256 = HF_PERFORATED_RESNET18_SHA256
+    return model
+
+
 def _build_mobilenetv2_cifar10(**_: Any) -> Any:
     """MobileNetV2 re-strided for 32x32 input, as in kuangliu/pytorch-cifar.
 
@@ -1701,6 +1813,7 @@ MODEL_FACTORIES: dict[str, Callable[..., Any]] = {
     "snn_nmnist": lambda num_classes=10, **_: _construct(SpikingConvNet, num_classes=num_classes),
     "unet_isic": lambda **_: TinyUNet(),
     "resnet18_cifar10": _build_resnet18_cifar10,
+    "resnet18_hf_perforated_cifar10": _build_hf_perforated_resnet18_cifar10,
     "mobilenetv2_cifar10": _build_mobilenetv2_cifar10,
     "saint_adult": lambda num_classes=2, categorical_cardinalities=None, **_: _construct(
         SAINT,

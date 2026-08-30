@@ -26,9 +26,9 @@ from .compat import (
     clear_pai_tracker_state,
     configure_pai_candidate_graph,
     load_pai_system,
-    pai_save_path,
     pai_resume_state_exists,
     pai_runtime_guard,
+    pai_save_path,
     pai_working_directory,
     save_pai_system,
     set_module_output_dimensions,
@@ -492,6 +492,7 @@ _PRIMARY_METRIC_KEY: dict[str, str] = {
     "snn_nmnist": "accuracy",
     "unet_isic": "dice",
     "resnet18_cifar10": "accuracy",
+    "resnet18_hf_perforated_cifar10": "accuracy",
     "mobilenetv2_cifar10": "accuracy",
     "saint_adult": "accuracy",
     "capsnet_mnist": "accuracy",
@@ -1931,7 +1932,13 @@ def _apply_pruning(model: Any, torch: Any, prune_amount: float) -> None:
 # uses torch.bmm with [B,3,3]/[B,64,64] matrices against [B,*,1024] inputs;
 # AOT-eager tracing of that pattern double-frees an MPS buffer during the
 # first eval-mode forward, so we keep it in eager mode.
-_TORCH_COMPILE_MPS_BLOCKLIST: frozenset[str] = frozenset({"pointnet_modelnet40", "snn_nmnist"})
+_TORCH_COMPILE_MPS_BLOCKLIST: frozenset[str] = frozenset(
+    {
+        "pointnet_modelnet40",
+        "resnet18_hf_perforated_cifar10",
+        "snn_nmnist",
+    }
+)
 
 # Models that crash with an MPS allocator double-free regardless of
 # torch.compile.  SpikingConvNet runs a 10-step BPTT loop through a custom

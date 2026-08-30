@@ -52,6 +52,7 @@ _MODEL_KEYS: str = (
     "lstm_autoencoder, distilbert, dqn_lunarlander, ppo_bipedalwalker, "
     "attentivefp_freesolv, gin_imdbb, tcn_forecaster, gru_forecaster, "
     "pointnet_modelnet40, vae_mnist, snn_nmnist, resnet18_cifar10, "
+    "resnet18_hf_perforated_cifar10, "
     "mobilenetv2_cifar10, saint_adult, capsnet_mnist"
 )
 
@@ -278,7 +279,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
         description=(
             "Dendritic quantization benchmark runner.\n\n"
-            "Trains 25 models across 12 conditions that isolate two factors: "
+            "Trains the registered models across 12 conditions that isolate two factors: "
             "PerforatedAI dendritic augmentation and post-training quantization "
             "(INT8 down to binary). Results are saved under --results-root "
             "and cross-model comparisons under --comparison-root.\n\n"
@@ -339,7 +340,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY",
         help=(
             "Space-separated list of model keys to include. "
-            "Omit to run all 25 models. "
+            "Omit to run all registered models. "
             f"Valid keys: {_MODEL_KEYS}"
         ),
     )
@@ -515,7 +516,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY",
         help=(
             "Space-separated list of model keys whose datasets should be downloaded. "
-            "Omit to download datasets for all 25 models. "
+            "Omit to download datasets for all registered models. "
             f"Valid keys: {_MODEL_KEYS}"
         ),
     )
@@ -643,7 +644,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY",
         help=(
             "Space-separated list of model keys to benchmark. "
-            "Omit to benchmark all 25 models. "
+            "Omit to benchmark all registered models. "
             f"Valid keys: {_MODEL_KEYS}"
         ),
     )

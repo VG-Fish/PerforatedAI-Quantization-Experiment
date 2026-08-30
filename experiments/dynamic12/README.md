@@ -1,8 +1,12 @@
 # Dynamic12
 
-The priority sweep is **ResNet-18 (CIFAR-10), SAINT (Adult), and PointNet
-(ModelNet40)**, replacing Dynamic11/12's TCN, GRU, and VAE. Earlier bundles in
-this directory are kept as-is and are *not* part of the priority sweep:
+The priority sweep pairs a **nondendritic ResNet-18 control** with
+**PerforatedAI's published ResNet-18 transferred to CIFAR-10**, alongside
+SAINT (Adult) and PointNet (ModelNet40). The ResNet backbone and five-branch
+pre-FC graph in the perforated arm come from
+`perforated-ai/resnet-18-perforated-gd` on Hugging Face; it is not a newly
+initialized local approximation. Earlier
+bundles in this directory are kept as-is and are *not* part of this sweep:
 
 | directory | what it holds |
 |---|---|
@@ -26,7 +30,7 @@ benchmark artifacts and does not start PAI candidate training.
 To restrict it, pass the same model argument to both checks:
 
 ```bash
-experiments/dynamic12/config/run_smoke_tests.sh --models resnet18_cifar10
+experiments/dynamic12/config/run_smoke_tests.sh --models resnet18_hf_perforated_cifar10
 ```
 
 The smoke test does **not** cover the training loop. For that, patch
@@ -40,17 +44,28 @@ track-only. Full rationale in `information/MODEL_REFERENCE.md`.
 
 | model | perforated | params added per dendrite |
 |---|---|---|
-| `resnet18_cifar10` | `.pre_fc` | 262,656 (+2.3%) |
+| `resnet18_cifar10` | none in the base arm (control) | — |
+| `resnet18_hf_perforated_cifar10` | published `.pre_fc` graph (already perforated) | no additional graph |
 | `saint_adult` | `.row_blocks.{0,1}.attn.qkv`, `.head.1` | 29,120 (+14.2%) |
 | `pointnet_modelnet40` | `.conv3.0`, `.head.0` | 656,896 (+18.9%) |
 
-ResNet-18 mirrors upstream PerforatedAI exactly: their published model
-(`LPA.ResNetPAIPreFC`, `perforated-ai/resnet-18-perforated-gd`) adds a 512→512
-`pre_fc` projection after global pooling and perforates only that, tracking the
-residual backbone. The projection is in **both** arms here so a dendritic win
-is not confounded with the extra dense layer. Upstream retains 5 dendrites;
-this benchmark caps at 1 (`_MODEL_DYNAMIC_PAI_SCHEDULES`) to keep a
-parameter-matched dense control practical.
+The Hugging Face ResNet uses the published weights and topology: a 512→512
+`pre_fc` projection after global pooling with five saved branches (the main
+projection plus four retained dendrite paths). Dynamic12 center-crops the
+learned ImageNet 7×7 stem to 3×3, removes max-pooling, and replaces only the
+1000-way classifier with a 10-way CIFAR classifier. Its `base_*` name means
+"the loaded checkpoint without another PAI conversion"; it is already the
+perforated model. Consequently, `dendrites_*` is skipped for this key rather
+than stacking a second, scientifically misleading dendritic graph.
+
+For the requested ResNet comparison, the runner treats
+`resnet18_cifar10/base_*` as the nondendritic control and
+`resnet18_hf_perforated_cifar10/base_*` as the dendritic/perforated
+counterpart. The latter keeps the `base_*` storage keys because those are the
+conditions supported by the loaded checkpoint; the comparison role is recorded
+in this document rather than relabeling artifacts in a way that would break
+the condition dependency chain. Both arms run FP32 plus Q8, Q4, Q2, Q1.58,
+and Q1, and every quantized arm receives PQAT.
 
 Every parameter must fall in the perforate or track list — one in neither gets
 no `parameter_type`, which PAI warns on each p-phase step and follows with
@@ -60,7 +75,8 @@ no `parameter_type`, which PAI warns on each p-phase step and follows with
 
 The learning rate is a pure function of the absolute epoch index, so a dendrite
 inserted near the end of the budget inherits whatever the anneal has left. For
-ResNet-18 that was **exactly zero**: its cosine uses the default
+the historical scratch `resnet18_cifar10` experiment that was **exactly zero**:
+its cosine uses the default
 `lr_min_factor=0.0`, so every epoch from 200 on — the entire window the dynamic
 cap exists to provide — ran at `lr=0`. A short run made this concrete: 13 of 19
 epochs at `lr=0.0`, validation flat inside 0.004, no dendrite phase ever
@@ -78,7 +94,8 @@ Two changes address this:
   gets as their own param group. The backbone keeps the identical schedule its
   `base_fp32` control runs, so a dendritic gain cannot be an artifact of a warm
   restart the control never received. It defaults to `0.0` — an exact no-op —
-  so no other model's stored results change meaning.
+  so no other model's stored results change meaning. This does not apply to
+  the published HF ResNet, whose topology is loaded rather than discovered.
 - The dynamic epoch cap is derived from the schedule instead of a flat `+16`,
   which could not fit even one dendrite: a switch costs its candidate phase
   (bounded by `MAX_DENDRITE_PHASE_EPOCHS = 8`) plus an adaptation window. For
@@ -99,8 +116,9 @@ p-phase, the only window the two schedules actually differ. The floor is
 mechanically real but inert-so-far on both cases tried. See
 MEASUREMENT_CAVEATS §11.
 
-With both changes in place all three priority models retain a dendrite on a
-short run, each adding exactly the documented per-dendrite cost:
+With both changes in place the scratch ResNet and the two dynamically
+perforated priority models retain a dendrite on a short run, each adding
+exactly the documented per-dendrite cost:
 
 | model | base -> dendritic params | added |
 |---|---|---|
@@ -115,23 +133,40 @@ budget, so the arms are not matched.
 ## The sweep
 
 ```bash
-# Three-seed FP32/Q8/Q2 replications for the priority architectures.
+# Three-seed replications with PQAT at every quantization level.
 experiments/dynamic12/config/run_validated_replications.sh
 ```
 
-Defaults: seeds 0–2, conditions `base_fp32 dendrites_fp32 base_q8 dendrites_q8
-base_q2 dendrites_q2`, `--allow-PQAT`, `--dynamic-dendritic-training`,
-`--jobs 2`, writing to `priority_replications/seed_$SEED`. Override with the
-`MODEL_KEYS`, `CONDITION_KEYS`, `SEEDS`, and `RUN_NAME` environment variables.
+Defaults: seeds 0–2. The script queues three groups per seed: the standard
+ResNet's six `base_*` control arms, the HF ResNet's six already-perforated
+`base_*` counterpart arms, and SAINT/PointNet with all 12 base/dendritic
+condition keys. Every quantized condition uses `--allow-PQAT`; SAINT and
+PointNet also use `--dynamic-dendritic-training`. Results go to
+`priority_replications/seed_$SEED`. Set `MODEL_KEYS` and `CONDITION_KEYS` for
+the previous single-sweep behavior, or use `BASE_RESNET_MODEL_KEYS`,
+`PERFORATED_RESNET_MODEL_KEYS`, `PRIORITY_MODEL_KEYS`, `SEEDS`, and `RUN_NAME`
+to change the paired defaults.
 
-**This is a long run.** ResNet-18 alone is ~8.6 FP32-hours per arm at its
-200-epoch budget, and the dendritic arm is unbounded under
-`--dynamic-dendritic-training`; PointNet is ~3.0. Budget on the order of a day
-per seed, and consider `SEEDS=0` first.
+**This is a long run.** The HF ResNet transfer uses 50 FP32 epochs plus up to
+10 PQAT epochs for each of five quantizers. PointNet and SAINT additionally
+train a dynamic dendritic source before its five descendants. Run seed 0 first
+when validating a new machine.
 
-`--allow-PQAT` means the `q8`/`q2` arms are quantization-aware fine-tunes, not
-pure PTQ. No stored result yet reflects the 2026-08-11 PQAT shadow-weight fix,
-so this sweep is its first validation.
+The runner rejects a saved quantized artifact when its QAT flag, epoch count,
+quantization revision, or `before_pqat/` and `after_pqat/` stage metadata do
+not match the requested PQAT run. After every seed, `verify_pqat.py` checks all
+requested quantized artifacts and fails the script if any arm was PTQ-only,
+skipped training, or lacks either stage snapshot.
+
+If a priority run is already active, queue the standard ResNet control without
+interrupting it:
+
+```bash
+experiments/dynamic12/config/queue_nondendritic_resnet_mps.sh
+```
+
+The queue waits for existing `dqb` workers, then runs seed 0's six standard
+ResNet `base_*` arms on MPS and verifies their PQAT stage metadata.
 
 ## Reading the output
 

@@ -2715,6 +2715,7 @@ _BATCH_SIZES: dict[str, int] = {
     "snn_nmnist": 16,  # N-MNIST SNN literature setting.
     "unet_isic": 8,  # ISIC lesion segmentation studies favor small batches.
     "resnet18_cifar10": 128,  # CIFAR SGD recipe batch size.
+    "resnet18_hf_perforated_cifar10": 128,  # Published HF backbone, CIFAR transfer.
     "mobilenetv2_cifar10": 128,  # CIFAR SGD recipe batch size.
     "saint_adult": 256,  # Official SAINT implementation default.
     "capsnet_mnist": 128,  # CapsNet MNIST recipe.
@@ -2734,6 +2735,7 @@ def dataset_exists(model_key: str) -> bool:
         "vae_mnist":            [root / "mnist"],
         "capsnet_mnist":        [root / "mnist"],
         "resnet18_cifar10":     [root / "cifar10"],
+        "resnet18_hf_perforated_cifar10": [root / "cifar10"],
         "mobilenetv2_cifar10":  [root / "cifar10"],
         "m5":                   [root / "speechcommands"],
         "lstm_forecaster":      [root / "etth1" / "ETTh1.csv"],
@@ -2799,6 +2801,7 @@ def build_task_bundle(model_key: str, batch_size: int | None = None) -> TaskBund
         "snn_nmnist": _build_nmnist,
         "unet_isic": MedicalDatasets.isic,
         "resnet18_cifar10": VisionDatasets.cifar10,
+        "resnet18_hf_perforated_cifar10": VisionDatasets.cifar10,
         "mobilenetv2_cifar10": VisionDatasets.cifar10,
         "saint_adult": _build_adult,
         "capsnet_mnist": VisionDatasets.mnist_augmented,

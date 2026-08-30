@@ -110,6 +110,7 @@ def get_model_input_shapes(model_key: str) -> tuple:
         "snn_nmnist": (2, 34, 34),
         "unet_isic": (3, 128, 128),
         "resnet18_cifar10": (3, 32, 32),
+        "resnet18_hf_perforated_cifar10": (3, 32, 32),
         "mobilenetv2_cifar10": (3, 32, 32),
         "saint_adult": (ADULT_FEATURES,),
         "capsnet_mnist": (1, 28, 28),

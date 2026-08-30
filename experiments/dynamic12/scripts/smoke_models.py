@@ -36,14 +36,19 @@ from dendritic_benchmark.training import (
     _run_training_batch,
 )
 
-
-DEFAULT_MODELS = ("resnet18_cifar10", "saint_adult", "pointnet_modelnet40")
+DEFAULT_MODELS = (
+    "resnet18_cifar10",
+    "resnet18_hf_perforated_cifar10",
+    "saint_adult",
+    "pointnet_modelnet40",
+)
 QUANTIZATION_CASES = (
     ("fp32", None, None, "tensor"),
     ("q8", 8, None, "tensor"),
     ("q4", 4, None, "tensor"),
-    ("q2", 2, "binary", "tensor"),
-    ("q1.58_channel", 2, "ternary", "channel"),
+    ("q2", 2, None, "tensor"),
+    ("q1.58", 2, "ternary", "tensor"),
+    ("q1", 1, "binary", "tensor"),
 )
 
 
@@ -62,7 +67,9 @@ def _require_finite(label: str, value: Any) -> None:
     tensors = list(_all_tensors(value))
     if not tensors:
         raise AssertionError(f"{label} did not contain a tensor")
-    bad = [tuple(tensor.shape) for tensor in tensors if not torch.isfinite(tensor).all()]
+    bad = [
+        tuple(tensor.shape) for tensor in tensors if not torch.isfinite(tensor).all()
+    ]
     if bad:
         raise AssertionError(f"{label} contains non-finite values in tensors {bad}")
 
@@ -88,6 +95,9 @@ def _training_config(model_key: str, runner: BenchmarkRunner) -> TrainingConfig:
         weight_decay=recipe.weight_decay,
         regression_loss=recipe.regression_loss,
         grad_clip_norm=recipe.grad_clip_norm,
+        quantization_granularity=runner._quantization_granularity(
+            model_key, condition_by_key("base_q1_58")
+        ),
     )
 
 
@@ -105,10 +115,11 @@ def _qat_finalization_smoke(
     a second ternary grid before test evaluation.
     """
     qat_model = copy.deepcopy(model).to(device)
+    qat_granularity = config.quantization_granularity
     qat_config = TrainingConfig(
         bit_width=2,
         quantization_mode="ternary",
-        quantization_granularity="channel",
+        quantization_granularity=qat_granularity,
         use_qat=True,
         learning_rate=config.learning_rate,
         optimizer_name="adam",
@@ -116,7 +127,12 @@ def _qat_finalization_smoke(
         grad_clip_norm=config.grad_clip_norm,
     )
     _qat_init_shadow(qat_model)
-    _make_quantized_copy(qat_model, 2, mode="ternary", granularity="channel")
+    _make_quantized_copy(
+        qat_model,
+        2,
+        mode="ternary",
+        granularity=qat_granularity,
+    )
     optimizer = torch.optim.Adam(qat_model.parameters(), lr=qat_config.learning_rate)
     criterion = _binary_or_multi_loss(model_key, qat_config)
     qat_model.train()
@@ -180,7 +196,11 @@ def smoke_model(
         raise AssertionError(f"{model_key} did not backpropagate to {missing_grads}")
     _require_finite(
         f"{model_key} gradients",
-        [parameter.grad for parameter in model.parameters() if parameter.grad is not None],
+        [
+            parameter.grad
+            for parameter in model.parameters()
+            if parameter.grad is not None
+        ],
     )
     optimizer.step()
 
@@ -205,7 +225,9 @@ def smoke_model(
                     f"{reference_signature!r} -> {_tensor_signature(candidate_outputs)!r}"
                 )
             quantized_cases.append(label)
-    quantized_cases.append(_qat_finalization_smoke(model_key, model, batch, config, device))
+    quantized_cases.append(
+        _qat_finalization_smoke(model_key, model, batch, config, device)
+    )
 
     return {
         "model": model_key,
@@ -219,7 +241,9 @@ def smoke_model(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--models", nargs="+", choices=DEFAULT_MODELS, default=DEFAULT_MODELS)
+    parser.add_argument(
+        "--models", nargs="+", choices=DEFAULT_MODELS, default=DEFAULT_MODELS
+    )
     parser.add_argument("--model-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
@@ -232,15 +256,21 @@ def main() -> None:
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     device = choose_device()
-    print(f"Dynamic12 model smoke test on {device} (scale={args.model_scale}, seed={args.seed})")
-    print("model             loss         parameters  output                         PTQ")
-    with tempfile.TemporaryDirectory(prefix="dynamic12_model_smoke_") as temporary_directory:  # type: ignore[no-matching-overload]
+    print(
+        f"Dynamic12 model smoke test on {device} (scale={args.model_scale}, seed={args.seed})"
+    )
+    print(
+        "model             loss         parameters  output                         PTQ"
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="dynamic12_model_smoke_"
+    ) as temporary_directory:  # type: ignore[no-matching-overload]
         smoke_root = Path(temporary_directory)
         for model_key in args.models:
             result = smoke_model(model_key, args.model_scale, device, smoke_root)
             print(
                 f"{result['model']:<17} {result['loss']:>10.5f} "
-                f"{result['parameters']:>10d}  {str(result['output']):<30} "
+                f"{result['parameters']:>10d}  {result['output']!s:<30} "
                 f"{', '.join(result['quantization_cases'])}"
             )
     print("PASS: forward, backward, optimizer, and all Dynamic12 PTQ paths are finite.")
