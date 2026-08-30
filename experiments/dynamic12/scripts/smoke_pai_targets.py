@@ -30,7 +30,9 @@ TARGET_CASES = (
     ("saint_adult", "default"),
     ("pointnet_modelnet40", "default"),
 )
-PAI_ELIGIBLE_TYPES = (nn.Linear, nn.Conv1d, nn.Conv2d)
+# Direct-ID registration also supports a cohesive tensor-in/tensor-out
+# Sequential module. Dynamic12 uses that form for SAINT's classifier head.
+PAI_ELIGIBLE_TYPES = (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Sequential)
 
 
 def _normalise(module_id: str) -> str:

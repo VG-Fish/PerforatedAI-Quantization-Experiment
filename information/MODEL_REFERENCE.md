@@ -1226,15 +1226,15 @@ flowchart TD
     mix --> mean["mean over feature tokens → (B,64)"]
     mean --> head["LN → Linear 64→64 → ReLU → Linear → num_classes"]
 ```
-- Perforation registration: **`.row_blocks.0.attn.qkv`,
-  `.row_blocks.1.attn.qkv`, `.head.1`** (+29,120 parameters per dendrite).
-  This has always been the effective set — it is the complement of SAINT's
-  track-only list — but it is now stated explicitly so it no longer depends on
-  which modules happen to be `nn.Linear`. The `top10` run's stored PBScores
-  support it: `.row_blocks.0.attn.qkv` peaks at 0.092 and `.head.1` at 0.060
-  correlation, both well above the 0.02 "good placement" bar in the
-  `perforatedai-analyze` skill. The row-block LayerNorms and `.head.0` are
-  track-only; leaving them out gave 640 parameters no `parameter_type`.
+- Perforation registration: **the complete `.head` classifier** (+4,418
+  parameters per dendrite). It is one tensor-in/tensor-out path — LayerNorm,
+  64→64 Linear, ReLU, and 64→2 Linear — so a dendrite can be trained as a
+  cohesive functional unit. The row-attention QKV projections are track-only
+  for this calibration instead of being independently perforated. The first
+  switch is fixed at epoch 100, after the dense validation trajectory has
+  plateaued, leaving the bounded candidate and adaptation phases useful cosine
+  learning rate. Dendritic PQAT descendants are refused unless the FP32 source
+  records both a candidate-insertion switch and a larger final topology.
 - PQAT epoch budget: `10`
 
 ## 24. `capsnet_mnist` — CapsNet

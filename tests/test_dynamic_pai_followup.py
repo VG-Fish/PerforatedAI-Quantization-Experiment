@@ -201,12 +201,9 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             )
             self.assertEqual(
                 runner._perforation_module_ids_to_perforate("saint_adult"),
-                [
-                    ".row_blocks.0.attn.qkv",
-                    ".row_blocks.1.attn.qkv",
-                    ".head.1",
-                ],
+                [".head"],
             )
+            self.assertEqual(runner._pai_fixed_switch_interval("saint_adult"), 100)
             self.assertEqual(
                 runner._perforation_module_ids_to_perforate("pointnet_modelnet40"),
                 [".conv3.0", ".head.0"],
@@ -251,6 +248,31 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                     if not any(covers(i, name) for i in ids)
                 ]
                 self.assertEqual(uncovered, [], f"{model_key} leaves parameters untyped")
+
+    def test_dendritic_pqat_requires_a_verified_fp32_source(self) -> None:
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
+            root_path = Path(root)
+            runner = BenchmarkRunner(results_root=root_path / "results")
+            source_dir = root_path / "results" / "saint_adult" / "dendrites_fp32"
+            source_dir.mkdir(parents=True)
+            (source_dir / "record.json").write_text(
+                json.dumps({"dendrite_audit_status": "no_retained_insertion"})
+            )
+            with self.assertRaisesRegex(RuntimeError, "verified retained"):
+                runner._require_verified_dendritic_pqat_source(
+                    "saint_adult",
+                    condition_by_key("dendrites_q8"),
+                    {"dendrites_fp32": source_dir},
+                )
+
+            (source_dir / "record.json").write_text(
+                json.dumps({"dendrite_audit_status": "verified_retained"})
+            )
+            runner._require_verified_dendritic_pqat_source(
+                "saint_adult",
+                condition_by_key("dendrites_q8"),
+                {"dendrites_fp32": source_dir},
+            )
 
     def test_resnet_prefc_is_in_both_arms_and_starts_as_identity(self) -> None:
         model = build_model("resnet18_cifar10")

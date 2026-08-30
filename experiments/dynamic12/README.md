@@ -46,7 +46,7 @@ track-only. Full rationale in `information/MODEL_REFERENCE.md`.
 |---|---|---|
 | `resnet18_cifar10` | none in the base arm (control) | — |
 | `resnet18_hf_perforated_cifar10` | published `.pre_fc` graph (already perforated) | no additional graph |
-| `saint_adult` | `.row_blocks.{0,1}.attn.qkv`, `.head.1` | 29,120 (+14.2%) |
+| `saint_adult` | complete `.head` classifier | 4,418 (+2.1%) |
 | `pointnet_modelnet40` | `.conv3.0`, `.head.0` | 656,896 (+18.9%) |
 
 The Hugging Face ResNet uses the published weights and topology: a 512→512
@@ -124,7 +124,7 @@ exactly the documented per-dendrite cost:
 |---|---|---|
 | `resnet18_cifar10` | 11,436,618 -> 11,699,274 | +262,656 |
 | `pointnet_modelnet40` | 3,471,473 -> 4,128,369 | +656,896 |
-| `saint_adult` | 211,906 -> 241,026 | +29,120 |
+| `saint_adult` | 211,906 -> 216,324 | +4,418 |
 
 Those runs' accuracies are **not** effect sizes: under
 `--dynamic-dendritic-training` the dendritic arm trains past the base arm's
@@ -167,6 +167,12 @@ experiments/dynamic12/config/queue_nondendritic_resnet_mps.sh
 
 The queue waits for existing `dqb` workers, then runs seed 0's six standard
 ResNet `base_*` arms on MPS and verifies their PQAT stage metadata.
+
+SAINT's current calibration queue uses one complete classifier-head target and
+a fixed first PAI switch at epoch 100. It runs only `base_fp32` and
+`dendrites_fp32`; the five dendritic PQAT descendants are intentionally blocked
+until the source record has both a raw candidate-insertion switch and a larger
+final retained topology.
 
 ## Reading the output
 

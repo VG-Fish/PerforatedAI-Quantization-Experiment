@@ -101,6 +101,11 @@ _MODEL_DENDRITIC_FIXED_SWITCH_INTERVALS = {
     # recipe, so it trained at the LR floor.  Give its decoder target a single,
     # early fixed switch and a shared 150-epoch adaptation budget.
     "vae_mnist": 20,
+    # SAINT's dense validation peak is epoch 62 and its later trajectory has
+    # plateaued by epoch 100. HISTORY mode never kept its late QKV candidate,
+    # so make the single classifier-head insertion while its cosine LR still
+    # has room for the bounded candidate and adaptation phases.
+    "saint_adult": 100,
 }
 _PAI_VARIANTS = frozenset(
     {
@@ -121,7 +126,7 @@ _MODEL_ARTIFACT_REVISIONS = {
     "vae_mnist": "dynamic11_fair_ternary_v2",
     "resnet18_cifar10": "dynamic12_prefc_target_v1",
     "resnet18_hf_perforated_cifar10": "dynamic12_hf_perforated_gd_cifar_v1",
-    "saint_adult": "dynamic12_row_qkv_target_v1",
+    "saint_adult": "dynamic12_head_target_fixed100_v1",
     "pointnet_modelnet40": "dynamic12_late_feature_target_v1",
 }
 # Dynamic9 showed that the global three-dendrite schedule adds unnecessary
@@ -616,20 +621,14 @@ class BenchmarkRunner:
             # the retained dendrite rather than the extra dense projection.
             return [".pre_fc"]
         if model_key == "saint_adult":
-            # Not a new selection: this is exactly the complement of the
-            # track-only list SAINT already carried, stated explicitly so the
-            # target set stops depending on which modules happen to be
-            # Linear/Conv. Verified equivalent -- both spellings wrap
-            # {.head.1, .row_blocks.0.attn.qkv, .row_blocks.1.attn.qkv} and
-            # add the same 29,120 parameters. The stored PBScores from the
-            # top10 run back the set: .row_blocks.0.attn.qkv peaks at 0.092
-            # and .head.1 at 0.060 correlation, both well over the 0.02
-            # "good placement" bar in the perforatedai-analyze skill.
-            return [
-                ".row_blocks.0.attn.qkv",
-                ".row_blocks.1.attn.qkv",
-                ".head.1",
-            ]
+            # Perforate the complete tensor-in/tensor-out classifier rather
+            # than isolated QKV projections in batch-coupled row attention.
+            # This retains one coherent LN -> Linear -> ReLU -> Linear path,
+            # including all of its parameters (+4,418 per dendrite), and
+            # leaves the attention topology unchanged for the first calibrated
+            # SAINT retry. A column block is the next labelled expansion only
+            # if this smaller head target verifies a retained insertion.
+            return [".head"]
         if model_key == "pointnet_modelnet40":
             # Late per-point features and the first classifier projection are
             # wide, tensor-returning layers.  The two T-Nets are deliberately
@@ -763,30 +762,24 @@ class BenchmarkRunner:
             # predict how much headroom a layer has to absorb new capacity, and on a
             # 1433-input bag-of-words first layer that headroom is where the gain is.
             # See experiments/dynamic5/config/PERFORATION.md.
-            # Only .head.1 (0.229) and the row_blocks attn.qkv layers (0.10-0.15)
-            # cleared the >0.02 PBScore bar the perforatedai-analyze guidance
-            # treats as "efficient dendrite user" on the 2026-08-03 dynamic run;
-            # every column_blocks/ffn/attn.out/feature_embed/head.3 layer sat at
-            # 0.009-0.03. Track the ones that showed no real signal.
-            # The row blocks' LayerNorms and the head's input LayerNorm
-            # (`.head.0`) were previously in neither list, so their 640
-            # parameters carried no parameter_type -- the same p-phase warning
-            # and pdb.set_trace path documented for distilbert below. They are
-            # leaf norms with no perforated child, so tracking the module is
-            # the right remedy here rather than parameter_ids_to_track.
+            # The row-attention QKV projections are deliberately track-only in
+            # the first SAINT retry. The complete classifier head is selected
+            # above, so none of its children may also be registered as tracked
+            # modules. The remaining LayerNorms must still be explicit here:
+            # otherwise PAI leaves their parameters untyped during p-phase.
             "saint_adult": [
                 ".feature_embed",
                 ".column_blocks",
+                ".row_blocks.0.attn.qkv",
                 ".row_blocks.0.attn.out",
                 ".row_blocks.0.ffn",
                 ".row_blocks.0.norm1",
                 ".row_blocks.0.norm2",
+                ".row_blocks.1.attn.qkv",
                 ".row_blocks.1.attn.out",
                 ".row_blocks.1.ffn",
                 ".row_blocks.1.norm1",
                 ".row_blocks.1.norm2",
-                ".head.0",
-                ".head.3",
             ],
             # Every parameter-bearing head child except the perforated
             # `.head.0`. `.head.1` (BatchNorm1d) and `.head.4` (the 512->256
@@ -1508,6 +1501,32 @@ class BenchmarkRunner:
         status = record.get("dendrite_audit_status")
         return str(status) if status else None
 
+    def _require_verified_dendritic_pqat_source(
+        self, model_key: str, condition: ConditionSpec, saved_dirs: dict[str, Path]
+    ) -> None:
+        """Block PQAT descendants until their FP32 topology is auditable.
+
+        A quantized dendritic arm only fine-tunes the saved FP32 graph; it
+        cannot create a retained dendrite itself. Continuing after a missing
+        insertion would therefore label an unchanged dense model as a
+        dendritic PQAT result.
+        """
+        if not (
+            condition.use_dendrites
+            and condition.quantized
+            and condition.source_key != condition.key
+        ):
+            return
+        status = self._saved_dendrite_audit_status(condition.source_key, saved_dirs)
+        if status == "verified_retained":
+            return
+        raise RuntimeError(
+            f"{model_key} / {condition.key} requires a verified retained "
+            f"{condition.source_key} source before PQAT; found {status or 'no source record'}. "
+            "Run the FP32 dendritic source, inspect its raw PAI switch and "
+            "architecture evidence, then rerun the PQAT descendants."
+        )
+
     def _condition_record_usable(
         self,
         model_key: str,
@@ -1562,6 +1581,9 @@ class BenchmarkRunner:
         # ``_condition_record_usable`` rejected.  Do not let the mere presence
         # of a stale record bypass a model/PAI revision and silently keep old
         # results in a new experiment directory.
+        self._require_verified_dendritic_pqat_source(
+            model_spec.key, condition, saved_dirs
+        )
         _log(f"[train] {model_spec.key} / {condition.key} — starting…", before=True)
         # Re-seed per condition so a model's base_* and dendrites_* arms draw
         # the same initial weights, making them a paired comparison.

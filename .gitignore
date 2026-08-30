@@ -39,6 +39,7 @@ experiments/dynamic12/config/*
 !experiments/dynamic12/config/run_smoke_tests.sh
 !experiments/dynamic12/config/run_tcn_audited_variants.sh
 !experiments/dynamic12/config/run_validated_replications.sh
+!experiments/dynamic12/config/queue_saint_head_mps.sh
 !experiments/dynamic12/scripts/
 experiments/dynamic12/scripts/*
 !experiments/dynamic12/scripts/smoke_models.py
