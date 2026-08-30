@@ -14,6 +14,8 @@ dependencies = [
     "argcomplete>=3.6.2",
     "datasets>=3.0.0",
     "transformers>=4.40.0",
+    "huggingface_hub>=0.30.0",
+    "safetensors>=0.5.0",
     "gymnasium[classic-control,box2d]>=1.0.0",
     "matplotlib>=3.10.9",
     "python-dotenv>=1.0.1",
@@ -32,6 +34,7 @@ dependencies = [
     "deadcode>=2.4.1",
     "perforatedai>=3.2.6",
     "perforatedbp>=3.2.6",
+    "pytest>=9.1.1",
 ]
 
 [project.scripts]

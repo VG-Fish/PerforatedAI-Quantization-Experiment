@@ -28,3 +28,30 @@ logs*/
 archive/
 
 experiments/
+# Dynamic12's results stay local, while its reproducible smoke-test entrypoints
+# and short usage note belong with the source tree.
+!experiments/
+experiments/*
+!experiments/dynamic12/
+experiments/dynamic12/*
+!experiments/dynamic12/README.md
+!experiments/dynamic12/config/
+experiments/dynamic12/config/*
+!experiments/dynamic12/config/run_smoke_tests.sh
+!experiments/dynamic12/config/run_tcn_audited_variants.sh
+!experiments/dynamic12/config/run_validated_replications.sh
+!experiments/dynamic12/config/queue_saint_head_mps.sh
+!experiments/dynamic12/config/queue_textcnn_mpnn_mps.sh
+!experiments/dynamic12/config/queue_nondendritic_resnet_mps.sh
+!experiments/dynamic12/scripts/
+experiments/dynamic12/scripts/*
+!experiments/dynamic12/scripts/smoke_models.py
+!experiments/dynamic12/scripts/smoke_pai_targets.py
+!experiments/dynamic12/scripts/plot_dynamic_seven.py
+!experiments/dynamic12/scripts/plot_quantization_heatmap.py
+!experiments/dynamic12/scripts/verify_pqat.py
+!experiments/dynamic12/tuning/
+experiments/dynamic12/tuning/*
+!experiments/dynamic12/tuning/tune_gru_capacity.py
+!experiments/dynamic12/tuning/tune_vae_capacity.py
+.pytest_cache/

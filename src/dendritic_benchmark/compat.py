@@ -3,6 +3,7 @@ import importlib
 import math
 import os
 import pdb
+import random
 import re
 import shutil
 import sys
@@ -30,6 +31,13 @@ _PAI_WORKING_DIRECTORY_DEPTH = 0
 # checkpoint. Distinct from PAI's internal "latest", which is written mid-way
 # through add_validation_score and so can disagree with the epoch checkpoint.
 PAI_RESUME_NAME = "dqb_resume"
+# Name of the PAI system snapshot taken at the *exact* moment the contents of
+# model.pt are decided -- after the best-epoch restore decision and before any
+# quantization. PAI_RESUME_NAME above is written inside the epoch loop and so
+# can still describe a different dendrite structure than the artifact that
+# training finally persists; downstream quantized conditions rebuild their
+# skeleton from this one instead. See MEASUREMENT_CAVEATS.md #5.
+PAI_ARTIFACT_NAME = "dqb_artifact"
 _PAI_CONFIG_LIST_SETTERS: tuple[str, ...] = (
     "set_modules_to_track",
     "set_module_names_to_track",
@@ -111,12 +119,52 @@ class PAIModuleSelection:
 
 
 @dataclass(frozen=True)
+class PAIDynamicSchedule:
+    """Optional per-model overrides for the dynamic PAI schedule.
+
+    The defaults remain deliberately centralized in
+    :func:`_configure_dynamic_pai_schedule`.  A benchmark should override only
+    the knobs supported by measured behavior, rather than fork the whole PAI
+    configuration for every model.
+    """
+
+    max_dendrites: int | None = None
+    n_epochs_to_switch: int | None = None
+    history_lookback: int | None = None
+    initial_history_after_switches: int | None = None
+    p_epochs_to_switch: int | None = None
+    improvement_threshold: tuple[float, ...] | None = None
+    candidate_weight_initialization_multiplier: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return only explicit overrides for artifact metadata."""
+        return {
+            key: value
+            for key, value in {
+                "max_dendrites": self.max_dendrites,
+                "n_epochs_to_switch": self.n_epochs_to_switch,
+                "history_lookback": self.history_lookback,
+                "initial_history_after_switches": self.initial_history_after_switches,
+                "p_epochs_to_switch": self.p_epochs_to_switch,
+                "improvement_threshold": list(self.improvement_threshold)
+                if self.improvement_threshold is not None
+                else None,
+                "candidate_weight_initialization_multiplier": (
+                    self.candidate_weight_initialization_multiplier
+                ),
+            }.items()
+            if value is not None
+        }
+
+
+@dataclass(frozen=True)
 class PAIRuntimeOptions:
     use_runtime_guard: bool = False
     no_backward_workaround: bool = False
     candidate_graph_enabled: bool = True
     initial_correlation_batches_limit: int | None = None
     fixed_switch_interval: int | None = None
+    dynamic_schedule: PAIDynamicSchedule | None = None
 
 
 def _call_if_available(target: Any, method_name: str, *args: Any) -> None:
@@ -269,12 +317,65 @@ def _configure_interval_pai_schedule(pc: Any, *, switch_interval: int) -> None:
     )
 
 
+def _default_dynamic_improvement_thresholds(max_dendrites: int) -> list[float]:
+    """Return one positive plateau threshold for every possible dendrite count."""
+    if max_dendrites < 1:
+        raise ValueError("max_dendrites must be at least one")
+    defaults = [0.005, 0.002, 0.001, 0.001]
+    required = max_dendrites + 1
+    if required <= len(defaults):
+        return defaults[:required]
+    return [*defaults, *([defaults[-1]] * (required - len(defaults)))]
+
+
+# One source of truth for the dynamic-schedule defaults.  _configure_dynamic_
+# pai_schedule applies them to PAI; pipeline.py reads the same numbers when it
+# sizes the dynamic epoch cap, so the two cannot drift apart.
+PAI_DYNAMIC_SCHEDULE_DEFAULTS: dict[str, Any] = {
+    "max_dendrites": 3,
+    "n_epochs_to_switch": 10,
+    "history_lookback": 8,
+    "initial_history_after_switches": 8,
+    "p_epochs_to_switch": 2,
+    "candidate_weight_initialization_multiplier": 0.005,
+}
+
+
+def _schedule_value(
+    schedule: PAIDynamicSchedule | None, field: str, default: Any
+) -> Any:
+    if schedule is None:
+        return default
+    value = getattr(schedule, field)
+    return default if value is None else value
+
+
+def dynamic_schedule_field(schedule: PAIDynamicSchedule | None, field: str) -> Any:
+    """Effective value of a dynamic-schedule field, override or default."""
+    if field not in PAI_DYNAMIC_SCHEDULE_DEFAULTS:
+        raise KeyError(f"no dynamic schedule default registered for {field!r}")
+    return _schedule_value(schedule, field, PAI_DYNAMIC_SCHEDULE_DEFAULTS[field])
+
+
 def _configure_dynamic_pai_schedule(
     pc: Any,
     batches_per_epoch: int | None = None,
     initial_correlation_batches_limit: int | None = None,
     fixed_switch_interval: int | None = None,
+    schedule: PAIDynamicSchedule | None = None,
 ) -> None:
+    max_dendrites = dynamic_schedule_field(schedule, "max_dendrites")
+    if not isinstance(max_dendrites, int) or max_dendrites < 1:
+        raise ValueError("PAI dynamic max_dendrites must be a positive integer")
+    thresholds = _schedule_value(
+        schedule,
+        "improvement_threshold",
+        tuple(_default_dynamic_improvement_thresholds(max_dendrites)),
+    )
+    if len(thresholds) < max_dendrites + 1:
+        raise ValueError(
+            "PAI dynamic improvement_threshold needs max_dendrites + 1 entries"
+        )
     if fixed_switch_interval is not None:
         _configure_interval_pai_schedule(pc, switch_interval=fixed_switch_interval)
     else:
@@ -282,33 +383,58 @@ def _configure_dynamic_pai_schedule(
         _apply_pai_schedule_values(
             pc,
             {
-                "set_n_epochs_to_switch": 10,
+                "set_n_epochs_to_switch": dynamic_schedule_field(
+                    schedule, "n_epochs_to_switch"
+                ),
                 # PAI names the plateau-detection window "history_lookback"; the
                 # default of 1 switches on transient noise.
-                "set_history_lookback": 8,
+                "set_history_lookback": dynamic_schedule_field(
+                    schedule, "history_lookback"
+                ),
+                # MUST accompany any history_lookback > 1. PAI's running
+                # average only seeds from the first real score while
+                # epochs_since_cycle_switch < initial_history_after_switches;
+                # at the default 0 that branch never runs and the EMA warms up
+                # from ZERO — a better-than-anything-real score for every
+                # metric that is not positive-maximize (ELBO ~ -92 under
+                # maximize, MAE/RMSE under minimize), so PAI pins its best
+                # model at epoch ~1 and restore-on-complete ships a
+                # barely-trained network (MEASUREMENT_CAVEATS §10; dynamic8's
+                # vae/tcn/mpnn dendritic arms). Matching the lookback gives a
+                # cumulative-mean warm-up over the same window after every
+                # switch.
+                "set_initial_history_after_switches": dynamic_schedule_field(
+                    schedule, "initial_history_after_switches"
+                ),
                 # Indexed by dendrites added (globals_perforatedai getter_val), so
                 # this needs max_dendrites + 1 entries. The final entry must stay
                 # above zero: at a threshold of 0 only improvement_threshold_raw
                 # (1e-5) separates a real gain from validation jitter, and the
                 # plateau detector never sees n_epochs_to_switch quiet epochs.
-                "set_improvement_threshold": [0.005, 0.002, 0.001, 0.001],
+                "set_improvement_threshold": list(thresholds),
             },
         )
     _apply_pai_schedule_values(
         pc,
         {
-            "set_p_epochs_to_switch": 2,
+            "set_p_epochs_to_switch": dynamic_schedule_field(
+                schedule, "p_epochs_to_switch"
+            ),
             # Dendrites stopped paying for themselves well before the sixth on
             # every model measured so far, and each extra one costs ~100 epochs
             # at a steadily worse seconds-per-epoch.
-            "set_max_dendrites": 3,
+            "set_max_dendrites": max_dendrites,
             # Zeroing the best score on switch also zeroes running_accuracy,
             # which is an EMA over history_lookback epochs. Climbing back from
             # 0 to a ~0.99 metric takes ~70 epochs, and every one of them
             # registers as an improvement, so epoch_last_improved is refreshed
             # continuously and the switch trigger cannot fire.
             "set_reset_best_score_on_switch": False,
-            "set_candidate_weight_initialization_multiplier": 0.005,
+            "set_candidate_weight_initialization_multiplier": (
+                dynamic_schedule_field(
+                    schedule, "candidate_weight_initialization_multiplier"
+                )
+            ),
             # Not set here: pai_improvement_threshold / _raw, which gate how much
             # a node's correlation must gain in one epoch to keep the dendrite
             # phase alive.  Raising them from the (0.1, 1e-4) defaults to
@@ -364,6 +490,7 @@ def _configure_pai_training_schedule(
     batches_per_epoch: int | None = None,
     initial_correlation_batches_limit: int | None = None,
     fixed_switch_interval: int | None = None,
+    dynamic_schedule: PAIDynamicSchedule | None = None,
 ) -> None:
     pc = gpa.pc
     if dynamic_dendritic_training:
@@ -372,6 +499,7 @@ def _configure_pai_training_schedule(
             batches_per_epoch=batches_per_epoch,
             initial_correlation_batches_limit=initial_correlation_batches_limit,
             fixed_switch_interval=fixed_switch_interval,
+            schedule=dynamic_schedule,
         )
         return
 
@@ -723,7 +851,7 @@ def perforate_model(
         _mirror_env_aliases()
         runtime_options = runtime_options or PAIRuntimeOptions()
         GPA = importlib.import_module(_PAI_GLOBALS_MODULE)
-        UPA = importlib.import_module("perforatedai.utils_perforatedai")
+        UPA: Any = importlib.import_module("perforatedai.utils_perforatedai")
         upa_perforate_model = getattr(UPA, "perforate_model")
 
         modules_mod = importlib.import_module("perforatedai.modules_perforatedai")
@@ -748,6 +876,7 @@ def perforate_model(
                         runtime_options.initial_correlation_batches_limit
                     ),
                     fixed_switch_interval=runtime_options.fixed_switch_interval,
+                    dynamic_schedule=runtime_options.dynamic_schedule,
                 )
             with pai_working_directory():
                 perforated = upa_perforate_model(
@@ -806,6 +935,11 @@ def pai_resume_state_exists(save_name: str, name: str = PAI_RESUME_NAME) -> bool
     return (pai_save_path(save_name) / f"{name}.pt").exists()
 
 
+def pai_system_checkpoint_exists(save_name: str, name: str) -> bool:
+    """Report whether a named PAI system checkpoint exists for ``save_name``."""
+    return (pai_save_path(save_name) / f"{name}.pt").exists()
+
+
 def save_pai_system(
     model: Any, save_name: str, name: str = PAI_RESUME_NAME
 ) -> bool:
@@ -818,9 +952,9 @@ def save_pai_system(
     a zero-dendrite model and restarts the schedule from the first cycle.
     """
     try:
-        UPA = importlib.import_module("perforatedai.utils_perforatedai")
+        UPA: Any = importlib.import_module("perforatedai.utils_perforatedai")
         with _suppress_pai_debugger(), pai_working_directory():
-            UPA.save_system(model, _pai_flat_save_name(save_name), name)
+            getattr(UPA, "save_system")(model, _pai_flat_save_name(save_name), name)
     except Exception as exc:
         print(
             f"[pai-state] could not snapshot PAI state ({exc}); a resumed run "
@@ -845,7 +979,7 @@ def load_pai_system(
             # load_from_manual_save keeps PAI from advancing its epoch counter:
             # its own periodic saves happen before start_epoch, whereas this
             # snapshot is taken after add_validation_score has already run it.
-            return UPA.load_system(
+            return getattr(UPA, "load_system")(
                 model,
                 _pai_flat_save_name(save_name),
                 name,
@@ -969,6 +1103,48 @@ def load_pai_system_checkpoint(
         ) from exc
 
 
+def seed_everything(seed: int) -> None:
+    """Seed every RNG that can move a benchmark result.
+
+    Without this, two runs of the same config are two different experiments.
+    Measured on `gcn`: `base_fp32` moved 0.7960 -> 0.7620 between two runs of
+    the identical command -- 3.4pp with no quantization involved, against a
+    dendrite effect of +0.30pp -- and PAI settled on 4 dendrites one run and 3
+    the other. See information/MEASUREMENT_CAVEATS.md #7.
+
+    Called once per (model, condition) rather than once per process, so each
+    condition is reproducible on its own and, more importantly, so a model's
+    `base_*` and `dendrites_*` arms draw the *same* initial weights. That makes
+    the arms a paired comparison: a difference between them is the dendrites,
+    not a different lottery ticket.
+
+    Note this does not force deterministic kernels
+    (`torch.use_deterministic_algorithms`). MPS has no deterministic mode for
+    several of the ops these models use, so it would fail outright rather than
+    silently disagree; seeding removes the large run-to-run swings while
+    leaving nondeterministic reduction order, which is worth far less than
+    3.4pp.
+    """
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    try:
+        import numpy as np
+
+        np.random.seed(seed % (2**32))
+    except Exception:
+        pass
+    torch.manual_seed(seed)
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
+    try:
+        torch.mps.manual_seed(seed)
+    except Exception:
+        pass
+
+
 def choose_device() -> Any:
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         try:
@@ -981,25 +1157,140 @@ def choose_device() -> Any:
     return torch.device("cpu")
 
 
+# Clip ratios searched when calibrating the integer grid. 1.0 is plain
+# max-based scaling; lower values trade saturation of the largest weights for
+# a finer step over the bulk of the distribution.
+_QUANT_CLIP_RATIOS = tuple(round(1.0 - 0.05 * i, 4) for i in range(13))  # 1.00 -> 0.40
+
+# Calibration searches a subsample of very large tensors; the chosen scale is
+# then applied to the full tensor.
+_QUANT_CALIBRATION_SAMPLE = 1 << 16
+
+
+def _calibrate_scale(tensor: Any, qmin: int, qmax: int) -> float:
+    """Pick the quantization scale that minimizes ``||q(W) - W||^2``.
+
+    Calibrating on ``abs().max()`` lets one outlier weight define the whole
+    grid: the step becomes ``max_abs / codes``, so if that weight is 20x the
+    next largest, every ordinary weight collapses onto one or two codes. That
+    is the mechanism behind information/MEASUREMENT_CAVEATS.md #1, and the
+    reason ``m5``'s 4-bit scores fell 21pp while every other model was fine
+    at 4-bit -- its first conv has ``absmax 1.90`` against ``std 0.29``.
+
+    A fixed percentile would fix that but is arbitrary in the other
+    direction: at 8-bit there are 256 codes, the step is already fine, and
+    clipping a genuinely large weight costs more than it buys. Searching clip
+    ratios for the lowest reconstruction error picks per tensor *and* per bit
+    width -- it lands on ~1.0 where codes are plentiful and clips hard at
+    2-bit where they are not -- so no magic constant has to be right for
+    every layer in the suite.
+    """
+    flat = tensor.detach().flatten().float()
+    sample = flat
+    if sample.numel() > _QUANT_CALIBRATION_SAMPLE:
+        # Strided, not random. A torch.randperm subsample here draws from the
+        # global RNG, which would make quantization itself nondeterministic --
+        # two runs of the same seeded config could quantize the same weights to
+        # different grids. That was measurable: gcn's q2 moved by one test node
+        # between the recorded value and a recomputation from the same
+        # checkpoint. A fixed stride is reproducible, costs nothing, and for
+        # picking a clip ratio is as representative as a random draw, since
+        # weight order within a flattened tensor carries no relevant structure.
+        step = (sample.numel() + _QUANT_CALIBRATION_SAMPLE - 1) // _QUANT_CALIBRATION_SAMPLE
+        sample = flat[::step]
+    # The clip search runs on the sample, but the grid must still cover the
+    # tensor's true range, so the largest magnitude comes from the full tensor.
+    max_abs = float(flat.abs().max())
+    if max_abs == 0:
+        return 0.0
+    best_scale = max_abs / abs(qmin)
+    best_error = None
+    for ratio in _QUANT_CLIP_RATIOS:
+        scale = max_abs * ratio / abs(qmin)
+        if scale <= 0:
+            continue
+        approx = torch.clamp(torch.round(sample / scale), qmin, qmax) * scale
+        error = float(torch.sum((approx - sample) ** 2))
+        if best_error is None or error < best_error:
+            best_error = error
+            best_scale = scale
+    return best_scale
+
+
 def symmetric_quantize_tensor(tensor: Any, bit_width: int) -> Any:
+    """Uniform symmetric integer quantization onto the standard signed grid.
+
+    ``qmin = -2**(b-1)``, ``qmax = 2**(b-1)-1`` -- e.g. {-2..1} at 2-bit,
+    {-8..7} at 4-bit, {-128..127} at 8-bit. The scale divides by the largest
+    code *magnitude* (``|qmin|``), not ``qmax``; dividing by ``qmax`` would
+    leave an ordinary symmetric tensor on only {-scale, 0, +scale} at 2-bit,
+    which is the three-level collapse of caveat #1.
+    """
     if bit_width >= 16:
         return tensor.clone()
     if bit_width <= 1:
-        return tensor.sign().clamp(min=-1, max=1)
-    levels = 2**bit_width - 1
-    max_abs = tensor.abs().max()
-    if max_abs == 0:
-        return tensor.clone()
-    scale = max_abs / (levels // 2)
-    return torch.round(tensor / scale).clamp(-(levels // 2), levels // 2) * scale
+        return binary_quantize_tensor(tensor)
+    qmin = -(2 ** (bit_width - 1))
+    qmax = 2 ** (bit_width - 1) - 1
+    scale = _calibrate_scale(tensor, qmin, qmax)
+    if scale <= 0:
+        return torch.zeros_like(tensor)
+    return torch.clamp(torch.round(tensor / scale), qmin, qmax) * scale
 
 
 def ternary_quantize_tensor(tensor: Any) -> Any:
-    threshold = tensor.std(unbiased=False) * 0.5
-    pos = (tensor > threshold).to(tensor.dtype)
-    neg = (tensor < -threshold).to(tensor.dtype)
-    return pos - neg
+    """BitNet b1.58 absmean ternarization: ``round(clamp(W/s, -1, 1)) * s``.
+
+    The previous kernel returned a bare ``{-1, 0, +1}`` indicator with **no
+    scale factor**, so a layer whose weights had ``std ~ 0.005`` came back
+    with every surviving weight at magnitude 1.0 -- a ~200x amplification
+    that compounds multiplicatively through depth. That is why ``mpnn``
+    scored 617.0 RMSE at q1.58 against 0.72 in fp32, and why several models
+    collapsed to chance rather than degrading. b1.58 keeps the ternary
+    *codes* but restores the per-tensor scale ``s = mean(|W|)``, which is the
+    published formulation and the only thing that makes the arm comparable to
+    its own fp32 baseline.
+    """
+    scale = tensor.detach().abs().mean()
+    if scale == 0:
+        return torch.zeros_like(tensor)
+    return torch.clamp(torch.round(tensor / scale), -1, 1) * scale
+
+
+def ternary_quantize_tensor_per_channel(tensor: Any) -> Any:
+    """Ternarize each output channel of a weight tensor independently.
+
+    A single scale is needlessly destructive for a decoder/output projection:
+    each output row has a different activation and weight scale, while ternary
+    codes themselves are unchanged.  For matrices and convolution kernels the
+    first axis is the output-channel axis; scalar/vector parameters retain the
+    well-tested per-tensor formulation above.  The small vector of scales is
+    deployment metadata, not additional learned precision.
+    """
+    if getattr(tensor, "ndim", 0) < 2:
+        return ternary_quantize_tensor(tensor)
+    reduce_dims = tuple(range(1, tensor.ndim))
+    scale = tensor.detach().abs().mean(dim=reduce_dims, keepdim=True)
+    safe_scale = scale.clamp_min(torch.finfo(tensor.dtype).eps)
+    quantized = torch.clamp(torch.round(tensor / safe_scale), -1, 1) * safe_scale
+    return torch.where(scale == 0, torch.zeros_like(quantized), quantized)
 
 
 def binary_quantize_tensor(tensor: Any) -> Any:
-    return torch.where(tensor >= 0, torch.ones_like(tensor), -torch.ones_like(tensor))
+    """XNOR-Net binarization: ``mean(|W|) * sign(W)``.
+
+    Same missing-scale defect as :func:`ternary_quantize_tensor` (``mpnn``
+    reached 1030.7 RMSE at q1), plus a second failure the scale also fixes:
+    the old kernel mapped ``0 -> +1``, so an all-zero parameter became an
+    all-ones parameter. ``m5``'s ``dendrites_to_top.0`` is exactly that -- a
+    genuinely zeroed dendrite output gate that binarization turned fully on.
+    With ``scale == 0`` such a tensor now stays zero.
+    """
+    scale = tensor.detach().abs().mean()
+    if scale == 0:
+        return torch.zeros_like(tensor)
+    return torch.where(
+        tensor >= 0,
+        torch.full_like(tensor, float(scale)),
+        torch.full_like(tensor, -float(scale)),
+    )

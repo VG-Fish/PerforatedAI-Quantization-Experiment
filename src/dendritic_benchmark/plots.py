@@ -1,7 +1,7 @@
 import math
 import textwrap
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import matplotlib
 
@@ -352,7 +352,9 @@ def heatmap(
     ax.grid(which="minor", color=BACKGROUND, linestyle="-", linewidth=2)
     ax.tick_params(which="minor", bottom=False, left=False)
 
-    _annotate_heatmap_cells(ax, matrix, plot_values, image.cmap, image.norm)
+    _annotate_heatmap_cells(
+        ax, matrix, plot_values, image.cmap, cast(Normalize | None, image.norm)
+    )
 
     colorbar = fig.colorbar(image, ax=ax, shrink=0.82)
     colorbar.ax.tick_params(colors=TEXT)

@@ -13,21 +13,27 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import torch
 import torch.nn as nn
 
 from .compat import (
+    PAI_ARTIFACT_NAME,
     PAI_DIRECTORY_NAME,
+    PAI_RESUME_NAME,
+    PAIDynamicSchedule,
     PAIModuleSelection,
     PAIRuntimeOptions,
     attach_module_output_dimensions,
     choose_device,
     configure_pai_candidate_graph,
+    dynamic_schedule_field,
     latest_pai_switch_checkpoint,
     load_pai_system_checkpoint,
+    pai_system_checkpoint_exists,
     perforate_model,
+    seed_everything,
     set_module_output_dimensions,
     set_pai_root,
 )
@@ -41,10 +47,21 @@ from .results import (
     write_manifest,
     write_model_reports,
 )
-from .specs import CONDITION_SPECS, MODEL_SPECS, ConditionSpec, condition_by_key, model_by_key
+from .specs import (
+    CONDITION_SPECS,
+    MODEL_SPECS,
+    ConditionSpec,
+    condition_by_key,
+    condition_supported_by_model,
+    model_by_key,
+)
 from .training import (
+    DENDRITE_AUDIT_REVISION,
+    MAX_DENDRITE_PHASE_EPOCHS,
+    QUANTIZATION_EVALUATION_REVISION,
     LRScheduleName,
     OptimizerName,
+    RegressionLossName,
     TrainingConfig,
     TrainingRecord,
     infer_module_output_dimensions,
@@ -72,6 +89,77 @@ _MODEL_DENDRITIC_MEMORY_CLEANUP_INTERVALS = {
 # interval instead, sized to the epochs their baseline recipe needs to converge.
 _MODEL_DENDRITIC_FIXED_SWITCH_INTERVALS = {
     "distilbert": 3,
+    # Dynamic10's TCN reached its best validation epoch at 9, while HISTORY
+    # mode first restructured at epoch 20. Insert the single permitted
+    # dendrite early enough for it to affect the selected checkpoint.
+    "tcn_forecaster": 6,
+    # Dynamic11's gate search began after the GRU cosine had effectively
+    # bottomed out.  The decoder-projection search now switches while the
+    # weather model still has time to adapt.
+    "gru_forecaster": 8,
+    # The old VAE candidate did not arrive until epoch 86 of a 50-epoch cosine
+    # recipe, so it trained at the LR floor.  Give its decoder target a single,
+    # early fixed switch and a shared 150-epoch adaptation budget.
+    "vae_mnist": 20,
+    # SAINT's dense validation peak is epoch 62 and its later trajectory has
+    # plateaued by epoch 100. HISTORY mode never kept its late QKV candidate,
+    # so make the single classifier-head insertion while its cosine LR still
+    # has room for the bounded candidate and adaptation phases.
+    "saint_adult": 100,
+}
+_PAI_VARIANTS = frozenset(
+    {
+        "default",
+        "gru_gate_ablation",
+        "mpnn_capacity",
+        "tcn_head_both",
+        "tcn_head_output",
+        "vae_latent",
+    }
+)
+# A revision is part of an artifact's identity, just like model_scale. It keeps
+# a prior Dynamic11 record from being reused after an architecture, target, or
+# optimization change that record cannot represent.
+_MODEL_ARTIFACT_REVISIONS = {
+    "tcn_forecaster": "dynamic11_targeted_head_v2",
+    "gru_forecaster": "dynamic11_multiscale_decoder_v2",
+    "vae_mnist": "dynamic11_fair_ternary_v2",
+    "resnet18_cifar10": "dynamic12_prefc_target_v1",
+    "resnet18_hf_perforated_cifar10": "dynamic12_hf_perforated_gd_cifar_v1",
+    "saint_adult": "dynamic12_head_target_fixed100_v1",
+    "pointnet_modelnet40": "dynamic12_late_feature_target_v1",
+}
+# Dynamic9 showed that the global three-dendrite schedule adds unnecessary
+# capacity to several models. These are deliberately sparse overrides; fields
+# omitted here keep the well-tested global defaults in compat.py.
+_MODEL_DYNAMIC_PAI_SCHEDULES = {
+    "gcn": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=6),
+    "actor_critic": PAIDynamicSchedule(max_dendrites=2, p_epochs_to_switch=6),
+    "lenet5": PAIDynamicSchedule(max_dendrites=1),
+    "tcn_forecaster": PAIDynamicSchedule(max_dendrites=1),
+    "mpnn": PAIDynamicSchedule(max_dendrites=3),
+    "vae_mnist": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=6),
+    "gru_forecaster": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=6),
+    # Keep the first three replacement experiments capacity-conservative.  A
+    # single retained dendrite makes a parameter-matched dense control practical
+    # if any configuration shows a credible gain.  Note this diverges from
+    # upstream for ResNet-18: PerforatedAI's published model retains 5
+    # dendrites on .pre_fc (--dendrite-mode 1 -> max_dendrites=5), so a result
+    # here is not a reproduction of their ImageNet number even before the
+    # dataset difference.
+    "resnet18_cifar10": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=10),
+    "saint_adult": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=10),
+    "pointnet_modelnet40": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=10),
+}
+_PAI_VARIANT_SCHEDULES = {
+    "mpnn_capacity": {
+        "mpnn": PAIDynamicSchedule(max_dendrites=4),
+    },
+    # Retain the recurrent-gate configuration only as a labelled ablation; it
+    # must not silently stand in for the new decoder-target default.
+    "gru_gate_ablation": {
+        "gru_forecaster": PAIDynamicSchedule(max_dendrites=1, n_epochs_to_switch=8),
+    },
 }
 # Full-transformer PAI wrapping makes DistilBERT's candidate forward exceed
 # Apple Silicon MPS memory. Keep dendrite search on the task-specific head.
@@ -97,9 +185,19 @@ class ModelTrainingRecipe:
     lr_decay_gamma: float = 1.0
     # Floor for "cosine"/"linear", as a fraction of learning_rate.
     lr_min_factor: float = 0.0
+    # Dynamic PAI may legitimately continue beyond max_epochs while a
+    # candidate completes.  Decay over this explicit horizon instead of
+    # prematurely pinning the learning rate at its floor.
+    lr_schedule_epochs: int | None = None
+    # Floor for the dendrite param group, as a fraction of learning_rate.
+    # Only newly inserted dendrite parameters see it; the backbone keeps the
+    # schedule its dense control runs.  See _dendrite_learning_rate.  Defaults
+    # to a no-op; opting in is per-recipe so no stored result changes meaning.
+    dendrite_lr_min_factor: float = 0.0
     # Linear warmup ramp, in epochs, applied under every schedule.
     warmup_epochs: int = 0
     label_smoothing: float = 0.0
+    regression_loss: RegressionLossName = "mse"
     grad_clip_norm: float | None = None
     nesterov: bool = False
 
@@ -143,6 +241,7 @@ class SourceCheckpointLoadConfig:
     candidate_graph_enabled: bool = True
     initial_correlation_batches_limit: int | None = None
     fixed_switch_interval: int | None = None
+    dynamic_schedule: PAIDynamicSchedule | None = None
 
 
 def _log(msg: str, *, before: bool = False, after: bool = False) -> None:
@@ -194,7 +293,15 @@ class BenchmarkRunner:
         self,
         results_root: Path | str = "results",
         comparison_root: Path | str = "comparison",
+        *,
+        model_scale: float = 1.0,
+        pai_variant: str = "default",
     ):
+        if not 0 < model_scale <= 1:
+            raise ValueError("model_scale must be greater than zero and at most one")
+        if pai_variant not in _PAI_VARIANTS:
+            choices = ", ".join(sorted(_PAI_VARIANTS))
+            raise ValueError(f"Unknown PAI variant {pai_variant!r}; choose one of {choices}")
         self.results_root = validate_output_path(Path(results_root), label="results_root")
         self.comparison_root = validate_output_path(Path(comparison_root), label="comparison_root")
         self.results_root.mkdir(parents=True, exist_ok=True)
@@ -202,10 +309,27 @@ class BenchmarkRunner:
         # Keep PAI artifacts with the results they belong to. The CLI already
         # does this; repeating it here covers programmatic callers.
         set_pai_root(self.results_root / PAI_DIRECTORY_NAME)
+        # Overwritten by run(); defined here so _train_pending_condition can be
+        # called directly by programmatic callers that never went through run().
+        self._seed: int | None = None
+        self._model_scale = model_scale
+        self._pai_variant = pai_variant
 
     def _split_compatible_state(
         self, state: dict[str, Any], current_state: dict[str, Any]
     ) -> tuple[dict[str, Any], list[str]]:
+        """Split a source ``state_dict`` into the part that fits ``current_state``
+        and the keys that do not.
+
+        Mismatches are reported in *both* directions. Iterating only over
+        ``state`` catches source tensors the target has no slot for, but is
+        blind to the opposite and more damaging case: target parameters the
+        source never supplies. Those survive ``load_state_dict(strict=False)``
+        at whatever ``perforate_model`` initialized them to, so an untrained,
+        randomly-initialized dendrite gets quantized and scored as though it
+        were part of the trained model. ``actor_critic`` and ``m5`` shipped a
+        whole phantom dendrite this way. See MEASUREMENT_CAVEATS.md #5.
+        """
         compatible_state: dict[str, Any] = {}
         skipped: list[str] = []
         for key, value in state.items():
@@ -216,19 +340,58 @@ class BenchmarkRunner:
                 skipped.append(key)
                 continue
             compatible_state[key] = value
+        for key in current_state:
+            if _is_ignorable_state_key(key) or key in state:
+                continue
+            skipped.append(key)
         return compatible_state, skipped
 
     def _load_compatible_state(self, model: Any, state: dict[str, Any]) -> None:
-        compatible_state, skipped = self._split_compatible_state(
-            state, model.state_dict()
-        )
-        model.load_state_dict(compatible_state, strict=False)
+        """Load a dendritic source checkpoint's weights onto a model whose
+        structure was independently reconstructed from PAI's *latest* switch
+        checkpoint (see ``_load_source_checkpoint`` below).
+
+        Those two things should always agree: with the fix in
+        ``training.py::_load_compatible_best_state``, ``state`` (loaded from
+        ``model.pt``) is always self-consistent -- it is either the true
+        best-epoch model or the true final-epoch model, never a shape-filtered
+        hybrid. If reconstructing from the latest switch checkpoint still
+        doesn't match it, that means the two independent checkpointing systems
+        (this benchmark's own best-epoch tracking vs. PAI's own switch
+        checkpoints) have genuinely diverged -- see
+        information/MEASUREMENT_CAVEATS.md #3. Previously this was a silent
+        partial load, which produced a `dendrites_q*` record with a different
+        (and wrong) param_count than its own `dendrites_fp32` record. Failing
+        loudly here instead surfaces the mismatch at the point it happens,
+        rather than downstream in a comparison table.
+        """
+        current_state = model.state_dict()
+        compatible_state, skipped = self._split_compatible_state(state, current_state)
         if skipped:
-            print(
-                "[state] skipped incompatible source-checkpoint tensors: "
-                + ", ".join(sorted(skipped)[:5])
-                + ("..." if len(skipped) > 5 else "")
+            unfilled = sorted(k for k in skipped if k not in state)
+            mismatched = sorted(k for k in skipped if k in state)
+            detail = []
+            if unfilled:
+                detail.append(
+                    f"{len(unfilled)} target tensor(s) the source never supplies "
+                    f"(would stay at init: {', '.join(unfilled[:3])}"
+                    + ("..." if len(unfilled) > 3 else "")
+                    + ")"
+                )
+            if mismatched:
+                detail.append(
+                    f"{len(mismatched)} shape mismatch(es) "
+                    f"({', '.join(mismatched[:3])}"
+                    + ("..." if len(mismatched) > 3 else "")
+                    + ")"
+                )
+            raise RuntimeError(
+                "[state] source-checkpoint structure does not match the "
+                "PAI-reconstructed model -- refusing a partial load. "
+                + "; ".join(detail)
+                + ". See information/MEASUREMENT_CAVEATS.md #3 and #5."
             )
+        model.load_state_dict(compatible_state, strict=False)
 
     def _load_state(
         self, model: Any, checkpoint_path: Path, *, strict: bool = True
@@ -287,13 +450,14 @@ class BenchmarkRunner:
                         load_config.initial_correlation_batches_limit
                     ),
                     fixed_switch_interval=load_config.fixed_switch_interval,
+                    dynamic_schedule=load_config.dynamic_schedule,
                 ),
             )
             model = self._configure_perforated_model(
                 model, load_config.module_output_dimensions
             )
             source_save_name = self._pai_save_name(model_key, source_key)
-            pai_checkpoint_name = latest_pai_switch_checkpoint(source_save_name)
+            pai_checkpoint_name = self._source_pai_checkpoint_name(source_save_name)
             if pai_checkpoint_name is not None:
                 model = load_pai_system_checkpoint(
                     model,
@@ -332,6 +496,7 @@ class BenchmarkRunner:
                         load_config.initial_correlation_batches_limit
                     ),
                     fixed_switch_interval=load_config.fixed_switch_interval,
+                    dynamic_schedule=load_config.dynamic_schedule,
                 ),
             )
             model = self._configure_perforated_model(
@@ -339,6 +504,32 @@ class BenchmarkRunner:
             )
             configure_pai_candidate_graph(load_config.candidate_graph_enabled)
         return model
+
+    def _source_pai_checkpoint_name(self, source_save_name: str) -> str | None:
+        """Return the PAI checkpoint that should reconstruct a source artifact.
+
+        Post-training quantized dendritic conditions load the benchmark's
+        ``model.pt`` from their FP32 source. For dynamic PAI runs, the latest
+        ``switch_N`` checkpoint can be structurally stale by the time training
+        exits; the final/resume snapshot is the one saved alongside the final
+        benchmark checkpoint and should therefore be tried first. ``switch_N``
+        remains the fallback for older results that predate final snapshots.
+
+        ``PAI_ARTIFACT_NAME`` is preferred over all of them: it is written at
+        the one instant that is guaranteed to describe ``model.pt``, whereas
+        ``PAI_RESUME_NAME`` is written inside the epoch loop and can describe a
+        structure the artifact never had. See MEASUREMENT_CAVEATS.md #5.
+        """
+        for checkpoint_name in (
+            PAI_ARTIFACT_NAME,
+            PAI_RESUME_NAME,
+            "latest",
+            "best_model",
+            "final_clean_pai",
+        ):
+            if pai_system_checkpoint_exists(source_save_name, checkpoint_name):
+                return checkpoint_name
+        return latest_pai_switch_checkpoint(source_save_name)
 
     def _artifact_path(
         self, condition_dir: Path, prefer_dendritic: bool = False
@@ -376,29 +567,32 @@ class BenchmarkRunner:
         return [key for key in [spec.key for spec in CONDITION_SPECS] if key in ordered]
 
     def _model_kwargs(self, model_key: str) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"model_scale": self._model_scale}
         if model_key in {"lenet5", "snn_nmnist", "capsnet_mnist"}:
-            return {"num_classes": 10}
-        if model_key == "m5":
-            return {"num_classes": 12}
-        if model_key == "textcnn":
-            return {"num_classes": 4}
-        if model_key == "gcn":
-            return {"num_classes": 7}
-        if model_key in {"tabnet", "saint_adult"}:
+            kwargs["num_classes"] = 10
+        elif model_key == "m5":
+            kwargs["num_classes"] = 12
+        elif model_key == "textcnn":
+            kwargs["num_classes"] = 4
+        elif model_key == "gcn":
+            kwargs["num_classes"] = 7
+        elif model_key in {"tabnet", "saint_adult"}:
             # Adult's 8 nominal columns reach the models as integer codes; both
             # size embedding tables from this schema rather than treating a code
             # as a number. See TabularColumnEmbedding.
-            return {
-                "num_classes": 2,
-                "categorical_cardinalities": ADULT_CATEGORICAL_CARDINALITIES,
-            }
-        if model_key == "gin_imdbb":
-            return {"num_classes": 2}
-        if model_key == "pointnet_modelnet40":
-            return {"num_classes": 40}
-        if model_key == "distilbert":
-            return {"num_classes": 2}
-        return {}
+            kwargs.update(
+                {
+                    "num_classes": 2,
+                    "categorical_cardinalities": ADULT_CATEGORICAL_CARDINALITIES,
+                }
+            )
+        elif model_key == "gin_imdbb":
+            kwargs["num_classes"] = 2
+        elif model_key == "pointnet_modelnet40":
+            kwargs["num_classes"] = 40
+        elif model_key == "distilbert":
+            kwargs["num_classes"] = 2
+        return kwargs
 
     def _perforation_track_modules(self) -> list[Any]:
         if nn is None:
@@ -410,18 +604,98 @@ class BenchmarkRunner:
         return [nn.Linear, nn.Conv1d, nn.Conv2d]
 
     def _perforation_modules_to_perforate(self, model_key: str) -> list[Any]:
-        if model_key == "distilbert":
+        if self._perforation_module_ids_to_perforate(model_key):
             return []
         return list(self._perforation_track_modules())
 
     def _perforation_module_ids_to_perforate(self, model_key: str) -> list[str]:
+        if model_key == "resnet18_cifar10":
+            # Mirrors upstream exactly. PerforatedAI's published ResNet-18
+            # (LPA.ResNetPAIPreFC; examples/imagenet/resnet_prefc.py, and the
+            # perforated-ai/resnet-18-perforated-gd card) adds a 512 -> 512
+            # pre-classifier projection after global pooling and perforates
+            # only that, leaving the residual backbone tracked. Their training
+            # command is `--convert-count 0`, which tracks .layer1..4 outright,
+            # plus .conv1/.bn1/.fc -- so .pre_fc is the sole perforated module.
+            # Our dense arm carries the same layer, so the comparison isolates
+            # the retained dendrite rather than the extra dense projection.
+            return [".pre_fc"]
+        if model_key == "saint_adult":
+            # Perforate the complete tensor-in/tensor-out classifier rather
+            # than isolated QKV projections in batch-coupled row attention.
+            # This retains one coherent LN -> Linear -> ReLU -> Linear path,
+            # including all of its parameters (+4,418 per dendrite), and
+            # leaves the attention topology unchanged for the first calibrated
+            # SAINT retry. A column block is the next labelled expansion only
+            # if this smaller head target verifies a retained insertion.
+            return [".head"]
+        if model_key == "pointnet_modelnet40":
+            # Late per-point features and the first classifier projection are
+            # wide, tensor-returning layers.  The two T-Nets are deliberately
+            # excluded: a dendrite there perturbs the learned coordinate basis
+            # every downstream point is expressed in, so it is not the local
+            # change a late-layer dendrite is.  They are also where the
+            # parameters are -- perforating all 18 eligible Linear/Conv modules
+            # (what type-based registration did) costs +3,459,569 parameters,
+            # +100%, for one dendrite, against +656,896 (+18.9%) for these two.
+            return [".conv3.0", ".head.0"]
         if model_key == "distilbert":
             return list(_DISTILBERT_PAI_CLASSIFICATION_HEAD)
+        if model_key == "mpnn":
+            return [
+                ".readout.0",
+                ".readout_gate",
+                ".layers.2.update.hidden_gates",
+                ".layers.2.update.input_gates",
+                ".layers.3.update.hidden_gates",
+                ".layers.3.update.input_gates",
+            ]
+        if model_key == "vae_mnist":
+            if self._pai_variant == "vae_latent":
+                return [".mu", ".logvar"]
+            return [".decoder.4"]
+        if model_key == "tcn_forecaster":
+            # Dynamic11's fresh PBscores favour the input projection of the
+            # nonlinear head.  Keep alternate output/both-target runs explicit
+            # so their added capacity never contaminates the default result.
+            if self._pai_variant == "tcn_head_output":
+                return [".head.3"]
+            if self._pai_variant == "tcn_head_both":
+                return [".head.0", ".head.3"]
+            return [".head.0"]
+        if model_key == "gru_forecaster":
+            if self._pai_variant == "gru_gate_ablation":
+                return [".cells.0.input_gates", ".cells.1.input_gates"]
+            # The recurrent-gate run did not retain useful capacity and its
+            # candidates trained after the cosine had decayed.  The new
+            # multiscale decoder exposes this narrow bottleneck exactly once;
+            # a dendrite here is cheap, survives final cleanup, and can affect
+            # every forecasted timestep.
+            return [".head.1"]
         return []
 
     def _perforation_track_only_module_ids(self, model_key: str) -> list[str]:
         return {
-            "actor_critic": [".value"],
+            # Dynamic9's only clearly efficient actor-critic candidate was the
+            # second shared-backbone projection. Holding the policy/value heads
+            # out also avoids changing outputs represented in an active buffer.
+            "actor_critic": [".value", ".backbone.0", ".policy"],
+            # Dynamic9's useful LeNet signal came from the classifier. Keeping
+            # both convolutions tracked-only turns this into a classifier-only
+            # dendrite experiment rather than spending capacity on early maps.
+            "lenet5": [".features.0", ".features.3"],
+            # Mirror PerforatedAI's ResNet wrapper: retain the entire residual
+            # backbone as ordinary neurons and restrict candidate growth to the
+            # added pre-classifier projection.
+            "resnet18_cifar10": [
+                ".conv1",
+                ".bn1",
+                ".layer1",
+                ".layer2",
+                ".layer3",
+                ".layer4",
+                ".fc",
+            ],
             # Dendrites go on the shared .backbone only. The two heads are held
             # out for a reason specific to on-policy training, not for the old
             # PBScore reason (which measured a behaviour-cloning run in which
@@ -435,10 +709,21 @@ class BenchmarkRunner:
             # baseline the buffer's advantages were computed against. Behind
             # them, the backbone can absorb capacity without either effect.
             "ppo_bipedalwalker": [".critic", ".actor_mean"],
-            # Recurrent gates run per-timestep; perforating them dominates wallclock
-            # on long sequences. Marking .cells as track-only (not perforated)
-            # confines dendrite insertion to the readout Linear in .head only.
-            "gru_forecaster": [".cells"],
+            "gru_forecaster": (
+                [
+                    ".cells.0.hidden_gates",
+                    ".cells.1.hidden_gates",
+                    ".head",
+                ]
+                if self._pai_variant == "gru_gate_ablation"
+                else [
+                    ".cells.0.input_gates",
+                    ".cells.0.hidden_gates",
+                    ".cells.1.input_gates",
+                    ".cells.1.hidden_gates",
+                    ".head.4",
+                ]
+            ),
             # MobileNetV2's final classifier Linear sits inside nn.Sequential(Dropout, Linear),
             # and the initial Conv2d sits inside Conv2dNormActivation (also an nn.Sequential);
             # perforating either leaves DendriteValueTracker.shape uninitialized at the PA switch.
@@ -448,20 +733,71 @@ class BenchmarkRunner:
             # 0.166; perforating all of them just spreads the max_dendrites=3
             # budget across near-noise candidates instead of the layer that
             # actually correlates with the learning signal.
-            "tcn_forecaster": [".net"],
-            # Only .head.1 (0.229) and the row_blocks attn.qkv layers (0.10-0.15)
-            # cleared the >0.02 PBScore bar the perforatedai-analyze guidance
-            # treats as "efficient dendrite user" on the 2026-08-03 dynamic run;
-            # every column_blocks/ffn/attn.out/feature_embed/head.3 layer sat at
-            # 0.009-0.03. Track the ones that showed no real signal.
+            "tcn_forecaster": (
+                [".net", ".head.0"]
+                if self._pai_variant == "tcn_head_output"
+                else [".net", ".head.3"]
+                if self._pai_variant != "tcn_head_both"
+                else [".net"]
+            ),
+            # gcn is deliberately absent, and it is worth recording why so nobody adds
+            # it back on the same reasoning that failed here.
+            #
+            # .conv1 holds 91,776 of GCN's 92,231 parameters (99.5%) yet scored the
+            # *lower* Best-PBScore on the 2026-08-03 dynamic run -- 0.0635 against
+            # .conv2's 0.0925. Both the perforatedai-analyze PBScore guidance and the
+            # "convert only top layers" advice in the perforatedai skill therefore say
+            # to hold .conv1 out and let dendrites go to the 455-parameter .conv2.
+            #
+            # Measured, that is wrong. Three paired dqb runs per arm, dynamic mode,
+            # comparing dendrites_fp32 against the same run's own base_fp32:
+            #
+            #   .conv1 track-only   +0.0030 +0.0050 +0.0040  -> +0.40pp, 1.01x params
+            #   .conv1 perforated   +0.0190 +0.0290 +0.0220  -> +2.33pp, 3.67x params
+            #
+            # Welch t ~ 6.4 on ~2 dof against a 4.30 critical value. Excluding .conv1
+            # cuts the parameter cost 3.6x but keeps only 17% of the accuracy gain, so
+            # nearly all of the dendritic benefit comes from the layer PBScore ranked
+            # *lower*. PBScore ranks candidates within a layer's own signal; it does not
+            # predict how much headroom a layer has to absorb new capacity, and on a
+            # 1433-input bag-of-words first layer that headroom is where the gain is.
+            # See experiments/dynamic5/config/PERFORATION.md.
+            # The row-attention QKV projections are deliberately track-only in
+            # the first SAINT retry. The complete classifier head is selected
+            # above, so none of its children may also be registered as tracked
+            # modules. The remaining LayerNorms must still be explicit here:
+            # otherwise PAI leaves their parameters untyped during p-phase.
             "saint_adult": [
                 ".feature_embed",
                 ".column_blocks",
+                ".row_blocks.0.attn.qkv",
                 ".row_blocks.0.attn.out",
                 ".row_blocks.0.ffn",
+                ".row_blocks.0.norm1",
+                ".row_blocks.0.norm2",
+                ".row_blocks.1.attn.qkv",
                 ".row_blocks.1.attn.out",
                 ".row_blocks.1.ffn",
-                ".head.3",
+                ".row_blocks.1.norm1",
+                ".row_blocks.1.norm2",
+            ],
+            # Every parameter-bearing head child except the perforated
+            # `.head.0`. `.head.1` (BatchNorm1d) and `.head.4` (the 512->256
+            # Linear, 131k parameters) have to be named explicitly: a parameter
+            # in neither list gets no parameter_type, which PAI warns on for
+            # every p-phase step and follows with pdb.set_trace -- fatal in a
+            # non-interactive worker. `.head.{2,3,6,7}` are ReLU/Dropout and
+            # hold no parameters, so they are omitted rather than tracked.
+            "pointnet_modelnet40": [
+                ".input_transform",
+                ".conv1",
+                ".feature_transform",
+                ".conv2",
+                ".conv3.1",
+                ".head.1",
+                ".head.4",
+                ".head.5",
+                ".head.8",
             ],
             # Only the classification head is perforated (see
             # _DISTILBERT_PAI_CLASSIFICATION_HEAD), which leaves all 100 backbone
@@ -495,6 +831,10 @@ class BenchmarkRunner:
             # tracked, which leaves these two biases untyped and warning on
             # every p-phase step. See PAIModuleSelection.parameter_ids_to_track.
             "gcn": [".conv1.bias", ".conv2.bias"],
+            # This learned positional term is a raw parameter rather than a
+            # child module, so tag it explicitly when the selected SAINT
+            # projections are perforated.
+            "saint_adult": [".column_embedding"],
         }.get(model_key, [])
 
     def _use_pai_runtime_guard(self) -> bool:
@@ -506,7 +846,22 @@ class BenchmarkRunner:
         )
 
     def _pai_fixed_switch_interval(self, model_key: str) -> int | None:
+        if model_key == "gru_forecaster" and self._pai_variant == "gru_gate_ablation":
+            return None
         return _MODEL_DENDRITIC_FIXED_SWITCH_INTERVALS.get(model_key)
+
+    def _pai_dynamic_schedule(self, model_key: str) -> PAIDynamicSchedule | None:
+        """Return the measured schedule for a model and optional ablation variant."""
+        variant_schedule = _PAI_VARIANT_SCHEDULES.get(self._pai_variant, {}).get(
+            model_key
+        )
+        if variant_schedule is not None:
+            return variant_schedule
+        return _MODEL_DYNAMIC_PAI_SCHEDULES.get(model_key)
+
+    @staticmethod
+    def _model_artifact_revision(model_key: str) -> str | None:
+        return _MODEL_ARTIFACT_REVISIONS.get(model_key)
 
     def _configure_perforated_model(
         self,
@@ -530,7 +885,7 @@ class BenchmarkRunner:
         fine_tune_epochs = condition.fine_tune_epochs
         if condition.quantized and condition.source_key != condition.key:
             if allow_pqat:
-                fine_tune_epochs = self._pqat_epoch_budget(model_key)
+                fine_tune_epochs = self._pqat_epoch_budget(model_key, condition)
                 max_epochs = fine_tune_epochs
                 use_qat = True
             else:
@@ -601,6 +956,11 @@ class BenchmarkRunner:
             if training_plan.update_dendrites_during_training
             else None
         )
+        dynamic_schedule = (
+            self._pai_dynamic_schedule(model_key)
+            if training_plan.update_dendrites_during_training
+            else None
+        )
         if condition.source_key in saved_dirs:
             checkpoint = self._artifact_path(
                 saved_dirs[condition.source_key],
@@ -627,6 +987,7 @@ class BenchmarkRunner:
                         initial_correlation_batches_limit
                     ),
                     fixed_switch_interval=fixed_switch_interval,
+                    dynamic_schedule=dynamic_schedule,
                 ),
             )
         if not condition.use_dendrites:
@@ -647,6 +1008,7 @@ class BenchmarkRunner:
                 candidate_graph_enabled=training_plan.update_dendrites_during_training,
                 initial_correlation_batches_limit=initial_correlation_batches_limit,
                 fixed_switch_interval=fixed_switch_interval,
+                dynamic_schedule=dynamic_schedule,
             ),
         )
         configure_pai_candidate_graph(training_plan.update_dendrites_during_training)
@@ -785,14 +1147,28 @@ class BenchmarkRunner:
             "tcn_forecaster": ModelTrainingRecipe(
                 128, 80, 1.0e-3, "adam", 0.9, 1.0e-4,
                 lr_schedule="cosine", lr_min_factor=0.01, grad_clip_norm=1.0,
+                regression_loss="smooth_l1",
             ),
             # Batch 24 -> 128 (see _BATCH_SIZES) cuts the step count per epoch by
-            # 5.3x, so the epoch budget goes up to keep the number of optimiser
-            # steps in the same range; the run still costs well under the 4.2h the
-            # old setting did. Weather now runs Autoformer's 96-step horizon.
+            # 5.3x. Weather runs Autoformer's 96-step horizon.
+            #
+            # 80 epochs at 1e-3 was wrong in a way the stored Dynamic10 history
+            # shows plainly: validation MAE bottomed at epoch 5 and then rose for
+            # 75 straight epochs (0.3305 -> 0.3957) while train MAE fell to
+            # 0.184. Cosine barely moves in that window -- the LR was still
+            # 9.9e-4 at the epoch the model was at its best -- so the entire
+            # budget was spent overfitting past the checkpoint that got reported.
+            # At 3e-4 over 24 epochs the model peaks at epoch 14 and *stays*
+            # there (best 0.2586, final 0.2587) instead of peaking early and
+            # decaying. The peak value itself is a wash; ending training at the
+            # optimum rather than 75 epochs beyond it is the point, and it is
+            # what lets the warm-started dendritic arm be scored against a
+            # converged baseline. In the full pipeline the best epoch moves
+            # 5 -> 16 of 24 and training drops 1716s -> 356s. See
+            # GRUForecaster for the RevIN measurements.
             "gru_forecaster": ModelTrainingRecipe(
-                128, 80, 1.0e-3, lr_schedule="cosine", lr_min_factor=0.01,
-                grad_clip_norm=1.0,
+                128, 24, 3.0e-4, lr_schedule="cosine", lr_min_factor=0.01,
+                grad_clip_norm=1.0, regression_loss="smooth_l1",
             ),
             # Decay by 0.7 every 20 epochs, matching the reference PointNet
             # implementation's schedule (Qi et al., provider.py). A constant 1e-3
@@ -809,12 +1185,21 @@ class BenchmarkRunner:
             # epochs now runs in a third of the wall clock the old 100 did. The
             # reference trains 250, and the 100-epoch run was still climbing
             # (best val accuracy arrived at epoch 81 of 100).
+            # dendrite_lr_min_factor: step decay reaches 0.7^10 = 2.8% of base
+            # by epoch 200 and holds there for the dynamic tail.
             "pointnet_modelnet40": ModelTrainingRecipe(
                 32, 200, 1.0e-3, "adam", 0.9, 1.0e-4,
                 lr_schedule="step", lr_decay_every=20, lr_decay_gamma=0.7,
+                dendrite_lr_min_factor=0.1,
             ),
             "vae_mnist": ModelTrainingRecipe(
-                128, 50, 1.0e-3, lr_schedule="cosine", lr_min_factor=0.02
+                # Dynamic11's dendritic VAE ran to epoch 149 while its dense
+                # control stopped at 50, and the first candidate arrived after
+                # the cosine schedule was already at its floor.  The shared
+                # 150-epoch horizon makes the FP32 control fair and leaves a
+                # useful rate for a decoder dendrite to adapt.
+                128, 150, 1.0e-3, lr_schedule="cosine", lr_min_factor=0.02,
+                lr_schedule_epochs=150,
             ),
             # 242s/epoch is the most expensive model in the suite, so the budget
             # stays at 50; the annealed tail is what buys the accuracy (val was
@@ -833,8 +1218,24 @@ class BenchmarkRunner:
             # zero, random-crop+flip. Held at a flat 0.05 for 90 epochs this
             # plateaued at 88.85% with train loss stuck at 0.18 — the anneal is
             # exactly the missing piece. 24s/epoch, so 200 epochs is ~80 min.
+            # dendrite_lr_min_factor: this cosine anneals to exactly 0.0 (the
+            # default lr_min_factor), so every epoch from 200 on -- the whole
+            # window the dynamic cap exists to provide -- ran at lr=0. Measured
+            # on a short run: 13 of 19 epochs at lr=0.0, validation flat inside
+            # 0.004, no dendrite phase ever entered. The floor (0.1 * 0.1 =
+            # 0.01) applies only to retained dendrite parameters; the backbone
+            # keeps the identical schedule its base_fp32 control runs.
             "resnet18_cifar10": ModelTrainingRecipe(
                 128, 200, 1.0e-1, "sgd", 0.9, 5.0e-4,
+                lr_schedule="cosine", warmup_epochs=5, label_smoothing=0.1,
+                nesterov=True, dendrite_lr_min_factor=0.1,
+            ),
+            # Transfer PerforatedAI's published ImageNet checkpoint rather than
+            # asking PAI to rediscover its pre-FC dendrites from scratch on
+            # CIFAR-10.  Their transfer-learning example uses 50 epochs, SGD
+            # 1e-3, five warmup epochs, cosine decay, and label smoothing 0.1.
+            "resnet18_hf_perforated_cifar10": ModelTrainingRecipe(
+                128, 50, 1.0e-3, "sgd", 0.9, 1.0e-4,
                 lr_schedule="cosine", warmup_epochs=5, label_smoothing=0.1,
                 nesterov=True,
             ),
@@ -849,10 +1250,12 @@ class BenchmarkRunner:
             ),
             # 2.2s/epoch, and val accuracy was still ticking up at epoch 100
             # (0.8467 -> 0.8495). SAINT (Somepalli et al.) reports ~86% on Adult.
+            # dendrite_lr_min_factor: the cosine floor is 2% of base (2e-6),
+            # which is not a rate a freshly initialized dendrite can train at.
             "saint_adult": ModelTrainingRecipe(
                 256, 200, 1.0e-4, "adamw", 0.9, 1.0e-5,
                 lr_schedule="cosine", warmup_epochs=5, lr_min_factor=0.02,
-                grad_clip_norm=1.0,
+                grad_clip_norm=1.0, dendrite_lr_min_factor=0.1,
             ),
             # Sabour et al. train with Adam 1e-3 and exponential decay; the real
             # fix here is the margin loss (see CapsuleMarginLoss in training.py),
@@ -866,17 +1269,82 @@ class BenchmarkRunner:
             model_key,
             ModelTrainingRecipe(64, 4 * EPOCH_MULTIPLIER, 1.0e-3),
         )
+        if model_key == "tcn_forecaster" and self._model_scale < 1.0:
+            # The compact TCN follow-up has less base capacity but the same
+            # chronological validation gap seen in Dynamic9. Keep the measured
+            # dropout=0.2 architecture and modestly raise L2 for both paired
+            # arms before asking a dendrite to recover capacity.
+            recipe = replace(recipe, weight_decay=2.0e-4)
+        if model_key == "tcn_forecaster" and condition.key.endswith("q1_58"):
+            # Ternary QAT was still improving at the end of Dynamic10's
+            # ten-epoch phase. A lower step avoids repeatedly jumping between
+            # quantization bins while the longer phase can recover accuracy.
+            recipe = replace(recipe, learning_rate=3.0e-4)
+        if model_key == "vae_mnist" and condition.key.endswith("q1_58"):
+            # Ternary VAE PQAT has a much sharper reconstruction loss than
+            # the FP32 phase.  A smaller step lets its full-precision shadow
+            # accumulate movement between ternary projections.
+            recipe = replace(recipe, learning_rate=2.0e-4)
         dendritic_batch_size = _MODEL_DENDRITIC_BATCH_SIZES.get(model_key)
         if condition.use_dendrites and dendritic_batch_size is not None:
             return recipe.with_batch_size(dendritic_batch_size)
         return recipe
 
-    def _pqat_epoch_budget(self, model_key: str) -> int:
+    def _pqat_epoch_budget(self, model_key: str, condition: ConditionSpec) -> int:
         """Allocate a short PQAT phase from the model's canonical epoch recipe."""
+        if model_key == "tcn_forecaster" and condition.key.endswith("q1_58"):
+            return 36
+        if model_key == "vae_mnist" and condition.key.endswith("q1_58"):
+            return 40
         recipe = self._training_hyperparameters(
             model_key, condition_by_key("base_fp32")
         )
         return max(1, min(10, math.ceil(recipe.max_epochs * 0.30)))
+
+    # A retained dendrite has to (a) finish its candidate phase and (b) train
+    # long enough for the validation metric to show whether it earned its
+    # parameters.  Twenty epochs of (b) is the smallest window in which any
+    # model in this suite has ever moved its metric by more than run-to-run
+    # noise.
+    _DENDRITE_ADAPTATION_EPOCHS = 20
+
+    @staticmethod
+    def _dynamic_training_epoch_cap(
+        training_plan: ConditionTrainingPlan,
+        dynamic_schedule: PAIDynamicSchedule | None = None,
+    ) -> int | None:
+        """Bound a dynamic PAI run without undercutting its paired control.
+
+        The old flat ``+16`` could not fit even one dendrite.  A switch costs
+        the candidate phase (``p_epochs_to_switch``, itself bounded by
+        ``max_dendrite_phase_epochs=8`` in training.py) plus an adaptation
+        window, and it is charged once per dendrite.  At the dynamic12 defaults
+        -- ``p_epochs_to_switch=10``, ``max_dendrites=1`` -- +16 left at most
+        eight epochs of adaptation, and on ResNet-18 all sixteen fell past the
+        cosine floor where the learning rate is exactly 0.0.  Deriving the tail
+        from the schedule keeps the bound tight for a one-dendrite run while
+        still holding a runaway no-improvement tracker to a finite budget.
+        """
+        if not training_plan.update_dendrites_during_training:
+            return None
+        max_dendrites = dynamic_schedule_field(dynamic_schedule, "max_dendrites")
+        p_epochs = dynamic_schedule_field(dynamic_schedule, "p_epochs_to_switch")
+        per_dendrite = min(p_epochs, MAX_DENDRITE_PHASE_EPOCHS) + (
+            BenchmarkRunner._DENDRITE_ADAPTATION_EPOCHS
+        )
+        return training_plan.max_epochs + max(16, max_dendrites * per_dendrite)
+
+    @staticmethod
+    def _quantization_granularity(
+        model_key: str, condition: ConditionSpec
+    ) -> Literal["tensor", "channel"]:
+        """Choose the quantizer scale layout without changing its bit codes."""
+        if (
+            condition.quantization_mode == "ternary"
+            and model_key in {"tcn_forecaster", "vae_mnist"}
+        ):
+            return "channel"
+        return "tensor"
 
     def _memory_cleanup_interval_batches(
         self,
@@ -906,7 +1374,7 @@ class BenchmarkRunner:
         condition_dir = self.results_root / model_key / condition.key
         record_path = condition_dir / _RECORD_JSON
         _log(f"[skip] {model_key} / {condition.key} — record.json found, skipping training.")
-        record = TrainingRecord(**json.loads(record_path.read_text()))
+        record = cast(Any, TrainingRecord)(**json.loads(record_path.read_text()))
         model_records.append(record.to_dict())
         all_records.append(record.to_dict())
         saved_dirs[condition.key] = condition_dir
@@ -940,17 +1408,151 @@ class BenchmarkRunner:
             )
         )
 
+    def _condition_metadata_current(
+        self,
+        model_key: str,
+        condition: ConditionSpec,
+        condition_dir: Path,
+        *,
+        allow_pqat: bool = False,
+    ) -> bool:
+        """Reject saved artifacts built with a different compact/PAI profile."""
+        metrics_path = condition_dir / "metrics.json"
+        if not metrics_path.exists():
+            return False
+        try:
+            metadata = json.loads(metrics_path.read_text())
+        except json.JSONDecodeError:
+            return False
+        try:
+            recorded_scale = float(metadata.get("model_scale", 1.0))
+        except (TypeError, ValueError):
+            return False
+        if recorded_scale != self._model_scale:
+            return False
+        if metadata.get("model_revision") != self._model_artifact_revision(model_key):
+            return False
+        recipe = self._training_hyperparameters(model_key, condition)
+        if metadata.get("lr_schedule_epochs") != recipe.lr_schedule_epochs:
+            return False
+        if (
+            metadata.get("quantization_granularity", "tensor")
+            != self._quantization_granularity(model_key, condition)
+        ):
+            return False
+        if (
+            condition.quantized
+            and metadata.get("quantization_evaluation_revision")
+            != QUANTIZATION_EVALUATION_REVISION
+        ):
+            return False
+        if condition.quantized:
+            expected_qat = bool(condition.use_qat or allow_pqat)
+            if bool(metadata.get("use_qat", False)) != expected_qat:
+                return False
+            if expected_qat:
+                try:
+                    recorded_fine_tune_epochs = int(
+                        metadata.get("fine_tune_epochs", 0)
+                    )
+                except (TypeError, ValueError):
+                    return False
+                if recorded_fine_tune_epochs <= 0:
+                    return False
+                for stage_name, stage_uses_qat in (
+                    ("before_pqat", False),
+                    ("after_pqat", True),
+                ):
+                    stage_path = condition_dir / stage_name / "metrics.json"
+                    try:
+                        stage_metadata = json.loads(stage_path.read_text())
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        return False
+                    if stage_metadata.get("use_qat") is not stage_uses_qat:
+                        return False
+        if not condition.use_dendrites:
+            return True
+        if metadata.get("dendrite_audit_revision") != DENDRITE_AUDIT_REVISION:
+            return False
+        if metadata.get("pai_variant") != self._pai_variant:
+            return False
+        expected_schedule = self._pai_dynamic_schedule(model_key)
+        recorded_schedule = metadata.get("pai_dynamic_schedule")
+        # Compare both directions of the None boundary too: adding or removing a
+        # _MODEL_DYNAMIC_PAI_SCHEDULES override is a None-to-dict transition, and
+        # for models absent from _MODEL_ARTIFACT_REVISIONS this is the only guard
+        # that would catch the artifact being trained under the other schedule.
+        expected_dict = (
+            expected_schedule.to_dict() if expected_schedule is not None else None
+        )
+        if recorded_schedule != expected_dict:
+            return False
+        return True
+
+    @staticmethod
+    def _saved_dendrite_audit_status(
+        source_key: str, saved_dirs: dict[str, Path]
+    ) -> str | None:
+        source_dir = saved_dirs.get(source_key)
+        if source_dir is None:
+            return None
+        record_path = source_dir / _RECORD_JSON
+        try:
+            record = json.loads(record_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        status = record.get("dendrite_audit_status")
+        return str(status) if status else None
+
+    def _require_verified_dendritic_pqat_source(
+        self, model_key: str, condition: ConditionSpec, saved_dirs: dict[str, Path]
+    ) -> None:
+        """Block PQAT descendants until their FP32 topology is auditable.
+
+        A quantized dendritic arm only fine-tunes the saved FP32 graph; it
+        cannot create a retained dendrite itself. Continuing after a missing
+        insertion would therefore label an unchanged dense model as a
+        dendritic PQAT result.
+        """
+        if not (
+            condition.use_dendrites
+            and condition.quantized
+            and condition.source_key != condition.key
+        ):
+            return
+        status = self._saved_dendrite_audit_status(condition.source_key, saved_dirs)
+        if status == "verified_retained":
+            return
+        raise RuntimeError(
+            f"{model_key} / {condition.key} requires a verified retained "
+            f"{condition.source_key} source before PQAT; found {status or 'no source record'}. "
+            "Run the FP32 dendritic source, inspect its raw PAI switch and "
+            "architecture evidence, then rerun the PQAT descendants."
+        )
+
     def _condition_record_usable(
         self,
         model_key: str,
         condition: ConditionSpec,
         *,
         ignore_saved: bool,
+        allow_pqat: bool,
     ) -> bool:
         if ignore_saved:
             return False
         condition_dir = self.results_root / model_key / condition.key
         if not (condition_dir / _RECORD_JSON).exists():
+            return False
+        if not self._condition_metadata_current(
+            model_key,
+            condition,
+            condition_dir,
+            allow_pqat=allow_pqat,
+        ):
+            _log(
+                f"[stale] {model_key} / {condition.key} — model, PAI, "
+                "quantization, or PQAT metadata changed; retraining."
+            )
             return False
         if (
             model_key == "distilbert"
@@ -978,30 +1580,35 @@ class BenchmarkRunner:
         dynamic_dendritic_training: bool,
     ) -> bool:
         condition_dir = self.results_root / model_spec.key / condition.key
-        record_path = condition_dir / _RECORD_JSON
-        if record_path.exists() and not ignore_saved:
-            _log(f"[skip] {model_spec.key} / {condition.key} — record.json found, skipping training.")
-            record = TrainingRecord(**json.loads(record_path.read_text()))
-            newly_trained = False
-        else:
-            _log(f"[train] {model_spec.key} / {condition.key} — starting…", before=True)
-            record = self._run_condition(
-                model_spec.key,
-                model_spec.metric_name,
-                model_spec.metric_direction,
-                bundle,
-                condition,
-                saved_dirs,
-                allow_pqat,
-                dynamic_dendritic_training,
-            )
-            save_training_record(record, condition_dir)
-            _log(
-                f"[done] {model_spec.key} / {condition.key} — "
-                f"{model_spec.metric_name}: {record.metric_value:.4f}",
-                after=True,
-            )
-            newly_trained = True
+        # This method is called only for conditions that
+        # ``_condition_record_usable`` rejected.  Do not let the mere presence
+        # of a stale record bypass a model/PAI revision and silently keep old
+        # results in a new experiment directory.
+        self._require_verified_dendritic_pqat_source(
+            model_spec.key, condition, saved_dirs
+        )
+        _log(f"[train] {model_spec.key} / {condition.key} — starting…", before=True)
+        # Re-seed per condition so a model's base_* and dendrites_* arms draw
+        # the same initial weights, making them a paired comparison.
+        if self._seed is not None:
+            seed_everything(self._seed)
+        record = self._run_condition(
+            model_spec.key,
+            model_spec.metric_name,
+            model_spec.metric_direction,
+            bundle,
+            condition,
+            saved_dirs,
+            allow_pqat,
+            dynamic_dendritic_training,
+        )
+        save_training_record(record, condition_dir)
+        _log(
+            f"[done] {model_spec.key} / {condition.key} — "
+            f"{model_spec.metric_name}: {record.metric_value:.4f}",
+            after=True,
+        )
+        newly_trained = True
         model_records.append(record.to_dict())
         all_records.append(record.to_dict())
         saved_dirs[condition.key] = condition_dir
@@ -1016,10 +1623,33 @@ class BenchmarkRunner:
         allow_pqat: bool,
         dynamic_dendritic_training: bool,
     ) -> bool:
+        unsupported_conditions = [
+            condition
+            for condition in selected_conditions
+            if not condition_supported_by_model(model_spec.key, condition.key)
+        ]
+        if unsupported_conditions:
+            # This checkpoint already contains the published pre-FC dendrites.
+            # Its base_q* arms are therefore the quantized perforated model;
+            # wrapping that static graph in another PAI search is unsupported
+            # and would no longer answer the requested transfer/PQAT question.
+            selected_conditions = [
+                condition
+                for condition in selected_conditions
+                if condition_supported_by_model(model_spec.key, condition.key)
+            ]
+            skipped = ", ".join(condition.key for condition in unsupported_conditions)
+            _log(
+                f"[conditions] {model_spec.key} already contains published "
+                f"dendrites; skipping non-distinct conditions: {skipped}"
+            )
         pending = [
             cond for cond in selected_conditions
             if not self._condition_record_usable(
-                model_spec.key, cond, ignore_saved=ignore_saved
+                model_spec.key,
+                cond,
+                ignore_saved=ignore_saved,
+                allow_pqat=allow_pqat,
             )
         ]
         already_done = [cond for cond in selected_conditions if cond not in pending]
@@ -1052,6 +1682,11 @@ class BenchmarkRunner:
                 recipe = self._training_hyperparameters(model_spec.key, condition)
                 bundle = bundles_by_batch_size.get(recipe.batch_size)
                 if bundle is None:
+                    # Seed before the bundle too: dataset splits and shuffle
+                    # order are drawn here, and a different train/val split is
+                    # just as much a different experiment as a different init.
+                    if self._seed is not None:
+                        seed_everything(self._seed)
                     bundle = build_task_bundle(
                         model_spec.key, batch_size=recipe.batch_size
                     )
@@ -1079,8 +1714,13 @@ class BenchmarkRunner:
         allow_pqat: bool = False,
         dynamic_dendritic_training: bool = False,
         write_reports: bool = True,
+        seed: int | None = None,
     ) -> list[dict[str, Any]]:
         """Train the selected models sequentially in this process.
+
+        ``seed`` is re-applied before every (model, condition) — see
+        :func:`compat.seed_everything` for why per-condition and not per-process.
+        ``None`` leaves every RNG unseeded, which is the historical behaviour.
 
         ``write_reports=False`` suppresses the manifest and the cross-model
         comparison reports, which are built from *this* runner's records and so
@@ -1096,6 +1736,9 @@ class BenchmarkRunner:
         selected_condition_keys = self._expand_condition_keys(condition_keys)
         selected_conditions = [condition_by_key(key) for key in selected_condition_keys]
         all_records: list[dict[str, Any]] = []
+        self._seed = seed
+        if seed is not None:
+            _log(f"[seed] every model/condition seeded with {seed}")
 
         for model_spec in selected_models:
             newly_trained = self._process_one_model_spec(
@@ -1149,6 +1792,7 @@ class BenchmarkRunner:
             model_key, condition, training_hyperparameters, allow_pqat
         )
         model = build_model(model_key, **self._model_kwargs(model_key))
+        dense_param_count = sum(parameter.numel() for parameter in model.parameters())
         condition_dir = self.results_root / model_key / condition.key
         pai_config_snapshot = condition_dir / "PAI_config.json"
         batches_per_epoch = self._batches_per_epoch(bundle)
@@ -1179,9 +1823,22 @@ class BenchmarkRunner:
         memory_cleanup_interval_batches = self._memory_cleanup_interval_batches(
             model_key, condition, batches_per_epoch
         )
+        dynamic_schedule = (
+            self._pai_dynamic_schedule(model_key)
+            if training_plan.update_dendrites_during_training
+            else None
+        )
+        fixed_switch_interval = (
+            self._pai_fixed_switch_interval(model_key)
+            if training_plan.update_dendrites_during_training
+            else None
+        )
         training_config = TrainingConfig(
             bit_width=condition.bit_width,
             quantization_mode=condition.quantization_mode,
+            quantization_granularity=self._quantization_granularity(
+                model_key, condition
+            ),
             use_dendrites=condition.use_dendrites,
             use_pruning=condition.use_pruning,
             prune_amount=condition.prune_amount,
@@ -1197,8 +1854,26 @@ class BenchmarkRunner:
             lr_decay_every=training_hyperparameters.lr_decay_every,
             lr_decay_gamma=training_hyperparameters.lr_decay_gamma,
             lr_min_factor=training_hyperparameters.lr_min_factor,
+            lr_schedule_epochs=training_hyperparameters.lr_schedule_epochs,
+            dendrite_lr_min_factor=training_hyperparameters.dendrite_lr_min_factor,
+            max_dynamic_training_epochs=self._dynamic_training_epoch_cap(
+                training_plan, dynamic_schedule
+            ),
+            quantization_evaluation_revision=(
+                QUANTIZATION_EVALUATION_REVISION if condition.quantized else None
+            ),
+            dendrite_audit_revision=(
+                DENDRITE_AUDIT_REVISION if condition.use_dendrites else None
+            ),
+            dense_param_count=dense_param_count,
+            source_dendrite_audit_status=(
+                self._saved_dendrite_audit_status(condition.source_key, saved_dirs)
+                if condition.use_dendrites and condition.source_key != condition.key
+                else None
+            ),
             warmup_epochs=training_hyperparameters.warmup_epochs,
             label_smoothing=training_hyperparameters.label_smoothing,
+            regression_loss=training_hyperparameters.regression_loss,
             grad_clip_norm=training_hyperparameters.grad_clip_norm,
             source_condition_key=condition.source_key,
             enable_pai_dendrite_updates=training_plan.update_dendrites_during_training,
@@ -1210,6 +1885,13 @@ class BenchmarkRunner:
             pai_candidate_graph_batch_limit=pai_candidate_graph_batch_limit,
             memory_cleanup_interval_batches=memory_cleanup_interval_batches,
             pai_save_name=self._pai_save_name(model_key, condition.key),
+            model_scale=self._model_scale,
+            pai_variant=self._pai_variant,
+            model_revision=self._model_artifact_revision(model_key),
+            pai_fixed_switch_interval=fixed_switch_interval,
+            pai_dynamic_schedule=(
+                dynamic_schedule.to_dict() if dynamic_schedule is not None else None
+            ),
         )
         return train_and_evaluate(
             model_key=model_key,
@@ -1292,6 +1974,7 @@ DEFAULT_PROGRESS_INTERVAL = 60
 # _DEFAULT_COST_HOURS.
 _MODEL_COST_HOURS: dict[str, float] = {
     "resnet18_cifar10": 8.6,
+    "resnet18_hf_perforated_cifar10": 2.5,
     "mobilenetv2_cifar10": 8.0,
     "snn_nmnist": 4.4,
     "capsnet_mnist": 3.8,

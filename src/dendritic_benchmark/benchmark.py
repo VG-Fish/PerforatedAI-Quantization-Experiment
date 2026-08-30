@@ -110,6 +110,7 @@ def get_model_input_shapes(model_key: str) -> tuple:
         "snn_nmnist": (2, 34, 34),
         "unet_isic": (3, 128, 128),
         "resnet18_cifar10": (3, 32, 32),
+        "resnet18_hf_perforated_cifar10": (3, 32, 32),
         "mobilenetv2_cifar10": (3, 32, 32),
         "saint_adult": (ADULT_FEATURES,),
         "capsnet_mnist": (1, 28, 28),
@@ -267,6 +268,30 @@ class BenchmarkOrchestrator:
                 and hasattr(model_state[key], "shape")
                 and value.shape == model_state[key].shape
             }
+            # A dendritic model.pt carries PerforatedAI wrapper key names, so
+            # against a plain build_model() skeleton almost nothing matches.
+            # The old strict=False load then "succeeded" on a handful of
+            # tensors and the latency row silently described an unperforated,
+            # mostly randomly-initialized network — dendrites_* latencies were
+            # base-architecture numbers. Refuse instead: a missing row is
+            # honest, a wrong-architecture row is not.
+            skipped_source = [
+                key for key in state
+                if key not in compatible_state and not key.endswith("tracker_string")
+            ]
+            unfilled_target = [
+                key for key in model_state
+                if key not in compatible_state and not key.endswith("tracker_string")
+            ]
+            if skipped_source or unfilled_target:
+                _log(
+                    f"model.pt in {condition_dir.name} does not match the plain "
+                    f"model architecture ({len(skipped_source)} checkpoint "
+                    f"tensor(s) unloadable, {len(unfilled_target)} model "
+                    "tensor(s) unfilled — likely a PerforatedAI dendritic "
+                    "checkpoint); refusing to benchmark the wrong architecture."
+                )
+                return False
             model.load_state_dict(compatible_state, strict=False)
             return True
         except Exception as exc:

@@ -5,7 +5,7 @@ import shutil
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -34,11 +34,12 @@ from .results import (
 )
 from .specs import MODEL_SPECS
 
-argcomplete: Optional[Any] = None
 try:
-    import argcomplete
+    import argcomplete as _argcomplete
 except Exception:  # pragma: no cover - optional runtime enhancement
     argcomplete = None
+else:
+    argcomplete: Any | None = _argcomplete
 
 
 def _log(msg: str) -> None:
@@ -51,6 +52,7 @@ _MODEL_KEYS: str = (
     "lstm_autoencoder, distilbert, dqn_lunarlander, ppo_bipedalwalker, "
     "attentivefp_freesolv, gin_imdbb, tcn_forecaster, gru_forecaster, "
     "pointnet_modelnet40, vae_mnist, snn_nmnist, resnet18_cifar10, "
+    "resnet18_hf_perforated_cifar10, "
     "mobilenetv2_cifar10, saint_adult, capsnet_mnist"
 )
 
@@ -277,7 +279,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
         description=(
             "Dendritic quantization benchmark runner.\n\n"
-            "Trains 25 models across 12 conditions that isolate two factors: "
+            "Trains the registered models across 12 conditions that isolate two factors: "
             "PerforatedAI dendritic augmentation and post-training quantization "
             "(INT8 down to binary). Results are saved under --results-root "
             "and cross-model comparisons under --comparison-root.\n\n"
@@ -338,7 +340,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY",
         help=(
             "Space-separated list of model keys to include. "
-            "Omit to run all 25 models. "
+            "Omit to run all registered models. "
             f"Valid keys: {_MODEL_KEYS}"
         ),
     )
@@ -383,6 +385,37 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run_parser.add_argument(
+        "--model-scale",
+        type=float,
+        default=1.0,
+        metavar="FACTOR",
+        help=(
+            "Scale the width of the compact-capable benchmark models before "
+            "training. Use a value in (0, 1]; 0.75 is the recommended "
+            "parameter-efficiency follow-up. (default: 1.0)"
+        ),
+    )
+    run_parser.add_argument(
+        "--pai-variant",
+        choices=(
+            "default",
+            "gru_gate_ablation",
+            "mpnn_capacity",
+            "tcn_head_both",
+            "tcn_head_output",
+            "vae_latent",
+        ),
+        default="default",
+        help=(
+            "Select a measured PAI targeting ablation. `default` uses the "
+            "current targeted settings; `tcn_head_output`/`tcn_head_both` "
+            "screen alternate TCN head targets; `gru_gate_ablation` restores "
+            "the prior gate search; `vae_latent` perforates VAE latent heads; "
+            "`mpnn_capacity` permits a fourth targeted MPNN dendrite. "
+            "(default: default)"
+        ),
+    )
+    run_parser.add_argument(
         "-j",
         "--jobs",
         type=int,
@@ -414,6 +447,22 @@ def build_parser() -> argparse.ArgumentParser:
             "not cover these: training resumes from an epoch checkpoint whenever "
             "one exists, so after a model definition change a stale checkpoint "
             "would silently continue an old-architecture run."
+        ),
+    )
+    run_parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Seed Python, NumPy and torch RNGs before every model/condition. "
+            "Omit to leave them unseeded (the historical behaviour). Without a "
+            "seed, run-to-run variance can exceed the effect being measured: "
+            "gcn's base_fp32 moved 3.4pp between two runs of the identical "
+            "command, against a dendrite effect of 0.30pp. Re-seeding per "
+            "condition also makes a model's base_* and dendrites_* arms start "
+            "from the same weights, so the two are a paired comparison. Vary "
+            "this across runs to get the error bars that variance demands."
         ),
     )
     run_mode = run_parser.add_mutually_exclusive_group()
@@ -467,7 +516,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY",
         help=(
             "Space-separated list of model keys whose datasets should be downloaded. "
-            "Omit to download datasets for all 25 models. "
+            "Omit to download datasets for all registered models. "
             f"Valid keys: {_MODEL_KEYS}"
         ),
     )
@@ -595,7 +644,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY",
         help=(
             "Space-separated list of model keys to benchmark. "
-            "Omit to benchmark all 25 models. "
+            "Omit to benchmark all registered models. "
             f"Valid keys: {_MODEL_KEYS}"
         ),
     )
@@ -663,7 +712,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
-    runner = BenchmarkRunner(results_root=results_root, comparison_root=comparison_root)
+    runner = BenchmarkRunner(
+        results_root=results_root,
+        comparison_root=comparison_root,
+        model_scale=args.model_scale,
+        pai_variant=args.pai_variant,
+    )
     selected_models = args.models or [spec.key for spec in MODEL_SPECS]
 
     # A worker is one of the processes a parallel run spawned. It trains its
@@ -677,6 +731,7 @@ def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
             allow_pqat=args.allow_pqat,
             dynamic_dendritic_training=args.dynamic_dendritic_training,
             write_reports=False,
+            seed=args.seed,
         )
         return
 
@@ -687,6 +742,7 @@ def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
             ignore_saved=args.ignore_saved_models,
             allow_pqat=args.allow_pqat,
             dynamic_dendritic_training=args.dynamic_dendritic_training,
+            seed=args.seed,
         )
         return
 
@@ -725,6 +781,12 @@ def _run_passthrough(args: Any, comparison_root: Path) -> list[str]:
         flags.append("--allow-PQAT")
     if args.dynamic_dendritic_training:
         flags.append("--dynamic-dendritic-training")
+    if args.model_scale != 1.0:
+        flags += ["--model-scale", str(args.model_scale)]
+    if args.pai_variant != "default":
+        flags += ["--pai-variant", args.pai_variant]
+    if args.seed is not None:
+        flags += ["--seed", str(args.seed)]
     return flags
 
 
