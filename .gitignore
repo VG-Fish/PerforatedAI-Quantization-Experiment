@@ -31,6 +31,7 @@ experiments/
 # and short usage note belong with the source tree.
 !experiments/
 experiments/*
+!experiments/PAI_GRAPH_FOLDERS.md
 !experiments/dynamic12/
 experiments/dynamic12/*
 !experiments/dynamic12/README.md
