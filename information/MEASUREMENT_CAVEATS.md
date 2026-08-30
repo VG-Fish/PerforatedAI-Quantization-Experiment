@@ -1194,8 +1194,38 @@ retention here is attributable to the epoch-cap change (+28 vs +16), **not** to
 the learning-rate floor -- floor-off retains a dendrite too. Second, SAINT is a
 weak test of this fix: its floor case is 2e-6 against 1e-5, both negligible
 rates, whereas ResNet-18's is 0.0 against 0.01, which is categorical rather
-than a factor of five. The ResNet-18 A/B is the one that can actually answer
-this, and it has not been run to completion yet.
+than a factor of five.
+
+**The ResNet-18 A/B (2026-08-30) is the stronger test, and it came out null
+too.** Same 8-epoch dendrite budget, fast-switch, seed 0, floor 0.0 vs 0.01 --
+a 10^4x ratio rather than SAINT's 5x:
+
+| | dendrites_fp32 best | best_epoch |
+|---|---|---|
+| floor off (0.0) | 0.9036 | 22 |
+| floor on (0.01) | 0.9039 | 30 |
+
+`history.csv` makes this exact rather than approximate: per-epoch validation
+accuracy is **bit-identical between the two runs for every epoch of the
+p-phase** (epochs 20-27, the only window where the schedules actually differ --
+lr=0.0 vs lr=0.01 on the dendrite group, confirmed from the raw history rows).
+The dendrite itself trained at a genuinely different rate in each run --
+`_apply_lr_schedule` is doing what it says -- and it changed nothing
+observable. The 0.0003 final-accuracy gap traces to a `best_epoch` pick (30 vs
+22) after the two runs' post-p-phase RNG streams decorrelated, not to the
+floor.
+
+So: across the two models this has been tested on, one weak test and one
+categorical test, the learning-rate floor has not moved a single outcome. The
+fix remains mechanically verified -- the dendrite parameter group really does
+train at a different, non-collapsed rate -- but it should currently be read as
+**inert-so-far**, not as a performance improvement. The most likely reading is
+that an 8-epoch p-phase, even at a live rate, is too short for a
+freshly-initialized dendrite's training rate to matter next to *whether* it
+gets retained at all (the epoch-cap change). A longer p-phase budget, or a
+model whose dendrite has more to learn than ResNet's single wide `.pre_fc`
+projection, would be a better next test than assuming the current null
+generalizes.
 
 ### Scope of invalidated data
 

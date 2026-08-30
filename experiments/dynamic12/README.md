@@ -89,10 +89,15 @@ group first exists. If that line never appears, no dendrite was retained.
 
 What is measured so far: the mechanism is verified (a real optimizer step at
 epoch 228 moves the dendrite and not the backbone), and the floor is verified
-inert while the schedule stays above it. It is **not** yet measured to change
-any outcome — a SAINT A/B in the binding regime came out inside run-to-run
-noise, and dendrite retention there came from the epoch cap, not the floor.
-See MEASUREMENT_CAVEATS §11.
+inert while the schedule stays above it. It is **not** measured to change any
+outcome on either model tested: a SAINT A/B in the binding regime came out
+inside run-to-run noise, and dendrite retention there came from the epoch cap,
+not the floor. A follow-up ResNet-18 A/B (0.0 vs 0.01 — a categorical rather
+than marginal difference) went further: per-epoch validation accuracy was
+**bit-identical** between floor-on and floor-off for every epoch of the
+p-phase, the only window the two schedules actually differ. The floor is
+mechanically real but inert-so-far on both cases tried. See
+MEASUREMENT_CAVEATS §11.
 
 With both changes in place all three priority models retain a dendrite on a
 short run, each adding exactly the documented per-dendrite cost:
