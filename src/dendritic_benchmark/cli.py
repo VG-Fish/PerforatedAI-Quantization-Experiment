@@ -5,7 +5,7 @@ import shutil
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -34,11 +34,12 @@ from .results import (
 )
 from .specs import MODEL_SPECS
 
-argcomplete: Optional[Any] = None
 try:
-    import argcomplete
+    import argcomplete as _argcomplete
 except Exception:  # pragma: no cover - optional runtime enhancement
     argcomplete = None
+else:
+    argcomplete: Any | None = _argcomplete
 
 
 def _log(msg: str) -> None:

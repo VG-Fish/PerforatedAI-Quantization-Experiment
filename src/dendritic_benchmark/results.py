@@ -70,7 +70,7 @@ def _load_best_model_stats(condition_dir: Path) -> dict[str, Any] | None:
     if not stats_path.exists():
         return None
     with stats_path.open("r", newline="") as fh:
-        reader = csv.DictReader(fh)
+        reader = csv.DictReader(fh)  # type: ignore[no-matching-overload]
         row = next(reader, None)
     if not row:
         return None
@@ -194,10 +194,19 @@ def _legacy_dendrite_audit_status(record: dict[str, Any]) -> str | None:
     raw_architecture = summary.get("raw_pai_logs", {}).get("architecture", {})
     source_record = _load_condition_record(source_dir)
     dense_record = _load_condition_record(source_dir.parent / "base_fp32")
+    final_param_count = (source_record or {}).get("param_count")
+    dense_param_count = (dense_record or {}).get("param_count")
+    raw_param_count = raw_architecture.get("max_param_count")
+    if (
+        final_param_count is None
+        or dense_param_count is None
+        or raw_param_count is None
+    ):
+        return None
     try:
-        final_params = int((source_record or {}).get("param_count"))
-        dense_params = int((dense_record or {}).get("param_count"))
-        raw_params = int(raw_architecture.get("max_param_count"))
+        final_params = int(final_param_count)
+        dense_params = int(dense_param_count)
+        raw_params = int(raw_param_count)
     except (TypeError, ValueError):
         return None
     if (
@@ -531,7 +540,7 @@ def _load_history_csv(history_file: Path) -> tuple[list[dict[str, Any]], list[st
     history: list[dict[str, Any]] = []
     try:
         with history_file.open("r", newline="") as fh:
-            reader = csv.DictReader(fh)
+            reader = csv.DictReader(fh)  # type: ignore[no-matching-overload]
             for row in reader:
                 parsed_row: dict[str, Any] = {}
                 for key, value in row.items():
@@ -579,7 +588,7 @@ def _write_arch_evolution(
     try:
         arch_history = []
         with best_arch_file.open("r", newline="") as fh:
-            reader = csv.DictReader(fh)
+            reader = csv.DictReader(fh)  # type: ignore[no-matching-overload]
             for row in reader:
                 arch_history.append(
                     {"cycle": int(row["cycle"]), "best_metric_value": float(row["best_metric_value"])}
@@ -823,7 +832,7 @@ def _load_benchmark_manifest_rows(benchmark_root: Path) -> list[dict[str, Any]]:
     if not manifest_path.exists():
         return []
     with manifest_path.open("r", newline="") as fh:
-        rows = list(csv.DictReader(fh))
+        rows = list(csv.DictReader(fh))  # type: ignore[no-matching-overload]
 
     parsed_rows: list[dict[str, Any]] = []
     for row in rows:

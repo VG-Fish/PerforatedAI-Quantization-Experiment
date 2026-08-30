@@ -234,7 +234,7 @@ def main() -> None:
     device = choose_device()
     print(f"Dynamic12 model smoke test on {device} (scale={args.model_scale}, seed={args.seed})")
     print("model             loss         parameters  output                         PTQ")
-    with tempfile.TemporaryDirectory(prefix="dynamic12_model_smoke_") as temporary_directory:
+    with tempfile.TemporaryDirectory(prefix="dynamic12_model_smoke_") as temporary_directory:  # type: ignore[no-matching-overload]
         smoke_root = Path(temporary_directory)
         for model_key in args.models:
             result = smoke_model(model_key, args.model_scale, device, smoke_root)

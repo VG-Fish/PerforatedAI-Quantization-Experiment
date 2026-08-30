@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import torch
 import torch.nn as nn
@@ -1290,7 +1290,7 @@ class BenchmarkRunner:
     @staticmethod
     def _quantization_granularity(
         model_key: str, condition: ConditionSpec
-    ) -> str:
+    ) -> Literal["tensor", "channel"]:
         """Choose the quantizer scale layout without changing its bit codes."""
         if (
             condition.quantization_mode == "ternary"
@@ -1327,7 +1327,7 @@ class BenchmarkRunner:
         condition_dir = self.results_root / model_key / condition.key
         record_path = condition_dir / _RECORD_JSON
         _log(f"[skip] {model_key} / {condition.key} — record.json found, skipping training.")
-        record = TrainingRecord(**json.loads(record_path.read_text()))
+        record = cast(Any, TrainingRecord)(**json.loads(record_path.read_text()))
         model_records.append(record.to_dict())
         all_records.append(record.to_dict())
         saved_dirs[condition.key] = condition_dir

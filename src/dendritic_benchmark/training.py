@@ -881,8 +881,8 @@ def _evaluate_episodic_return(
         return {}
     env_id, continuous = entry
     try:
-        gymnasium = importlib.import_module("gymnasium")
-        env = gymnasium.make(env_id)
+        gymnasium: Any = importlib.import_module("gymnasium")
+        env = getattr(gymnasium, "make")(env_id)
     except Exception as exc:  # missing gymnasium, missing Box2D, bad env id
         print(f"[rl-eval] {model_key}: {env_id} unavailable ({exc}); skipping return")
         return {}
@@ -1641,7 +1641,7 @@ def _load_continued_history(output_dir: Path) -> list[dict[str, Any]]:
         return []
     try:
         with path.open(newline="") as fh:
-            return list(csv.DictReader(fh))
+            return list(csv.DictReader(fh))  # type: ignore[no-matching-overload]
     except (OSError, csv.Error):
         return []
 
@@ -1656,7 +1656,7 @@ def _read_pai_architecture_log(save_name: str | None) -> dict[str, Any]:
         return {"status": "missing", "path": str(path)}
     try:
         with path.open(newline="") as fh:
-            rows = list(csv.DictReader(fh))
+            rows = list(csv.DictReader(fh))  # type: ignore[no-matching-overload]
     except (OSError, csv.Error):
         return {"status": "unreadable", "path": str(path)}
     if not rows:
@@ -1688,7 +1688,7 @@ def _read_pai_switch_log(save_name: str | None) -> dict[str, Any]:
         return {"status": "missing", "path": str(path)}
     try:
         with path.open(newline="") as fh:
-            rows = list(csv.DictReader(fh))
+            rows = list(csv.DictReader(fh))  # type: ignore[no-matching-overload]
     except (OSError, csv.Error):
         return {"status": "unreadable", "path": str(path)}
     epoch_column = next(
@@ -2011,8 +2011,8 @@ def _pai_tracker() -> Any | None:
 
 def _pai_module_count(model: Any) -> int | None:
     try:
-        upa = importlib.import_module("perforatedai.utils_perforatedai")
-        return len(upa.get_pai_modules(model, 0))
+        upa: Any = importlib.import_module("perforatedai.utils_perforatedai")
+        return len(getattr(upa, "get_pai_modules")(model, 0))
     except Exception:
         return None
 
@@ -2049,8 +2049,8 @@ def _copy_pai_graphs_to_output(pai_save_name: str, output_dir: Path) -> None:
 
 def _post_pai_run_config_event(config: TrainingConfig) -> None:
     try:
-        gpa = importlib.import_module("perforatedai.globals_perforatedai")
-        events_url = getattr(gpa.pc, "events_url", None)
+        gpa: Any = importlib.import_module("perforatedai.globals_perforatedai")
+        events_url = getattr(getattr(gpa, "pc"), "events_url", None)
         if not events_url:
             return
         import requests
@@ -2085,11 +2085,11 @@ def _pai_pdb_suppressed() -> "Any":
     def _no_set_trace(*, header: str | None = None) -> None:
         _ = header
 
-    pdb_module.set_trace = _no_set_trace
+    setattr(pdb_module, "set_trace", _no_set_trace)
     try:
         yield
     finally:
-        pdb_module.set_trace = original
+        setattr(pdb_module, "set_trace", original)
 
 
 def _warn_pai_optimizer_fallback(exc: BaseException) -> None:
@@ -3219,7 +3219,7 @@ def _run_dynamic_dendrite_update(
 
     pdb_module: Any = _pdb
     _orig_set_trace: Callable[..., None] = pdb_module.set_trace
-    pdb_module.set_trace = _no_set_trace
+    setattr(pdb_module, "set_trace", _no_set_trace)
     try:
         module_dimensions = getattr(
             context.model, MODULE_OUTPUT_DIMENSIONS_ATTR, None
@@ -3261,7 +3261,7 @@ def _run_dynamic_dendrite_update(
             "of continuing without PAI."
         ) from pai_exc
     finally:
-        pdb_module.set_trace = _orig_set_trace
+        setattr(pdb_module, "set_trace", _orig_set_trace)
 
 
 def _dendrite_freeze_start_epoch(max_epochs: int, freeze_fraction: float) -> int | None:
@@ -3585,9 +3585,10 @@ def _scheduled_learning_rate(
         # epoch 0 gets base/warmup rather than 0, which would be a dead epoch.
         return base * float(epoch + 1) / float(warmup)
     if config.lr_schedule == "step":
-        if not config.lr_decay_every:
+        lr_decay_every = config.lr_decay_every
+        if not lr_decay_every:
             return None
-        return base * (config.lr_decay_gamma ** (epoch // config.lr_decay_every))
+        return base * (config.lr_decay_gamma ** (epoch // lr_decay_every))
     if config.lr_schedule not in {"cosine", "linear"}:
         return None
     floor = base * config.lr_min_factor
@@ -3619,8 +3620,9 @@ def _run_training_epochs(
         context.config.train_dendrites_until_complete and pai_tracker is not None
     )
     start_epoch = 0
-    if context.output_dir is not None:
-        ckpt = _load_epoch_checkpoint(context.output_dir, context.torch)
+    output_dir = context.output_dir
+    if output_dir is not None:
+        ckpt = _load_epoch_checkpoint(output_dir, context.torch)
         if ckpt is not None:
             # Restore the dendrite structure first so the checkpoint's tensors
             # and optimizer groups have something shaped like them to land in.
@@ -3658,13 +3660,13 @@ def _run_training_epochs(
             config=context.config,
             location=f"{context.run_label} epoch {epoch + 1} end",
         )
-        if context.output_dir is not None:
+        if output_dir is not None:
             # Written before the epoch checkpoint so the PAI snapshot's
             # tracker_string buffer is already on the model when its
             # state_dict is captured, keeping the two files consistent.
             _save_pai_resume_state(context)
             _save_epoch_checkpoint(
-                context.output_dir, epoch, state, optimizer, context.model, context.torch
+                output_dir, epoch, state, optimizer, context.model, context.torch
             )
         _update_epoch_progress(epoch_progress, context, state, val_metric)
         if _training_collapsed(state, context.metric_direction):
@@ -3953,9 +3955,10 @@ def _configure_mps_matmul_precision(torch: Any, device: Any) -> None:
 
 
 def _is_pqat_enabled(config: TrainingConfig, condition_key: str) -> bool:
+    bit_width = config.bit_width
     return (
-        config.bit_width is not None
-        and config.bit_width < 32
+        bit_width is not None
+        and bit_width < 32
         and config.use_qat
         and config.fine_tune_epochs > 0
         and config.source_condition_key is not None
@@ -3964,11 +3967,13 @@ def _is_pqat_enabled(config: TrainingConfig, condition_key: str) -> bool:
 
 
 def _should_quantize_for_training(config: TrainingConfig) -> bool:
-    return config.bit_width is not None and config.bit_width < 32 and config.use_qat
+    bit_width = config.bit_width
+    return bit_width is not None and bit_width < 32 and config.use_qat
 
 
 def _should_quantize_for_eval(config: TrainingConfig) -> bool:
-    return config.bit_width is not None and config.bit_width < 32
+    bit_width = config.bit_width
+    return bit_width is not None and bit_width < 32
 
 
 def _use_pai_runtime_guard() -> bool:
@@ -4079,7 +4084,7 @@ def train_and_evaluate(
     pai_guard = (
         pai_runtime_guard()
         if use_dendrites and _use_pai_runtime_guard()
-        else nullcontext()
+        else nullcontext(None)  # type: ignore[no-matching-overload]
     )
     with pai_guard:
         optimizer, pai_tracker = _setup_pai_optimizer(model, torch, config)
@@ -4142,7 +4147,8 @@ def train_and_evaluate(
         # information/MEASUREMENT_CAVEATS.md #3.
         _load_compatible_best_state(model, best_state)
 
-    if use_dendrites and config.pai_save_name:
+    pai_save_name = config.pai_save_name
+    if use_dendrites and pai_save_name:
         # Pin the PAI structure to the artifact, not to the epoch loop.
         #
         # model.pt is written from `model` as it stands right here: after the
@@ -4161,7 +4167,7 @@ def train_and_evaluate(
         # instant by construction, which is the only way the two independent
         # checkpoint systems can be kept in agreement.
         save_pai_system(
-            _unwrap_compiled(model), config.pai_save_name, PAI_ARTIFACT_NAME
+            _unwrap_compiled(model), pai_save_name, PAI_ARTIFACT_NAME
         )
 
     model = _finalize_quantized_model_for_eval(model, config)
@@ -4284,6 +4290,6 @@ def train_and_evaluate(
         dendrite_audit_reason=str(dendrite_audit["reason"]),
     )
     _write_best_model_stats_csv(output_dir, record)
-    if use_dendrites and config.pai_save_name:
-        _copy_pai_graphs_to_output(config.pai_save_name, output_dir)
+    if use_dendrites and pai_save_name:
+        _copy_pai_graphs_to_output(pai_save_name, output_dir)
     return record

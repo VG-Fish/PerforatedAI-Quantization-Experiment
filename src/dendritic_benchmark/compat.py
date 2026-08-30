@@ -829,7 +829,7 @@ def perforate_model(
         _mirror_env_aliases()
         runtime_options = runtime_options or PAIRuntimeOptions()
         GPA = importlib.import_module(_PAI_GLOBALS_MODULE)
-        UPA = importlib.import_module("perforatedai.utils_perforatedai")
+        UPA: Any = importlib.import_module("perforatedai.utils_perforatedai")
         upa_perforate_model = getattr(UPA, "perforate_model")
 
         modules_mod = importlib.import_module("perforatedai.modules_perforatedai")
@@ -930,9 +930,9 @@ def save_pai_system(
     a zero-dendrite model and restarts the schedule from the first cycle.
     """
     try:
-        UPA = importlib.import_module("perforatedai.utils_perforatedai")
+        UPA: Any = importlib.import_module("perforatedai.utils_perforatedai")
         with _suppress_pai_debugger(), pai_working_directory():
-            UPA.save_system(model, _pai_flat_save_name(save_name), name)
+            getattr(UPA, "save_system")(model, _pai_flat_save_name(save_name), name)
     except Exception as exc:
         print(
             f"[pai-state] could not snapshot PAI state ({exc}); a resumed run "
@@ -957,7 +957,7 @@ def load_pai_system(
             # load_from_manual_save keeps PAI from advancing its epoch counter:
             # its own periodic saves happen before start_epoch, whereas this
             # snapshot is taken after add_validation_score has already run it.
-            return UPA.load_system(
+            return getattr(UPA, "load_system")(
                 model,
                 _pai_flat_save_name(save_name),
                 name,

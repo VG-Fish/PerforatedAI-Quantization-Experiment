@@ -152,6 +152,9 @@ class DendriticGRUCell(nn.Module):
     that; see the note there for why the benchmark cares.
     """
 
+    input_gates: nn.Linear
+    hidden_gates: nn.Linear
+
     def __init__(self, input_size: int, hidden_size: int):
         super().__init__()
         self.hidden_size = hidden_size
@@ -670,7 +673,7 @@ def _orthogonal_init(layer: nn.Linear, gain: float, bias: float = 0.0) -> None:
     """
     nn.init.orthogonal_(layer.weight, gain)
     if layer.bias is not None:
-        nn.init.constant_(layer.bias, bias)
+        nn.init.constant_(cast(torch.Tensor, layer.bias), bias)
 
 
 class RunningObsNorm(nn.Module):
@@ -1183,7 +1186,8 @@ class GRUForecaster(nn.Module):
             std = x.std(1, keepdim=True).clamp_min(1e-5)
             x = (x - mean) / std
         sequence = x
-        for cell in self.cells:
+        for module in self.cells:
+            cell = cast(DendriticGRUCell, module)
             gates = cell.input_gates(sequence)
             state = sequence.new_zeros(sequence.shape[0], self.hidden)
             # Retain the final-layer trajectory too: the decoder pools several

@@ -6,28 +6,33 @@ from __future__ import annotations
 import argparse
 import math
 import time
+from typing import Any
 
 import torch
 
 from dendritic_benchmark.compat import choose_device
-from dendritic_benchmark.data import build_task_bundle
+from dendritic_benchmark.data import TaskBundle, build_task_bundle
 from dendritic_benchmark.models import build_model
 from dendritic_benchmark.training import _compute_loss
 
 
-def evaluate(model: torch.nn.Module, loader: object, device: torch.device) -> float:
+def evaluate(model: torch.nn.Module, loader: Any, device: torch.device) -> float:
     model.eval()
     total_loss, examples = 0.0, 0
     with torch.no_grad():
-        for batch in loader:  # type: ignore[union-attr]
+        for batch in loader:
             inputs = batch[0].to(device)
             outputs = model(inputs)
             total_loss += _compute_loss("vae_mnist", None, outputs, inputs).item() * inputs.size(0)
             examples += inputs.size(0)
-    return -total_loss / max(1, examples)
+    if examples == 0:
+        return -total_loss
+    return -total_loss / examples
 
 
-def run_arm(scale: float, seed: int, epochs: int, bundle: object, device: torch.device) -> tuple[int, float, float]:
+def run_arm(
+    scale: float, seed: int, epochs: int, bundle: TaskBundle, device: torch.device
+) -> tuple[int, float, float]:
     torch.manual_seed(seed)
     model = build_model("vae_mnist", model_scale=scale).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1.0e-3)

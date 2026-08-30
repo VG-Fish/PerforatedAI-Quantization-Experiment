@@ -6,20 +6,27 @@ from __future__ import annotations
 import argparse
 import math
 import time
+from typing import Any
 
 import torch
 
 from dendritic_benchmark.compat import choose_device
-from dendritic_benchmark.data import build_task_bundle
+from dendritic_benchmark.data import TaskBundle, build_task_bundle
 from dendritic_benchmark.models import GRUForecaster
 
 
-def evaluate(model: torch.nn.Module, loader: object, device: torch.device, scale: float, offset: float) -> float:
+def evaluate(
+    model: torch.nn.Module,
+    loader: Any,
+    device: torch.device,
+    scale: float,
+    offset: float,
+) -> float:
     model.eval()
     total_error = 0.0
     examples = 0
     with torch.no_grad():
-        for inputs, targets in loader:  # type: ignore[union-attr]
+        for inputs, targets in loader:
             inputs, targets = inputs.to(device), targets.to(device)
             predictions = model(inputs)
             total_error += (
@@ -27,10 +34,14 @@ def evaluate(model: torch.nn.Module, loader: object, device: torch.device, scale
                 * inputs.size(0)
             )
             examples += inputs.size(0)
-    return total_error / max(1, examples)
+    if examples == 0:
+        return total_error
+    return total_error / examples
 
 
-def run_arm(width: int, seed: int, epochs: int, bundle: object, device: torch.device) -> tuple[int, float, float]:
+def run_arm(
+    width: int, seed: int, epochs: int, bundle: TaskBundle, device: torch.device
+) -> tuple[int, float, float]:
     torch.manual_seed(seed)
     model = GRUForecaster(hidden=48, decoder_hidden=width).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=3.0e-4)

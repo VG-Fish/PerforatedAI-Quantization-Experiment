@@ -112,7 +112,7 @@ def main() -> None:
     if not 0 < args.model_scale <= 1:
         raise ValueError("--model-scale must be greater than zero and at most one")
     cases = _target_cases(args.models)
-    with tempfile.TemporaryDirectory(prefix="dynamic12_pai_target_smoke_") as temporary_directory:
+    with tempfile.TemporaryDirectory(prefix="dynamic12_pai_target_smoke_") as temporary_directory:  # type: ignore[no-matching-overload]
         root = Path(temporary_directory)
         print(f"Dynamic12 PAI target smoke test (scale={args.model_scale})")
         print("model             variant            target -> inferred output dimensions")

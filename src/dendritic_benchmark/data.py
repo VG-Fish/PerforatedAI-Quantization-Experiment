@@ -8,7 +8,7 @@ import zipfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, cast
 
 import torch
 
@@ -509,8 +509,11 @@ def _bundle_from_dataset(
     *,
     num_workers: int = 2,
 ) -> TaskBundle:
+    train_ds, val_ds, test_ds = _split_dataset(dataset)
     return _bundle_from_splits(
-        *_split_dataset(dataset),
+        train_ds,
+        val_ds,
+        test_ds,
         batch_size,
         metric_name,
         metric_direction,
@@ -539,17 +542,20 @@ class VisionDatasets:
         random translation below reproduces; LeNet-5 benefits from the same.
         """
         torchvision = _require_dependency("torchvision")
-        transforms = __import__("torchvision.transforms", fromlist=["transforms"])
+        transforms: Any = __import__("torchvision.transforms", fromlist=["transforms"])
+        compose = getattr(transforms, "Compose")
+        to_tensor = getattr(transforms, "ToTensor")
+        random_affine = getattr(transforms, "RandomAffine")
         root: Path = _data_root() / "mnist"
         root.mkdir(parents=True, exist_ok=True)
-        eval_transform = transforms.Compose([transforms.ToTensor()])
+        eval_transform = compose([to_tensor()])
         train_transform = (
-            transforms.Compose(
+            compose(
                 [
-                    transforms.RandomAffine(
+                    random_affine(
                         degrees=0, translate=(2 / 28, 2 / 28), fill=0
                     ),
-                    transforms.ToTensor(),
+                    to_tensor(),
                 ]
             )
             if augment
@@ -591,21 +597,26 @@ class VisionDatasets:
     @staticmethod
     def cifar10(batch_size: int) -> TaskBundle:
         torchvision = _require_dependency("torchvision")
-        transforms = __import__("torchvision.transforms", fromlist=["transforms"])
+        transforms: Any = __import__("torchvision.transforms", fromlist=["transforms"])
+        compose = getattr(transforms, "Compose")
+        random_crop = getattr(transforms, "RandomCrop")
+        random_horizontal_flip = getattr(transforms, "RandomHorizontalFlip")
+        to_tensor = getattr(transforms, "ToTensor")
+        normalize = getattr(transforms, "Normalize")
         root: Path = _data_root() / "cifar10"
         root.mkdir(parents=True, exist_ok=True)
-        transform = transforms.Compose(
+        transform = compose(
             [
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+                random_crop(32, padding=4),
+                random_horizontal_flip(),
+                to_tensor(),
+                normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
             ]
         )
-        test_transform = transforms.Compose(
+        test_transform = compose(
             [
-                transforms.ToTensor(),
-                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+                to_tensor(),
+                normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
             ]
         )
         train_full = torchvision.datasets.CIFAR10(
@@ -809,7 +820,7 @@ class TimeSeriesDatasets:
         """Read every numeric, non-date column of a CSV into a ``[T, C]`` tensor."""
         rows: list[list[float]] = []
         with path.open(newline="") as fh:
-            reader: csv.DictReader[str] = csv.DictReader(fh)
+            reader: csv.DictReader[str] = csv.DictReader(fh)  # type: ignore[no-matching-overload]
             for row in reader:
                 values: list[float] = []
                 for key, value in row.items():
@@ -836,7 +847,7 @@ class TimeSeriesDatasets:
         path: Path = _download(ETTH1_URL, _data_root() / "etth1" / "ETTh1.csv")
         rows: list[float] = []
         with path.open(newline="") as fh:
-            reader: csv.DictReader[str] = csv.DictReader(fh)
+            reader: csv.DictReader[str] = csv.DictReader(fh)  # type: ignore[no-matching-overload]
             for row in reader:
                 rows.append(float(row["OT"]))
         return _chronological_forecast_bundle(
@@ -918,7 +929,10 @@ class TimeSeriesDatasets:
 class TextDataSets:
     @staticmethod
     def _tokenize(text: str) -> list[str]:
-        return "".join(char.lower() if char.isalnum() else " " for char in text).split()
+        return cast(
+            list[str],
+            "".join(char.lower() if char.isalnum() else " " for char in text).split(),
+        )
 
     @staticmethod
     def _build_vocab(texts: Iterable[str], vocab_size: int) -> dict[str, int]:
@@ -1544,7 +1558,7 @@ class GraphDatasets:
         edge_features: list[Any] = []
         labels: list[float] = []
         with path.open(newline="") as fh:
-            reader: csv.DictReader[str] = csv.DictReader(fh)
+            reader: csv.DictReader[str] = csv.DictReader(fh)  # type: ignore[no-matching-overload]
             for row in reader:
                 smiles: str | None = (
                     row.get("smiles") or row.get("smile") or row.get("SMILES")
@@ -1818,8 +1832,11 @@ def _build_cartpole(batch_size: int) -> TaskBundle:
     # heuristic. An episodic return *is* now measured once at the end of
     # training — see _evaluate_episodic_return in training.py — and that is the
     # number to read against published CartPole results.
+    train_ds, val_ds, test_ds = _split_by_episode(_TensorRowsDataset(x, y), episode_ids)
     return _bundle_from_splits(
-        *_split_by_episode(_TensorRowsDataset(x, y), episode_ids),
+        train_ds,
+        val_ds,
+        test_ds,
         batch_size,
         "Action Accuracy",
         "maximize",
@@ -1854,8 +1871,11 @@ def _build_lunarlander(batch_size: int) -> TaskBundle:
         discrete=True,
     )
     # Behaviour cloning, not reinforcement learning — see _build_cartpole.
+    train_ds, val_ds, test_ds = _split_by_episode(_TensorRowsDataset(x, y), episode_ids)
     return _bundle_from_splits(
-        *_split_by_episode(_TensorRowsDataset(x, y), episode_ids),
+        train_ds,
+        val_ds,
+        test_ds,
         batch_size,
         "Action Accuracy",
         "maximize",
@@ -2528,10 +2548,12 @@ def _build_modelnet40(batch_size: int) -> TaskBundle:
 
 def _build_nmnist(batch_size: int) -> TaskBundle:
     tonic = _require_dependency("tonic")
-    transforms = __import__("tonic.transforms", fromlist=["transforms"])
-    transform = transforms.Compose(
+    transforms: Any = __import__("tonic.transforms", fromlist=["transforms"])
+    compose = getattr(transforms, "Compose")
+    to_frame = getattr(transforms, "ToFrame")
+    transform = compose(
         [
-            transforms.ToFrame(
+            to_frame(
                 sensor_size=tonic.datasets.NMNIST.sensor_size,
                 n_time_bins=10,
             ),
@@ -2588,10 +2610,11 @@ class _ISICDataset:
         return len(self.samples)
 
     def __getitem__(self, index: int) -> tuple[Any, Any]:
-        pil_image = __import__("PIL.Image", fromlist=["Image"])
+        pil_image: Any = __import__("PIL.Image", fromlist=["Image"])
+        open_image = getattr(pil_image, "open")
         image_path, mask_path = self.samples[index]
-        image = pil_image.open(image_path).convert("RGB").resize((self.image_size, self.image_size))
-        mask = pil_image.open(mask_path).convert("L").resize((self.image_size, self.image_size))
+        image = open_image(image_path).convert("RGB").resize((self.image_size, self.image_size))
+        mask = open_image(mask_path).convert("L").resize((self.image_size, self.image_size))
         image_t = torch.tensor(list(image.getdata()), dtype=torch.float32).view(
             self.image_size, self.image_size, 3
         ).permute(2, 0, 1) / 255.0
@@ -2645,10 +2668,13 @@ class MedicalDatasets:
         # (109, 111) are entirely abnormal, so a random split would put their
         # morphology in training and the autoencoder would reconstruct them as
         # readily as a normal beat.  Train on normal beats only.
+        train_ds, val_ds, test_ds = _split_anomaly_dataset(
+            _TensorRowsDataset(stacked, stacked, label_tensor), label_tensor
+        )
         return _bundle_from_splits(
-            *_split_anomaly_dataset(
-                _TensorRowsDataset(stacked, stacked, label_tensor), label_tensor
-            ),
+            train_ds,
+            val_ds,
+            test_ds,
             batch_size,
             "AUC",
             "maximize",

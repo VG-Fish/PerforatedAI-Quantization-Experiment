@@ -155,7 +155,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
         self.assertEqual(pc.values["set_improvement_threshold"], [0.005, 0.002])
 
     def test_targeted_profiles_keep_only_measured_modules(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             runner = BenchmarkRunner(results_root=Path(root) / "results")
             self.assertEqual(
                 runner._perforation_track_only_module_ids("actor_critic"),
@@ -182,7 +182,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             )
 
     def test_priority_model_profiles_use_safe_late_targets(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             runner = BenchmarkRunner(results_root=Path(root) / "results")
             self.assertEqual(
                 runner._perforation_module_ids_to_perforate("resnet18_cifar10"),
@@ -204,10 +204,10 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                 runner._perforation_module_ids_to_perforate("pointnet_modelnet40"),
                 [".conv3.0", ".head.0"],
             )
-            self.assertEqual(
-                runner._pai_dynamic_schedule("resnet18_cifar10").max_dendrites,
-                1,
-            )
+            schedule = runner._pai_dynamic_schedule("resnet18_cifar10")
+            self.assertIsNotNone(schedule)
+            assert schedule is not None
+            self.assertEqual(schedule.max_dendrites, 1)
 
     def test_priority_models_leave_no_parameter_untyped(self) -> None:
         """Every parameter must be perforated or tracked, or PAI drops into pdb.
@@ -229,7 +229,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             "saint_adult": {"num_classes": 2},
             "pointnet_modelnet40": {"num_classes": 40},
         }
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             runner = BenchmarkRunner(results_root=Path(root) / "results")
             for model_key, kwargs in cases.items():
                 model = build_model(model_key, **kwargs)
@@ -279,7 +279,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
         self.assertIsInstance(
             _binary_or_multi_loss("tcn_forecaster", config), torch.nn.SmoothL1Loss
         )
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             runner = BenchmarkRunner(results_root=Path(root) / "results")
             self.assertEqual(runner._pai_fixed_switch_interval("tcn_forecaster"), 6)
             ternary = condition_by_key("base_q1_58")
@@ -348,7 +348,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
         )
 
     def test_gru_pai_targets_decoder_and_keeps_gate_run_as_ablation(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             runner = BenchmarkRunner(results_root=Path(root) / "results")
             self.assertEqual(
                 runner._perforation_module_ids_to_perforate("gru_forecaster"),
@@ -379,7 +379,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             self.assertIsNone(gate_runner._pai_fixed_switch_interval("gru_forecaster"))
 
     def test_tcn_targets_best_scoring_head_projection_by_default(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             runner = BenchmarkRunner(results_root=Path(root) / "results")
             self.assertEqual(
                 runner._perforation_module_ids_to_perforate("tcn_forecaster"),
@@ -391,7 +391,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             )
 
     def test_vae_uses_fair_horizon_and_channelwise_ternary_pqat(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             runner = BenchmarkRunner(results_root=Path(root) / "results")
             recipe = runner._training_hyperparameters(
                 "vae_mnist", condition_by_key("base_fp32")
@@ -428,7 +428,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
         )
 
     def test_changed_model_revision_invalidates_prior_dynamic11_record(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             root_path = Path(root)
             runner = BenchmarkRunner(results_root=root_path / "results")
             condition_dir = root_path / "results" / "gru_forecaster" / "base_fp32"
@@ -450,7 +450,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             )
 
     def test_summary_marks_stale_raw_architecture_log(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             root_path = Path(root)
             set_pai_root(root_path / "PAI")
             raw_pai_dir = root_path / "PAI" / "gcn_dendrites_fp32"
