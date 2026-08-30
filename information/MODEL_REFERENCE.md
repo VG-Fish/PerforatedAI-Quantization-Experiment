@@ -37,6 +37,19 @@ For each model below, this document captures:
   - `warmup_epochs` — linear ramp from `base/warmup` up to `base`, applied under
     every schedule. Granularity is one epoch, so it is only used on budgets long
     enough for that to be meaningful.
+  - `dendrite_lr_min_factor` — floor applied **only to retained dendrite
+    parameters**, as a fraction of the base rate. Because the rate is a pure
+    function of the absolute epoch index, a dendrite inserted late inherits
+    whatever the anneal has left; for a cosine with `lr_min_factor=0.0` that is
+    exactly zero, which is what ResNet-18 was doing for the entire dynamic tail
+    (MEASUREMENT_CAVEATS §11). PAI's optimizer is built with two parameter
+    groups so this floor reaches the dendrite without touching the backbone —
+    the backbone keeps the identical schedule its dense control runs, so a
+    dendritic gain cannot be an artifact of a warm restart the control never
+    received. Dendrite-side parameters are matched structurally
+    (`<mod>.dendrite_module.layers.*`, `<mod>.dendrites_to_top.*`), excluding
+    `<mod>.dendrite_module.parent_module.*`, PAI's frozen shadow copy. Defaults
+    to `0.0`, an exact no-op; only the three dynamic12 priority models opt in.
 - Regularisation fields:
   - `label_smoothing` — passed to `CrossEntropyLoss`; classification models only
   - `grad_clip_norm` — global-norm clip applied after `backward()` and before

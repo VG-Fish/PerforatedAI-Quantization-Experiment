@@ -20,6 +20,8 @@ Status at a glance:
 | 7 | run-to-run variance (3.4pp) exceeds the effect being measured (0.3pp) | yes — nothing was seeded | **partly** — `--seed` added, but error bars still need multiple seeds, see §7 |
 | 8 | the collapse guard killed 4 of 7 dendritic runs mid-dendrite-phase (plus `lenet5` in an ordinary plateau); only `gcn` and `actor_critic` completed their schedules | yes — a dendrite phase freezes validation by construction, and the rescue path was unreachable | **yes** — see §8 (counts corrected after §9) |
 | 9 | `actor_critic dendrites_fp32` `history.csv` shows 60 of 145 real epochs | yes — `_persist_over_budget_snapshot` splits over-budget rows into `continued_until_complete/` **by design** | **n/a** — reading rule documented, see §9 |
+| 10 | PAI's zero-seeded running average corrupts best-model tracking for every non-positive-maximize metric | yes — the first-score seeding branch never ran at `initial_history_after_switches=0` | **yes** — see §10 |
+| 11 | a dendrite inserted late trains at a learning rate at or near zero, so it cannot earn its parameters | yes — the LR is a pure function of the absolute epoch index, and the dynamic tail sits past the anneal | **yes** — see §11 |
 
 **Anything measured at `q1`, `q1_58`, `q2`, or `q4` before 2026-08-28 is invalid**
 (§6), and every `dendrites_q*` number for `actor_critic` and `m5` in `dynamic7` is
@@ -1075,3 +1077,135 @@ no longer manufactures a monotone rise from zero. Full record:
 base architecture at an epoch-0/1 score while the harness history shows later
 improvement, that condition's final model is a warm-up-era restore and its
 test metric measures the wrong network.
+
+---
+
+## 11. A late-inserted dendrite trains at a learning rate at or near zero (FOUND + FIXED 2026-08-30)
+
+### The observation
+
+A short `resnet18_cifar10 dendrites_fp32` run, reading `history.csv` together
+with `continued_until_complete/history.csv`:
+
+```
+epoch  6  lr=0.1   train=0.8333  val=0.8127
+epoch  7  lr=0.0   train=0.8527  val=0.8392
+epoch  8  lr=0.0   train=0.8524  val=0.8410
+...
+epoch 19  lr=0.0   train=0.8524  val=0.8414
+```
+
+**13 of 19 epochs at `lr` exactly `0.0`** — about two-thirds of a 1,972-second
+run. Validation sits inside a 0.0036 band throughout and `pai_dendrite_phase`
+is `False` for every one of them. Nothing was learning.
+
+### Root cause
+
+Three settings compose badly, and none is wrong on its own:
+
+1. `resnet18_cifar10` uses `lr_schedule="cosine"` with `lr_min_factor`
+   defaulting to `0.0` (`pipeline.py`, `ModelTrainingRecipe`).
+2. `_scheduled_learning_rate` (`training.py`) clamps `progress` at `1.0`, so
+   from `max_epochs` onward `lr = floor = base * 0.0 = 0.0` exactly. It is a
+   pure function of the absolute epoch index — deliberately, so that a
+   checkpoint resume and PAI's optimizer rebuild both land on the same curve.
+3. `_dynamic_training_epoch_cap` returned `max_epochs + 16`.
+
+So the 16 extra epochs that exist *solely* to let a dendrite be inserted and
+adapt all ran at `lr = 0`. It is bad well before the cliff, too:
+
+| epoch | ResNet-18 lr | % of base |
+|---|---|---|
+| 150 | 0.015364 | 15.4% |
+| 180 | 0.002573 | 2.6% |
+| 190 | 0.000647 | 0.65% |
+| 200–216 | **0.000000** | **0%** |
+
+SAINT's cosine floor is 2% of base (2e-6) and PointNet's step decay reaches
+0.7^10 = 2.8% by epoch 200 and holds there. Neither is a rate at which a
+freshly initialized module trains.
+
+### The second-order problem
+
+`DOING_HISTORY` fires on "no improvement for `n_epochs_to_switch` epochs with
+`history_lookback` history". A cosine-to-zero tail produces exactly that
+signature *regardless of what the network is doing* — the plateau it detects is
+the anneal, not capacity saturation. Dendrites were therefore being inserted
+for the wrong reason, at the one moment they could not train. This is a
+coherent explanation for `no_retained_insertion` on both ResNet-18 and SAINT.
+
+### Fix
+
+- **`dendrite_lr_min_factor`** (new, per recipe). PAI's optimizer is now built
+  with two parameter groups; the dendrite group's rate is floored at
+  `learning_rate * dendrite_lr_min_factor`. The backbone group keeps the
+  identical schedule its `base_fp32` control runs, so a dendritic gain cannot
+  be an artifact of a warm restart the control never received — which is why
+  this is a targeted floor rather than a whole-model schedule restart.
+
+  Dendrite-side parameters are identified structurally, from module layout
+  rather than `parameter_type` (which only separates `neuron` from `ignored`
+  and does not single out newly inserted tensors). Read off a real perforated
+  PointNet checkpoint: `<mod>.dendrites_to_top.<i>` and
+  `<mod>.dendrite_module.layers.<i>.*` are dendrite-side;
+  `<mod>.dendrite_module.parent_module.*` is the frozen shadow copy PAI carries
+  for candidate scoring and stays on the backbone schedule.
+
+  It **defaults to `0.0`, an exact no-op**. Only the three dynamic12 priority
+  models opt in (at `0.1`), so no stored result for any other model changes
+  meaning. `mobilenetv2_cifar10` has the same cosine-to-zero recipe and the
+  same latent problem; it is deliberately left alone until it is re-run.
+
+- **`_dynamic_training_epoch_cap`** is derived from the PAI schedule instead of
+  a flat `+16`, which could not fit even one dendrite: a switch costs its
+  candidate phase (bounded by `MAX_DENDRITE_PHASE_EPOCHS = 8`, not by the
+  configured `p_epochs_to_switch = 10`) plus an adaptation window. For the
+  priority models the cap is now `+28`.
+
+The dynamic-schedule defaults moved into a single
+`PAI_DYNAMIC_SCHEDULE_DEFAULTS` table in `compat.py`, read by both the PAI
+configuration path and the cap, so the two cannot drift.
+
+### What the fix is, and is not, measured to do
+
+Verified mechanically. With a real `optimizer.step()` at epoch 228 of a
+200-epoch ResNet-18 schedule -- inside the dynamic tail, where the backbone
+rate is exactly 0.0 -- the dendrite and its dendrite-to-neuron mixing weight
+move; the backbone and PAI's frozen shadow copy do not. Covered by
+`test_optimizer_step_moves_dendrites_after_the_backbone_freezes`.
+
+Verified inert when it should be inert. A SAINT A/B at a 12-epoch budget was
+bit-identical between floor-on and floor-off, because the switch landed while
+the schedule was still at 4e-5, above the 1e-5 floor. `max(scheduled, floor)`
+never bound.
+
+**Not** measured to change outcomes. A second SAINT A/B at a 6-epoch budget,
+where the tail *is* pinned below the floor, came out inside the noise:
+
+| | base | dendritic | audit |
+|---|---|---|---|
+| floor off (0.0) | 0.8456 | 0.8506 | `verified_retained` |
+| floor on (0.1) | 0.8444 | 0.8501 | `verified_retained` |
+
+The two dendritic arms differ by 0.0005, but the two *base* arms differ by
+0.0012 despite identical configuration and seed, so run-to-run nondeterminism
+is about twice the effect being read. Two things follow. First, dendrite
+retention here is attributable to the epoch-cap change (+28 vs +16), **not** to
+the learning-rate floor -- floor-off retains a dendrite too. Second, SAINT is a
+weak test of this fix: its floor case is 2e-6 against 1e-5, both negligible
+rates, whereas ResNet-18's is 0.0 against 0.01, which is categorical rather
+than a factor of five. The ResNet-18 A/B is the one that can actually answer
+this, and it has not been run to completion yet.
+
+### Scope of invalidated data
+
+None. No stored result used `dendrite_lr_min_factor`, and the default
+reproduces the previous schedule exactly. What this *does* mean is that any
+prior dendritic run whose switch landed in an annealed tail was measuring a
+dendrite that could not train — the arm is not wrong, but it is not evidence
+against dendrites either.
+
+**Reading rule:** the run log prints
+`[pai-lr] dendrite parameter group: N tensors / M parameters held at a floor of
+F` on the epoch the group first exists. If that line never appears, no dendrite
+was retained and the arm carries no dendritic signal.

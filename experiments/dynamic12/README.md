@@ -56,6 +56,57 @@ Every parameter must fall in the perforate or track list — one in neither gets
 no `parameter_type`, which PAI warns on each p-phase step and follows with
 `pdb.set_trace`. `tests/test_dynamic_pai_followup.py` asserts this structurally.
 
+## Giving a late dendrite a live learning rate
+
+The learning rate is a pure function of the absolute epoch index, so a dendrite
+inserted near the end of the budget inherits whatever the anneal has left. For
+ResNet-18 that was **exactly zero**: its cosine uses the default
+`lr_min_factor=0.0`, so every epoch from 200 on — the entire window the dynamic
+cap exists to provide — ran at `lr=0`. A short run made this concrete: 13 of 19
+epochs at `lr=0.0`, validation flat inside 0.004, no dendrite phase ever
+entered. SAINT's floor was 2% of base and PointNet's 2.8%; neither is a rate a
+freshly initialized module can train at.
+
+Worse, the plateau `DOING_HISTORY` detects at a cosine tail *is* the anneal, not
+capacity saturation — so dendrites were being inserted for the wrong reason at
+the worst possible moment.
+
+Two changes address this:
+
+- `dendrite_lr_min_factor` (per recipe, `0.1` for all three priority models)
+  floors **only the retained dendrite parameters**, which PAI's optimizer now
+  gets as their own param group. The backbone keeps the identical schedule its
+  `base_fp32` control runs, so a dendritic gain cannot be an artifact of a warm
+  restart the control never received. It defaults to `0.0` — an exact no-op —
+  so no other model's stored results change meaning.
+- The dynamic epoch cap is derived from the schedule instead of a flat `+16`,
+  which could not fit even one dendrite: a switch costs its candidate phase
+  (bounded by `MAX_DENDRITE_PHASE_EPOCHS = 8`) plus an adaptation window. For
+  the priority models this is `+28` rather than `+16`.
+
+The run log prints `[pai-lr] dendrite parameter group: ...` on the epoch the
+group first exists. If that line never appears, no dendrite was retained.
+
+What is measured so far: the mechanism is verified (a real optimizer step at
+epoch 228 moves the dendrite and not the backbone), and the floor is verified
+inert while the schedule stays above it. It is **not** yet measured to change
+any outcome — a SAINT A/B in the binding regime came out inside run-to-run
+noise, and dendrite retention there came from the epoch cap, not the floor.
+See MEASUREMENT_CAVEATS §11.
+
+With both changes in place all three priority models retain a dendrite on a
+short run, each adding exactly the documented per-dendrite cost:
+
+| model | base -> dendritic params | added |
+|---|---|---|
+| `resnet18_cifar10` | 11,436,618 -> 11,699,274 | +262,656 |
+| `pointnet_modelnet40` | 3,471,473 -> 4,128,369 | +656,896 |
+| `saint_adult` | 211,906 -> 241,026 | +29,120 |
+
+Those runs' accuracies are **not** effect sizes: under
+`--dynamic-dendritic-training` the dendritic arm trains past the base arm's
+budget, so the arms are not matched.
+
 ## The sweep
 
 ```bash

@@ -328,6 +328,19 @@ def _default_dynamic_improvement_thresholds(max_dendrites: int) -> list[float]:
     return [*defaults, *([defaults[-1]] * (required - len(defaults)))]
 
 
+# One source of truth for the dynamic-schedule defaults.  _configure_dynamic_
+# pai_schedule applies them to PAI; pipeline.py reads the same numbers when it
+# sizes the dynamic epoch cap, so the two cannot drift apart.
+PAI_DYNAMIC_SCHEDULE_DEFAULTS: dict[str, Any] = {
+    "max_dendrites": 3,
+    "n_epochs_to_switch": 10,
+    "history_lookback": 8,
+    "initial_history_after_switches": 8,
+    "p_epochs_to_switch": 2,
+    "candidate_weight_initialization_multiplier": 0.005,
+}
+
+
 def _schedule_value(
     schedule: PAIDynamicSchedule | None, field: str, default: Any
 ) -> Any:
@@ -337,6 +350,13 @@ def _schedule_value(
     return default if value is None else value
 
 
+def dynamic_schedule_field(schedule: PAIDynamicSchedule | None, field: str) -> Any:
+    """Effective value of a dynamic-schedule field, override or default."""
+    if field not in PAI_DYNAMIC_SCHEDULE_DEFAULTS:
+        raise KeyError(f"no dynamic schedule default registered for {field!r}")
+    return _schedule_value(schedule, field, PAI_DYNAMIC_SCHEDULE_DEFAULTS[field])
+
+
 def _configure_dynamic_pai_schedule(
     pc: Any,
     batches_per_epoch: int | None = None,
@@ -344,7 +364,7 @@ def _configure_dynamic_pai_schedule(
     fixed_switch_interval: int | None = None,
     schedule: PAIDynamicSchedule | None = None,
 ) -> None:
-    max_dendrites = _schedule_value(schedule, "max_dendrites", 3)
+    max_dendrites = dynamic_schedule_field(schedule, "max_dendrites")
     if not isinstance(max_dendrites, int) or max_dendrites < 1:
         raise ValueError("PAI dynamic max_dendrites must be a positive integer")
     thresholds = _schedule_value(
@@ -363,13 +383,13 @@ def _configure_dynamic_pai_schedule(
         _apply_pai_schedule_values(
             pc,
             {
-                "set_n_epochs_to_switch": _schedule_value(
-                    schedule, "n_epochs_to_switch", 10
+                "set_n_epochs_to_switch": dynamic_schedule_field(
+                    schedule, "n_epochs_to_switch"
                 ),
                 # PAI names the plateau-detection window "history_lookback"; the
                 # default of 1 switches on transient noise.
-                "set_history_lookback": _schedule_value(
-                    schedule, "history_lookback", 8
+                "set_history_lookback": dynamic_schedule_field(
+                    schedule, "history_lookback"
                 ),
                 # MUST accompany any history_lookback > 1. PAI's running
                 # average only seeds from the first real score while
@@ -383,8 +403,8 @@ def _configure_dynamic_pai_schedule(
                 # vae/tcn/mpnn dendritic arms). Matching the lookback gives a
                 # cumulative-mean warm-up over the same window after every
                 # switch.
-                "set_initial_history_after_switches": _schedule_value(
-                    schedule, "initial_history_after_switches", 8
+                "set_initial_history_after_switches": dynamic_schedule_field(
+                    schedule, "initial_history_after_switches"
                 ),
                 # Indexed by dendrites added (globals_perforatedai getter_val), so
                 # this needs max_dendrites + 1 entries. The final entry must stay
@@ -397,8 +417,8 @@ def _configure_dynamic_pai_schedule(
     _apply_pai_schedule_values(
         pc,
         {
-            "set_p_epochs_to_switch": _schedule_value(
-                schedule, "p_epochs_to_switch", 2
+            "set_p_epochs_to_switch": dynamic_schedule_field(
+                schedule, "p_epochs_to_switch"
             ),
             # Dendrites stopped paying for themselves well before the sixth on
             # every model measured so far, and each extra one costs ~100 epochs
@@ -410,8 +430,10 @@ def _configure_dynamic_pai_schedule(
             # registers as an improvement, so epoch_last_improved is refreshed
             # continuously and the switch trigger cannot fire.
             "set_reset_best_score_on_switch": False,
-            "set_candidate_weight_initialization_multiplier": _schedule_value(
-                schedule, "candidate_weight_initialization_multiplier", 0.005
+            "set_candidate_weight_initialization_multiplier": (
+                dynamic_schedule_field(
+                    schedule, "candidate_weight_initialization_multiplier"
+                )
             ),
             # Not set here: pai_improvement_threshold / _raw, which gate how much
             # a node's correlation must gain in one epoch to keep the dendrite

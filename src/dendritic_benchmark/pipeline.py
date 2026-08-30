@@ -28,6 +28,7 @@ from .compat import (
     attach_module_output_dimensions,
     choose_device,
     configure_pai_candidate_graph,
+    dynamic_schedule_field,
     latest_pai_switch_checkpoint,
     load_pai_system_checkpoint,
     pai_system_checkpoint_exists,
@@ -49,6 +50,7 @@ from .results import (
 from .specs import CONDITION_SPECS, MODEL_SPECS, ConditionSpec, condition_by_key, model_by_key
 from .training import (
     DENDRITE_AUDIT_REVISION,
+    MAX_DENDRITE_PHASE_EPOCHS,
     LRScheduleName,
     OptimizerName,
     QUANTIZATION_EVALUATION_REVISION,
@@ -174,6 +176,11 @@ class ModelTrainingRecipe:
     # candidate completes.  Decay over this explicit horizon instead of
     # prematurely pinning the learning rate at its floor.
     lr_schedule_epochs: int | None = None
+    # Floor for the dendrite param group, as a fraction of learning_rate.
+    # Only newly inserted dendrite parameters see it; the backbone keeps the
+    # schedule its dense control runs.  See _dendrite_learning_rate.  Defaults
+    # to a no-op; opting in is per-recipe so no stored result changes meaning.
+    dendrite_lr_min_factor: float = 0.0
     # Linear warmup ramp, in epochs, applied under every schedule.
     warmup_epochs: int = 0
     label_smoothing: float = 0.0
@@ -1177,9 +1184,12 @@ class BenchmarkRunner:
             # epochs now runs in a third of the wall clock the old 100 did. The
             # reference trains 250, and the 100-epoch run was still climbing
             # (best val accuracy arrived at epoch 81 of 100).
+            # dendrite_lr_min_factor: step decay reaches 0.7^10 = 2.8% of base
+            # by epoch 200 and holds there for the dynamic tail.
             "pointnet_modelnet40": ModelTrainingRecipe(
                 32, 200, 1.0e-3, "adam", 0.9, 1.0e-4,
                 lr_schedule="step", lr_decay_every=20, lr_decay_gamma=0.7,
+                dendrite_lr_min_factor=0.1,
             ),
             "vae_mnist": ModelTrainingRecipe(
                 # Dynamic11's dendritic VAE ran to epoch 149 while its dense
@@ -1207,10 +1217,17 @@ class BenchmarkRunner:
             # zero, random-crop+flip. Held at a flat 0.05 for 90 epochs this
             # plateaued at 88.85% with train loss stuck at 0.18 — the anneal is
             # exactly the missing piece. 24s/epoch, so 200 epochs is ~80 min.
+            # dendrite_lr_min_factor: this cosine anneals to exactly 0.0 (the
+            # default lr_min_factor), so every epoch from 200 on -- the whole
+            # window the dynamic cap exists to provide -- ran at lr=0. Measured
+            # on a short run: 13 of 19 epochs at lr=0.0, validation flat inside
+            # 0.004, no dendrite phase ever entered. The floor (0.1 * 0.1 =
+            # 0.01) applies only to retained dendrite parameters; the backbone
+            # keeps the identical schedule its base_fp32 control runs.
             "resnet18_cifar10": ModelTrainingRecipe(
                 128, 200, 1.0e-1, "sgd", 0.9, 5.0e-4,
                 lr_schedule="cosine", warmup_epochs=5, label_smoothing=0.1,
-                nesterov=True,
+                nesterov=True, dendrite_lr_min_factor=0.1,
             ),
             # Same story at 89.14% over 150 flat epochs; published MobileNetV2
             # CIFAR-10 runs reach ~94.1% with SGD 0.1 + cosine over 200 epochs.
@@ -1223,10 +1240,12 @@ class BenchmarkRunner:
             ),
             # 2.2s/epoch, and val accuracy was still ticking up at epoch 100
             # (0.8467 -> 0.8495). SAINT (Somepalli et al.) reports ~86% on Adult.
+            # dendrite_lr_min_factor: the cosine floor is 2% of base (2e-6),
+            # which is not a rate a freshly initialized dendrite can train at.
             "saint_adult": ModelTrainingRecipe(
                 256, 200, 1.0e-4, "adamw", 0.9, 1.0e-5,
                 lr_schedule="cosine", warmup_epochs=5, lr_min_factor=0.02,
-                grad_clip_norm=1.0,
+                grad_clip_norm=1.0, dendrite_lr_min_factor=0.1,
             ),
             # Sabour et al. train with Adam 1e-3 and exponential decay; the real
             # fix here is the margin loss (see CapsuleMarginLoss in training.py),
@@ -1272,20 +1291,38 @@ class BenchmarkRunner:
         )
         return max(1, min(10, math.ceil(recipe.max_epochs * 0.30)))
 
+    # A retained dendrite has to (a) finish its candidate phase and (b) train
+    # long enough for the validation metric to show whether it earned its
+    # parameters.  Twenty epochs of (b) is the smallest window in which any
+    # model in this suite has ever moved its metric by more than run-to-run
+    # noise.
+    _DENDRITE_ADAPTATION_EPOCHS = 20
+
     @staticmethod
     def _dynamic_training_epoch_cap(
         training_plan: ConditionTrainingPlan,
+        dynamic_schedule: PAIDynamicSchedule | None = None,
     ) -> int | None:
         """Bound a dynamic PAI run without undercutting its paired control.
 
-        One permitted dendrite needs only a short post-switch adaptation phase.
-        Sixteen extra epochs exceed the configured six-epoch PAI phase twice
-        over, while preventing a no-improvement tracker from consuming an
-        unbounded amount of compute and invalidating the matched budget.
+        The old flat ``+16`` could not fit even one dendrite.  A switch costs
+        the candidate phase (``p_epochs_to_switch``, itself bounded by
+        ``max_dendrite_phase_epochs=8`` in training.py) plus an adaptation
+        window, and it is charged once per dendrite.  At the dynamic12 defaults
+        -- ``p_epochs_to_switch=10``, ``max_dendrites=1`` -- +16 left at most
+        eight epochs of adaptation, and on ResNet-18 all sixteen fell past the
+        cosine floor where the learning rate is exactly 0.0.  Deriving the tail
+        from the schedule keeps the bound tight for a one-dendrite run while
+        still holding a runaway no-improvement tracker to a finite budget.
         """
         if not training_plan.update_dendrites_during_training:
             return None
-        return training_plan.max_epochs + 16
+        max_dendrites = dynamic_schedule_field(dynamic_schedule, "max_dendrites")
+        p_epochs = dynamic_schedule_field(dynamic_schedule, "p_epochs_to_switch")
+        per_dendrite = min(p_epochs, MAX_DENDRITE_PHASE_EPOCHS) + (
+            BenchmarkRunner._DENDRITE_ADAPTATION_EPOCHS
+        )
+        return training_plan.max_epochs + max(16, max_dendrites * per_dendrite)
 
     @staticmethod
     def _quantization_granularity(
@@ -1718,8 +1755,9 @@ class BenchmarkRunner:
             lr_decay_gamma=training_hyperparameters.lr_decay_gamma,
             lr_min_factor=training_hyperparameters.lr_min_factor,
             lr_schedule_epochs=training_hyperparameters.lr_schedule_epochs,
+            dendrite_lr_min_factor=training_hyperparameters.dendrite_lr_min_factor,
             max_dynamic_training_epochs=self._dynamic_training_epoch_cap(
-                training_plan
+                training_plan, dynamic_schedule
             ),
             quantization_evaluation_revision=(
                 QUANTIZATION_EVALUATION_REVISION if condition.quantized else None

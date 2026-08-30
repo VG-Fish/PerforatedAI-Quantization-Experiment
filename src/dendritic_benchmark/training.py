@@ -68,6 +68,12 @@ RegressionLossName = Literal["mse", "mae", "smooth_l1"]
 # All three honour warmup_epochs first. See ModelTrainingRecipe in pipeline.py.
 LRScheduleName = Literal["constant", "step", "cosine", "linear"]
 
+# Hard ceiling on a single PAI dendrite ("p") phase, in epochs.  PAI's own
+# pai_improvement_threshold gates do not reliably end the phase (raising them
+# changed nothing on 91 of 92 switch checks), so this is what actually bounds
+# it.  pipeline.py reads it when sizing the dynamic epoch cap.
+MAX_DENDRITE_PHASE_EPOCHS = 8
+
 
 @dataclass
 class TrainingConfig:
@@ -99,6 +105,16 @@ class TrainingConfig:
     # beyond ``max_epochs``; without this it reaches the LR floor before a
     # late candidate has a chance to adapt.
     lr_schedule_epochs: int | None = None
+    # Floor for the dendrite param group only, as a fraction of learning_rate.
+    # Applies from the epoch PAI retains a dendrite; the backbone group is
+    # untouched. See _dendrite_learning_rate.
+    #
+    # Defaults to 0.0 -- a no-op that reproduces the pre-2026-08-30 schedule
+    # exactly -- so that enabling it stays an explicit, per-recipe decision and
+    # no stored result silently changes meaning. The dynamic12 priority models
+    # opt in; every other model keeps the behaviour its results were measured
+    # under until it is re-run.
+    dendrite_lr_min_factor: float = 0.0
     # Linear ramp from 0 to learning_rate over this many epochs, applied under
     # every schedule. Fractional epochs are not supported; the ramp is per-epoch.
     warmup_epochs: int = 0
@@ -145,7 +161,7 @@ class TrainingConfig:
     # (3 epochs, gcn, the one model that did complete) and below the collapse
     # guard, so the forced switch happens while the run is still alive.
     # 0 disables the guard.
-    max_dendrite_phase_epochs: int = 8
+    max_dendrite_phase_epochs: int = MAX_DENDRITE_PHASE_EPOCHS
     # Open-ended PAI completion is useful only while it remains close to the
     # paired dense budget.  A no-improvement tracker can otherwise keep an
     # already-degraded architecture training forever.  ``None`` retains the
@@ -1956,10 +1972,82 @@ def _apply_torch_compile(
     return model
 
 
+# Marker key written into a param group so _apply_lr_schedule can tell the
+# dendrite group apart from the backbone group. PyTorch preserves unknown keys
+# in param_groups verbatim, and PAI hands optimArgs straight to the optimizer
+# constructor, so the marker survives both construction paths.
+PAI_DENDRITE_PARAM_GROUP_KEY = "pai_dendrite_group"
+
+
+def _is_dendrite_parameter_name(name: str) -> bool:
+    """True for parameters PerforatedAI adds when it retains a dendrite.
+
+    Keyed on module layout rather than on ``parameter_type`` because the type
+    attribute only distinguishes ``neuron`` from ``ignored`` before a switch --
+    it does not single out the newly inserted tensors. The two names below are
+    what a retained dendrite actually contributes, read off a perforated
+    PointNet checkpoint (``dendrites_fp32/model.pt``):
+
+        conv3.0.dendrites_to_top.0                      (1,024)
+        conv3.0.dendrite_module.layers.0.weight       (131,072)
+        conv3.0.dendrite_module.layers.0.bias           (1,024)
+
+    ``dendrite_module.parent_module.*`` is deliberately excluded: it is the
+    frozen shadow copy of the neuron PAI carries for candidate scoring, typed
+    ``ignored``, and it must keep following the backbone schedule.
+    """
+    if ".dendrite_module." in name and ".parent_module." not in name:
+        return True
+    return ".dendrites_to_top" in name or name.startswith("dendrites_to_top")
+
+
+def _split_dendrite_parameters(model: Any) -> tuple[list[Any], list[Any]]:
+    """Partition every parameter into (backbone, dendrite-side).
+
+    Deliberately does **not** filter on ``requires_grad``. PAI freezes the
+    parent network for the duration of a dendrite phase and unfreezes it
+    afterwards; an optimizer rebuilt mid-phase against only the then-trainable
+    tensors would drop the whole backbone permanently, and it would never train
+    again once PAI unfroze it. Passing frozen parameters to an optimizer is
+    harmless -- their grad stays ``None`` and the step skips them -- and it is
+    what ``model.parameters()`` did before this split existed.
+    """
+    backbone: list[Any] = []
+    dendrite: list[Any] = []
+    for name, parameter in model.named_parameters():
+        (dendrite if _is_dendrite_parameter_name(name) else backbone).append(parameter)
+    return backbone, dendrite
+
+
+def _optimizer_param_groups(model: Any, config: TrainingConfig) -> Any:
+    """Return ``params`` for the optimizer, split by group when dendrites exist.
+
+    Before any dendrite is retained -- and for every non-dendritic condition --
+    the dendrite list is empty and this returns a plain parameter iterable, so
+    the optimizer is built exactly as it was before this split existed.
+    """
+    if not config.use_dendrites:
+        return model.parameters()
+    backbone, dendrite = _split_dendrite_parameters(model)
+    if not dendrite:
+        return model.parameters()
+    floor = config.learning_rate * config.dendrite_lr_min_factor
+    print(
+        f"[pai-lr] dendrite parameter group: {len(dendrite)} tensors / "
+        f"{sum(p.numel() for p in dendrite)} parameters held at a floor of "
+        f"{floor:g} ({len(backbone)} backbone tensors follow the schedule)"
+    )
+    return [
+        {"params": backbone, PAI_DENDRITE_PARAM_GROUP_KEY: False},
+        {"params": dendrite, PAI_DENDRITE_PARAM_GROUP_KEY: True},
+    ]
+
+
 def _build_optimizer(model: Any, torch: Any, config: TrainingConfig) -> Any:
+    params = _optimizer_param_groups(model, config)
     if config.optimizer_name == "sgd":
         return torch.optim.SGD(
-            model.parameters(),
+            params,
             lr=config.learning_rate,
             momentum=config.momentum,
             weight_decay=config.weight_decay,
@@ -1967,12 +2055,12 @@ def _build_optimizer(model: Any, torch: Any, config: TrainingConfig) -> Any:
         )
     if config.optimizer_name == "adamw":
         return torch.optim.AdamW(
-            model.parameters(),
+            params,
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
         )
     return torch.optim.Adam(
-        model.parameters(),
+        params,
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
@@ -1988,7 +2076,7 @@ def _optimizer_class(torch: Any, config: TrainingConfig) -> Any:
 
 def _optimizer_args(model: Any, config: TrainingConfig) -> dict[str, Any]:
     args: dict[str, Any] = {
-        "params": model.parameters(),
+        "params": _optimizer_param_groups(model, config),
         "lr": config.learning_rate,
         "weight_decay": config.weight_decay,
     }
@@ -3599,15 +3687,38 @@ def _scheduled_learning_rate(
     return floor + 0.5 * (base - floor) * (1.0 + math.cos(math.pi * progress))
 
 
+def _dendrite_learning_rate(
+    config: "TrainingConfig", scheduled_lr: float
+) -> float:
+    """Return the lr for newly inserted dendrite parameters.
+
+    The backbone schedule is annealed on the assumption that the network it
+    trains has been learning since epoch 0. A dendrite inserted at epoch 190 of
+    200 has not: it is a freshly initialized module handed whatever the anneal
+    has left, which for a cosine run with ``lr_min_factor=0.0`` is exactly zero
+    (measured on ResNet-18: 13 of 19 epochs at lr=0.0, val flat within 0.004).
+    Holding the dendrite group at a floor keeps it trainable no matter when the
+    plateau detector fires, while leaving the backbone on the schedule its
+    dense control also runs -- so a dendritic gain stays attributable to the
+    dendrite rather than to a warm restart the control never got.
+    """
+    floor = config.learning_rate * config.dendrite_lr_min_factor
+    return max(scheduled_lr, floor)
+
+
 def _apply_lr_schedule(
     optimizer: Any, config: "TrainingConfig", epoch: int, max_epochs: int
 ) -> None:
-    """Set every param group's lr to what the configured schedule says at ``epoch``."""
+    """Set each param group's lr from the schedule, floored for dendrites."""
     target_lr = _scheduled_learning_rate(config, epoch, max_epochs)
     if target_lr is None:
         return
     for group in optimizer.param_groups:
-        group["lr"] = target_lr
+        group["lr"] = (
+            _dendrite_learning_rate(config, target_lr)
+            if group.get(PAI_DENDRITE_PARAM_GROUP_KEY, False)
+            else target_lr
+        )
 
 
 def _run_training_epochs(

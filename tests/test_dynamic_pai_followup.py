@@ -17,16 +17,23 @@ from dendritic_benchmark.compat import (
 )
 from dendritic_benchmark.data import _make_loader
 from dendritic_benchmark.models import GRUForecaster, TCNForecaster, build_model
-from dendritic_benchmark.pipeline import BenchmarkRunner
+from dendritic_benchmark.pipeline import BenchmarkRunner, ConditionTrainingPlan
 from dendritic_benchmark.specs import condition_by_key
 from dendritic_benchmark.training import (
     ArtifactMetadata,
+    MAX_DENDRITE_PHASE_EPOCHS,
+    PAI_DENDRITE_PARAM_GROUP_KEY,
     TrainingConfig,
+    _apply_lr_schedule,
     _binary_or_multi_loss,
+    _build_optimizer,
     _dendrite_audit,
     _finalize_quantized_model_for_eval,
     _final_clean_pai_parameter_stats,
+    _dendrite_learning_rate,
+    _is_dendrite_parameter_name,
     _make_quantized_copy,
+    _optimizer_param_groups,
     _scheduled_learning_rate,
     _write_pai_summary,
 )
@@ -425,6 +432,196 @@ class DynamicPAIFollowupTests(unittest.TestCase):
         self.assertGreater(
             _scheduled_learning_rate(config, 86, 50) or 0.0,
             2.0e-5,
+        )
+
+    # Parameter names read off a real perforated PointNet checkpoint
+    # (dendrites_fp32/model.pt, 4,128,369 params after one retained dendrite).
+    _DENDRITE_NAMES = (
+        "conv3.0.dendrites_to_top.0",
+        "conv3.0.dendrite_module.layers.0.weight",
+        "conv3.0.dendrite_module.layers.0.bias",
+    )
+    _BACKBONE_NAMES = (
+        "conv3.0.main_module.weight",
+        "conv3.0.dendrite_module.parent_module.weight",
+        "conv3.0.dendrite_module.parent_module.bias",
+        "head.0.main_module.weight",
+        "input_transform.conv1.weight",
+    )
+
+    def test_dendrite_parameter_predicate_matches_real_checkpoint_names(self) -> None:
+        for name in self._DENDRITE_NAMES:
+            self.assertTrue(_is_dendrite_parameter_name(name), name)
+        for name in self._BACKBONE_NAMES:
+            self.assertFalse(_is_dendrite_parameter_name(name), name)
+
+    def test_optimizer_groups_split_only_once_dendrites_exist(self) -> None:
+        class _Fake(torch.nn.Module):
+            def __init__(self, names: tuple[str, ...]) -> None:
+                super().__init__()
+                self._names = names
+                self._params = torch.nn.ParameterList(
+                    [torch.nn.Parameter(torch.zeros(2)) for _ in names]
+                )
+
+            def named_parameters(self, *args, **kwargs):  # type: ignore[override]
+                return zip(self._names, self._params)
+
+        dendritic = TrainingConfig(use_dendrites=True)
+        # Before any dendrite is retained the split must be a no-op, so the
+        # optimizer is built exactly as it was before grouping existed.
+        groups = _optimizer_param_groups(_Fake(self._BACKBONE_NAMES), dendritic)
+        self.assertNotIsInstance(groups, list)
+
+        groups = _optimizer_param_groups(
+            _Fake(self._BACKBONE_NAMES + self._DENDRITE_NAMES), dendritic
+        )
+        self.assertIsInstance(groups, list)
+        self.assertEqual(len(groups), 2)
+        by_flag = {g[PAI_DENDRITE_PARAM_GROUP_KEY]: g["params"] for g in groups}
+        self.assertEqual(len(by_flag[True]), len(self._DENDRITE_NAMES))
+        self.assertEqual(len(by_flag[False]), len(self._BACKBONE_NAMES))
+
+        # A non-dendritic condition never groups, whatever the names look like.
+        self.assertNotIsInstance(
+            _optimizer_param_groups(
+                _Fake(self._BACKBONE_NAMES + self._DENDRITE_NAMES),
+                TrainingConfig(use_dendrites=False),
+            ),
+            list,
+        )
+
+    def test_dendrite_group_keeps_a_live_rate_past_the_cosine_floor(self) -> None:
+        """The ResNet-18 recipe annealed the dendrite group to exactly 0.0.
+
+        Measured before this fix: 13 of 19 epochs at lr=0.0 with validation
+        flat inside 0.004.  The backbone must keep the schedule its dense
+        control runs; only the inserted dendrite gets the floor.
+        """
+        config = TrainingConfig(
+            use_dendrites=True, learning_rate=0.1, lr_schedule="cosine",
+            warmup_epochs=5, lr_min_factor=0.0, dendrite_lr_min_factor=0.1,
+        )
+        # The floor is opt-in: the default must reproduce the old schedule.
+        self.assertEqual(TrainingConfig().dendrite_lr_min_factor, 0.0)
+        optimizer = type("_Opt", (), {})()
+        optimizer.param_groups = [
+            {"lr": 0.0, PAI_DENDRITE_PARAM_GROUP_KEY: False},
+            {"lr": 0.0, PAI_DENDRITE_PARAM_GROUP_KEY: True},
+        ]
+        _apply_lr_schedule(optimizer, config, 200, 200)
+        backbone, dendrite = optimizer.param_groups
+        self.assertEqual(backbone["lr"], 0.0)
+        self.assertAlmostEqual(dendrite["lr"], 0.01)
+
+        # While the schedule is still above the floor both groups agree, so
+        # an early insertion behaves exactly as it did before this change.
+        _apply_lr_schedule(optimizer, config, 120, 200)
+        backbone, dendrite = optimizer.param_groups
+        self.assertEqual(backbone["lr"], dendrite["lr"])
+
+    def test_priority_recipes_opt_into_the_dendrite_lr_floor(self) -> None:
+        """The three dynamic12 priority models must not anneal dendrites to nil."""
+        with tempfile.TemporaryDirectory() as root:
+            runner = BenchmarkRunner(results_root=Path(root) / "results")
+            base = condition_by_key("base_fp32")
+            for model_key in (
+                "resnet18_cifar10", "saint_adult", "pointnet_modelnet40",
+            ):
+                recipe = runner._training_hyperparameters(model_key, base)
+                self.assertGreater(
+                    recipe.dendrite_lr_min_factor, 0.0, model_key
+                )
+                floor = recipe.learning_rate * recipe.dendrite_lr_min_factor
+                config = TrainingConfig(
+                    use_dendrites=True,
+                    learning_rate=recipe.learning_rate,
+                    lr_schedule=recipe.lr_schedule,
+                    lr_decay_every=recipe.lr_decay_every,
+                    lr_decay_gamma=recipe.lr_decay_gamma,
+                    lr_min_factor=recipe.lr_min_factor,
+                    warmup_epochs=recipe.warmup_epochs,
+                    dendrite_lr_min_factor=recipe.dendrite_lr_min_factor,
+                )
+                # At the far end of the dynamic tail the backbone is at or
+                # below its floor; the dendrite group must still be trainable.
+                tail = recipe.max_epochs + 28
+                scheduled = _scheduled_learning_rate(config, tail, recipe.max_epochs)
+                self.assertIsNotNone(scheduled)
+                self.assertAlmostEqual(
+                    _dendrite_learning_rate(config, float(scheduled or 0.0)), floor
+                )
+
+    def test_optimizer_step_moves_dendrites_after_the_backbone_freezes(self) -> None:
+        """End-to-end: a real step must still move a dendrite at lr-floor time.
+
+        This is the behaviour the whole fix exists for.  At epoch 228 -- inside
+        the dynamic tail, where ResNet-18's cosine sits at exactly 0.0 -- the
+        backbone and PAI's frozen shadow copy must not move, and the dendrite
+        and its dendrite-to-neuron mixing weight must.
+        """
+        class _Model(torch.nn.Module):
+            _NAMES = (
+                "layer.main_module.weight",
+                "layer.dendrite_module.parent_module.weight",
+                "layer.dendrite_module.layers.0.weight",
+                "layer.dendrites_to_top.0",
+            )
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.p = torch.nn.ParameterList(
+                    [torch.nn.Parameter(torch.zeros(2)) for _ in self._NAMES]
+                )
+
+            def named_parameters(self, *args, **kwargs):  # type: ignore[override]
+                return zip(self._NAMES, self.p)
+
+        config = TrainingConfig(
+            use_dendrites=True, learning_rate=0.1, lr_schedule="cosine",
+            warmup_epochs=5, lr_min_factor=0.0, dendrite_lr_min_factor=0.1,
+            optimizer_name="sgd", momentum=0.9, nesterov=True,
+        )
+        model = _Model()
+        optimizer = _build_optimizer(model, torch, config)
+        self.assertEqual(
+            [g.get(PAI_DENDRITE_PARAM_GROUP_KEY) for g in optimizer.param_groups],
+            [False, True],
+        )
+        _apply_lr_schedule(optimizer, config, 228, 200)
+        self.assertEqual(optimizer.param_groups[0]["lr"], 0.0)
+
+        for parameter in model.p:
+            parameter.grad = torch.ones(2)
+        before = [parameter.detach().clone() for parameter in model.p]
+        optimizer.step()
+        moved = [
+            not torch.equal(parameter.detach(), original)
+            for parameter, original in zip(model.p, before)
+        ]
+        self.assertEqual(moved, [False, False, True, True])
+
+    def test_dynamic_epoch_cap_fits_a_whole_dendrite(self) -> None:
+        plan = ConditionTrainingPlan(
+            max_epochs=200, use_qat=False, fine_tune_epochs=0,
+            update_dendrites_during_training=True,
+        )
+        schedule = PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=10)
+        cap = BenchmarkRunner._dynamic_training_epoch_cap(plan, schedule)
+        # Candidate phase is bounded by MAX_DENDRITE_PHASE_EPOCHS, not by the
+        # configured p_epochs_to_switch of 10.
+        self.assertEqual(
+            cap, 200 + MAX_DENDRITE_PHASE_EPOCHS + BenchmarkRunner._DENDRITE_ADAPTATION_EPOCHS
+        )
+        self.assertGreater(cap, 200 + 16)
+        self.assertIsNone(
+            BenchmarkRunner._dynamic_training_epoch_cap(
+                ConditionTrainingPlan(
+                    max_epochs=200, use_qat=False, fine_tune_epochs=0,
+                    update_dendrites_during_training=False,
+                ),
+                schedule,
+            )
         )
 
     def test_changed_model_revision_invalidates_prior_dynamic11_record(self) -> None:
