@@ -181,6 +181,83 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                 [".mu", ".logvar"],
             )
 
+    def test_priority_model_profiles_use_safe_late_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            runner = BenchmarkRunner(results_root=Path(root) / "results")
+            self.assertEqual(
+                runner._perforation_module_ids_to_perforate("resnet18_cifar10"),
+                [".pre_fc"],
+            )
+            self.assertEqual(
+                runner._perforation_track_only_module_ids("resnet18_cifar10"),
+                [".conv1", ".bn1", ".layer1", ".layer2", ".layer3", ".layer4", ".fc"],
+            )
+            self.assertEqual(
+                runner._perforation_module_ids_to_perforate("saint_adult"),
+                [
+                    ".row_blocks.0.attn.qkv",
+                    ".row_blocks.1.attn.qkv",
+                    ".head.1",
+                ],
+            )
+            self.assertEqual(
+                runner._perforation_module_ids_to_perforate("pointnet_modelnet40"),
+                [".conv3.0", ".head.0"],
+            )
+            self.assertEqual(
+                runner._pai_dynamic_schedule("resnet18_cifar10").max_dendrites,
+                1,
+            )
+
+    def test_priority_models_leave_no_parameter_untyped(self) -> None:
+        """Every parameter must be perforated or tracked, or PAI drops into pdb.
+
+        PAI assigns a ``parameter_type`` from the module that owns each
+        parameter. One that is in neither list gets none, which it warns about
+        on every p-phase step and follows with ``pdb.set_trace`` -- a hang in a
+        non-interactive worker. This caught ``.head.1``/``.head.4`` on PointNet
+        (132,352 parameters, the 512->256 Linear among them) and the row-block
+        and head LayerNorms on SAINT.
+        """
+
+        def covers(module_id: str, parameter_name: str) -> bool:
+            dotted = "." + parameter_name
+            return dotted == module_id or dotted.startswith(module_id + ".")
+
+        cases = {
+            "resnet18_cifar10": {},
+            "saint_adult": {"num_classes": 2},
+            "pointnet_modelnet40": {"num_classes": 40},
+        }
+        with tempfile.TemporaryDirectory() as root:
+            runner = BenchmarkRunner(results_root=Path(root) / "results")
+            for model_key, kwargs in cases.items():
+                model = build_model(model_key, **kwargs)
+                ids = [
+                    *runner._perforation_module_ids_to_perforate(model_key),
+                    *runner._perforation_track_only_module_ids(model_key),
+                    *runner._perforation_parameter_ids_to_track(model_key),
+                ]
+                uncovered = [
+                    name
+                    for name, _ in model.named_parameters()
+                    if not any(covers(i, name) for i in ids)
+                ]
+                self.assertEqual(uncovered, [], f"{model_key} leaves parameters untyped")
+
+    def test_resnet_prefc_is_in_both_arms_and_starts_as_identity(self) -> None:
+        model = build_model("resnet18_cifar10")
+        self.assertIsInstance(model.pre_fc, torch.nn.Linear)
+        self.assertEqual(model.pre_fc.in_features, model.pre_fc.out_features)
+        torch.testing.assert_close(
+            model.pre_fc.weight.detach(),
+            torch.eye(model.pre_fc.in_features),
+        )
+        torch.testing.assert_close(
+            model.pre_fc.bias.detach(),
+            torch.zeros(model.pre_fc.out_features),
+        )
+
     def test_compact_models_have_fewer_parameters(self) -> None:
         full = build_model("mpnn", model_scale=1.0)
         compact = build_model("mpnn", model_scale=0.75)

@@ -192,6 +192,17 @@ For each model below, this document captures:
   - The benchmark registers tensor-returning `nn.Linear`, `nn.Conv1d`, and `nn.Conv2d` modules for PerforatedAI perforation.
   - Recurrent, graph-attention, capsule, and tabular-attention models expose their gates/projections as explicit Linear/Conv modules, rather than handing tuple-returning `nn.LSTM`, `nn.GRU`, or `nn.MultiheadAttention` modules directly to PerforatedAI.
   - Dendritic conditions fail fast if PerforatedAI is unavailable or cannot perforate the model; the runner does not silently record unperforated fallback models as dendritic results.
+  - **Every parameter must land in one of the two lists.** PAI reads a
+    parameter's `parameter_type` off the module that owns it, so a parameter
+    that is neither perforated nor tracked gets none — PAI then warns about it
+    on every p-phase step and follows the warning with `pdb.set_trace`, which
+    hangs a non-interactive worker. Naming a *module* is the remedy when it has
+    no perforated child (SAINT's LayerNorms, PointNet's `.head.1`/`.head.4`);
+    `append_parameter_ids_to_track` is the remedy when it does (GCN's biases,
+    which sit beside a perforated Linear). This is easy to get wrong by
+    off-by-one in a `nn.Sequential` and produces no error at perforation time,
+    so `tests/test_dynamic_pai_followup.py` asserts full coverage structurally
+    for the priority models.
 - Dendritic memory cleanup:
   - Long dendritic runs periodically clear PerforatedAI processor buffers and the accelerator cache after completed batches.
   - DistilBERT dendritic runs use a 128-batch cleanup interval to avoid late-epoch MPS memory pressure.
@@ -890,7 +901,16 @@ flowchart TD
   - `lr_decay_gamma=0.7`
 - Loss: cross-entropy + 0.001 × the feature-transform orthogonality penalty from
   Qi et al. §3.4, applied to the 64×64 transform only.
-- Perforation registration: default
+- Perforation registration: **`.conv3.0` and `.head.0` only** (the 128→1024
+  point-feature convolution and the first classifier projection). Everything
+  else is track-only. The two T-Nets are excluded on purpose: a dendrite there
+  perturbs the learned coordinate basis every downstream point is expressed
+  in, so it is not a local change the way a late-layer dendrite is. It is also
+  where the parameters are — perforating all 18 eligible Linear/Conv modules,
+  which is what "default" registration did, cost +3,459,569 parameters (+100%)
+  for one dendrite against +656,896 (+18.9%) for these two.
+  `.head.1` and `.head.4` must stay explicitly tracked; see the note in
+  `pipeline.py`.
 - PQAT epoch budget: `10`
 - Cost: ~36 s/epoch. It was ~200 s before the clouds were cached, of which ~190 s
   was re-parsing OFF text — the dataloader, not the network, was this model's
@@ -1022,8 +1042,12 @@ flowchart TD
   - `warmup_epochs=5`
   - `label_smoothing=0.1`
   - `nesterov=True`
-- Perforation registration: default
+- Perforation registration: **`.pre_fc` only.** `.conv1`, `.bn1`, `.layer1`–
+  `.layer4` and `.fc` are track-only. This mirrors upstream PerforatedAI
+  exactly — see the pre-FC note below.
 - PQAT epoch budget: `10`
+- Parameters: **11,436,618** (11,173,962 backbone + 262,656 `pre_fc`), in both
+  arms. One retained dendrite on `.pre_fc` adds a further 262,656 (+2.3%).
 - Architecture diagram:
 
 ```mermaid
@@ -1033,9 +1057,43 @@ flowchart TD
     l1 --> l2["Layer2: BasicBlock × 2 (128, stride 2)"]
     l2 --> l3["Layer3: BasicBlock × 2 (256, stride 2)"]
     l3 --> l4["Layer4: BasicBlock × 2 (512, stride 2)"]
-    l4 --> gap["AdaptiveAvgPool"] --> fc["Linear 512→10"]
+    l4 --> gap["AdaptiveAvgPool"] --> pre["Linear 512→512 (pre_fc, identity-init) + ReLU"]
+    pre --> fc["Linear 512→10"]
     note["BasicBlock = Conv→BN→ReLU→Conv→BN + skip"]
+    note2["pre_fc is the sole perforated module; it exists in the base arm too"]
 ```
+
+### The pre-FC projection (`ResNet18PreFC` in `models.py`)
+
+PerforatedAI does **not** perforate ResNet's residual convolutions. Its
+published ResNet-18 — `ResNetPAIPreFC` in `perforatedai.library_perforatedai`,
+`examples/imagenet/resnet_prefc.py` in the PerforatedAI repo, and the
+`perforated-ai/resnet-18-perforated-gd` model on Hugging Face — inserts a
+square 512→512 `pre_fc` projection after global pooling and perforates only
+that. Their ImageNet training command is `--convert-count 0`, which tracks
+`.layer1`–`.layer4` outright, plus `.conv1`, `.bn1`, `.fc`, leaving `.pre_fc`
+as the only perforated module. Upstream's forward path is
+`fc(relu(pre_fc(flatten(avgpool(x)))))`, reproduced verbatim here.
+
+Two deliberate departures, both recorded rather than accidental:
+
+- **The projection is in both arms.** Upstream only ever builds the perforated
+  model. Here, giving the base arm the same layer is what keeps a dendritic
+  win from being confounded with the extra 512×512 dense layer itself.
+- **Identity initialization**, where upstream uses the default `nn.Linear`
+  init. `layer4` ends in a ReLU, so pooled features are non-negative and the
+  added ReLU is a no-op; an identity `pre_fc` therefore makes this network
+  numerically equal to stock ResNet-18 at step zero. Verified against
+  `LPA.ResNetPAIPreFC` directly.
+
+The class is restated locally rather than imported so that building a *base*
+model never requires `perforatedai` to be installed or licensed.
+
+Upstream's HF card reports 5 retained dendrites per pre-FC neuron
+(`--dendrite-mode 1` → `max_dendrites=5`, Perforated Backpropagation off).
+This benchmark caps it at 1 (`_MODEL_DYNAMIC_PAI_SCHEDULES`) so a
+parameter-matched dense control stays practical — a deliberate divergence from
+the published configuration, not a match to it.
 
 ## 22. `mobilenetv2_cifar10` — MobileNetV2
 
@@ -1100,7 +1158,15 @@ flowchart TD
     mix --> mean["mean over feature tokens → (B,64)"]
     mean --> head["LN → Linear 64→64 → ReLU → Linear → num_classes"]
 ```
-- Perforation registration: default
+- Perforation registration: **`.row_blocks.0.attn.qkv`,
+  `.row_blocks.1.attn.qkv`, `.head.1`** (+29,120 parameters per dendrite).
+  This has always been the effective set — it is the complement of SAINT's
+  track-only list — but it is now stated explicitly so it no longer depends on
+  which modules happen to be `nn.Linear`. The `top10` run's stored PBScores
+  support it: `.row_blocks.0.attn.qkv` peaks at 0.092 and `.head.1` at 0.060
+  correlation, both well above the 0.02 "good placement" bar in the
+  `perforatedai-analyze` skill. The row-block LayerNorms and `.head.0` are
+  track-only; leaving them out gave 640 parameters no `parameter_type`.
 - PQAT epoch budget: `10`
 
 ## 24. `capsnet_mnist` — CapsNet

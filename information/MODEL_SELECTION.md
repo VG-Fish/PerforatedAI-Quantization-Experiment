@@ -1,5 +1,21 @@
 # Model selection for the 7-model run
 
+> **SUPERSEDED for the Dynamic12 priority sweep (2026-08-29).** That sweep runs
+> `resnet18_cifar10`, `saint_adult`, and `pointnet_modelnet40` — two of which
+> this document rules out. Criterion 1 excluded `pointnet_modelnet40` and
+> `resnet18_cifar10` because an expired PerforatedAI token had blocked their
+> low-bit dendritic conditions. **That block is gone**: the token in `.env`
+> perforates all three cleanly, verified 2026-08-29 by calling
+> `compat.perforate_model` on each. The criterion-1 exclusion is therefore void,
+> and with it the reason those two were not candidates.
+>
+> Nothing else here is retracted — the cost table, the domain-diversity
+> argument, and the `top10` signal-quality analysis all still read correctly for
+> the 7-model run they were written for. See `experiments/dynamic12/README.md`
+> for the priority sweep's own scope and `information/MODEL_REFERENCE.md` for
+> the three models' perforation targets.
+
+
 The user's plan: drop `tcn_forecaster` from the current 5 (`lenet5`, `gcn`,
 `actor_critic`, `saint_adult`, `tcn_forecaster`) and add 3 new models from the
 23 in `specs.py::MODEL_SPECS`, for 7 total. This documents why `textcnn`, `m5`,

@@ -9,12 +9,12 @@ cd "$repo_dir"
 export DQB_DATA_NUM_WORKERS="${DQB_DATA_NUM_WORKERS:-0}"
 export PYTHONPATH="$repo_dir/src${PYTHONPATH:+:$PYTHONPATH}"
 
-read -r -a model_values <<< "${MODEL_KEYS:-gru_forecaster vae_mnist}"
+read -r -a model_values <<< "${MODEL_KEYS:-resnet18_cifar10 saint_adult pointnet_modelnet40}"
 read -r -a condition_values <<< "${CONDITION_KEYS:-base_fp32 dendrites_fp32 base_q8 dendrites_q8 base_q2 dendrites_q2}"
 read -r -a seed_values <<< "${SEEDS:-0 1 2}"
 
-model_scale="${MODEL_SCALE:-0.75}"
-run_name="${RUN_NAME:-validated_replications}"
+model_scale="${MODEL_SCALE:-1.0}"
+run_name="${RUN_NAME:-priority_replications}"
 
 for seed_value in "${seed_values[@]}"; do
   run_root="$bundle_dir/$run_name/seed_$seed_value"

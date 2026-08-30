@@ -110,6 +110,9 @@ _MODEL_ARTIFACT_REVISIONS = {
     "tcn_forecaster": "dynamic11_targeted_head_v2",
     "gru_forecaster": "dynamic11_multiscale_decoder_v2",
     "vae_mnist": "dynamic11_fair_ternary_v2",
+    "resnet18_cifar10": "dynamic12_prefc_target_v1",
+    "saint_adult": "dynamic12_row_qkv_target_v1",
+    "pointnet_modelnet40": "dynamic12_late_feature_target_v1",
 }
 # Dynamic9 showed that the global three-dendrite schedule adds unnecessary
 # capacity to several models. These are deliberately sparse overrides; fields
@@ -122,6 +125,16 @@ _MODEL_DYNAMIC_PAI_SCHEDULES = {
     "mpnn": PAIDynamicSchedule(max_dendrites=3),
     "vae_mnist": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=6),
     "gru_forecaster": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=6),
+    # Keep the first three replacement experiments capacity-conservative.  A
+    # single retained dendrite makes a parameter-matched dense control practical
+    # if any configuration shows a credible gain.  Note this diverges from
+    # upstream for ResNet-18: PerforatedAI's published model retains 5
+    # dendrites on .pre_fc (--dendrite-mode 1 -> max_dendrites=5), so a result
+    # here is not a reproduction of their ImageNet number even before the
+    # dataset difference.
+    "resnet18_cifar10": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=10),
+    "saint_adult": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=10),
+    "pointnet_modelnet40": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=10),
 }
 _PAI_VARIANT_SCHEDULES = {
     "mpnn_capacity": {
@@ -576,6 +589,42 @@ class BenchmarkRunner:
         return list(self._perforation_track_modules())
 
     def _perforation_module_ids_to_perforate(self, model_key: str) -> list[str]:
+        if model_key == "resnet18_cifar10":
+            # Mirrors upstream exactly. PerforatedAI's published ResNet-18
+            # (LPA.ResNetPAIPreFC; examples/imagenet/resnet_prefc.py, and the
+            # perforated-ai/resnet-18-perforated-gd card) adds a 512 -> 512
+            # pre-classifier projection after global pooling and perforates
+            # only that, leaving the residual backbone tracked. Their training
+            # command is `--convert-count 0`, which tracks .layer1..4 outright,
+            # plus .conv1/.bn1/.fc -- so .pre_fc is the sole perforated module.
+            # Our dense arm carries the same layer, so the comparison isolates
+            # the retained dendrite rather than the extra dense projection.
+            return [".pre_fc"]
+        if model_key == "saint_adult":
+            # Not a new selection: this is exactly the complement of the
+            # track-only list SAINT already carried, stated explicitly so the
+            # target set stops depending on which modules happen to be
+            # Linear/Conv. Verified equivalent -- both spellings wrap
+            # {.head.1, .row_blocks.0.attn.qkv, .row_blocks.1.attn.qkv} and
+            # add the same 29,120 parameters. The stored PBScores from the
+            # top10 run back the set: .row_blocks.0.attn.qkv peaks at 0.092
+            # and .head.1 at 0.060 correlation, both well over the 0.02
+            # "good placement" bar in the perforatedai-analyze skill.
+            return [
+                ".row_blocks.0.attn.qkv",
+                ".row_blocks.1.attn.qkv",
+                ".head.1",
+            ]
+        if model_key == "pointnet_modelnet40":
+            # Late per-point features and the first classifier projection are
+            # wide, tensor-returning layers.  The two T-Nets are deliberately
+            # excluded: a dendrite there perturbs the learned coordinate basis
+            # every downstream point is expressed in, so it is not the local
+            # change a late-layer dendrite is.  They are also where the
+            # parameters are -- perforating all 18 eligible Linear/Conv modules
+            # (what type-based registration did) costs +3,459,569 parameters,
+            # +100%, for one dendrite, against +656,896 (+18.9%) for these two.
+            return [".conv3.0", ".head.0"]
         if model_key == "distilbert":
             return list(_DISTILBERT_PAI_CLASSIFICATION_HEAD)
         if model_key == "mpnn":
@@ -621,6 +670,18 @@ class BenchmarkRunner:
             # both convolutions tracked-only turns this into a classifier-only
             # dendrite experiment rather than spending capacity on early maps.
             "lenet5": [".features.0", ".features.3"],
+            # Mirror PerforatedAI's ResNet wrapper: retain the entire residual
+            # backbone as ordinary neurons and restrict candidate growth to the
+            # added pre-classifier projection.
+            "resnet18_cifar10": [
+                ".conv1",
+                ".bn1",
+                ".layer1",
+                ".layer2",
+                ".layer3",
+                ".layer4",
+                ".fc",
+            ],
             # Dendrites go on the shared .backbone only. The two heads are held
             # out for a reason specific to on-policy training, not for the old
             # PBScore reason (which measured a behaviour-cloning run in which
@@ -692,14 +753,43 @@ class BenchmarkRunner:
             # treats as "efficient dendrite user" on the 2026-08-03 dynamic run;
             # every column_blocks/ffn/attn.out/feature_embed/head.3 layer sat at
             # 0.009-0.03. Track the ones that showed no real signal.
+            # The row blocks' LayerNorms and the head's input LayerNorm
+            # (`.head.0`) were previously in neither list, so their 640
+            # parameters carried no parameter_type -- the same p-phase warning
+            # and pdb.set_trace path documented for distilbert below. They are
+            # leaf norms with no perforated child, so tracking the module is
+            # the right remedy here rather than parameter_ids_to_track.
             "saint_adult": [
                 ".feature_embed",
                 ".column_blocks",
                 ".row_blocks.0.attn.out",
                 ".row_blocks.0.ffn",
+                ".row_blocks.0.norm1",
+                ".row_blocks.0.norm2",
                 ".row_blocks.1.attn.out",
                 ".row_blocks.1.ffn",
+                ".row_blocks.1.norm1",
+                ".row_blocks.1.norm2",
+                ".head.0",
                 ".head.3",
+            ],
+            # Every parameter-bearing head child except the perforated
+            # `.head.0`. `.head.1` (BatchNorm1d) and `.head.4` (the 512->256
+            # Linear, 131k parameters) have to be named explicitly: a parameter
+            # in neither list gets no parameter_type, which PAI warns on for
+            # every p-phase step and follows with pdb.set_trace -- fatal in a
+            # non-interactive worker. `.head.{2,3,6,7}` are ReLU/Dropout and
+            # hold no parameters, so they are omitted rather than tracked.
+            "pointnet_modelnet40": [
+                ".input_transform",
+                ".conv1",
+                ".feature_transform",
+                ".conv2",
+                ".conv3.1",
+                ".head.1",
+                ".head.4",
+                ".head.5",
+                ".head.8",
             ],
             # Only the classification head is perforated (see
             # _DISTILBERT_PAI_CLASSIFICATION_HEAD), which leaves all 100 backbone
@@ -733,6 +823,10 @@ class BenchmarkRunner:
             # tracked, which leaves these two biases untyped and warning on
             # every p-phase step. See PAIModuleSelection.parameter_ids_to_track.
             "gcn": [".conv1.bias", ".conv2.bias"],
+            # This learned positional term is a raw parameter rather than a
+            # child module, so tag it explicitly when the selected SAINT
+            # projections are perforated.
+            "saint_adult": [".column_embedding"],
         }.get(model_key, [])
 
     def _use_pai_runtime_guard(self) -> bool:

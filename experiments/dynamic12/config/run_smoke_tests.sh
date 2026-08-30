@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fast preflight for Dynamic12's three modified models.  Uses one real batch
+# Fast preflight for Dynamic12's three priority models.  Uses one real batch
 # per model; it does not train epochs or mutate the benchmark result tree.
 set -euo pipefail
 

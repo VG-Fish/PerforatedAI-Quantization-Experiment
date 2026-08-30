@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fast end-to-end smoke test for the Dynamic12 TCN, GRU, and VAE changes.
+"""Fast end-to-end smoke test for Dynamic12's ResNet, SAINT, and PointNet runs.
 
 This deliberately uses one real training batch for each model.  It checks the
 same forward/loss/backward path and PTQ helper that the benchmark runner uses,
@@ -37,7 +37,7 @@ from dendritic_benchmark.training import (
 )
 
 
-DEFAULT_MODELS = ("tcn_forecaster", "gru_forecaster", "vae_mnist")
+DEFAULT_MODELS = ("resnet18_cifar10", "saint_adult", "pointnet_modelnet40")
 QUANTIZATION_CASES = (
     ("fp32", None, None, "tensor"),
     ("q8", 8, None, "tensor"),
@@ -220,7 +220,7 @@ def smoke_model(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--models", nargs="+", choices=DEFAULT_MODELS, default=DEFAULT_MODELS)
-    parser.add_argument("--model-scale", type=float, default=0.75)
+    parser.add_argument("--model-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 

@@ -26,13 +26,9 @@ from dendritic_benchmark.training import infer_module_output_dimensions
 
 
 TARGET_CASES = (
-    ("tcn_forecaster", "default"),
-    ("tcn_forecaster", "tcn_head_output"),
-    ("tcn_forecaster", "tcn_head_both"),
-    ("gru_forecaster", "default"),
-    ("gru_forecaster", "gru_gate_ablation"),
-    ("vae_mnist", "default"),
-    ("vae_mnist", "vae_latent"),
+    ("resnet18_cifar10", "default"),
+    ("saint_adult", "default"),
+    ("pointnet_modelnet40", "default"),
 )
 PAI_ELIGIBLE_TYPES = (nn.Linear, nn.Conv1d, nn.Conv2d)
 
@@ -104,10 +100,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models",
         nargs="+",
-        choices=("tcn_forecaster", "gru_forecaster", "vae_mnist"),
-        default=("tcn_forecaster", "gru_forecaster", "vae_mnist"),
+        choices=("resnet18_cifar10", "saint_adult", "pointnet_modelnet40"),
+        default=("resnet18_cifar10", "saint_adult", "pointnet_modelnet40"),
     )
-    parser.add_argument("--model-scale", type=float, default=0.75)
+    parser.add_argument("--model-scale", type=float, default=1.0)
     return parser.parse_args()
 
 

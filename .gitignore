@@ -47,3 +47,4 @@ experiments/dynamic12/scripts/*
 experiments/dynamic12/tuning/*
 !experiments/dynamic12/tuning/tune_gru_capacity.py
 !experiments/dynamic12/tuning/tune_vae_capacity.py
+.pytest_cache/

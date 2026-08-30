@@ -1562,12 +1562,61 @@ class CapsNet(nn.Module):
         return outputs.norm(dim=-1)
 
 
+class ResNet18PreFC(nn.Module):
+    """CIFAR ResNet-18 with the PerforatedAI-style pre-classifier projection.
+
+    A local restatement of upstream ``ResNetPAIPreFC``
+    (``perforatedai.library_perforatedai``, and ``resnet_prefc.py`` in the
+    PerforatedAI ImageNet example), which inserts a square ``pre_fc``
+    projection after global pooling and perforates that layer while keeping
+    the residual backbone tracked.  The forward path here is theirs verbatim:
+    ``fc(relu(pre_fc(flatten(avgpool(x)))))``.  It is restated rather than
+    imported so that building a *base* model never requires ``perforatedai``.
+
+    Two deliberate departures from upstream:
+
+    * The projection lives in **both** benchmark arms.  Otherwise a dendritic
+      result would be confounded with the extra 512 x 512 dense layer itself.
+    * Identity initialization, where upstream uses the default ``nn.Linear``
+      init.  Since ``layer4`` ends in a ReLU, the pooled features are
+      non-negative and the added ReLU is a no-op, so an identity ``pre_fc``
+      makes this network numerically equal to stock ResNet-18 at step zero --
+      verified against ``LPA.ResNetPAIPreFC`` -- while still free to learn.
+    """
+
+    def __init__(self, backbone: Any):
+        super().__init__()
+        self.conv1 = backbone.conv1
+        self.bn1 = backbone.bn1
+        self.relu = backbone.relu
+        self.maxpool = backbone.maxpool
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
+        self.avgpool = backbone.avgpool
+        in_features = backbone.fc.in_features
+        self.pre_fc = nn.Linear(in_features, in_features)
+        nn.init.eye_(self.pre_fc.weight)
+        nn.init.zeros_(self.pre_fc.bias)
+        self.fc = backbone.fc
+
+    def forward(self, x: Any) -> Any:
+        x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = torch.flatten(self.avgpool(x), 1)
+        return self.fc(F.relu(self.pre_fc(x)))
+
+
 def _build_resnet18_cifar10(**_: Any) -> Any:
     torchvision_models = cast(Any, __import__("torchvision.models", fromlist=["models"]))
     model = torchvision_models.resnet18(weights=None, num_classes=10)
     model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
     model.maxpool = nn.Identity()
-    return model
+    return ResNet18PreFC(model)
 
 
 def _build_mobilenetv2_cifar10(**_: Any) -> Any:
