@@ -7,6 +7,12 @@ exact code responsible and lays out fix options. Line numbers are current as of
 commit `675105a` (branch `dynamic5-baselines`). Caveats §4 and §5 were found live
 during the `dynamic7` run itself, on 2026-08-28.
 
+> **See also:** `DENDRITE_EFFECT_AUDIT_2026-08-30.md` tests whether the dendrite
+> effect on the dynamic12 models exceeds each run's own validation noise and what
+> continued training alone would have delivered. It is the effect-size counterpart
+> to §7 here: of nine dendritic runs, one (PointNet) clears its noise floor with
+> margin, one (LeNet-5) is marginal, and none has been replicated across seeds.
+
 Status at a glance:
 
 | # | caveat | root cause found | fix applied |
