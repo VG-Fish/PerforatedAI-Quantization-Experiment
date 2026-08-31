@@ -12,7 +12,8 @@ build/
 .DS_Store
 PAI/
 .claude
-uv.lock
+# uv.lock is tracked on purpose: CI syncs with `--frozen`, which fails
+# outright without a committed lockfile.
 sonar-project.properties
 .scannerwork/
 .uv-cache/
