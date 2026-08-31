@@ -1,27 +1,9 @@
 # CLI Command Diagrams
 
 <!-- status-banner -->
-> **Status: historical reference.** The flowcharts still describe how each command moves through the pipeline. The option and default tables are superseded by the generated command reference in [CURRENT_GUIDE.md](CURRENT_GUIDE.md), which is rendered from the CLI's own registry.
+> **Status: historical reference.** The flowcharts still describe how each command moves through the pipeline. The option tables and flag listings this file used to carry were removed in the 2026-08-31 cleanup: the command reference in [CURRENT_GUIDE.md](CURRENT_GUIDE.md) is rendered from the CLI's own registry and cannot drift from it. The flowcharts predate `dqb docs` and `dqb evidence_index`, which have no diagram here.
 
-Mermaid flowcharts for all `uv run dqb` commands.
-
----
-
-## Shared Options
-
-These flags are shared by all commands:
-
-| Flag | Default | Description |
-|---|---|---|
-| `--results-root DIR` | `results` | Root directory for per-model result folders (also used by `benchmark_models` to locate trained models) |
-| `--results-directory NAME` | _unset_ | Optional subdirectory under `--results-root`; when set, results path becomes `<results-root>/<results-directory>` |
-| `--logging-dir DIR` | `logs` | Directory for timestamped log files |
-
-`--comparison-root DIR` is available on `uv run dqb run`, `uv run dqb compare`, and `uv run dqb benchmark_models`.
-
-`--benchmark-root DIR` is available only on `uv run dqb benchmark_models`.
-
-Generating commands update `.dqb/command_config.json` with the concrete user-supplied output paths they used. `uv run dqb clean` reads that registry later.
+Mermaid flowcharts for the `uv run dqb` training and analysis commands.
 
 ---
 
@@ -32,26 +14,6 @@ Trains models across all (or a subset of) conditions and saves results.
 By default the selected models are split across four worker processes and a
 live progress table is printed until they all exit. Partitioning is by *model*,
 never by condition, so the dependency chain below stays inside one worker.
-
-```bash
-uv run dqb run
-uv run dqb --results-directory experiment_a run
-uv run dqb run --models lenet5 textcnn
-uv run dqb run --conditions base_fp32 base_q8 dendrites_fp32
-uv run dqb run --results-root results
-uv run dqb run --comparison-root comparison
-uv run dqb run --allow-PQAT
-uv run dqb run --dynamic-dendritic-training
-uv run dqb run --ignore-saved-models
-
-# parallelism
-uv run dqb run --jobs 1          # train in this process, print to the terminal
-uv run dqb run --jobs 8
-uv run dqb run --fresh           # drop stale epoch_checkpoint.pt files first
-uv run dqb run --detach          # launch workers and exit
-uv run dqb run --status          # report on a running (or finished) run
-uv run dqb run -i 120            # seconds between progress tables
-```
 
 ```mermaid
 flowchart TD
@@ -138,12 +100,6 @@ flowchart LR
 
 Pre-downloads and caches all datasets so that `run` can work offline.
 
-```bash
-uv run dqb download_data
-uv run dqb download_data --models lenet5 mpnn
-uv run dqb download_data --strict
-```
-
 ```mermaid
 flowchart TD
     A([uv run dqb download_data]) --> B["Parse args<br>--models, --strict"]
@@ -188,13 +144,6 @@ flowchart TD
 
 Rebuilds all comparison outputs from previously saved `record.json` files without retraining.
 
-```bash
-uv run dqb compare
-uv run dqb --results-directory experiment_a compare
-uv run dqb compare --manifest
-uv run dqb compare --results-root results --comparison-root comparison
-```
-
 ```mermaid
 flowchart TD
     A([uv run dqb compare]) --> B["Parse args --manifest"]
@@ -229,13 +178,6 @@ flowchart TD
 
 Renders per-epoch training-curve plots from saved result histories without retraining.
 
-```bash
-uv run dqb generate_graphs
-uv run dqb --results-directory experiment_a generate_graphs
-uv run dqb generate_graphs --results-root results
-uv run dqb generate_graphs --regenerate-graphs
-```
-
 ```mermaid
 flowchart TD
     A([uv run dqb generate_graphs]) --> B["Parse args<br>--regenerate-graphs"]
@@ -266,18 +208,6 @@ flowchart TD
 ## `uv run dqb benchmark_models`
 
 Measures wall-clock inference latency for all trained models using `torch.utils.benchmark.Timer`. Already-benchmarked model/condition pairs are skipped by default (existing `{condition}.json` is reused). Pass `--re-run` to force re-measurement.
-
-```bash
-uv run dqb benchmark_models
-uv run dqb --results-directory experiment_a benchmark_models
-uv run dqb benchmark_models --models lenet5 m5
-uv run dqb benchmark_models --conditions base_fp32 base_q4 dendrites_q4
-uv run dqb benchmark_models --batch-sizes 1 8 32
-uv run dqb benchmark_models --num-runs 10
-uv run dqb benchmark_models --benchmark-root my_benchmarks
-uv run dqb benchmark_models --comparison-root my_comparison
-uv run dqb benchmark_models --re-run
-```
 
 ```mermaid
 flowchart TD
@@ -330,11 +260,6 @@ Results are organized by model and condition:
 ## `uv run dqb clean`
 
 Removes generated outputs recorded by previous `uv run dqb` commands.
-
-```bash
-uv run dqb clean --dry-run
-uv run dqb clean
-```
 
 ```mermaid
 flowchart TD

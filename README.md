@@ -268,7 +268,7 @@ the generated guide, the generated guide is the current state.
 
 ## Available commands (uv run dqb)
 
-The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` for flowcharts and full details.
+The CLI exposes several helpful subcommands. Every option, with its default, is in the generated command reference in `information/CURRENT_GUIDE.md`; `information/CLI_DIAGRAMS.md` has the per-command flowcharts.
 
 - `uv run dqb run`
 	- Train models across one or more conditions. A bare run uses the evidence-backed default roster (`lenet5`, `tcn_forecaster`, `pointnet_modelnet40`, `resnet18_cifar10`, and `saint_adult`) across every condition. Use `--models all` to opt into the full exploratory 24-model roster.
@@ -370,4 +370,4 @@ The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` f
 - `uv run dqb --help`
 	- Show help for the `dqb` command and available subcommands/flags.
 
-For full command flow diagrams and more flags, open `information/CLI_DIAGRAMS.md`.
+For every flag and its default, see the command reference in `information/CURRENT_GUIDE.md`; for the command flow diagrams, `information/CLI_DIAGRAMS.md`.

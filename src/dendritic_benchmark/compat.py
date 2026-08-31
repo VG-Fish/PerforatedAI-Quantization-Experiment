@@ -730,11 +730,6 @@ def set_pai_root(root: Path | str) -> Path:
     return _PAI_ROOT
 
 
-def pai_root() -> Path:
-    """Return the directory PerforatedAI artifacts are written under."""
-    return _PAI_ROOT
-
-
 @contextmanager
 def pai_working_directory() -> Iterator[None]:
     """Run PerforatedAI file I/O with ``PAI/`` as the working directory.

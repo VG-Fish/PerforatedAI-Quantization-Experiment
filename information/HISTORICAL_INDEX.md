@@ -3,7 +3,9 @@
 Every document under `information/`, what state it is in, and what it may still be
 cited for. Three of these files are generated; the rest are hand-written and keep
 their original numbers on purpose, because they are the evidence of what was true
-when they were written.
+when they were written. A hand-written document is trimmed only when a section of it
+duplicates a generated file or proposes work that has since shipped; the trim is
+recorded in that document's own banner.
 
 **Statuses**
 
@@ -21,26 +23,21 @@ when they were written.
 | [EVIDENCE_INDEX.md](EVIDENCE_INDEX.md) | current (generated) | what generated evidence exists on disk, in which run namespace, with which manifest verdict |
 | [RETENTION_POLICY.md](RETENTION_POLICY.md) | current | which generated trees may be archived or deleted, and what must exist first |
 | [DENDRITE_EFFECT_AUDIT_2026-08-30.md](DENDRITE_EFFECT_AUDIT_2026-08-30.md) | current | the standing verdict on whether the dendrite effect beats noise and more training |
-| [MEASUREMENT_CAVEATS.md](MEASUREMENT_CAVEATS.md) | current (dated line numbers) | the five measurement caveats, their root causes, and the fix options |
-| [audit/audit_report.md](audit/audit_report.md) | current | the cleanup priority ledger (P0–P2) and its implementation updates |
-| [audit/00_investigation_map.md](audit/00_investigation_map.md) | current | scope, repository shape, and the reconnaissance behind the audit |
-| [audit/10_training_pai_quantization.md](audit/10_training_pai_quantization.md) | current | training/PAI/quantization findings |
-| [audit/20_pipeline_cli_artifacts.md](audit/20_pipeline_cli_artifacts.md) | current | pipeline/CLI/artifact-lifecycle findings |
-| [audit/30_models_data_scope.md](audit/30_models_data_scope.md) | current | model/data/scope findings |
-| [audit/40_crosscutting_static_docs.md](audit/40_crosscutting_static_docs.md) | current | Sonar inventory, `ty` diagnostics, docs and test findings |
+| [MEASUREMENT_CAVEATS.md](MEASUREMENT_CAVEATS.md) | current (dated line numbers) | the eleven measurement caveats, their root causes, and which results each one invalidates |
+| [audit/audit_report.md](audit/audit_report.md) | current | the cleanup priority ledger, what P0–P2 built, what is still open, and the dead-code ledger |
 
 ## Historical
 
 | document | status | cite it for | do not cite it for |
 |---|---|---|---|
-| [DOCUMENTATION.md](DOCUMENTATION.md) | historical | experiment rationale, PerforatedAI integration walkthrough, quantization background | the roster, the condition grid, or any command syntax |
+| [DOCUMENTATION.md](DOCUMENTATION.md) | historical | experiment rationale, PerforatedAI integration walkthrough, quantization background, the baseline-quality record | the roster or the condition grid |
 | [MODEL_REFERENCE.md](MODEL_REFERENCE.md) | historical | per-model hyperparameters, preprocessing, and PAI targeting narrative | metrics, metric directions, or which models are in the default roster |
-| [CLI_DIAGRAMS.md](CLI_DIAGRAMS.md) | historical | command flowcharts | flags, defaults, or the list of subcommands |
+| [CLI_DIAGRAMS.md](CLI_DIAGRAMS.md) | historical | command flowcharts and the generated-output directory layout | flags, defaults, or the list of subcommands |
 | [REMAINING_FIXES.md](REMAINING_FIXES.md) | historical (2026-08-07) | why the baseline-quality pass changed what it changed | the outstanding-work list; the audit ledger owns that now |
 | [CODE_REVIEW_2026-08-28.md](CODE_REVIEW_2026-08-28.md) | historical (2026-08-28) | the bugs found and fixed in that pass | current open findings |
 | [DYNAMIC8_RUN_2026-08-28.md](DYNAMIC8_RUN_2026-08-28.md) | historical run report | what dynamic8 ran and observed | reportable results — it predates the artifact manifest |
 | [DYNAMIC9_RUN_2026-08-28.md](DYNAMIC9_RUN_2026-08-28.md) | historical run report | what dynamic9 ran and observed | reportable results — it predates the artifact manifest |
-| [DYNAMIC_DENDRITIC_MIGRATION.md](DYNAMIC_DENDRITIC_MIGRATION.md) | historical | the reasoning behind moving from fixed-interval to HISTORY scheduling | proposals — the migration is complete |
+| [DYNAMIC_DENDRITIC_MIGRATION.md](DYNAMIC_DENDRITIC_MIGRATION.md) | historical | the reasoning behind moving from fixed-interval to HISTORY scheduling, and the PerforatedAI 3.2.3 `save_name` constraint | schedule values — `compat.py::PAI_DYNAMIC_SCHEDULE_DEFAULTS` is the live one |
 
 ## Superseded
 

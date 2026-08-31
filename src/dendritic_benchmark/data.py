@@ -146,7 +146,6 @@ class _Bond:
     source: int
     target: int
     order: float
-    ring_closure: bool
 
 
 @dataclass
@@ -1383,9 +1382,7 @@ class GraphDatasets:
                 pending_order = None
                 if label in ring_open:
                     partner, partner_order = ring_open.pop(label)
-                    bonds.append(
-                        _Bond(partner, previous, max(order, partner_order), True)
-                    )
+                    bonds.append(_Bond(partner, previous, max(order, partner_order)))
                 else:
                     ring_open[label] = (previous, order)
                 continue
@@ -1395,7 +1392,7 @@ class GraphDatasets:
             current: int = len(atoms)
             atoms.append(atom)
             if previous is not None:
-                bonds.append(_Bond(previous, current, pending_order or 1.0, False))
+                bonds.append(_Bond(previous, current, pending_order or 1.0))
             pending_order = None
             previous = current
         if not atoms:
@@ -1406,11 +1403,11 @@ class GraphDatasets:
     def _ring_bond_flags(atom_count: int, bonds: list[_Bond]) -> list[bool]:
         """Mark every bond that lies on a cycle, by finding the graph's bridges.
 
-        ``_Bond.ring_closure`` marks only the one bond that *closes* a SMILES
-        ring, so the previous featuriser set ``in_ring`` on two atoms of a
-        benzene and left the other four at zero — aromaticity and ring
-        membership are among the strongest signals for solubility, and the
-        models were being shown a corrupted version of both.
+        A SMILES string only marks the single bond that *closes* a ring, so the
+        previous featuriser set ``in_ring`` on two atoms of a benzene and left
+        the other four at zero — aromaticity and ring membership are among the
+        strongest signals for solubility, and the models were being shown a
+        corrupted version of both.
 
         A bond lies on a cycle exactly when it is not a bridge, so one
         bridge-finding pass labels every ring bond correctly, fused and

@@ -1,23 +1,16 @@
 # Model selection for the 7-model run
 
 <!-- status-banner -->
-> **Status: superseded (2026-08-29).** Kept for its cost table and domain-diversity reasoning. The default roster in force today is generated in [CURRENT_GUIDE.md](CURRENT_GUIDE.md).
-
-> **SUPERSEDED for the Dynamic12 priority sweep (2026-08-29).** That sweep runs
-> `resnet18_cifar10`, `saint_adult`, and `pointnet_modelnet40` — two of which
-> this document rules out. Criterion 1 excluded `pointnet_modelnet40` and
-> `resnet18_cifar10` because an expired PerforatedAI token had blocked their
-> low-bit dendritic conditions. **That block is gone**: the token in `.env`
-> perforates all three cleanly, verified 2026-08-29 by calling
-> `compat.perforate_model` on each. The criterion-1 exclusion is therefore void,
-> and with it the reason those two were not candidates.
->
-> Nothing else here is retracted — the cost table, the domain-diversity
-> argument, and the `top10` signal-quality analysis all still read correctly for
-> the 7-model run they were written for. See `experiments/dynamic12/README.md`
-> for the priority sweep's own scope and `information/MODEL_REFERENCE.md` for
-> the three models' perforation targets.
-
+> **Status: superseded (2026-08-29).** Criterion 1 below excluded
+> `pointnet_modelnet40` and `resnet18_cifar10` because an expired PerforatedAI token
+> had blocked their low-bit dendritic conditions. That block is gone — the token in
+> `.env` perforates both cleanly, verified 2026-08-29 — so the criterion-1 exclusion
+> is void, and the Dynamic12 priority sweep runs them. Nothing else here is retracted:
+> the cost table, the domain-diversity argument, and the `top10` signal-quality
+> analysis still read correctly for the 7-model run they were written for. The default
+> roster in force today is generated in [CURRENT_GUIDE.md](CURRENT_GUIDE.md); see
+> `experiments/dynamic12/README.md` for the priority sweep's scope and
+> [MODEL_REFERENCE.md](MODEL_REFERENCE.md) for those models' perforation targets.
 
 The user's plan: drop `tcn_forecaster` from the current 5 (`lenet5`, `gcn`,
 `actor_critic`, `saint_adult`, `tcn_forecaster`) and add 3 new models from the
