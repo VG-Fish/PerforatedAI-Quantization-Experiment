@@ -25,7 +25,6 @@ from .compat import (
     MODULE_OUTPUT_DIMENSIONS_ATTR,
     PAI_ARTIFACT_NAME,
     attach_module_output_dimensions,
-    binary_quantize_tensor,
     choose_device,
     clear_pai_processor_buffers,
     clear_pai_tracker_state,
@@ -37,11 +36,19 @@ from .compat import (
     pai_working_directory,
     save_pai_system,
     set_module_output_dimensions,
-    symmetric_quantize_tensor,
-    ternary_quantize_tensor,
-    ternary_quantize_tensor_per_channel,
 )
 from .data import _explained_variance
+from .model_adapters import model_adapter
+from .plans import LRScheduleName, OptimizerName, RegressionLossName
+from .quantization import (
+    make_quantized_copy as _make_quantized_copy,
+    qat_init_shadow as _qat_init_shadow,
+    qat_project_for_forward as _qat_project_for_forward,
+    qat_restore_shadow_for_step as _qat_restore_shadow_for_step,
+    qat_sync_shadow_after_step as _qat_sync_shadow_after_step,
+    should_quantize_for_eval as _should_quantize_for_eval,
+    should_quantize_for_training as _should_quantize_for_training,
+)
 
 _MODEL_PT: str = "model.pt"
 _BEST_MODEL_STATS_CSV: str = "best_model_stats.csv"
@@ -64,14 +71,11 @@ _FALLBACK_MODULE_OUTPUT_DIMENSIONS: dict[str, dict[str, list[int]]] = {
         ".message.2": [-1, -1, 0],
     },
 }
-OptimizerName = Literal["adam", "adamw", "sgd"]
-RegressionLossName = Literal["mse", "mae", "smooth_l1"]
 # "constant" leaves the learning rate alone for the whole run.
 # "step"     multiplies it by lr_decay_gamma every lr_decay_every epochs.
 # "cosine"   anneals it from learning_rate down to learning_rate*lr_min_factor.
 # "linear"   decays it linearly to learning_rate*lr_min_factor (BERT-style).
 # All three honour warmup_epochs first. See ModelTrainingRecipe in pipeline.py.
-LRScheduleName = Literal["constant", "step", "cosine", "linear"]
 
 # Hard ceiling on a single PAI dendrite ("p") phase, in epochs.  PAI's own
 # pai_improvement_threshold gates do not reliably end the phase (raising them
@@ -142,6 +146,7 @@ class TrainingConfig:
     # Explicitly invalidates artifacts when a model architecture or its
     # experiment-critical training plan changes without a model-scale change.
     model_revision: str | None = None
+    dataset_revision: str | None = None
     pai_fixed_switch_interval: int | None = None
     pai_dynamic_schedule: dict[str, Any] | None = None
     # Ceiling on a single dendrite ("p") phase in dynamic mode, and the only
@@ -240,6 +245,7 @@ class ArtifactMetadata:
     pai_dynamic_schedule: dict[str, Any] | None
     pai_save_name: str | None
     quantization_granularity: str = "tensor"
+    dataset_revision: str | None = None
     lr_schedule_epochs: int | None = None
     model_revision: str | None = None
     max_dynamic_training_epochs: int | None = None
@@ -482,35 +488,19 @@ def _ppo_metrics(outputs: Any, targets: Any) -> dict[str, float]:
 
 
 _PRIMARY_METRIC_KEY: dict[str, str] = {
-    "lenet5": "accuracy",
-    "m5": "accuracy",
-    "lstm_forecaster": "mae",
-    "textcnn": "accuracy",
-    "gcn": "accuracy",
-    "tabnet": "accuracy",
-    "mpnn": "rmse",
-    "actor_critic": "reward_proxy",
-    "lstm_autoencoder": "auc",
-    "distilbert": "accuracy",
-    "dqn_lunarlander": "reward_proxy",
-    # A real return from the environment, not a proxy: ppo_bipedalwalker trains
-    # on policy, so the natural selection metric is the thing being optimised.
-    # It is also leak-free by construction — a rollout cannot overlap a split.
-    "ppo_bipedalwalker": "episodic_return",
-    "attentivefp_freesolv": "rmse",
-    "gin_imdbb": "accuracy",
-    "tcn_forecaster": "mae",
-    "gru_forecaster": "mae",
-    "pointnet_modelnet40": "accuracy",
-    "vae_mnist": "elbo",
-    "snn_nmnist": "accuracy",
-    "unet_isic": "dice",
-    "resnet18_cifar10": "accuracy",
-    "resnet18_hf_perforated_cifar10": "accuracy",
-    "mobilenetv2_cifar10": "accuracy",
-    "saint_adult": "accuracy",
-    "capsnet_mnist": "accuracy",
+    key: model_adapter(key).primary_metric_key
+    for key in (
+        "lenet5", "m5", "lstm_forecaster", "textcnn", "gcn", "tabnet",
+        "mpnn", "actor_critic", "lstm_autoencoder", "distilbert",
+        "dqn_lunarlander", "ppo_bipedalwalker", "attentivefp_freesolv",
+        "gin_imdbb", "tcn_forecaster", "gru_forecaster",
+        "pointnet_modelnet40", "vae_mnist", "snn_nmnist",
+        "resnet18_cifar10", "resnet18_hf_perforated_cifar10",
+        "mobilenetv2_cifar10", "saint_adult", "capsnet_mnist",
+    )
 }
+# Kept outside the registered roster until its dataset support is promoted.
+_PRIMARY_METRIC_KEY["unet_isic"] = "dice"
 
 
 class CapsuleMarginLoss(torch.nn.Module):
@@ -977,7 +967,7 @@ def _evaluate_episodic_return(
 
 def _rescale_to_dataset_units(value: Any, offset: float, scale: float) -> Any:
     """Undo a dataset's target standardisation so metrics keep their real units."""
-    if scale == 1.0 and offset == 0.0:
+    if math.isclose(scale, 1.0) and math.isclose(offset, 0.0):
         return value
     return value.float() * scale + offset
 
@@ -992,20 +982,23 @@ def _compute_all_metrics(
     target_offset: float = 0.0,
     target_scale: float = 1.0,
 ) -> dict[str, float]:
+    task_kind = (
+        "segmentation" if model_key == "unet_isic" else model_adapter(model_key).task_kind
+    )
     if model_key == "actor_critic" and isinstance(outputs, tuple):
         outputs = outputs[0]
-    if model_key in {"lstm_forecaster", "mpnn", "attentivefp_freesolv", "tcn_forecaster", "gru_forecaster"}:
+    if task_kind == "regression":
         return _regression_metrics(
             _rescale_to_dataset_units(outputs, target_offset, target_scale),
             _rescale_to_dataset_units(targets, target_offset, target_scale),
         )
-    if model_key == "ppo_bipedalwalker":
+    if task_kind == "on_policy":
         return _ppo_metrics(outputs, targets)
-    if model_key == "vae_mnist":
+    if task_kind == "vae":
         return _vae_metrics(outputs, targets)
-    if model_key == "unet_isic":
+    if task_kind == "segmentation":
         return {"dice": _dice_from_logits(outputs, targets)}
-    if model_key == "lstm_autoencoder":
+    if task_kind == "anomaly":
         return _anomaly_metrics(outputs, targets, metric_targets)
     metrics = _classification_metrics(outputs, targets)
     if model_key in {"actor_critic", "dqn_lunarlander"}:
@@ -1259,45 +1252,6 @@ def _unwrap_compiled(model: Any) -> Any:
     return getattr(model, "_orig_mod", model)
 
 
-def _quantize_tensor(
-    tensor: Any,
-    bit_width: int,
-    mode: str | None,
-    granularity: str = "tensor",
-) -> Any:
-    """Dispatch to the right quantization kernel, on CPU.
-
-    Running these kernels on MPS triggered a malloc double-free for PointNet
-    post-training ternary quantization, so the math stays off-device; the
-    caller streams the result back with ``.to(param.device)``.
-    """
-    cpu_tensor = tensor.detach().cpu()
-    if mode == "binary" or bit_width == 1:
-        return binary_quantize_tensor(cpu_tensor)
-    if mode == "ternary":
-        if granularity == "channel":
-            return ternary_quantize_tensor_per_channel(cpu_tensor)
-        return ternary_quantize_tensor(cpu_tensor)
-    return symmetric_quantize_tensor(cpu_tensor, bit_width)
-
-
-def _make_quantized_copy(
-    model: Any,
-    bit_width: int | None,
-    mode: str | None = None,
-    granularity: str = "tensor",
-) -> Any:
-    if bit_width is None or bit_width >= 32:
-        return model
-    with torch.no_grad():
-        for param in model.parameters():
-            if param.numel() == 0:
-                continue
-            quantized = _quantize_tensor(param, bit_width, mode, granularity)
-            param.copy_(quantized.to(param.device))
-    return model
-
-
 def _finalize_quantized_model_for_eval(model: Any, config: "TrainingConfig") -> Any:
     """Return deployment weights without accidentally re-quantizing a QAT model.
 
@@ -1318,100 +1272,6 @@ def _finalize_quantized_model_for_eval(model: Any, config: "TrainingConfig") -> 
         config.quantization_mode,
         config.quantization_granularity,
     )
-
-
-# Attribute name used to stash each quantized parameter's full-precision
-# "shadow" value across a PQAT fine-tune. See _qat_init_shadow for why this
-# exists: without it, PQAT fine-tuning does nothing.
-_QAT_SHADOW_ATTR = "_pai_qat_shadow"
-
-
-def _qat_init_shadow(model: Any) -> None:
-    """Snapshot full-precision weights before PQAT fine-tuning quantizes them.
-
-    Every low-bit PQAT run (any base_q*/dendrites_q* condition trained with
-    ``--allow-PQAT``) used to report a validation score frozen bit-for-bit for
-    its entire fine-tune budget (best_epoch == 1, loss identical to 10
-    decimal places epoch over epoch). The cause: _run_training_batch used to
-    call optimizer.step() and then immediately hard-requantize the weights
-    back onto the quantization grid every batch. binary_quantize_tensor is a
-    sign() projection, so unless a single Adam step (~1e-3 in magnitude) was
-    big enough to push a weight all the way past zero, that snap silently
-    erased the step — nothing ever accumulated, and effectively zero learning
-    happened for the whole fine-tune. Ternary/int quantization have the same
-    failure mode at a finer grid spacing.
-
-    The fix is the standard BinaryConnect/XNOR-Net pattern: keep a
-    full-precision "shadow" copy of each parameter that the optimizer
-    actually updates, and only ever quantize a projected copy of it into
-    ``.data`` for the forward/backward pass. See _qat_project_for_forward /
-    _qat_restore_shadow_for_step / _qat_sync_shadow_after_step.
-    """
-    for param in model.parameters():
-        if param.numel() == 0:
-            continue
-        setattr(param, _QAT_SHADOW_ATTR, param.detach().clone())
-
-
-def _qat_shadow_for(param: Any) -> Any:
-    """Return this parameter's full-precision shadow, self-healing from the
-    current .data if one was never stashed (e.g. a mid-PQAT resume reloaded
-    a state_dict, which does not carry the plain Python attribute). .data is
-    always left on the quantization grid between batches, so re-deriving from
-    it loses only the fractional progress since that snap, not the shadow's
-    whole history."""
-    shadow = getattr(param, _QAT_SHADOW_ATTR, None)
-    if shadow is None:
-        shadow = param.detach().clone()
-        setattr(param, _QAT_SHADOW_ATTR, shadow)
-    return shadow
-
-
-def _qat_project_for_forward(model: Any, config: "TrainingConfig") -> None:
-    """Write quantize(shadow) into .data so the forward pass sees the
-    deployment-realistic quantized weights (matches eval and the next
-    batch's starting point)."""
-    if not _should_quantize_for_training(config):
-        return
-    bit_width = config.bit_width
-    assert bit_width is not None  # guaranteed by _should_quantize_for_training
-    with torch.no_grad():
-        for param in model.parameters():
-            if param.numel() == 0:
-                continue
-            shadow = _qat_shadow_for(param)
-            quantized = _quantize_tensor(
-                shadow,
-                bit_width,
-                config.quantization_mode,
-                config.quantization_granularity,
-            )
-            param.data.copy_(quantized.to(param.device))
-
-
-def _qat_restore_shadow_for_step(model: Any, config: "TrainingConfig") -> None:
-    """Swap .data back to the continuous shadow right before optimizer.step()
-    so the update accumulates in full precision instead of being erased by
-    the next hard re-quantization."""
-    if not _should_quantize_for_training(config):
-        return
-    with torch.no_grad():
-        for param in model.parameters():
-            if param.numel() == 0:
-                continue
-            param.data.copy_(_qat_shadow_for(param))
-
-
-def _qat_sync_shadow_after_step(model: Any, config: "TrainingConfig") -> None:
-    """Persist the optimizer's update (applied to the restored full-precision
-    .data) back into the shadow."""
-    if not _should_quantize_for_training(config):
-        return
-    with torch.no_grad():
-        for param in model.parameters():
-            if param.numel() == 0:
-                continue
-            _qat_shadow_for(param).copy_(param.data)
 
 
 def _artifact_path(output_dir: Path, use_dendrites: bool) -> Path:
@@ -1626,6 +1486,7 @@ def _persist_stage_artifacts(
             "condition_key": metadata.condition_key,
             "source_condition_key": metadata.source_condition_key,
             "model_revision": metadata.model_revision,
+            "dataset_revision": metadata.dataset_revision,
             "model_scale": metadata.model_scale,
             "seed": metadata.seed,
             "pai_variant": metadata.pai_variant,
@@ -2634,7 +2495,7 @@ def _is_pinned(item: Any) -> bool:
         return False
     try:
         return bool(item.is_pinned())
-    except (AttributeError, RuntimeError, NotImplementedError):
+    except (AttributeError, RuntimeError):
         return False
 
 
@@ -3987,6 +3848,7 @@ def _build_artifact_metadata(
         memory_cleanup_interval_batches=config.memory_cleanup_interval_batches,
         model_scale=config.model_scale,
         model_revision=config.model_revision,
+        dataset_revision=config.dataset_revision,
         pai_variant=config.pai_variant,
         pai_fixed_switch_interval=config.pai_fixed_switch_interval,
         pai_dynamic_schedule=config.pai_dynamic_schedule,
@@ -4034,6 +3896,7 @@ def _metadata_for_stage(
         memory_cleanup_interval_batches=metadata.memory_cleanup_interval_batches,
         model_scale=metadata.model_scale,
         model_revision=metadata.model_revision,
+        dataset_revision=metadata.dataset_revision,
         pai_variant=metadata.pai_variant,
         pai_fixed_switch_interval=metadata.pai_fixed_switch_interval,
         pai_dynamic_schedule=metadata.pai_dynamic_schedule,
@@ -4221,16 +4084,6 @@ def _is_pqat_enabled(config: TrainingConfig, condition_key: str) -> bool:
         and config.source_condition_key is not None
         and config.source_condition_key != condition_key
     )
-
-
-def _should_quantize_for_training(config: TrainingConfig) -> bool:
-    bit_width = config.bit_width
-    return bit_width is not None and bit_width < 32 and config.use_qat
-
-
-def _should_quantize_for_eval(config: TrainingConfig) -> bool:
-    bit_width = config.bit_width
-    return bit_width is not None and bit_width < 32
 
 
 def _use_pai_runtime_guard() -> bool:

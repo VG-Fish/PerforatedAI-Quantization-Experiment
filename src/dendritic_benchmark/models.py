@@ -1731,15 +1731,27 @@ def _build_hf_perforated_resnet18_cifar10(
     is replaced with a freshly initialized CIFAR classifier, matching
     PerforatedAI's own transfer-learning example.
     """
-    if model_scale != 1.0:
+    if not math.isclose(model_scale, 1.0):
         raise ValueError(
             "resnet18_hf_perforated_cifar10 uses a fixed published checkpoint "
             "and therefore requires model_scale=1.0"
         )
     torchvision_models = cast(Any, __import__("torchvision.models", fromlist=["models"]))
     try:
-        from perforatedai import library_perforatedai as LPA
-        from perforatedai import network_perforatedai as NPA
+        LPA = cast(
+            Any,
+            __import__(
+                "perforatedai.library_perforatedai",
+                fromlist=["library_perforatedai"],
+            ),
+        )
+        NPA = cast(
+            Any,
+            __import__(
+                "perforatedai.network_perforatedai",
+                fromlist=["network_perforatedai"],
+            ),
+        )
         from safetensors.torch import load_file
     except ImportError as exc:  # pragma: no cover - dependencies are declared
         raise ImportError(

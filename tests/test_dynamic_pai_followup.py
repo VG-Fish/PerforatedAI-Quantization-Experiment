@@ -110,11 +110,14 @@ class DynamicPAIFollowupTests(unittest.TestCase):
         target = h.unsqueeze(1).expand(2, 5, 5, 4)
         expected = layer.edge_mlp(torch.cat([target, source, edge_features], dim=-1))
         expected.square().sum().backward()
-        expected_input_grad = h.grad.detach().clone()
-        expected_parameter_grads = {
-            name: parameter.grad.detach().clone()
-            for name, parameter in layer.edge_mlp.named_parameters()
-        }
+        h_grad = h.grad
+        assert h_grad is not None
+        expected_input_grad = h_grad.detach().clone()
+        expected_parameter_grads = {}
+        for name, parameter in layer.edge_mlp.named_parameters():
+            parameter_grad = parameter.grad
+            assert parameter_grad is not None
+            expected_parameter_grads[name] = parameter_grad.detach().clone()
 
         layer.zero_grad(set_to_none=True)
         h = h.detach().clone().requires_grad_(True)
@@ -652,7 +655,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
 
     def test_priority_recipes_opt_into_the_dendrite_lr_floor(self) -> None:
         """The three dynamic12 priority models must not anneal dendrites to nil."""
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             runner = BenchmarkRunner(results_root=Path(root) / "results")
             base = condition_by_key("base_fp32")
             for model_key in (

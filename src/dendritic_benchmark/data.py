@@ -33,6 +33,7 @@ from .models import (
 
 DATA_ROOT_ENV: str = "DQB_DATA_ROOT"
 DEFAULT_DATA_ROOT: str = "data"
+DATA_PIPELINE_REVISION: str = "dqb_preprocessing_2026_08_30_v1"
 EXTRACTED_MARKER: str = ".extracted"
 # Versioned: a cached rollout file records whichever heuristic produced it and
 # whatever payload schema was current when it was written. Reusing one after
@@ -929,7 +930,12 @@ class TimeSeriesDatasets:
 class TextDataSets:
     @staticmethod
     def _tokenize(text: str) -> list[str]:
-        return "".join(char.lower() if char.isalnum() else " " for char in text).split()
+        return [
+            str(token)
+            for token in "".join(
+                char.lower() if char.isalnum() else " " for char in text
+            ).split()
+        ]
 
     @staticmethod
     def _build_vocab(texts: Iterable[str], vocab_size: int) -> dict[str, int]:
@@ -1471,7 +1477,7 @@ class GraphDatasets:
             return EDGE_TRIPLE
         if bond.order >= 2.0:
             return EDGE_DOUBLE
-        if bond.order == 1.5:
+        if math.isclose(bond.order, 1.5):
             return EDGE_AROMATIC
         return EDGE_SINGLE
 
@@ -2103,7 +2109,7 @@ class PPORolloutSource:
                     # only on the way into the environment, and pretending the
                     # clipped value was the sample would put a point mass at the
                     # bounds that this density does not have.
-                    log_probs[step] = distribution.log_prob(action).sum()
+                    log_probs[step] = distribution.log_prob(action).sum(dim=-1)
                     values[step] = value.squeeze(0).cpu()
 
                     stepped = env.step(
@@ -2306,6 +2312,8 @@ def _read_off_mesh(path: Path) -> tuple[Any, Any]:
     here so the sampler downstream only has to handle triangles.
     """
     tokens = path.read_text().split()
+    if len(tokens) < 4:
+        raise ValueError(f"invalid OFF mesh header in {path}")
     if tokens[0] == "OFF":
         cursor = 1
     else:  # "OFF<v> <f> <e>" with no separator after the keyword
@@ -2315,6 +2323,16 @@ def _read_off_mesh(path: Path) -> tuple[Any, Any]:
     face_count = int(tokens[cursor + 1])
     cursor += 3  # counts are vertices, faces, edges (edges is always 0 here)
 
+    # Counts originate in downloaded mesh files. Bound them both absolutely
+    # and by the payload already read before using them as allocation/loop
+    # bounds; malformed input must fail without consuming unbounded resources.
+    if not 3 <= vertex_count <= 1_000_000:
+        raise ValueError(f"invalid OFF vertex count {vertex_count} in {path}")
+    if not 1 <= face_count <= 1_000_000:
+        raise ValueError(f"invalid OFF face count {face_count} in {path}")
+    if 3 * vertex_count > len(tokens) - cursor:
+        raise ValueError(f"truncated OFF vertex payload in {path}")
+
     stop = cursor + 3 * vertex_count
     vertices = torch.tensor(
         [float(value) for value in tokens[cursor:stop]], dtype=torch.float32
@@ -2323,8 +2341,15 @@ def _read_off_mesh(path: Path) -> tuple[Any, Any]:
 
     faces: list[tuple[int, int, int]] = []
     for _ in range(face_count):
+        if cursor >= len(tokens):
+            raise ValueError(f"truncated OFF face payload in {path}")
         sides = int(tokens[cursor])
+        remaining = len(tokens) - cursor - 1
+        if not 3 <= sides <= min(vertex_count, remaining):
+            raise ValueError(f"invalid OFF face width {sides} in {path}")
         corners = [int(value) for value in tokens[cursor + 1 : cursor + 1 + sides]]
+        if any(corner < 0 or corner >= vertex_count for corner in corners):
+            raise ValueError(f"OFF face index out of range in {path}")
         cursor += 1 + sides
         for offset in range(1, sides - 1):
             faces.append((corners[0], corners[offset], corners[offset + 1]))
@@ -2353,7 +2378,7 @@ def _sample_mesh_surface(vertices: Any, faces: Any, count: int, seed: int) -> An
     edge_a = triangles[:, 1] - triangles[:, 0]
     edge_b = triangles[:, 2] - triangles[:, 0]
     areas = 0.5 * torch.cross(edge_a, edge_b, dim=-1).norm(dim=-1)
-    if not torch.isfinite(areas).all() or float(areas.sum()) <= 0.0:
+    if not torch.isfinite(areas).all() or float(areas.sum(dim=0)) <= 0.0:
         # Fully degenerate mesh (zero area, or NaN coordinates). Nothing to
         # sample a surface from, so fall back to the vertices.
         index = torch.randint(len(vertices), (count,), generator=generator)

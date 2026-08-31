@@ -2,16 +2,14 @@ import functools
 import gc
 import json
 import math
-import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
@@ -40,9 +38,16 @@ from .compat import (
     set_module_output_dimensions,
     set_pai_root,
 )
-from .data import build_task_bundle
+from .data import DATA_PIPELINE_REVISION, build_task_bundle
 from .log_utils import validate_output_path
+from .model_adapters import model_adapter
 from .models import ADULT_CATEGORICAL_CARDINALITIES, build_model
+from .plans import (
+    ConditionTrainingPlan,
+    ExperimentPlan,
+    ModelTrainingRecipe,
+    SourceCheckpointLoadConfig,
+)
 from .results import (
     load_training_records,
     save_training_record,
@@ -62,14 +67,12 @@ from .training import (
     DENDRITE_AUDIT_REVISION,
     MAX_DENDRITE_PHASE_EPOCHS,
     QUANTIZATION_EVALUATION_REVISION,
-    LRScheduleName,
-    OptimizerName,
-    RegressionLossName,
     TrainingConfig,
     TrainingRecord,
     infer_module_output_dimensions,
     train_and_evaluate,
 )
+from .workers import WorkerSupervisor, terminate_process_groups
 
 EPOCH_MULTIPLIER = 10
 _RECORD_JSON = "record.json"
@@ -147,79 +150,6 @@ _DISTILBERT_PAI_CLASSIFICATION_HEAD = [
     ".model.pre_classifier",
     ".model.classifier",
 ]
-
-
-@dataclass(frozen=True)
-class ModelTrainingRecipe:
-    batch_size: int
-    max_epochs: int
-    learning_rate: float
-    optimizer_name: OptimizerName = "adam"
-    momentum: float = 0.9
-    weight_decay: float = 0.0
-    # "constant" | "step" | "cosine" | "linear". See LRScheduleName in training.py.
-    lr_schedule: LRScheduleName = "constant"
-    # Step decay: multiply lr by lr_decay_gamma every lr_decay_every epochs.
-    # Only read when lr_schedule == "step".
-    lr_decay_every: int | None = None
-    lr_decay_gamma: float = 1.0
-    # Floor for "cosine"/"linear", as a fraction of learning_rate.
-    lr_min_factor: float = 0.0
-    # Dynamic PAI may legitimately continue beyond max_epochs while a
-    # candidate completes.  Decay over this explicit horizon instead of
-    # prematurely pinning the learning rate at its floor.
-    lr_schedule_epochs: int | None = None
-    # Floor for the dendrite param group, as a fraction of learning_rate.
-    # Only newly inserted dendrite parameters see it; the backbone keeps the
-    # schedule its dense control runs.  See _dendrite_learning_rate.  Defaults
-    # to a no-op; opting in is per-recipe so no stored result changes meaning.
-    dendrite_lr_min_factor: float = 0.0
-    # Linear warmup ramp, in epochs, applied under every schedule.
-    warmup_epochs: int = 0
-    label_smoothing: float = 0.0
-    regression_loss: RegressionLossName = "mse"
-    grad_clip_norm: float | None = None
-    nesterov: bool = False
-
-    def with_batch_size(
-        self, batch_size: int, *, scale_learning_rate: bool = True
-    ) -> "ModelTrainingRecipe":
-        """Copy at a different batch size, keeping the per-sample step constant.
-
-        Dendrite conditions run at a smaller batch so the candidate forward fits
-        in memory. Carrying the learning rate over unchanged multiplies the
-        per-sample step by ``batch_size / dendritic_batch_size``, which is what
-        diverged DistilBERT into a constant classifier on its second epoch
-        (AdamW at 1e-4, batch 32 -> 4: an 8x effective step, on a recipe already
-        5x the canonical 2e-5 for BERT fine-tuning).
-        """
-        scale = batch_size / self.batch_size if scale_learning_rate else 1.0
-        return replace(
-            self, batch_size=batch_size, learning_rate=self.learning_rate * scale
-        )
-
-
-@dataclass(frozen=True)
-class ConditionTrainingPlan:
-    max_epochs: int
-    use_qat: bool
-    fine_tune_epochs: int
-    update_dendrites_during_training: bool
-
-
-@dataclass(frozen=True)
-class SourceCheckpointLoadConfig:
-    save_name: str
-    maximizing_score: bool
-    module_selection: PAIModuleSelection
-    config_snapshot_path: Path | str | None = None
-    dendrite_training_max_epochs: int | None = None
-    batches_per_epoch: int | None = None
-    module_output_dimensions: dict[str, list[int]] | None = None
-    candidate_graph_enabled: bool = True
-    initial_correlation_batches_limit: int | None = None
-    fixed_switch_interval: int | None = None
-    dynamic_schedule: PAIDynamicSchedule | None = None
 
 
 def _log(msg: str, *, before: bool = False, after: bool = False) -> None:
@@ -495,30 +425,11 @@ class BenchmarkRunner:
 
     def _model_kwargs(self, model_key: str) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"model_scale": self._model_scale}
-        if model_key in {"lenet5", "snn_nmnist", "capsnet_mnist"}:
-            kwargs["num_classes"] = 10
-        elif model_key == "m5":
-            kwargs["num_classes"] = 12
-        elif model_key == "textcnn":
-            kwargs["num_classes"] = 4
-        elif model_key == "gcn":
-            kwargs["num_classes"] = 7
-        elif model_key in {"tabnet", "saint_adult"}:
-            # Adult's 8 nominal columns reach the models as integer codes; both
-            # size embedding tables from this schema rather than treating a code
-            # as a number. See TabularColumnEmbedding.
-            kwargs.update(
-                {
-                    "num_classes": 2,
-                    "categorical_cardinalities": ADULT_CATEGORICAL_CARDINALITIES,
-                }
-            )
-        elif model_key == "gin_imdbb":
-            kwargs["num_classes"] = 2
-        elif model_key == "pointnet_modelnet40":
-            kwargs["num_classes"] = 40
-        elif model_key == "distilbert":
-            kwargs["num_classes"] = 2
+        adapter = model_adapter(model_key)
+        if adapter.num_classes is not None:
+            kwargs["num_classes"] = adapter.num_classes
+        if adapter.categorical_input:
+            kwargs["categorical_cardinalities"] = ADULT_CATEGORICAL_CARDINALITIES
         return kwargs
 
     def _perforation_track_modules(self) -> list[Any]:
@@ -1371,6 +1282,8 @@ class BenchmarkRunner:
             return False
         if metadata.get("model_revision") != self._model_artifact_revision(model_key):
             return False
+        if metadata.get("dataset_revision") != DATA_PIPELINE_REVISION:
+            return False
         recipe = self._training_hyperparameters(model_key, condition)
         if metadata.get("lr_schedule_epochs") != recipe.lr_schedule_epochs:
             return False
@@ -1551,7 +1464,6 @@ class BenchmarkRunner:
         model_spec: Any,
         condition: ConditionSpec,
         bundle: Any,
-        ignore_saved: bool,
         model_records: list[dict[str, Any]],
         all_records: list[dict[str, Any]],
         saved_dirs: dict[str, Path],
@@ -1671,7 +1583,7 @@ class BenchmarkRunner:
                     )
                     bundles_by_batch_size[recipe.batch_size] = bundle
                 if self._train_pending_condition(
-                    model_spec, condition, bundle, ignore_saved,
+                    model_spec, condition, bundle,
                     model_records, all_records, saved_dirs, allow_pqat,
                     dynamic_dendritic_training,
                 ):
@@ -1815,6 +1727,26 @@ class BenchmarkRunner:
             if training_plan.update_dendrites_during_training
             else None
         )
+        experiment_plan = ExperimentPlan(
+            artifact_id=artifact_id,
+            model_key=model_key,
+            condition_key=condition.key,
+            source_condition_key=condition.source_key,
+            output_dir=condition_dir,
+            pai_save_name=pai_save_name,
+            model_revision=self._model_artifact_revision(model_key),
+            dataset_revision=DATA_PIPELINE_REVISION,
+            model_scale=self._model_scale,
+            seed=self._seed,
+            quantization_evaluation_revision=(
+                QUANTIZATION_EVALUATION_REVISION if condition.quantized else None
+            ),
+            pai_variant=self._pai_variant,
+            pai_fixed_switch_interval=fixed_switch_interval,
+            pai_dynamic_schedule=(
+                dynamic_schedule.to_dict() if dynamic_schedule is not None else None
+            ),
+        )
         training_config = TrainingConfig(
             bit_width=condition.bit_width,
             quantization_mode=condition.quantization_mode,
@@ -1842,7 +1774,7 @@ class BenchmarkRunner:
                 training_plan, dynamic_schedule
             ),
             quantization_evaluation_revision=(
-                QUANTIZATION_EVALUATION_REVISION if condition.quantized else None
+                experiment_plan.quantization_evaluation_revision
             ),
             dendrite_audit_revision=(
                 DENDRITE_AUDIT_REVISION if condition.use_dendrites else None
@@ -1857,7 +1789,7 @@ class BenchmarkRunner:
             label_smoothing=training_hyperparameters.label_smoothing,
             regression_loss=training_hyperparameters.regression_loss,
             grad_clip_norm=training_hyperparameters.grad_clip_norm,
-            source_condition_key=condition.source_key,
+            source_condition_key=experiment_plan.source_condition_key,
             enable_pai_dendrite_updates=training_plan.update_dendrites_during_training,
             train_dendrites_until_complete=(
                 training_plan.update_dendrites_during_training
@@ -1866,16 +1798,15 @@ class BenchmarkRunner:
             freeze_dendrite_updates_fraction=0.20,
             pai_candidate_graph_batch_limit=pai_candidate_graph_batch_limit,
             memory_cleanup_interval_batches=memory_cleanup_interval_batches,
-            pai_save_name=pai_save_name,
-            model_scale=self._model_scale,
-            pai_variant=self._pai_variant,
-            model_revision=self._model_artifact_revision(model_key),
-            pai_fixed_switch_interval=fixed_switch_interval,
-            pai_dynamic_schedule=(
-                dynamic_schedule.to_dict() if dynamic_schedule is not None else None
-            ),
-            artifact_id=artifact_id,
-            seed=self._seed,
+            pai_save_name=experiment_plan.pai_save_name,
+            model_scale=experiment_plan.model_scale,
+            pai_variant=experiment_plan.pai_variant,
+            model_revision=experiment_plan.model_revision,
+            dataset_revision=experiment_plan.dataset_revision,
+            pai_fixed_switch_interval=experiment_plan.pai_fixed_switch_interval,
+            pai_dynamic_schedule=experiment_plan.pai_dynamic_schedule,
+            artifact_id=experiment_plan.artifact_id,
+            seed=experiment_plan.seed,
         )
         return train_and_evaluate(
             model_key=model_key,
@@ -2333,7 +2264,6 @@ def _watch(
     results_root: Path,
     total_pairs: int,
     interval: int,
-    stop_pattern: str,
     on_finish: Callable[[], None],
 ) -> None:
     """Poll workers, respawning any that die before finishing their queue.
@@ -2348,53 +2278,28 @@ def _watch(
     transient fault) doesn't spin forever — it's reported and left stopped
     instead of silently retried, and everything else keeps going.
     """
-    restarts = [0] * len(procs)
-    given_up = [False] * len(procs)
-
-    def _settled(i: int) -> bool:
-        return given_up[i] or procs[i].poll() == 0
-
     try:
-        while True:
-            _emit_progress(emit, log_dir, results_root, total_pairs)
-
-            for i, proc in enumerate(procs):
-                # poll() also reaps, which keeps exited workers from lingering
-                # as zombies for the lifetime of the run.
-                code = proc.poll()
-                if code is None or code == 0 or given_up[i]:
-                    continue
-                if restarts[i] >= _MAX_WORKER_RESTARTS:
-                    given_up[i] = True
-                    emit(
-                        f"stream_{i + 1} crashed {restarts[i]} time(s) (last exit {code}) "
-                        f"and hit the restart limit — giving up on: {' '.join(streams[i])}",
-                        stderr=True,
-                    )
-                    continue
-                restarts[i] += 1
-                emit(
-                    f"stream_{i + 1} (pid {proc.pid}) exited with code {code} — restarting "
-                    f"(attempt {restarts[i]}/{_MAX_WORKER_RESTARTS}) in "
-                    f"{_RESTART_BACKOFF_SECONDS}s: {' '.join(streams[i])}",
-                    stderr=True,
-                )
-                time.sleep(_RESTART_BACKOFF_SECONDS)
-                procs[i] = _launch_worker(
-                    i + 1,
-                    streams[i],
-                    dqb_cmd=dqb_cmd,
-                    passthrough=passthrough,
-                    condition_keys=condition_keys,
-                    log_dir=log_dir,
-                )
-
-            if all(_settled(i) for i in range(len(procs))):
-                emit()
-                emit("all workers finished.")
-                on_finish()
-                return
-            time.sleep(interval)
+        supervisor = WorkerSupervisor(
+            processes=procs,
+            streams=streams,
+            launch=lambda index, models: _launch_worker(
+                index,
+                models,
+                dqb_cmd=dqb_cmd,
+                passthrough=passthrough,
+                condition_keys=condition_keys,
+                log_dir=log_dir,
+            ),
+            report_progress=lambda: _emit_progress(
+                emit, log_dir, results_root, total_pairs
+            ),
+            report=lambda message, stderr: emit(message, stderr=stderr),
+            on_finish=on_finish,
+            interval=interval,
+            max_restarts=_MAX_WORKER_RESTARTS,
+            restart_backoff_seconds=_RESTART_BACKOFF_SECONDS,
+        )
+        supervisor.watch()
     except KeyboardInterrupt:
         print()
         print("Ctrl-C — stopping all workers…")
@@ -2412,24 +2317,7 @@ def _terminate_all(procs: list[subprocess.Popen[bytes]], *, grace_seconds: float
     subprocesses it spawned — signalling the group via ``os.killpg`` reaches
     those too.
     """
-    for proc in procs:
-        if proc.poll() is not None:
-            continue
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-
-    deadline = time.monotonic() + grace_seconds
-    for proc in procs:
-        try:
-            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait()
+    terminate_process_groups(procs, grace_seconds=grace_seconds)
 
 
 def run_parallel(
@@ -2545,7 +2433,6 @@ def run_parallel(
         results_root=results_root,
         total_pairs=total_pairs,
         interval=interval,
-        stop_pattern=stop_pattern,
         on_finish=functools.partial(
             _build_final_reports, results_root, comparison_root, emit=emit
         ),

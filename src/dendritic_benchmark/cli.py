@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -19,6 +20,7 @@ from .compat import (
 )
 from .data import DATA_ROOT_ENV, DEFAULT_DATA_ROOT, build_task_bundle, dataset_exists
 from .log_utils import setup_logging, validate_output_path
+from .model_adapters import selected_model_keys
 from .pipeline import (
     DEFAULT_JOBS,
     DEFAULT_PROGRESS_INTERVAL,
@@ -342,7 +344,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY",
         help=(
             "Space-separated list of model keys to include. "
-            "Omit to run all registered models. "
+            "Omit to run the evidence-backed default roster; pass `all` to "
+            "opt into every registered exploratory model. "
             f"Valid keys: {_MODEL_KEYS}"
         ),
     )
@@ -733,7 +736,7 @@ def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
         pai_variant=args.pai_variant,
         pai_fixed_switch_interval=args.pai_fixed_switch_interval,
     )
-    selected_models = args.models or [spec.key for spec in MODEL_SPECS]
+    selected_models = selected_model_keys(args.models)
 
     if (
         not args.worker
@@ -812,7 +815,7 @@ def _run_passthrough(args: Any, comparison_root: Path) -> list[str]:
         flags.append("--allow-PQAT")
     if args.dynamic_dendritic_training:
         flags.append("--dynamic-dendritic-training")
-    if args.model_scale != 1.0:
+    if not math.isclose(args.model_scale, 1.0):
         flags += ["--model-scale", str(args.model_scale)]
     if args.pai_variant != "default":
         flags += ["--pai-variant", args.pai_variant]

@@ -3,7 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from types import ModuleType
+from typing import Any
 
 import torch
 
@@ -11,6 +11,7 @@ from dendritic_benchmark.artifacts import (
     finalize_artifact_manifest,
     write_artifact_manifest,
 )
+from dendritic_benchmark.data import DATA_PIPELINE_REVISION
 from dendritic_benchmark.models import (
     HF_PERFORATED_RESNET18_REPO_ID,
     HF_PERFORATED_RESNET18_SHA256,
@@ -35,13 +36,16 @@ HF_CHECKPOINT = (
 )
 
 
-def _load_verifier() -> ModuleType:
+def _load_verifier() -> Any:
     path = PROJECT_ROOT / "experiments" / "dynamic12" / "scripts" / "verify_pqat.py"
     spec = importlib.util.spec_from_file_location("dynamic12_verify_pqat", path)
-    if spec is None or spec.loader is None:
+    if spec is None:
+        raise RuntimeError(f"could not load {path}")
+    loader = spec.loader
+    if loader is None:
         raise RuntimeError(f"could not load {path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    loader.exec_module(module)
     return module
 
 
@@ -69,7 +73,7 @@ class Dynamic12HFPQATTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(output).all())
 
     def test_every_supported_quantized_condition_gets_a_pqat_plan(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             runner = BenchmarkRunner(results_root=Path(root) / "results")
             for model_key in (
                 "resnet18_hf_perforated_cifar10",
@@ -99,7 +103,7 @@ class Dynamic12HFPQATTests(unittest.TestCase):
         self.assertFalse(condition_supported_by_model(model_key, "dendrites_q1"))
 
     def test_pqat_artifact_reuse_requires_both_valid_stage_snapshots(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             root_path = Path(root)
             runner = BenchmarkRunner(results_root=root_path / "results")
             condition = condition_by_key("base_q8")
@@ -110,6 +114,7 @@ class Dynamic12HFPQATTests(unittest.TestCase):
                 "artifact_id": "test-artifact",
                 "model_scale": 1.0,
                 "model_revision": runner._model_artifact_revision("saint_adult"),
+                "dataset_revision": DATA_PIPELINE_REVISION,
                 "lr_schedule_epochs": recipe.lr_schedule_epochs,
                 "quantization_granularity": "tensor",
                 "quantization_evaluation_revision": QUANTIZATION_EVALUATION_REVISION,
@@ -173,7 +178,7 @@ class Dynamic12HFPQATTests(unittest.TestCase):
 
     def test_post_run_verifier_rejects_missing_pqat_stage(self) -> None:
         verifier = _load_verifier()
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             results_root = Path(root)
             artifact_dir = results_root / "saint_adult" / "base_q1"
             (artifact_dir / "before_pqat").mkdir(parents=True)

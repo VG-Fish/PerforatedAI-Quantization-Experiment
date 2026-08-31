@@ -62,7 +62,7 @@ def _audit_statuses(run: Path) -> dict[str, str]:
     with path.open() as handle:
         return {
             row["model_key"]: row["dendrite_audit_status"]
-            for row in csv.DictReader(handle)
+            for row in csv.DictReader(handle)  # type: ignore[no-matching-overload]
             if row.get("condition_key") == "dendrites_fp32"
         }
 

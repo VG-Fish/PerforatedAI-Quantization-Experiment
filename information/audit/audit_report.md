@@ -115,3 +115,15 @@ A fresh authenticated SonarCloud scan completed successfully for commit `49c8d63
 - `ty check`, tests, smoke matrix, and statistical validation run in CI.
 - Current docs are generated/verified from specs and CLI; historical docs are indexed and labeled.
 - Only after the above: remove the ledger’s approved generated files and legacy branches.
+
+## P1 implementation update (2026-08-30)
+
+The first P1 implementation pass established explicit policy boundaries without deleting historical evidence or changing trained-model math:
+
+- `quantization.py` now owns PTQ dispatch and QAT shadow-state lifecycle; the training engine keeps compatibility aliases for existing experiment scripts.
+- `plans.py` now owns immutable recipe, condition, source-checkpoint, and complete `ExperimentPlan` types. Every new artifact identity includes a dataset/preprocessing revision.
+- `model_adapters.py` is the shared registry for task kind, primary metric, constructor capabilities, and evidence-backed default scope. Exploratory models remain available through `--models all`.
+- `workers.py` now owns bounded restart and process-group termination policy instead of embedding it in the scientific runner.
+- The open correctness/security findings for unchecked OFF loop bounds, implicit reductions, exact float comparisons, the redundant exception, and unused parameters were addressed and covered by focused P1 tests.
+
+The larger recipe table, PAI targeting policy, metric implementations, and epoch engine remain candidates for subsequent extraction; this pass does not claim that every P1 complexity finding is eliminated.

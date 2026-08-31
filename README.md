@@ -161,6 +161,9 @@ uv run dqb download_data --strict
 # Train runs
 uv run dqb run
 uv run dqb run --models lenet5 textcnn
+
+# Explicitly opt into the full exploratory 24-model roster
+uv run dqb run --models all
 uv run dqb run --conditions base_fp32 dendrites_fp32
 uv run dqb run --allow-PQAT
 uv run dqb run --dynamic-dendritic-training
@@ -238,7 +241,7 @@ Read the full documents for architecture details, hypotheses, and example comman
 The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` for flowcharts and full details.
 
 - `uv run dqb run`
-	- Train models across one or more conditions. By default runs all models & conditions defined in the project.
+	- Train models across one or more conditions. A bare run uses the evidence-backed default roster (`lenet5`, `tcn_forecaster`, `pointnet_modelnet40`, `resnet18_cifar10`, and `saint_adult`) across every condition. Use `--models all` to opt into the full exploratory 24-model roster.
 	- Splits the selected models across 4 worker processes by default and prints a live progress table until they all exit. Training is compute-bound rather than data-bound, so this cuts wall-clock close to linearly — the full 23-model FP32 pass is ~24h sequentially. Each model keeps all of its conditions in one worker, so the `dendrites_q8` → `dendrites_fp32` dependency order still holds. Worker output goes to `<logging-dir>/streams/stream_N.log`, and every progress table is appended to `<logging-dir>/run_progress.log`.
 	- Ctrl-C detaches the progress display without stopping training. Stop training with `pkill -f 'dqb run'`.
 	- Useful flags: `--models`, `--conditions`, `--results-root`, `--results-directory`, `--comparison-root`, `--ignore-saved-models`, `--allow-PQAT`, `--dynamic-dendritic-training`, `--jobs` (1 trains in-process and prints to the terminal), `--fresh` (delete stale `epoch_checkpoint.pt` files first — `--ignore-saved-models` does *not* cover those), `--detach`, `--status`, `-i/--interval`.
