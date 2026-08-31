@@ -16,6 +16,11 @@ from typing import Any, Literal
 import torch
 from tqdm.auto import tqdm
 
+from .artifacts import write_artifact_manifest
+from .checkpointing import (
+    inspect_state_dict,
+    load_state_dict_checked,
+)
 from .compat import (
     MODULE_OUTPUT_DIMENSIONS_ATTR,
     PAI_ARTIFACT_NAME,
@@ -176,6 +181,11 @@ class TrainingConfig:
     dendrite_audit_revision: str | None = None
     dense_param_count: int | None = None
     source_dendrite_audit_status: str | None = None
+    # Unique namespace minted for this condition attempt. It binds the final
+    # files and the PAI side tree; rerunning into the same output directory can
+    # therefore never consume an earlier attempt's switch logs.
+    artifact_id: str = ""
+    seed: int | None = None
 
 
 @dataclass
@@ -199,6 +209,7 @@ class TrainingRecord:
     skip_reason: str = ""
     dendrite_audit_status: str = "not_applicable"
     dendrite_audit_reason: str = ""
+    artifact_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -236,6 +247,9 @@ class ArtifactMetadata:
     dendrite_audit_revision: str | None = None
     dense_param_count: int | None = None
     source_dendrite_audit_status: str | None = None
+    artifact_id: str = ""
+    seed: int | None = None
+    source_condition_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1245,20 +1259,6 @@ def _unwrap_compiled(model: Any) -> Any:
     return getattr(model, "_orig_mod", model)
 
 
-def _is_ignorable_state_key(key: str) -> bool:
-    return key.endswith("tracker_string")
-
-
-def _tensor_shape(value: Any) -> tuple[int, ...] | None:
-    shape = getattr(value, "shape", None)
-    if shape is None:
-        return None
-    try:
-        return tuple(shape)
-    except TypeError:
-        return None
-
-
 def _quantize_tensor(
     tensor: Any,
     bit_width: int,
@@ -1528,6 +1528,9 @@ def _write_metrics_and_history(
                 "pai_fixed_switch_interval": metadata.pai_fixed_switch_interval,
                 "pai_dynamic_schedule": metadata.pai_dynamic_schedule,
                 "pai_save_name": metadata.pai_save_name,
+                "artifact_id": metadata.artifact_id,
+                "seed": metadata.seed,
+                "source_condition_key": metadata.source_condition_key,
                 "artifact_path": str(stats.artifact_path),
                 "training_skipped": payload.training_skipped,
                 "skip_reason": payload.skip_reason,
@@ -1586,6 +1589,85 @@ def _persist_stage_artifacts(
         metadata=metadata,
         payload=payload,
         stats=stats,
+    )
+    if not metadata.artifact_id:
+        raise RuntimeError("artifact_id is required before persisting an artifact")
+    dendrite_status = "not_applicable"
+    pai_schedule_telemetry: dict[str, Any] = {}
+    if metadata.use_dendrites:
+        try:
+            summary = json.loads((output_dir / "pai_summary.json").read_text())
+            dendrite_status = str(
+                summary.get("dendrite_audit", {}).get("status", "unknown")
+            )
+            pai_schedule_telemetry = {
+                "requested": summary.get("requested_schedule", {}),
+                "observed": summary.get("observed_schedule", {}),
+            }
+        except (OSError, json.JSONDecodeError):
+            dendrite_status = "unknown"
+    bit_width = metadata.bit_width
+    quantized = bit_width is not None and bit_width < 32
+    quantization_status = (
+        "not_applicable"
+        if not quantized
+        else (
+            "current"
+            if metadata.quantization_evaluation_revision
+            == QUANTIZATION_EVALUATION_REVISION
+            else "unknown"
+        )
+    )
+    write_artifact_manifest(
+        output_dir,
+        artifact_id=metadata.artifact_id,
+        identity={
+            "model_key": metadata.model_key,
+            "condition_key": metadata.condition_key,
+            "source_condition_key": metadata.source_condition_key,
+            "model_revision": metadata.model_revision,
+            "model_scale": metadata.model_scale,
+            "seed": metadata.seed,
+            "pai_variant": metadata.pai_variant,
+            "pai_switch_mode": (
+                "fixed_diagnostic"
+                if metadata.pai_fixed_switch_interval is not None
+                else "history"
+            )
+            if metadata.enable_pai_dendrite_updates
+            else "not_applicable",
+            "pai_fixed_switch_interval": metadata.pai_fixed_switch_interval,
+            "pai_dynamic_schedule": metadata.pai_dynamic_schedule,
+            "dendrite_audit_revision": metadata.dendrite_audit_revision,
+            "quantization_evaluation_revision": (
+                metadata.quantization_evaluation_revision
+            ),
+        },
+        pai_save_name=metadata.pai_save_name,
+        validity={
+            "dendrite_status": dendrite_status,
+            "quantization_status": quantization_status,
+        },
+        telemetry={
+            "pai_schedule": pai_schedule_telemetry,
+            "learning_rates": {
+                "backbone": [
+                    row.get("backbone_learning_rate")
+                    for row in payload.history
+                    if row.get("backbone_learning_rate") is not None
+                ],
+                "dendrite": [
+                    row.get("dendrite_learning_rate")
+                    for row in payload.history
+                    if row.get("dendrite_learning_rate") is not None
+                ],
+            },
+        },
+        additional_files=tuple(
+            name
+            for name in ("pai_summary.json", "PAI_config.json", "artifact_attempt.json")
+            if (output_dir / name).is_file()
+        ),
     )
     return artifact_path, file_size_mb, param_count, nonzero_params
 
@@ -1756,6 +1838,28 @@ def _write_pai_summary(
     ]
     raw_architecture = _read_pai_architecture_log(metadata.pai_save_name)
     raw_switches = _read_pai_switch_log(metadata.pai_save_name)
+    observed_switch_epochs = list(raw_switches.get("switch_epochs", []))
+    observed_intervals = [
+        later - earlier
+        for earlier, later in zip(observed_switch_epochs, observed_switch_epochs[1:])
+    ]
+    forced_switches = [
+        {
+            "epoch": int(row["epoch"]),
+            "reason": str(row["pai_switch_reason"]),
+        }
+        for row in all_history
+        if row.get("pai_switch_reason") == "candidate_phase_timeout"
+        and str(row.get("epoch", "")).isdigit()
+    ]
+    termination_reason = next(
+        (
+            str(row["training_termination_reason"])
+            for row in reversed(all_history)
+            if row.get("training_termination_reason")
+        ),
+        "unknown",
+    )
     dendrite_audit = _dendrite_audit(
         metadata=metadata,
         param_count=param_count,
@@ -1781,6 +1885,21 @@ def _write_pai_summary(
                 "pai_variant": metadata.pai_variant,
                 "fixed_switch_interval": metadata.pai_fixed_switch_interval,
                 "dynamic_schedule": metadata.pai_dynamic_schedule,
+                "requested_schedule": {
+                    "mode": (
+                        "fixed_diagnostic"
+                        if metadata.pai_fixed_switch_interval is not None
+                        else "history"
+                    ),
+                    "fixed_switch_interval": metadata.pai_fixed_switch_interval,
+                    "dynamic_schedule": metadata.pai_dynamic_schedule,
+                },
+                "observed_schedule": {
+                    "switch_epochs": observed_switch_epochs,
+                    "switch_intervals": observed_intervals,
+                    "forced_switches": forced_switches,
+                    "termination_reason": termination_reason,
+                },
                 "final_model": {
                     "param_count": param_count,
                     "nonzero_params": nonzero_params,
@@ -2990,8 +3109,10 @@ def _load_epoch_checkpoint(
     try:
         return torch.load(path, map_location="cpu", weights_only=True)
     except Exception as exc:
-        print(f"[checkpoint] failed to load epoch checkpoint ({exc}); starting from scratch.")
-        return None
+        raise RuntimeError(
+            f"epoch checkpoint is unreadable ({exc}); use --fresh rather than "
+            "continuing inside an unknown artifact namespace"
+        ) from exc
 
 
 def _apply_epoch_checkpoint(
@@ -3001,11 +3122,18 @@ def _apply_epoch_checkpoint(
     optimizer: Any,
 ) -> int:
     resume_epoch = int(ckpt["epoch"]) + 1
-    _load_compatible_best_state(model, ckpt["model_state_dict"])
+    if not _load_compatible_best_state(model, ckpt["model_state_dict"]):
+        raise RuntimeError(
+            "epoch checkpoint topology does not match the restored model; "
+            "refusing to resume partially. Use --fresh to start a new attempt."
+        )
     try:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     except Exception as exc:
-        print(f"[checkpoint] could not restore optimizer state ({exc}); optimizer reset.")
+        raise RuntimeError(
+            "epoch checkpoint optimizer state is incompatible; refusing to "
+            "resume with a reset optimizer. Use --fresh to start a new attempt."
+        ) from exc
     state.history = list(ckpt.get("history", []))
     state.best_metric = ckpt["best_metric"]
     state.best_epoch = int(ckpt["best_epoch"])
@@ -3097,12 +3225,32 @@ def _build_history_row(
 ) -> dict[str, Any]:
     primary_metric_key = context.primary_metric_key
     val_metric = float(val_metrics.get(primary_metric_key, 0.0))
+    backbone_group = next(
+        (
+            group
+            for group in optimizer.param_groups
+            if not group.get(PAI_DENDRITE_PARAM_GROUP_KEY, False)
+        ),
+        optimizer.param_groups[0],
+    )
+    dendrite_group = next(
+        (
+            group
+            for group in optimizer.param_groups
+            if group.get(PAI_DENDRITE_PARAM_GROUP_KEY, False)
+        ),
+        None,
+    )
     history_row: dict[str, Any] = {
         "epoch": epoch + 1,
         "primary_metric_name": context.metric_name,
         "primary_metric_key": primary_metric_key,
         "metric_direction": context.metric_direction,
-        "learning_rate": float(optimizer.param_groups[0]["lr"]),
+        "learning_rate": float(backbone_group["lr"]),
+        "backbone_learning_rate": float(backbone_group["lr"]),
+        "dendrite_learning_rate": (
+            float(dendrite_group["lr"]) if dendrite_group is not None else None
+        ),
         "epoch_seconds": time.perf_counter() - epoch_start,
         "train_loss": train_loss,
         "train_primary_metric": float(train_metrics.get(primary_metric_key, 0.0)),
@@ -3215,53 +3363,27 @@ def _load_compatible_best_state(model: Any, best_state: dict[str, Any]) -> bool:
     construction.
     """
     plain_model = _unwrap_compiled(model)
-    current_state = plain_model.state_dict()
-    compatible_state: dict[str, Any] = {}
-    skipped: list[str] = []
-    for key, value in best_state.items():
-        if _is_ignorable_state_key(key):
-            continue
-        current_value = current_state.get(key)
-        if current_value is None and _is_pai_lazy_dendrite_buffer_key(key):
-            # Registered lazily inside create_new_dendrite_module, so a freshly
-            # perforated model doesn't have it yet -- adopted below if we
-            # proceed, not a sign of a real structural mismatch.
-            compatible_state[key] = value
-            continue
-        current_shape = _tensor_shape(current_value)
-        source_shape = _tensor_shape(value)
-        if current_shape is None or source_shape is None or current_shape != source_shape:
-            skipped.append(key)
-            continue
-        compatible_state[key] = value
-    supplied = set(compatible_state.keys())
-    missing_before = [
-        key for key in current_state
-        if key not in supplied and not _is_ignorable_state_key(key)
-    ]
-    if skipped or missing_before:
-        mismatched = sorted(set(skipped) | set(missing_before))
+    report = inspect_state_dict(
+        plain_model.state_dict(),
+        best_state,
+        allowed_unexpected=_is_pai_lazy_dendrite_buffer_key,
+    )
+    if not report.complete:
         print(
             "[state] best-epoch structure does not match the final trained "
             "structure (a dendrite was likely added after the best epoch) -- "
             "keeping the final model instead of a partial restore. "
-            "Mismatched tensors: " + ", ".join(mismatched[:5])
-            + ("..." if len(mismatched) > 5 else "")
+            + report.summary(limit=5)
         )
         return False
     adopted = _adopt_missing_pai_dendrite_buffers(plain_model, best_state)
-    missing, unexpected = plain_model.load_state_dict(compatible_state, strict=False)
+    load_state_dict_checked(plain_model, best_state, context="best-epoch checkpoint")
     if adopted:
         print(
             "[state] adopted lazy PAI dendrite buffers: "
             + ", ".join(adopted[:5])
             + ("..." if len(adopted) > 5 else "")
         )
-    if unexpected:
-        print(f"[state] ignored unexpected best-state tensors: {unexpected[:5]}")
-    real_missing = [key for key in missing if not _is_ignorable_state_key(key)]
-    if real_missing:
-        print(f"[state] retained current values for missing tensors: {real_missing[:5]}")
     return True
 
 
@@ -3546,8 +3668,8 @@ def _run_active_pai_update(
     optimizer: Any,
     pai_tracker: Any,
     val_metric: float,
+    force_switch: bool,
 ) -> tuple[Any, Any | None, bool, bool]:
-    force_switch = _pai_dendrite_phase_stalled(context, pai_tracker)
     _set_pai_candidate_graph_for_context(context, True)
     try:
         return _run_dynamic_dendrite_update(
@@ -3575,9 +3697,15 @@ def _apply_pai_epoch_update(
     history_row["pai_dendrite_phase"] = (
         _pai_dendrite_phase_epochs(pai_tracker) is not None
     )
+    force_switch = _pai_dendrite_phase_stalled(context, pai_tracker)
     optimizer, pai_tracker, restructured, training_complete = _run_active_pai_update(
         context=context, optimizer=optimizer, pai_tracker=pai_tracker,
-        val_metric=val_metric,
+        val_metric=val_metric, force_switch=force_switch,
+    )
+    history_row["pai_switch_reason"] = (
+        "candidate_phase_timeout"
+        if force_switch
+        else ("pai_schedule" if restructured else "")
     )
     history_row["pai_restructured"] = restructured
     history_row["pai_training_complete"] = training_complete
@@ -3788,6 +3916,7 @@ def _run_training_epochs(
             )
         _update_epoch_progress(epoch_progress, context, state, val_metric)
         if _training_collapsed(state, context.metric_direction):
+            history_row["training_termination_reason"] = "validation_collapse"
             print(
                 f"[collapse] {context.run_label}: validation "
                 f"{context.metric_name} frozen at {val_metric:.6f} for "
@@ -3803,6 +3932,7 @@ def _run_training_epochs(
             and context.config.max_dynamic_training_epochs is not None
             and epoch + 1 >= context.config.max_dynamic_training_epochs
         ):
+            history_row["training_termination_reason"] = "dynamic_epoch_cap"
             print(
                 f"[PAI cap] {context.run_label}: reached dynamic completion cap "
                 f"at epoch {epoch + 1}; retaining the best validation checkpoint."
@@ -3818,8 +3948,11 @@ def _run_training_epochs(
             and run_until_pai_complete
             and epoch + 1 >= context.max_epochs
         ):
+            history_row["training_termination_reason"] = "pai_training_complete"
             break
     epoch_progress.close()
+    if state.history and not state.history[-1].get("training_termination_reason"):
+        state.history[-1]["training_termination_reason"] = "epoch_budget"
     _set_pai_candidate_graph_for_context(context, False)
     return state.history, state.best_metric, state.best_epoch, state.best_state
 
@@ -3865,6 +3998,9 @@ def _build_artifact_metadata(
         dendrite_audit_revision=config.dendrite_audit_revision,
         dense_param_count=config.dense_param_count,
         source_dendrite_audit_status=config.source_dendrite_audit_status,
+        artifact_id=config.artifact_id,
+        seed=config.seed,
+        source_condition_key=config.source_condition_key,
     )
 
 
@@ -3909,6 +4045,9 @@ def _metadata_for_stage(
         dendrite_audit_revision=metadata.dendrite_audit_revision,
         dense_param_count=metadata.dense_param_count,
         source_dendrite_audit_status=metadata.source_dendrite_audit_status,
+        artifact_id=metadata.artifact_id,
+        seed=metadata.seed,
+        source_condition_key=metadata.source_condition_key,
     )
 
 
@@ -4406,6 +4545,7 @@ def train_and_evaluate(
         skip_reason=skip_reason,
         dendrite_audit_status=str(dendrite_audit["status"]),
         dendrite_audit_reason=str(dendrite_audit["reason"]),
+        artifact_id=config.artifact_id,
     )
     _write_best_model_stats_csv(output_dir, record)
     if use_dendrites and pai_save_name:

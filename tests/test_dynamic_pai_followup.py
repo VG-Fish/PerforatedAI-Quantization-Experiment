@@ -8,9 +8,14 @@ from unittest.mock import patch
 
 import torch
 
+from dendritic_benchmark.artifacts import (
+    finalize_artifact_manifest,
+    write_artifact_manifest,
+)
 from dendritic_benchmark.compat import (
     PAIDynamicSchedule,
     _configure_dynamic_pai_schedule,
+    _configure_pai_training_schedule,
     set_pai_root,
     ternary_quantize_tensor,
     ternary_quantize_tensor_per_channel,
@@ -39,8 +44,48 @@ from dendritic_benchmark.training import (
 )
 
 
+def _write_test_artifact(
+    condition_dir: Path,
+    *,
+    model_key: str,
+    condition_key: str,
+    dendrite_status: str,
+) -> None:
+    artifact_id = f"test-{dendrite_status}"
+    condition_dir.mkdir(parents=True, exist_ok=True)
+    (condition_dir / "model.pt").write_bytes(b"test checkpoint")
+    (condition_dir / "metrics.json").write_text(
+        json.dumps({"artifact_id": artifact_id})
+    )
+    (condition_dir / "history.csv").write_text("epoch\n1\n")
+    record = {
+        "artifact_id": artifact_id,
+        "model_key": model_key,
+        "condition_key": condition_key,
+        "dendrite_audit_status": dendrite_status,
+    }
+    (condition_dir / "record.json").write_text(json.dumps(record))
+    (condition_dir / "record.csv").write_text(
+        "artifact_id,model_key,condition_key,dendrite_audit_status\n"
+        f"{artifact_id},{model_key},{condition_key},{dendrite_status}\n"
+    )
+    (condition_dir / "best_model_stats.csv").write_text("metric_value\n0.5\n")
+    write_artifact_manifest(
+        condition_dir,
+        artifact_id=artifact_id,
+        identity={"model_key": model_key, "condition_key": condition_key},
+        pai_save_name="test-pai-namespace",
+        validity={
+            "dendrite_status": dendrite_status,
+            "quantization_status": "not_applicable",
+        },
+    )
+    finalize_artifact_manifest(condition_dir, artifact_id=artifact_id)
+
+
 class _RecordingPC:
     DOING_HISTORY = "history"
+    DOING_FIXED_SWITCH = "fixed"
 
     def __init__(self) -> None:
         self.values: dict[str, object] = {}
@@ -188,6 +233,25 @@ class DynamicPAIFollowupTests(unittest.TestCase):
         self.assertEqual(pc.values["set_p_epochs_to_switch"], 6)
         self.assertEqual(pc.values["set_improvement_threshold"], [0.005, 0.002])
 
+    def test_bounded_and_open_ended_training_share_history_schedule(self) -> None:
+        pc = _RecordingPC()
+
+        class _GPA:
+            def __init__(self, pai_config: _RecordingPC) -> None:
+                self.pc = pai_config
+
+        gpa = _GPA(pc)
+        _configure_pai_training_schedule(gpa)
+
+        self.assertEqual(pc.values["set_switch_mode"], "history")
+
+    def test_fixed_switching_requires_an_explicit_diagnostic_interval(self) -> None:
+        pc = _RecordingPC()
+        _configure_dynamic_pai_schedule(pc, fixed_switch_interval=8)
+
+        self.assertEqual(pc.values["set_switch_mode"], "fixed")
+        self.assertEqual(pc.values["set_first_fixed_switch_num"], 8)
+
     def test_targeted_profiles_keep_only_measured_modules(self) -> None:
         with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             runner = BenchmarkRunner(results_root=Path(root) / "results")
@@ -230,7 +294,14 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                 runner._perforation_module_ids_to_perforate("saint_adult"),
                 [".head"],
             )
-            self.assertEqual(runner._pai_fixed_switch_interval("saint_adult"), 100)
+            self.assertIsNone(runner._pai_fixed_switch_interval("saint_adult"))
+            diagnostic_runner = BenchmarkRunner(
+                results_root=Path(root) / "diagnostic-results",
+                pai_fixed_switch_interval=100,
+            )
+            self.assertEqual(
+                diagnostic_runner._pai_fixed_switch_interval("saint_adult"), 100
+            )
             self.assertEqual(
                 runner._perforation_module_ids_to_perforate("pointnet_modelnet40"),
                 [".conv3.0", ".head.0"],
@@ -282,8 +353,11 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             runner = BenchmarkRunner(results_root=root_path / "results")
             source_dir = root_path / "results" / "saint_adult" / "dendrites_fp32"
             source_dir.mkdir(parents=True)
-            (source_dir / "record.json").write_text(
-                json.dumps({"dendrite_audit_status": "no_retained_insertion"})
+            _write_test_artifact(
+                source_dir,
+                model_key="saint_adult",
+                condition_key="dendrites_fp32",
+                dendrite_status="no_retained_insertion",
             )
             with self.assertRaisesRegex(RuntimeError, "verified retained"):
                 runner._require_verified_dendritic_pqat_source(
@@ -292,8 +366,11 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                     {"dendrites_fp32": source_dir},
                 )
 
-            (source_dir / "record.json").write_text(
-                json.dumps({"dendrite_audit_status": "verified_retained"})
+            _write_test_artifact(
+                source_dir,
+                model_key="saint_adult",
+                condition_key="dendrites_fp32",
+                dendrite_status="verified_retained",
             )
             runner._require_verified_dendritic_pqat_source(
                 "saint_adult",
@@ -330,14 +407,14 @@ class DynamicPAIFollowupTests(unittest.TestCase):
         self.assertEqual(model.readout_windows, (8, 16, 32))
         self.assertIsInstance(model.head, torch.nn.Sequential)
 
-    def test_tcn_uses_smooth_l1_and_early_fixed_pai_switch(self) -> None:
+    def test_tcn_uses_smooth_l1_and_history_pai_switching(self) -> None:
         config = TrainingConfig(regression_loss="smooth_l1")
         self.assertIsInstance(
             _binary_or_multi_loss("tcn_forecaster", config), torch.nn.SmoothL1Loss
         )
         with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             runner = BenchmarkRunner(results_root=Path(root) / "results")
-            self.assertEqual(runner._pai_fixed_switch_interval("tcn_forecaster"), 6)
+            self.assertIsNone(runner._pai_fixed_switch_interval("tcn_forecaster"))
             ternary = condition_by_key("base_q1_58")
             recipe = runner._training_hyperparameters("tcn_forecaster", ternary)
             plan = runner._condition_training_plan(
@@ -420,10 +497,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                     ".head.4",
                 ],
             )
-            self.assertEqual(
-                runner._pai_fixed_switch_interval("gru_forecaster"),
-                8,
-            )
+            self.assertIsNone(runner._pai_fixed_switch_interval("gru_forecaster"))
             gate_runner = BenchmarkRunner(
                 results_root=Path(root) / "gate-results",
                 pai_variant="gru_gate_ablation",
@@ -433,6 +507,13 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                 [".cells.0.input_gates", ".cells.1.input_gates"],
             )
             self.assertIsNone(gate_runner._pai_fixed_switch_interval("gru_forecaster"))
+            diagnostic_runner = BenchmarkRunner(
+                results_root=Path(root) / "fixed-results",
+                pai_fixed_switch_interval=8,
+            )
+            self.assertEqual(
+                diagnostic_runner._pai_fixed_switch_interval("gru_forecaster"), 8
+            )
 
     def test_tcn_targets_best_scoring_head_projection_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
@@ -733,8 +814,16 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             _write_pai_summary(
                 output_dir=output_dir,
                 history=[
-                    {"epoch": 10, "pai_restructured": True},
-                    {"epoch": 20, "pai_training_complete": True},
+                    {
+                        "epoch": 10,
+                        "pai_restructured": True,
+                        "pai_switch_reason": "candidate_phase_timeout",
+                    },
+                    {
+                        "epoch": 20,
+                        "pai_training_complete": True,
+                        "training_termination_reason": "pai_training_complete",
+                    },
                 ],
                 metadata=metadata,
                 param_count=123,
@@ -747,6 +836,15 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             self.assertEqual(summary["history"]["training_complete_epochs"], [20])
             self.assertEqual(summary["architecture_log_consistency"], "stale")
             self.assertIsNone(summary["fixed_switch_interval"])
+            self.assertEqual(summary["requested_schedule"]["mode"], "history")
+            self.assertEqual(
+                summary["observed_schedule"]["forced_switches"],
+                [{"epoch": 10, "reason": "candidate_phase_timeout"}],
+            )
+            self.assertEqual(
+                summary["observed_schedule"]["termination_reason"],
+                "pai_training_complete",
+            )
 
 
 if __name__ == "__main__":

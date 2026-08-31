@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import shutil
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,7 @@ from .pipeline import (
     DEFAULT_JOBS,
     DEFAULT_PROGRESS_INTERVAL,
     BenchmarkRunner,
+    clear_epoch_checkpoints,
     run_parallel,
 )
 from .results import (
@@ -416,6 +418,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run_parser.add_argument(
+        "--pai-fixed-switch-interval",
+        type=int,
+        default=None,
+        metavar="EPOCHS",
+        help=(
+            "Diagnostic only: force PAI's fixed-switch mode at the requested "
+            "interval for dendritic search. HISTORY plateau detection is the "
+            "default for every model because prior fixed requests were not "
+            "honored by observed switch epochs."
+        ),
+    )
+    run_parser.add_argument(
         "-j",
         "--jobs",
         type=int,
@@ -717,8 +731,25 @@ def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
         comparison_root=comparison_root,
         model_scale=args.model_scale,
         pai_variant=args.pai_variant,
+        pai_fixed_switch_interval=args.pai_fixed_switch_interval,
     )
     selected_models = args.models or [spec.key for spec in MODEL_SPECS]
+
+    if (
+        not args.worker
+        and args.fresh
+        and (args.jobs <= 1 or len(selected_models) == 1)
+    ):
+        def emit_fresh(text: str = "", *, stderr: bool = False) -> None:
+            print(text, file=sys.stderr if stderr else sys.stdout)
+
+        clear_epoch_checkpoints(
+            results_root,
+            selected_models,
+            runner._expand_condition_keys(args.conditions),
+            fresh=True,
+            emit=emit_fresh,
+        )
 
     # A worker is one of the processes a parallel run spawned. It trains its
     # slice in this process and leaves the manifest and comparison reports to
@@ -785,6 +816,11 @@ def _run_passthrough(args: Any, comparison_root: Path) -> list[str]:
         flags += ["--model-scale", str(args.model_scale)]
     if args.pai_variant != "default":
         flags += ["--pai-variant", args.pai_variant]
+    if args.pai_fixed_switch_interval is not None:
+        flags += [
+            "--pai-fixed-switch-interval",
+            str(args.pai_fixed_switch_interval),
+        ]
     if args.seed is not None:
         flags += ["--seed", str(args.seed)]
     return flags

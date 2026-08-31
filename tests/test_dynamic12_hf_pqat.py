@@ -7,6 +7,10 @@ from types import ModuleType
 
 import torch
 
+from dendritic_benchmark.artifacts import (
+    finalize_artifact_manifest,
+    write_artifact_manifest,
+)
 from dendritic_benchmark.models import (
     HF_PERFORATED_RESNET18_REPO_ID,
     HF_PERFORATED_RESNET18_SHA256,
@@ -103,6 +107,7 @@ class Dynamic12HFPQATTests(unittest.TestCase):
             condition_dir.mkdir(parents=True)
             recipe = runner._training_hyperparameters("saint_adult", condition)
             metadata = {
+                "artifact_id": "test-artifact",
                 "model_scale": 1.0,
                 "model_revision": runner._model_artifact_revision("saint_adult"),
                 "lr_schedule_epochs": recipe.lr_schedule_epochs,
@@ -112,12 +117,41 @@ class Dynamic12HFPQATTests(unittest.TestCase):
                 "fine_tune_epochs": 10,
             }
             (condition_dir / "metrics.json").write_text(json.dumps(metadata))
+            (condition_dir / "model.pt").write_bytes(b"test checkpoint")
+            (condition_dir / "history.csv").write_text("epoch\n1\n")
             for stage_name, use_qat in (("before_pqat", False), ("after_pqat", True)):
                 stage_dir = condition_dir / stage_name
                 stage_dir.mkdir()
                 (stage_dir / "metrics.json").write_text(
                     json.dumps({"use_qat": use_qat})
                 )
+            record = {
+                "artifact_id": "test-artifact",
+                "model_key": "saint_adult",
+                "condition_key": condition.key,
+            }
+            (condition_dir / "record.json").write_text(json.dumps(record))
+            (condition_dir / "record.csv").write_text(
+                "artifact_id,model_key,condition_key\n"
+                f"test-artifact,saint_adult,{condition.key}\n"
+            )
+            (condition_dir / "best_model_stats.csv").write_text("metric_value\n0.5\n")
+            write_artifact_manifest(
+                condition_dir,
+                artifact_id="test-artifact",
+                identity={
+                    "model_key": "saint_adult",
+                    "condition_key": condition.key,
+                },
+                pai_save_name=None,
+                validity={
+                    "dendrite_status": "not_applicable",
+                    "quantization_status": "current",
+                },
+            )
+            finalize_artifact_manifest(
+                condition_dir, artifact_id="test-artifact"
+            )
 
             self.assertTrue(
                 runner._condition_metadata_current(

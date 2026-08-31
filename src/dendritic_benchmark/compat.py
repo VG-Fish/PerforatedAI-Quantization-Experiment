@@ -1,6 +1,5 @@
 import builtins
 import importlib
-import math
 import os
 import pdb
 import random
@@ -244,22 +243,6 @@ def _configure_pai_trackers(
     _call_if_available(pc, "set_no_backward_workaround", no_backward_workaround)
 
 
-def _bounded_dendrite_schedule(
-    max_epochs: int,
-    freeze_fraction: float,
-) -> tuple[int, int, int, int]:
-    freeze_epochs = 0
-    if max_epochs > 1 and freeze_fraction > 0:
-        freeze_epochs = max(
-            1, min(max_epochs - 1, math.ceil(max_epochs * freeze_fraction))
-        )
-    active_epochs = max(1, max_epochs - freeze_epochs)
-    target_switches = max(1, min(4, active_epochs // 4))
-    switch_interval = max(1, active_epochs // target_switches)
-    p_epochs = max(1, min(2, switch_interval // 2))
-    return active_epochs, target_switches, switch_interval, p_epochs
-
-
 def _call_pai_setter(pc: Any, setter_name: str, value: Any) -> None:
     setter = getattr(pc, setter_name, None)
     if setter is not None:
@@ -292,19 +275,12 @@ def _initial_correlation_batches(
 
 
 def _configure_interval_pai_schedule(pc: Any, *, switch_interval: int) -> None:
-    """Switch every ``switch_interval`` epochs instead of on a detected plateau.
+    """Configure the explicit fixed-switch diagnostic.
 
-    HISTORY mode compares a running average (an EMA over ``history_lookback``
-    epochs) that starts at 0 and only ever climbs toward the current score. Even
-    against a bit-for-bit frozen score it keeps clearing the relative
-    ``improvement_threshold`` every few epochs, so ``epoch_last_improved`` is
-    refreshed continuously and ``n_epochs_to_switch`` never counts down. The
-    2026-07-29 dynamic run spent 40 epochs and 15 h on DistilBERT that way with
-    ``num_cycles`` still 0 and an empty ``switch_epochs.csv``.
-
-    That trap is only affordable to wait out when epochs are cheap. For models
-    where they are not, switch on a fixed interval and accept a schedule that
-    ignores the plateau rather than one that never fires.
+    HISTORY is the benchmark default. Its former zero-seeded running-average
+    defect is handled by ``initial_history_after_switches`` below. Fixed mode
+    remains available only for schedule diagnostics, and requested versus
+    observed epochs are persisted in each condition's ``pai_summary.json``.
     """
     _set_pai_switch_mode(pc, "DOING_FIXED_SWITCH")
     _apply_pai_schedule_values(
@@ -452,63 +428,23 @@ def _configure_dynamic_pai_schedule(
         _call_pai_setter(pc, "set_initial_correlation_batches", correlation_batches)
 
 
-def _configure_bounded_pai_schedule(
-    pc: Any,
-    *,
-    max_epochs: int,
-    freeze_fraction: float,
-    batches_per_epoch: int | None = None,
-    initial_correlation_batches_limit: int | None = None,
-) -> None:
-    _, target_switches, switch_interval, p_epochs = _bounded_dendrite_schedule(
-        max_epochs, freeze_fraction
-    )
-    _set_pai_switch_mode(pc, "DOING_FIXED_SWITCH")
-    _apply_pai_schedule_values(
-        pc,
-        {
-            "set_first_fixed_switch_num": switch_interval,
-            "set_fixed_switch_num": switch_interval,
-            "set_n_epochs_to_switch": switch_interval,
-            "set_p_epochs_to_switch": p_epochs,
-            "set_max_dendrites": target_switches,
-        },
-    )
-    correlation_batches = _initial_correlation_batches(
-        batches_per_epoch, initial_correlation_batches_limit
-    )
-    if correlation_batches is not None:
-        _call_pai_setter(pc, "set_initial_correlation_batches", correlation_batches)
-
-
 def _configure_pai_training_schedule(
     gpa: Any,
     *,
-    max_epochs: int,
-    dynamic_dendritic_training: bool,
-    freeze_fraction: float,
     batches_per_epoch: int | None = None,
     initial_correlation_batches_limit: int | None = None,
     fixed_switch_interval: int | None = None,
     dynamic_schedule: PAIDynamicSchedule | None = None,
 ) -> None:
-    pc = gpa.pc
-    if dynamic_dendritic_training:
-        _configure_dynamic_pai_schedule(
-            pc,
-            batches_per_epoch=batches_per_epoch,
-            initial_correlation_batches_limit=initial_correlation_batches_limit,
-            fixed_switch_interval=fixed_switch_interval,
-            schedule=dynamic_schedule,
-        )
-        return
-
-    _configure_bounded_pai_schedule(
-        pc,
-        max_epochs=max_epochs,
-        freeze_fraction=freeze_fraction,
+    # Bounded and open-ended training differ only in when the benchmark stops
+    # accepting live PAI updates. They use the same HISTORY plateau schedule.
+    # Fixed mode is reachable solely through the explicit diagnostic interval.
+    _configure_dynamic_pai_schedule(
+        gpa.pc,
         batches_per_epoch=batches_per_epoch,
         initial_correlation_batches_limit=initial_correlation_batches_limit,
+        fixed_switch_interval=fixed_switch_interval,
+        schedule=dynamic_schedule,
     )
 
 
@@ -842,8 +778,6 @@ def perforate_model(
     confirm_unwrapped_modules: bool = True,
     config_snapshot_path: Path | str | None = None,
     dendrite_training_max_epochs: int | None = None,
-    dynamic_dendritic_training: bool = True,
-    freeze_dendrite_updates_fraction: float = 0.20,
     batches_per_epoch: int | None = None,
     runtime_options: PAIRuntimeOptions | None = None,
 ) -> Any:
@@ -868,9 +802,6 @@ def perforate_model(
             if dendrite_training_max_epochs is not None:
                 _configure_pai_training_schedule(
                     GPA,
-                    max_epochs=dendrite_training_max_epochs,
-                    dynamic_dendritic_training=dynamic_dendritic_training,
-                    freeze_fraction=freeze_dendrite_updates_fraction,
                     batches_per_epoch=batches_per_epoch,
                     initial_correlation_batches_limit=(
                         runtime_options.initial_correlation_batches_limit

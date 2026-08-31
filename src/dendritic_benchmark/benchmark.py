@@ -8,6 +8,8 @@ from typing import Any
 
 import torch
 
+from .artifacts import validate_artifact_manifest
+from .checkpointing import load_state_dict_checked
 from .compat import choose_device
 from .data import (
     AG_NEWS_SEQ_LEN,
@@ -257,42 +259,24 @@ class BenchmarkOrchestrator:
             return False
 
         try:
-            state = torch.load(model_path, map_location="cpu", weights_only=True)
-            model_state = model.state_dict()
-            compatible_state = {
-                key: value
-                for key, value in state.items()
-                if not key.endswith("tracker_string")
-                and model_state.get(key) is not None
-                and hasattr(value, "shape")
-                and hasattr(model_state[key], "shape")
-                and value.shape == model_state[key].shape
-            }
-            # A dendritic model.pt carries PerforatedAI wrapper key names, so
-            # against a plain build_model() skeleton almost nothing matches.
-            # The old strict=False load then "succeeded" on a handful of
-            # tensors and the latency row silently described an unperforated,
-            # mostly randomly-initialized network — dendrites_* latencies were
-            # base-architecture numbers. Refuse instead: a missing row is
-            # honest, a wrong-architecture row is not.
-            skipped_source = [
-                key for key in state
-                if key not in compatible_state and not key.endswith("tracker_string")
-            ]
-            unfilled_target = [
-                key for key in model_state
-                if key not in compatible_state and not key.endswith("tracker_string")
-            ]
-            if skipped_source or unfilled_target:
-                _log(
-                    f"model.pt in {condition_dir.name} does not match the plain "
-                    f"model architecture ({len(skipped_source)} checkpoint "
-                    f"tensor(s) unloadable, {len(unfilled_target)} model "
-                    "tensor(s) unfilled — likely a PerforatedAI dendritic "
-                    "checkpoint); refusing to benchmark the wrong architecture."
-                )
+            record = json.loads((condition_dir / "record.json").read_text())
+            artifact_id = record.get("artifact_id")
+            if not isinstance(artifact_id, str) or not artifact_id:
+                _log(f"Refusing unmanifested artifact in {condition_dir}")
                 return False
-            model.load_state_dict(compatible_state, strict=False)
+            verdict = validate_artifact_manifest(
+                condition_dir,
+                expected_artifact_id=artifact_id,
+                expected_model_key=record.get("model_key"),
+                expected_condition_key=record.get("condition_key"),
+            )
+            if not verdict.valid:
+                _log(f"Refusing invalid artifact in {condition_dir}: {verdict.reason}")
+                return False
+            state = torch.load(model_path, map_location="cpu", weights_only=True)
+            load_state_dict_checked(
+                model, state, context=f"latency artifact {model_path}"
+            )
             return True
         except Exception as exc:
             _log(f"Failed to load model state: {exc}")

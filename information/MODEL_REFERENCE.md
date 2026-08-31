@@ -221,7 +221,7 @@ For each model below, this document captures:
   - DistilBERT dendritic runs use a 128-batch cleanup interval to avoid late-epoch MPS memory pressure.
 - Dendritic epoch policy:
   - By default, dendritic FP32 runs use the listed `max_epochs` value as a hard budget matching Base FP32.
-  - PerforatedAI insertion is active for the first 80% of that budget with fixed switch intervals, then frozen for the last 20%.
+  - PerforatedAI HISTORY plateau detection is active for the first 80% of that budget, then insertion is frozen for the last 20%. Fixed switching is diagnostic-only via `--pai-fixed-switch-interval`.
   - With `uv run dqb run --dynamic-dendritic-training`, training continues past that budget until PerforatedAI reports `training_complete=True`.
   - Dynamic epochs beyond `max_epochs` are saved under `continued_until_complete/`.
 - Comparability to published results:

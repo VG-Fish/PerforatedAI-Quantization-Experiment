@@ -733,7 +733,7 @@ Declares benchmark model and condition metadata.
 - Perforates models with PerforatedAI for dendritic conditions.
 - Calls `train_and_evaluate()` for every model-condition pair.
 - When `--allow-PQAT` is enabled, all quantized conditions save a PTQ snapshot under `before_pqat/`, fine-tune for a short model-aware PQAT budget, and save the post-PQAT artifacts under `after_pqat/`.
-- In the default bounded dendritic mode, configures PAI to use fixed switch intervals inside the first 80% of the FP32 epoch budget and caps the number of dendrite additions to fit that budget. With `--dynamic-dendritic-training`, restores PAI's history-based until-complete schedule.
+- Uses PAI's HISTORY plateau schedule in both bounded and open-ended dendritic modes. The default bounded mode accepts live insertions during the first 80% of the FP32 budget and freezes them for the final 20%; `--dynamic-dendritic-training` instead continues until PAI completes. Fixed switching is available only through the explicit diagnostic option `--pai-fixed-switch-interval`, with requested and observed epochs persisted in `pai_summary.json`.
 - Writes per-condition training records and regenerates comparison outputs during the run.
 - Skips dataset loading entirely for models where all conditions are already recorded.
 

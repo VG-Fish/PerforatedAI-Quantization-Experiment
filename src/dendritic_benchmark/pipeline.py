@@ -9,15 +9,18 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, Protocol, cast
 
 import torch
 import torch.nn as nn
 
+from .artifacts import validate_artifact_manifest
+from .checkpointing import load_state_dict_checked
 from .compat import (
     PAI_ARTIFACT_NAME,
     PAI_DIRECTORY_NAME,
@@ -71,6 +74,8 @@ from .training import (
 EPOCH_MULTIPLIER = 10
 _RECORD_JSON = "record.json"
 _MODEL_PT = "model.pt"
+_ARTIFACT_ATTEMPT_JSON = "artifact_attempt.json"
+_EPOCH_CHECKPOINT_PT = "epoch_checkpoint.pt"
 _DEFAULT_PAI_INITIAL_CORRELATION_BATCH_LIMIT = 32
 _MODEL_PAI_INITIAL_CORRELATION_BATCH_LIMITS = {
     "distilbert": 4,
@@ -81,31 +86,6 @@ _MODEL_DENDRITIC_BATCH_SIZES = {
 _DEFAULT_DENDRITIC_MEMORY_CLEANUP_INTERVAL = 512
 _MODEL_DENDRITIC_MEMORY_CLEANUP_INTERVALS = {
     "distilbert": 128,
-}
-# PAI's HISTORY mode needs n_epochs_to_switch (10) quiet epochs to decide a switch,
-# and its running average keeps resetting that counter (see
-# _configure_interval_pai_schedule). At DistilBERT's ~23 min/epoch the 2026-07-29
-# run never got past switch 0 in 40 epochs. Models listed here switch on a fixed
-# interval instead, sized to the epochs their baseline recipe needs to converge.
-_MODEL_DENDRITIC_FIXED_SWITCH_INTERVALS = {
-    "distilbert": 3,
-    # Dynamic10's TCN reached its best validation epoch at 9, while HISTORY
-    # mode first restructured at epoch 20. Insert the single permitted
-    # dendrite early enough for it to affect the selected checkpoint.
-    "tcn_forecaster": 6,
-    # Dynamic11's gate search began after the GRU cosine had effectively
-    # bottomed out.  The decoder-projection search now switches while the
-    # weather model still has time to adapt.
-    "gru_forecaster": 8,
-    # The old VAE candidate did not arrive until epoch 86 of a 50-epoch cosine
-    # recipe, so it trained at the LR floor.  Give its decoder target a single,
-    # early fixed switch and a shared 150-epoch adaptation budget.
-    "vae_mnist": 20,
-    # SAINT's dense validation peak is epoch 62 and its later trajectory has
-    # plateaued by epoch 100. HISTORY mode never kept its late QKV candidate,
-    # so make the single classifier-head insertion while its cosine LR still
-    # has room for the bounded candidate and adaptation phases.
-    "saint_adult": 100,
 }
 _PAI_VARIANTS = frozenset(
     {
@@ -126,7 +106,7 @@ _MODEL_ARTIFACT_REVISIONS = {
     "vae_mnist": "dynamic11_fair_ternary_v2",
     "resnet18_cifar10": "dynamic12_prefc_target_v1",
     "resnet18_hf_perforated_cifar10": "dynamic12_hf_perforated_gd_cifar_v1",
-    "saint_adult": "dynamic12_head_target_fixed100_v1",
+    "saint_adult": "dynamic12_head_target_history_v2",
     "pointnet_modelnet40": "dynamic12_late_feature_target_v1",
 }
 # Dynamic9 showed that the global three-dendrite schedule adds unnecessary
@@ -234,8 +214,6 @@ class SourceCheckpointLoadConfig:
     module_selection: PAIModuleSelection
     config_snapshot_path: Path | str | None = None
     dendrite_training_max_epochs: int | None = None
-    dynamic_dendritic_training: bool = False
-    freeze_dendrite_updates_fraction: float = 0.20
     batches_per_epoch: int | None = None
     module_output_dimensions: dict[str, list[int]] | None = None
     candidate_graph_enabled: bool = True
@@ -264,30 +242,6 @@ def _release_accelerator_memory() -> None:
         torch.cuda.empty_cache()
 
 
-def _is_ignorable_state_key(key: str) -> bool:
-    return key.endswith("tracker_string")
-
-
-def _tensor_shape(value: Any) -> tuple[int, ...] | None:
-    shape = getattr(value, "shape", None)
-    if shape is None:
-        return None
-    try:
-        return tuple(shape)
-    except TypeError:
-        return None
-
-
-def _is_compatible_state_value(current_value: Any, source_value: Any) -> bool:
-    current_shape = _tensor_shape(current_value)
-    source_shape = _tensor_shape(source_value)
-    return (
-        current_shape is not None
-        and source_shape is not None
-        and current_shape == source_shape
-    )
-
-
 class BenchmarkRunner:
     def __init__(
         self,
@@ -296,12 +250,15 @@ class BenchmarkRunner:
         *,
         model_scale: float = 1.0,
         pai_variant: str = "default",
+        pai_fixed_switch_interval: int | None = None,
     ):
         if not 0 < model_scale <= 1:
             raise ValueError("model_scale must be greater than zero and at most one")
         if pai_variant not in _PAI_VARIANTS:
             choices = ", ".join(sorted(_PAI_VARIANTS))
             raise ValueError(f"Unknown PAI variant {pai_variant!r}; choose one of {choices}")
+        if pai_fixed_switch_interval is not None and pai_fixed_switch_interval < 1:
+            raise ValueError("pai_fixed_switch_interval must be a positive integer")
         self.results_root = validate_output_path(Path(results_root), label="results_root")
         self.comparison_root = validate_output_path(Path(comparison_root), label="comparison_root")
         self.results_root.mkdir(parents=True, exist_ok=True)
@@ -314,104 +271,66 @@ class BenchmarkRunner:
         self._seed: int | None = None
         self._model_scale = model_scale
         self._pai_variant = pai_variant
+        self._diagnostic_fixed_switch_interval = pai_fixed_switch_interval
 
-    def _split_compatible_state(
-        self, state: dict[str, Any], current_state: dict[str, Any]
-    ) -> tuple[dict[str, Any], list[str]]:
-        """Split a source ``state_dict`` into the part that fits ``current_state``
-        and the keys that do not.
-
-        Mismatches are reported in *both* directions. Iterating only over
-        ``state`` catches source tensors the target has no slot for, but is
-        blind to the opposite and more damaging case: target parameters the
-        source never supplies. Those survive ``load_state_dict(strict=False)``
-        at whatever ``perforate_model`` initialized them to, so an untrained,
-        randomly-initialized dendrite gets quantized and scored as though it
-        were part of the trained model. ``actor_critic`` and ``m5`` shipped a
-        whole phantom dendrite this way. See MEASUREMENT_CAVEATS.md #5.
-        """
-        compatible_state: dict[str, Any] = {}
-        skipped: list[str] = []
-        for key, value in state.items():
-            if _is_ignorable_state_key(key):
-                continue
-            current_value = current_state.get(key)
-            if not _is_compatible_state_value(current_value, value):
-                skipped.append(key)
-                continue
-            compatible_state[key] = value
-        for key in current_state:
-            if _is_ignorable_state_key(key) or key in state:
-                continue
-            skipped.append(key)
-        return compatible_state, skipped
-
-    def _load_compatible_state(self, model: Any, state: dict[str, Any]) -> None:
-        """Load a dendritic source checkpoint's weights onto a model whose
-        structure was independently reconstructed from PAI's *latest* switch
-        checkpoint (see ``_load_source_checkpoint`` below).
-
-        Those two things should always agree: with the fix in
-        ``training.py::_load_compatible_best_state``, ``state`` (loaded from
-        ``model.pt``) is always self-consistent -- it is either the true
-        best-epoch model or the true final-epoch model, never a shape-filtered
-        hybrid. If reconstructing from the latest switch checkpoint still
-        doesn't match it, that means the two independent checkpointing systems
-        (this benchmark's own best-epoch tracking vs. PAI's own switch
-        checkpoints) have genuinely diverged -- see
-        information/MEASUREMENT_CAVEATS.md #3. Previously this was a silent
-        partial load, which produced a `dendrites_q*` record with a different
-        (and wrong) param_count than its own `dendrites_fp32` record. Failing
-        loudly here instead surfaces the mismatch at the point it happens,
-        rather than downstream in a comparison table.
-        """
-        current_state = model.state_dict()
-        compatible_state, skipped = self._split_compatible_state(state, current_state)
-        if skipped:
-            unfilled = sorted(k for k in skipped if k not in state)
-            mismatched = sorted(k for k in skipped if k in state)
-            detail = []
-            if unfilled:
-                detail.append(
-                    f"{len(unfilled)} target tensor(s) the source never supplies "
-                    f"(would stay at init: {', '.join(unfilled[:3])}"
-                    + ("..." if len(unfilled) > 3 else "")
-                    + ")"
-                )
-            if mismatched:
-                detail.append(
-                    f"{len(mismatched)} shape mismatch(es) "
-                    f"({', '.join(mismatched[:3])}"
-                    + ("..." if len(mismatched) > 3 else "")
-                    + ")"
-                )
-            raise RuntimeError(
-                "[state] source-checkpoint structure does not match the "
-                "PAI-reconstructed model -- refusing a partial load. "
-                + "; ".join(detail)
-                + ". See information/MEASUREMENT_CAVEATS.md #3 and #5."
-            )
-        model.load_state_dict(compatible_state, strict=False)
-
-    def _load_state(
-        self, model: Any, checkpoint_path: Path, *, strict: bool = True
-    ) -> Any:
-        if checkpoint_path.exists():
-            # weights_only=True: this file only ever holds a plain
-            # state_dict() of tensors (written in training._persist_stage_artifacts),
-            # so the restricted unpickler is safe here and closes off arbitrary
-            # code execution from a malicious/corrupted checkpoint.
-            state = torch.load(checkpoint_path, map_location=choose_device(), weights_only=True)
-            if strict:
-                model.load_state_dict(state, strict=True)
-            else:
-                self._load_compatible_state(model, cast(dict[str, Any], state))
+    def _load_state(self, model: Any, checkpoint_path: Path) -> Any:
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"required source checkpoint is missing: {checkpoint_path}")
+        # weights_only=True: this file only ever holds a plain state_dict() of
+        # tensors, so the restricted unpickler closes off arbitrary code
+        # execution from a malicious/corrupted checkpoint.
+        state = torch.load(checkpoint_path, map_location=choose_device(), weights_only=True)
+        load_state_dict_checked(
+            model,
+            cast(dict[str, Any], state),
+            context=f"source checkpoint {checkpoint_path}",
+        )
         return model
 
-    def _pai_save_name(self, model_key: str, condition_key: str) -> str:
+    def _pai_save_name(
+        self, model_key: str, condition_key: str, artifact_id: str | None = None
+    ) -> str:
         if model_key == "distilbert" and "dendrites" in condition_key:
-            return f"{model_key}_{condition_key}_head_only"
-        return f"{model_key}_{condition_key}"
+            base = f"{model_key}_{condition_key}_head_only"
+        else:
+            base = f"{model_key}_{condition_key}"
+        return f"{base}_{artifact_id[:12]}" if artifact_id else base
+
+    def _artifact_attempt(self, condition_dir: Path, model_key: str, condition_key: str) -> tuple[str, str]:
+        """Mint a namespace, or resume only with its explicit persisted token."""
+        attempt_path = condition_dir / _ARTIFACT_ATTEMPT_JSON
+        checkpoint_exists = (condition_dir / _EPOCH_CHECKPOINT_PT).exists()
+        if checkpoint_exists:
+            try:
+                attempt = json.loads(attempt_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"{condition_dir} has an epoch checkpoint without a valid "
+                    "artifact attempt token; use --fresh instead of guessing its PAI namespace"
+                ) from exc
+            artifact_id = attempt.get("artifact_id")
+            pai_save_name = attempt.get("pai_save_name")
+            if not all(
+                isinstance(value, str) and value
+                for value in (artifact_id, pai_save_name)
+            ):
+                raise RuntimeError(f"invalid artifact attempt token in {attempt_path}")
+            return artifact_id, pai_save_name
+        artifact_id = uuid.uuid4().hex
+        pai_save_name = self._pai_save_name(model_key, condition_key, artifact_id)
+        condition_dir.mkdir(parents=True, exist_ok=True)
+        attempt_path.write_text(
+            json.dumps(
+                {
+                    "artifact_id": artifact_id,
+                    "model_key": model_key,
+                    "condition_key": condition_key,
+                    "pai_save_name": pai_save_name,
+                },
+                indent=2,
+            )
+        )
+        return artifact_id, pai_save_name
 
     def _load_source_checkpoint(
         self,
@@ -423,6 +342,15 @@ class BenchmarkRunner:
         load_config: SourceCheckpointLoadConfig,
     ) -> Any:
         source_condition = condition_by_key(source_key)
+        source_verdict = validate_artifact_manifest(
+            checkpoint_path.parent,
+            expected_model_key=model_key,
+            expected_condition_key=source_key,
+        )
+        if not source_verdict.valid:
+            raise RuntimeError(
+                f"source artifact is not verified: {source_verdict.reason}"
+            )
 
         # Dendritic checkpoints contain PerforatedAI wrapper keys, so the target model
         # must be perforated before we load them. Base checkpoints still load into the
@@ -438,10 +366,6 @@ class BenchmarkRunner:
                 dendrite_training_max_epochs=(
                     load_config.dendrite_training_max_epochs
                 ),
-                dynamic_dendritic_training=load_config.dynamic_dendritic_training,
-                freeze_dendrite_updates_fraction=(
-                    load_config.freeze_dendrite_updates_fraction
-                ),
                 batches_per_epoch=load_config.batches_per_epoch,
                 runtime_options=PAIRuntimeOptions(
                     use_runtime_guard=self._use_pai_runtime_guard(),
@@ -456,7 +380,14 @@ class BenchmarkRunner:
             model = self._configure_perforated_model(
                 model, load_config.module_output_dimensions
             )
-            source_save_name = self._pai_save_name(model_key, source_key)
+            source_manifest = source_verdict.manifest
+            if not source_verdict.valid or source_manifest is None:
+                raise RuntimeError(
+                    f"dendritic source artifact is not verified: {source_verdict.reason}"
+                )
+            source_save_name = source_manifest.get("pai_namespace")
+            if not isinstance(source_save_name, str) or not source_save_name:
+                raise RuntimeError("dendritic source artifact has no owned PAI namespace")
             pai_checkpoint_name = self._source_pai_checkpoint_name(source_save_name)
             if pai_checkpoint_name is not None:
                 model = load_pai_system_checkpoint(
@@ -468,7 +399,7 @@ class BenchmarkRunner:
                     model, load_config.module_output_dimensions
                 )
                 configure_pai_candidate_graph(load_config.candidate_graph_enabled)
-            model = self._load_state(model, checkpoint_path, strict=False)
+            model = self._load_state(model, checkpoint_path)
             configure_pai_candidate_graph(load_config.candidate_graph_enabled)
             return model
 
@@ -483,10 +414,6 @@ class BenchmarkRunner:
                 config_snapshot_path=load_config.config_snapshot_path,
                 dendrite_training_max_epochs=(
                     load_config.dendrite_training_max_epochs
-                ),
-                dynamic_dendritic_training=load_config.dynamic_dendritic_training,
-                freeze_dendrite_updates_fraction=(
-                    load_config.freeze_dendrite_updates_fraction
                 ),
                 batches_per_epoch=load_config.batches_per_epoch,
                 runtime_options=PAIRuntimeOptions(
@@ -846,9 +773,14 @@ class BenchmarkRunner:
         )
 
     def _pai_fixed_switch_interval(self, model_key: str) -> int | None:
-        if model_key == "gru_forecaster" and self._pai_variant == "gru_gate_ablation":
-            return None
-        return _MODEL_DENDRITIC_FIXED_SWITCH_INTERVALS.get(model_key)
+        """Return the explicitly requested fixed-switch diagnostic, if any.
+
+        HISTORY is the scientific default for every model. Fixed switching is
+        retained only to reproduce and diagnose PAI schedule behavior; the old
+        per-model defaults were not honored by the observed runs.
+        """
+        _ = model_key
+        return self._diagnostic_fixed_switch_interval
 
     def _pai_dynamic_schedule(self, model_key: str) -> PAIDynamicSchedule | None:
         """Return the measured schedule for a model and optional ablation variant."""
@@ -936,10 +868,10 @@ class BenchmarkRunner:
         saved_dirs: dict[str, Path],
         pai_config_snapshot: Path,
         training_plan: ConditionTrainingPlan,
-        dynamic_dendritic_training: bool,
         batches_per_epoch: int | None,
         module_selection: PAIModuleSelection,
         module_output_dimensions: dict[str, list[int]] | None,
+        pai_save_name: str,
     ) -> Any:
         dendrite_training_max_epochs = (
             training_plan.max_epochs
@@ -973,13 +905,11 @@ class BenchmarkRunner:
                 checkpoint,
                 condition.use_dendrites,
                 SourceCheckpointLoadConfig(
-                    save_name=self._pai_save_name(model_key, condition.key),
+                    save_name=pai_save_name,
                     maximizing_score=metric_direction == "maximize",
                     module_selection=module_selection,
                     config_snapshot_path=pai_config_snapshot,
                     dendrite_training_max_epochs=dendrite_training_max_epochs,
-                    dynamic_dendritic_training=dynamic_dendritic_training,
-                    freeze_dendrite_updates_fraction=0.20,
                     batches_per_epoch=batches_per_epoch,
                     module_output_dimensions=module_output_dimensions,
                     candidate_graph_enabled=training_plan.update_dendrites_during_training,
@@ -994,14 +924,12 @@ class BenchmarkRunner:
             return model
         model = perforate_model(
             model,
-            save_name=self._pai_save_name(model_key, condition.key),
+            save_name=pai_save_name,
             doing_pai=True,
             maximizing_score=metric_direction == "maximize",
             module_selection=module_selection,
             config_snapshot_path=pai_config_snapshot,
             dendrite_training_max_epochs=dendrite_training_max_epochs,
-            dynamic_dendritic_training=dynamic_dendritic_training,
-            freeze_dendrite_updates_fraction=0.20,
             batches_per_epoch=batches_per_epoch,
             runtime_options=PAIRuntimeOptions(
                 use_runtime_guard=self._use_pai_runtime_guard(),
@@ -1424,6 +1352,17 @@ class BenchmarkRunner:
             metadata = json.loads(metrics_path.read_text())
         except json.JSONDecodeError:
             return False
+        artifact_id = metadata.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            return False
+        verdict = validate_artifact_manifest(
+            condition_dir,
+            expected_artifact_id=artifact_id,
+            expected_model_key=model_key,
+            expected_condition_key=condition.key,
+        )
+        if not verdict.valid:
+            return False
         try:
             recorded_scale = float(metadata.get("model_scale", 1.0))
         except (TypeError, ValueError):
@@ -1476,6 +1415,10 @@ class BenchmarkRunner:
             return False
         if metadata.get("pai_variant") != self._pai_variant:
             return False
+        if metadata.get("pai_fixed_switch_interval") != self._pai_fixed_switch_interval(
+            model_key
+        ):
+            return False
         expected_schedule = self._pai_dynamic_schedule(model_key)
         recorded_schedule = metadata.get("pai_dynamic_schedule")
         # Compare both directions of the None boundary too: adding or removing a
@@ -1501,8 +1444,24 @@ class BenchmarkRunner:
             record = json.loads(record_path.read_text())
         except (OSError, json.JSONDecodeError):
             return None
+        artifact_id = record.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            return None
+        verdict = validate_artifact_manifest(
+            source_dir,
+            expected_artifact_id=artifact_id,
+            expected_model_key=record.get("model_key"),
+            expected_condition_key=record.get("condition_key"),
+        )
+        if not verdict.valid:
+            return None
         status = record.get("dendrite_audit_status")
-        return str(status) if status else None
+        manifest_status = (verdict.manifest or {}).get("validity", {}).get(
+            "dendrite_status"
+        )
+        if not status or status != manifest_status:
+            return None
+        return str(status)
 
     def _require_verified_dendritic_pqat_source(
         self, model_key: str, condition: ConditionSpec, saved_dirs: dict[str, Path]
@@ -1541,7 +1500,27 @@ class BenchmarkRunner:
         if ignore_saved:
             return False
         condition_dir = self.results_root / model_key / condition.key
-        if not (condition_dir / _RECORD_JSON).exists():
+        record_path = condition_dir / _RECORD_JSON
+        if not record_path.exists():
+            return False
+        try:
+            saved_record = json.loads(record_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return False
+        saved_artifact_id = saved_record.get("artifact_id")
+        if not isinstance(saved_artifact_id, str) or not saved_artifact_id:
+            return False
+        record_verdict = validate_artifact_manifest(
+            condition_dir,
+            expected_artifact_id=saved_artifact_id,
+            expected_model_key=model_key,
+            expected_condition_key=condition.key,
+        )
+        if not record_verdict.valid:
+            _log(
+                f"[stale] {model_key} / {condition.key} — "
+                f"{record_verdict.reason}; retraining."
+            )
             return False
         if not self._condition_metadata_current(
             model_key,
@@ -1787,13 +1766,16 @@ class BenchmarkRunner:
         allow_pqat: bool,
         dynamic_dendritic_training: bool,
     ) -> TrainingRecord:
+        condition_dir = self.results_root / model_key / condition.key
+        artifact_id, pai_save_name = self._artifact_attempt(
+            condition_dir, model_key, condition.key
+        )
         training_hyperparameters = self._training_hyperparameters(model_key, condition)
         training_plan = self._condition_training_plan(
             model_key, condition, training_hyperparameters, allow_pqat
         )
         model = build_model(model_key, **self._model_kwargs(model_key))
         dense_param_count = sum(parameter.numel() for parameter in model.parameters())
-        condition_dir = self.results_root / model_key / condition.key
         pai_config_snapshot = condition_dir / "PAI_config.json"
         batches_per_epoch = self._batches_per_epoch(bundle)
         module_selection, module_output_dimensions = (
@@ -1807,10 +1789,10 @@ class BenchmarkRunner:
             saved_dirs=saved_dirs,
             pai_config_snapshot=pai_config_snapshot,
             training_plan=training_plan,
-            dynamic_dendritic_training=dynamic_dendritic_training,
             batches_per_epoch=batches_per_epoch,
             module_selection=module_selection,
             module_output_dimensions=module_output_dimensions,
+            pai_save_name=pai_save_name,
         )
 
         weight_decay = training_hyperparameters.weight_decay
@@ -1884,7 +1866,7 @@ class BenchmarkRunner:
             freeze_dendrite_updates_fraction=0.20,
             pai_candidate_graph_batch_limit=pai_candidate_graph_batch_limit,
             memory_cleanup_interval_batches=memory_cleanup_interval_batches,
-            pai_save_name=self._pai_save_name(model_key, condition.key),
+            pai_save_name=pai_save_name,
             model_scale=self._model_scale,
             pai_variant=self._pai_variant,
             model_revision=self._model_artifact_revision(model_key),
@@ -1892,6 +1874,8 @@ class BenchmarkRunner:
             pai_dynamic_schedule=(
                 dynamic_schedule.to_dict() if dynamic_schedule is not None else None
             ),
+            artifact_id=artifact_id,
+            seed=self._seed,
         )
         return train_and_evaluate(
             model_key=model_key,
@@ -2045,6 +2029,10 @@ class _Emitter:
                 handle.write(text + "\n")
         except OSError as exc:
             print(f"  (could not append to {self._progress_log}: {exc.strerror})", file=sys.stderr)
+
+
+class _ProgressEmitter(Protocol):
+    def __call__(self, text: str = "", *, stderr: bool = False) -> None: ...
 
 
 def _dqb_command() -> list[str]:
@@ -2228,7 +2216,7 @@ def clear_epoch_checkpoints(
     condition_keys: list[str],
     *,
     fresh: bool,
-    emit: _Emitter,
+    emit: _ProgressEmitter,
 ) -> None:
     """Deal with epoch checkpoints left behind by an earlier run.
 

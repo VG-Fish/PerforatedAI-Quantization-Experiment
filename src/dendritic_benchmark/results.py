@@ -3,6 +3,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .artifacts import (
+    ArtifactVerdict,
+    finalize_artifact_manifest,
+    validate_artifact_manifest,
+)
 from .plots import (
     bar_chart,
     grouped_bar_chart,
@@ -21,11 +26,9 @@ _COERCE_INT_KEYS = {"best_epoch", "param_count", "nonzero_params"}
 _COERCE_FLOAT_KEYS = {"metric_value", "best_metric_value", "file_size_mb", "train_seconds"}
 _COERCE_BOOL_KEYS = {"training_skipped"}
 _BENCHMARK_MANIFEST_FIELDS = {"model_key", "condition_key", "batch_size", "mean_latency_ms", "median_latency_ms"}
-_NON_REPORTABLE_DENDRITE_STATUSES = {
-    "no_retained_insertion",
-    "inherited_no_retained_insertion",
-    "unverified",
-    "inherited_unverified",
+_REPORTABLE_DENDRITE_STATUSES = {
+    "verified_retained",
+    "inherited_verified_retained",
 }
 
 
@@ -99,6 +102,9 @@ def save_training_record(record: TrainingRecord, output_dir: Path) -> None:
         writer = csv.DictWriter(fh, fieldnames=list(payload.keys()))
         writer.writeheader()
         writer.writerow(payload)
+    if not record.artifact_id:
+        raise RuntimeError("cannot finalize an artifact without record.artifact_id")
+    finalize_artifact_manifest(output_dir, artifact_id=record.artifact_id)
 
 
 def load_training_records(results_root: Path) -> list[dict[str, Any]]:
@@ -161,107 +167,115 @@ def write_manifest(records: list[dict[str, Any]], output_path: Path) -> None:
         writer.writerows(records)
 
 
-def _legacy_dendrite_audit_status(record: dict[str, Any]) -> str | None:
-    """Infer an invalid legacy result from its source FP32 PAI summary.
-
-    New records carry an explicit status. Dynamic12's already-written records
-    predate that field, so the comparison report reads the raw switch evidence
-    rather than continuing to plot a no-insertion TCN run as a dendrite result.
-    """
-    condition_key = str(record.get("condition_key", ""))
-    if not condition_key.startswith("dendrites_"):
-        return None
-    artifact_dir = record.get("artifact_dir")
-    if not artifact_dir:
-        return None
-    condition_dir = Path(str(artifact_dir))
-    source_dir = (
-        condition_dir
-        if condition_key == "dendrites_fp32"
-        else condition_dir.parent / "dendrites_fp32"
-    )
-    summary_path = source_dir / "pai_summary.json"
-    try:
-        summary = json.loads(summary_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    explicit = summary.get("dendrite_audit", {}).get("status")
-    if explicit:
-        return str(explicit)
-    switches = summary.get("raw_pai_logs", {}).get("switches", {})
-    if switches.get("status") == "available" and int(switches.get("row_count", 0)) < 2:
-        return "no_retained_insertion"
-    raw_architecture = summary.get("raw_pai_logs", {}).get("architecture", {})
-    source_record = _load_condition_record(source_dir)
-    dense_record = _load_condition_record(source_dir.parent / "base_fp32")
-    final_param_count = (source_record or {}).get("param_count")
-    dense_param_count = (dense_record or {}).get("param_count")
-    raw_param_count = raw_architecture.get("max_param_count")
-    if (
-        final_param_count is None
-        or dense_param_count is None
-        or raw_param_count is None
-    ):
-        return None
-    try:
-        final_params = int(final_param_count)
-        dense_params = int(dense_param_count)
-        raw_params = int(raw_param_count)
-    except (TypeError, ValueError):
-        return None
-    if (
-        switches.get("status") == "available"
-        and int(switches.get("row_count", 0)) >= 2
-        and raw_architecture.get("status") == "available"
-        and final_params > dense_params
-        and raw_params == final_params
-    ):
-        return "verified_retained"
-    return None
-
-
 def _dendrite_audit_status(record: dict[str, Any]) -> str:
     explicit = record.get("dendrite_audit_status")
     if explicit:
         return str(explicit)
-    return _legacy_dendrite_audit_status(record) or "legacy_unchecked"
+    return "unknown"
 
 
-def _quantization_evaluation_status(record: dict[str, Any]) -> str:
+def _artifact_verdict(record: dict[str, Any]) -> ArtifactVerdict:
     artifact_dir = record.get("artifact_dir")
-    if not artifact_dir:
-        return "legacy_unchecked"
-    try:
-        metrics = json.loads((Path(str(artifact_dir)) / "metrics.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        return "legacy_unchecked"
-    if not metrics.get("use_qat"):
-        return "not_applicable"
-    if metrics.get("quantization_evaluation_revision") == QUANTIZATION_EVALUATION_REVISION:
-        return "current"
-    return "stale_double_projection"
-
-
-def _record_is_reportable(record: dict[str, Any]) -> bool:
-    return (
-        _dendrite_audit_status(record) not in _NON_REPORTABLE_DENDRITE_STATUSES
-        and _quantization_evaluation_status(record) != "stale_double_projection"
+    artifact_id = record.get("artifact_id")
+    model_key = record.get("model_key")
+    condition_key = record.get("condition_key")
+    if not all(
+        isinstance(value, str) and value
+        for value in (artifact_dir, artifact_id, model_key, condition_key)
+    ):
+        return ArtifactVerdict(
+            "unknown", "record is not bound to an artifact manifest identity"
+        )
+    return validate_artifact_manifest(
+        Path(artifact_dir),
+        expected_artifact_id=artifact_id,
+        expected_model_key=model_key,
+        expected_condition_key=condition_key,
     )
 
 
+def _condition_is_quantized(record: dict[str, Any]) -> bool:
+    try:
+        return condition_by_key(str(record.get("condition_key", ""))).quantized
+    except KeyError:
+        return False
+
+
+def _quantization_evaluation_status(
+    record: dict[str, Any], verdict: ArtifactVerdict | None = None
+) -> str:
+    if not _condition_is_quantized(record):
+        return "not_applicable"
+    verdict = verdict or _artifact_verdict(record)
+    manifest = verdict.manifest
+    if not verdict.valid or manifest is None:
+        return "unknown"
+    identity = manifest.get("identity", {})
+    validity = manifest.get("validity", {})
+    if (
+        identity.get("quantization_evaluation_revision")
+        == QUANTIZATION_EVALUATION_REVISION
+        and validity.get("quantization_status") == "current"
+    ):
+        return "current"
+    return "invalid_revision"
+
+
+def _record_is_reportable(
+    record: dict[str, Any], verdict: ArtifactVerdict | None = None
+) -> bool:
+    verdict = verdict or _artifact_verdict(record)
+    manifest = verdict.manifest
+    if not verdict.valid or manifest is None:
+        return False
+    condition_key = str(record.get("condition_key", ""))
+    if condition_key.startswith("dendrites_"):
+        status = _dendrite_audit_status(record)
+        manifest_status = manifest.get("validity", {}).get("dendrite_status")
+        if status not in _REPORTABLE_DENDRITE_STATUSES or manifest_status != status:
+            return False
+    if _condition_is_quantized(record):
+        return _quantization_evaluation_status(record, verdict) == "current"
+    return True
+
+
 def _write_dendrite_audit(records: list[dict[str, Any]], output_dir: Path) -> None:
-    rows = [
-        {
-            "model_key": record.get("model_key", ""),
-            "condition_key": record.get("condition_key", ""),
-            "dendrite_audit_status": _dendrite_audit_status(record),
-            "dendrite_audit_reason": record.get("dendrite_audit_reason", ""),
-            "quantization_evaluation_status": _quantization_evaluation_status(record),
-            "reportable": _record_is_reportable(record),
-        }
-        for record in records
-        if str(record.get("condition_key", "")).startswith("dendrites_")
-    ]
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        if not str(record.get("condition_key", "")).startswith("dendrites_"):
+            continue
+        verdict = _artifact_verdict(record)
+        manifest = verdict.manifest or {}
+        schedule = manifest.get("telemetry", {}).get("pai_schedule", {})
+        requested = schedule.get("requested", {})
+        observed = schedule.get("observed", {})
+        rows.append(
+            {
+                "model_key": record.get("model_key", ""),
+                "condition_key": record.get("condition_key", ""),
+                "dendrite_audit_status": _dendrite_audit_status(record),
+                "dendrite_audit_reason": record.get("dendrite_audit_reason", ""),
+                "quantization_evaluation_status": (
+                    _quantization_evaluation_status(record, verdict)
+                ),
+                "artifact_status": verdict.status,
+                "artifact_reason": verdict.reason,
+                "requested_switch_mode": requested.get("mode", "unknown"),
+                "requested_fixed_switch_interval": requested.get(
+                    "fixed_switch_interval", ""
+                ),
+                "observed_switch_epochs": json.dumps(
+                    observed.get("switch_epochs", [])
+                ),
+                "observed_switch_intervals": json.dumps(
+                    observed.get("switch_intervals", [])
+                ),
+                "termination_reason": observed.get(
+                    "termination_reason", "unknown"
+                ),
+                "reportable": _record_is_reportable(record, verdict),
+            }
+        )
     with (output_dir / "dendrite_audit.csv").open("w", newline="") as fh:
         if not rows:
             fh.write("")

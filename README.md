@@ -32,7 +32,7 @@ smoothing, and gradient clipping) instead of a flat rate for the whole run.
 `information/DOCUMENTATION.md` has the full account of what was changed and why;
 `information/MODEL_REFERENCE.md` lists the per-model settings.
 
-Dendritic FP32 training defaults to the same fixed epoch budget as the matching non-dendritic model. PerforatedAI dendrite insertion is active during the first 80% of those epochs with a fixed switch cadence tuned to the budget, then dendrite insertion is frozen for the final 20% so the selected architecture can settle. Pass `--dynamic-dendritic-training` to restore the open-ended PerforatedAI mode that keeps training until `training_complete=True`; any epochs beyond the canonical budget are written under `results/<model>/<condition>/continued_until_complete/`.
+Dendritic FP32 training defaults to the same fixed epoch budget as the matching non-dendritic model. PerforatedAI uses HISTORY plateau detection for every model; dendrite insertion is active during the first 80% of the budget, then frozen for the final 20% so the selected architecture can settle. Pass `--dynamic-dendritic-training` to keep the same HISTORY schedule open until `training_complete=True`; any epochs beyond the canonical budget are written under `results/<model>/<condition>/continued_until_complete/`. Fixed switching is available only as an explicit schedule diagnostic through `--pai-fixed-switch-interval EPOCHS`, and requested versus observed switches are recorded in `pai_summary.json`.
 
 For Apple Silicon runs, the training path selects MPS automatically, disables CUDA-only pinned memory, keeps DataLoader workers persistent, uses larger per-model batch sizes, sets high float32 matmul precision where supported, and compiles non-dendritic MPS models with `torch.compile(..., backend="aot_eager")` when available. Long dendritic runs periodically clear PerforatedAI processor buffers and the accelerator cache to avoid MPS memory pressure during late epochs.
 
@@ -92,6 +92,13 @@ active PerforatedAI config to
 `PAI/<model>_<condition>_PAI_config.json`, so each model/condition keeps its
 own reproducibility config instead of relying only on the latest global
 `PAI/PAI_config.json`.
+
+Every condition attempt receives a unique artifact ID and PAI namespace. A
+completed `artifact_manifest.json` binds that identity to hashes of the model,
+metrics, history, and record files. Reporting, reuse, source loading, and
+latency benchmarking reject missing, incomplete, mismatched, or modified
+manifests. An interrupted run resumes only when its `artifact_attempt.json`
+token matches the existing epoch checkpoint; otherwise use `--fresh`.
 
 When `--allow-PQAT` is supplied, PQAT is applied to all quantized conditions
 after their source checkpoint has been trained. Each quantized run saves a PTQ
@@ -157,6 +164,7 @@ uv run dqb run --models lenet5 textcnn
 uv run dqb run --conditions base_fp32 dendrites_fp32
 uv run dqb run --allow-PQAT
 uv run dqb run --dynamic-dendritic-training
+uv run dqb run --pai-fixed-switch-interval 8  # diagnostic only
 uv run dqb run --ignore-saved-models
 
 # Control how a run is parallelised (default: 4 workers + live progress table)
