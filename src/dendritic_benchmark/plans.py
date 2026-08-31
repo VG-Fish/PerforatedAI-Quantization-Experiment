@@ -47,6 +47,47 @@ class ModelTrainingRecipe:
         )
 
 
+class _ClearSentinel:
+    """Singleton meaning "set this recipe field to ``None``", not "leave it".
+
+    An override uses ``None`` to mean "unset -- keep the recipe's own value",
+    which leaves no way to express the opposite for the three
+    :class:`ModelTrainingRecipe` fields that are themselves nullable. A trial
+    that wants to *disable* gradient clipping, the step schedule, or the
+    LR-schedule horizon could not be written down at all, so those arms of the
+    sweep were unreachable from a JSON file.
+    """
+
+    _instance: "_ClearSentinel | None" = None
+
+    def __new__(cls) -> "_ClearSentinel":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "CLEAR"
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (_ClearSentinel, ())
+
+
+#: Sentinel for "override this field to ``None``". See :class:`_ClearSentinel`.
+CLEAR = _ClearSentinel()
+
+#: How ``CLEAR`` is spelled in an override JSON file and in the ``to_dict``
+#: form written to ``metrics.json``. A plain JSON ``null`` cannot carry the
+#: meaning: it is already how an unset field is written.
+CLEAR_JSON_VALUE = "__null__"
+
+#: The RecipeOverride fields that accept ``CLEAR``. Exactly the
+#: ``ModelTrainingRecipe`` fields whose own type admits ``None`` -- clearing
+#: any other field would produce a recipe the trainer cannot run.
+_CLEARABLE_RECIPE_FIELDS = frozenset(
+    {"lr_decay_every", "lr_schedule_epochs", "grad_clip_norm"}
+)
+
+
 def _load_override_json(cls: Any, path: Path | str) -> dict[str, Any]:
     """Parse an override JSON file and reject any key the dataclass has no field for.
 
@@ -95,32 +136,61 @@ class RecipeOverride:
     momentum: float | None = None
     weight_decay: float | None = None
     lr_schedule: LRScheduleName | None = None
-    lr_decay_every: int | None = None
+    lr_decay_every: int | _ClearSentinel | None = None
     lr_decay_gamma: float | None = None
     lr_min_factor: float | None = None
-    lr_schedule_epochs: int | None = None
+    lr_schedule_epochs: int | _ClearSentinel | None = None
     dendrite_lr_min_factor: float | None = None
     warmup_epochs: int | None = None
     label_smoothing: float | None = None
     regression_loss: RegressionLossName | None = None
-    grad_clip_norm: float | None = None
+    grad_clip_norm: float | _ClearSentinel | None = None
     nesterov: bool | None = None
+
+    def __post_init__(self) -> None:
+        for f in fields(self):
+            if (
+                isinstance(getattr(self, f.name), _ClearSentinel)
+                and f.name not in _CLEARABLE_RECIPE_FIELDS
+            ):
+                raise ValueError(
+                    f"RecipeOverride.{f.name} cannot be cleared to None: only "
+                    f"{sorted(_CLEARABLE_RECIPE_FIELDS)} are nullable on "
+                    "ModelTrainingRecipe"
+                )
 
     @classmethod
     def from_json_file(cls, path: Path | str) -> "RecipeOverride":
-        return cls(**_load_override_json(cls, path))
+        data = _load_override_json(cls, path)
+        for key, value in data.items():
+            if value == CLEAR_JSON_VALUE:
+                data[key] = CLEAR
+        return cls(**data)
 
     def to_dict(self) -> dict[str, Any]:
-        """The fields this override actually sets, for artifact identity."""
+        """The fields this override actually sets, for artifact identity.
+
+        ``CLEAR`` is emitted as :data:`CLEAR_JSON_VALUE` rather than as JSON
+        ``null``. This value is written to ``metrics.json`` and read back by
+        ``BenchmarkRunner._condition_metadata_current`` to decide whether a
+        saved artifact still matches; a ``null`` there would read back as an
+        unset field, so a "disable gradient clipping" trial would judge its own
+        artifact stale and retrain it on every invocation -- the same failure
+        ``PAIOverride.to_dict``'s tuple/list conversion exists to prevent.
+        """
         return {
-            f.name: value
+            f.name: (CLEAR_JSON_VALUE if isinstance(value, _ClearSentinel) else value)
             for f in fields(self)
             if (value := getattr(self, f.name)) is not None
         }
 
     def apply(self, recipe: "ModelTrainingRecipe") -> "ModelTrainingRecipe":
         """Return ``recipe`` with only this override's set fields replaced."""
-        changes = self.to_dict()
+        changes = {
+            f.name: (None if isinstance(value, _ClearSentinel) else value)
+            for f in fields(self)
+            if (value := getattr(self, f.name)) is not None
+        }
         return replace(recipe, **changes) if changes else recipe
 
 

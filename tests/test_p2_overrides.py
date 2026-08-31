@@ -14,7 +14,13 @@ from pathlib import Path
 from dendritic_benchmark.cli import build_parser
 from dendritic_benchmark.compat import PAIDynamicSchedule
 from dendritic_benchmark.pipeline import BenchmarkRunner
-from dendritic_benchmark.plans import ModelTrainingRecipe, PAIOverride, RecipeOverride
+from dendritic_benchmark.plans import (
+    CLEAR,
+    CLEAR_JSON_VALUE,
+    ModelTrainingRecipe,
+    PAIOverride,
+    RecipeOverride,
+)
 
 
 def _write_json(path: Path, payload: dict) -> Path:
@@ -34,6 +40,69 @@ class RecipeOverrideTests(unittest.TestCase):
             override.to_dict(), {"learning_rate": 0.05, "weight_decay": 5e-4}
         )
         self.assertIsNone(override.max_epochs)
+
+    def test_a_nullable_field_can_be_cleared_to_none(self) -> None:
+        # "None" already means "unset" on an override, so disabling gradient
+        # clipping, the step schedule, or the LR-schedule horizon needed an
+        # explicit sentinel. Without it those sweep arms were unreachable.
+        recipe = ModelTrainingRecipe(
+            batch_size=128,
+            max_epochs=40,
+            learning_rate=1e-2,
+            lr_schedule="step",
+            lr_decay_every=20,
+            lr_schedule_epochs=40,
+            grad_clip_norm=5.0,
+        )
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
+            path = _write_json(
+                Path(root) / "override.json",
+                {
+                    "grad_clip_norm": CLEAR_JSON_VALUE,
+                    "lr_decay_every": CLEAR_JSON_VALUE,
+                    "learning_rate": 0.003,
+                },
+            )
+            override = RecipeOverride.from_json_file(path)
+        self.assertIs(override.grad_clip_norm, CLEAR)
+        applied = override.apply(recipe)
+        self.assertIsNone(applied.grad_clip_norm)
+        self.assertIsNone(applied.lr_decay_every)
+        self.assertEqual(applied.learning_rate, 0.003)
+        # an untouched nullable field keeps the recipe's own value
+        self.assertEqual(applied.lr_schedule_epochs, 40)
+
+    def test_a_cleared_field_survives_the_metrics_json_round_trip(self) -> None:
+        # to_dict is written to metrics.json and read back by
+        # _condition_metadata_current. Emitting CLEAR as JSON null would read
+        # back as "unset", so the trial would judge its own artifact stale and
+        # retrain it on every invocation -- PAIOverride's tuple bug again.
+        override = RecipeOverride(grad_clip_norm=CLEAR, learning_rate=0.05)
+        recorded = override.to_dict()
+        self.assertEqual(recorded["grad_clip_norm"], CLEAR_JSON_VALUE)
+        self.assertEqual(json.loads(json.dumps(recorded)), recorded)
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
+            path = _write_json(Path(root) / "recorded.json", recorded)
+            self.assertEqual(RecipeOverride.from_json_file(path), override)
+
+    def test_clearing_a_non_nullable_field_is_rejected(self) -> None:
+        # ModelTrainingRecipe.learning_rate is not Optional; clearing it would
+        # build a recipe the trainer cannot run. The field's annotation already
+        # rejects CLEAR statically -- hence the ignore -- but an override
+        # arriving from a JSON file is never type-checked, so the runtime
+        # guard is the one that actually fires.
+        with self.assertRaises(ValueError) as ctx:
+            RecipeOverride(learning_rate=CLEAR)  # ty: ignore[invalid-argument-type]
+        self.assertIn("cannot be cleared to None", str(ctx.exception))
+
+    def test_clearing_a_non_nullable_field_is_rejected_from_json(self) -> None:
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
+            path = _write_json(
+                Path(root) / "override.json", {"learning_rate": CLEAR_JSON_VALUE}
+            )
+            with self.assertRaises(ValueError) as ctx:
+                RecipeOverride.from_json_file(path)
+        self.assertIn("cannot be cleared to None", str(ctx.exception))
 
     def test_from_json_file_rejects_unknown_keys(self) -> None:
         with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
@@ -270,12 +339,13 @@ class BenchmarkRunnerOverrideWiringTests(unittest.TestCase):
                 parameter_ids_to_track=runner._perforation_parameter_ids_to_track("m5"),
             )
             self.assertEqual(selection.module_ids_to_perforate, [".fc1"])
-            runner._reject_uncovered_override_parameters(model, "m5", selection)
+            runner._reject_uncovered_parameters(model, "m5", selection)
 
-    def test_a_default_target_set_is_not_subjected_to_the_override_guard(self) -> None:
-        # mpnn's checked-in defaults knowingly leave parameters untyped; the
-        # guard covers the override path only, so a default run is unaffected,
-        # and so is an override that touches only a schedule knob.
+    def test_the_guard_also_covers_a_checked_in_default_target_set(self) -> None:
+        # The guard was override-only while mpnn/gru_forecaster/vae_mnist still
+        # shipped incomplete defaults. They are covered now, so it applies to
+        # every ID-based selection -- a default that regresses must fail the
+        # same way an override does, and the message must say which it was.
         from dendritic_benchmark.compat import PAIModuleSelection
         from dendritic_benchmark.models import build_model
         from dendritic_benchmark.pipeline import _uncovered_parameter_names
@@ -296,9 +366,30 @@ class BenchmarkRunnerOverrideWiringTests(unittest.TestCase):
                     "mpnn"
                 ),
             )
-            self.assertTrue(_uncovered_parameter_names(model, selection))
-            plain._reject_uncovered_override_parameters(model, "mpnn", selection)
-            scheduled._reject_uncovered_override_parameters(model, "mpnn", selection)
+            # mpnn's own default is complete, so it passes on both runners --
+            # including the schedule-only override, which changes no target.
+            self.assertEqual(_uncovered_parameter_names(model, selection), [])
+            plain._reject_uncovered_parameters(model, "mpnn", selection)
+            scheduled._reject_uncovered_parameters(model, "mpnn", selection)
+
+            # Drop one track-only ID to simulate a regressed default. No
+            # override is set, so the message must blame the checked-in set.
+            regressed = PAIModuleSelection(
+                module_ids_to_perforate=selection.module_ids_to_perforate,
+                track_only_module_ids=[
+                    i
+                    for i in (selection.track_only_module_ids or [])
+                    if i != ".node_encoder"
+                ],
+                parameter_ids_to_track=selection.parameter_ids_to_track,
+            )
+            with self.assertRaises(ValueError) as ctx:
+                plain._reject_uncovered_parameters(model, "mpnn", regressed)
+            message = str(ctx.exception)
+            self.assertIn("the checked-in mpnn target set", message)
+            self.assertNotIn("--pai-override", message)
+            # and it must name the module to add, not only the parameter
+            self.assertIn(".node_encoder.0", message)
 
     def test_run_rejects_an_override_with_more_than_one_selected_model(self) -> None:
         with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
@@ -319,6 +410,120 @@ class ArtifactIdentityTests(unittest.TestCase):
         from dendritic_benchmark.pipeline import _MODEL_ARTIFACT_REVISIONS
 
         self.assertIn("m5", _MODEL_ARTIFACT_REVISIONS)
+
+    def test_coverage_repairs_bumped_their_models_artifact_revisions(self) -> None:
+        # mpnn/gru_forecaster/vae_mnist gained the track-only modules that
+        # complete their parameter coverage. A tracked module is wrapped where
+        # an untyped one is not, so a pre-coverage artifact has a different
+        # topology and must not be reused -- and it was trained with
+        # parameters PAI could not type, so it must not be reused anyway.
+        from dendritic_benchmark.pipeline import _MODEL_ARTIFACT_REVISIONS
+
+        for model_key in ("mpnn", "gru_forecaster", "vae_mnist"):
+            with self.subTest(model_key=model_key):
+                self.assertIn(model_key, _MODEL_ARTIFACT_REVISIONS)
+        # the two that already had one must not silently keep the old value
+        self.assertNotEqual(
+            _MODEL_ARTIFACT_REVISIONS["gru_forecaster"],
+            "dynamic11_multiscale_decoder_v2",
+        )
+        self.assertNotEqual(
+            _MODEL_ARTIFACT_REVISIONS["vae_mnist"], "dynamic11_fair_ternary_v2"
+        )
+
+    def test_paired_control_identity_names_the_dense_arm_of_a_dendritic_run(
+        self,
+    ) -> None:
+        # 00_assessment.md's validity protocol reads a dendritic result
+        # against a dense control. The field was a hardcoded None, so nothing
+        # on the record said which dense run that is.
+        from dendritic_benchmark.specs import condition_by_key
+
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
+            results_root = Path(root) / "results"
+            runner = BenchmarkRunner(results_root=results_root)
+            runner._seed = 1  # set by run(), not the constructor
+            recipe = ModelTrainingRecipe(
+                batch_size=32, max_epochs=200, learning_rate=1e-3
+            )
+
+            dense = runner._paired_control_identity(
+                "mpnn", condition_by_key("base_fp32"), recipe
+            )
+            self.assertIsNone(dense, "a dense run is paired with nothing")
+
+            identity = runner._paired_control_identity(
+                "mpnn", condition_by_key("dendrites_fp32"), recipe
+            )
+            assert identity is not None
+            self.assertEqual(identity["control_condition_key"], "base_fp32")
+            self.assertEqual(identity["control_model_key"], "mpnn")
+            self.assertEqual(identity["seed"], 1)
+            self.assertEqual(identity["dendritic_max_epochs"], 200)
+            # no dense record on disk yet: say so rather than imply one exists
+            self.assertEqual(identity["control_status"], "missing")
+            self.assertIsNone(identity["control_artifact_id"])
+            # the two unimplemented controls stay explicitly unset
+            self.assertIsNone(identity["matched_continuation_control"])
+            self.assertIsNone(identity["capacity_matched_control"])
+
+            control_dir = results_root / "mpnn" / "base_fp32"
+            control_dir.mkdir(parents=True)
+            _write_json(control_dir / "record.json", {"artifact_id": "deadbeef"})
+            linked = runner._paired_control_identity(
+                "mpnn", condition_by_key("dendrites_fp32"), recipe
+            )
+            assert linked is not None
+            self.assertEqual(linked["control_status"], "present")
+            self.assertEqual(linked["control_artifact_id"], "deadbeef")
+
+    def test_source_topology_hash_is_copied_from_the_fp32_source_manifest(
+        self,
+    ) -> None:
+        # "The same FP32 source topology for PTQ and PQAT" was unverifiable
+        # from the manifests: a run's own topology_hash describes its
+        # quantized result, and the before_pqat snapshot predates it. Copying
+        # the source's hash forward makes the two arms comparable.
+        from dendritic_benchmark.artifacts import ARTIFACT_MANIFEST_NAME
+        from dendritic_benchmark.specs import condition_by_key
+
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
+            runner = BenchmarkRunner(results_root=Path(root) / "results")
+            source_dir = Path(root) / "source"
+            source_dir.mkdir()
+            q4 = condition_by_key("dendrites_q4")
+
+            # no source directory recorded for this condition
+            self.assertIsNone(runner._source_topology_hash(q4, {}))
+            # a source with no manifest reports absence, not this run's hash
+            self.assertIsNone(
+                runner._source_topology_hash(q4, {q4.source_key: source_dir})
+            )
+
+            _write_json(
+                source_dir / ARTIFACT_MANIFEST_NAME,
+                {"telemetry": {"topology_hash": "abc123"}},
+            )
+            self.assertEqual(
+                runner._source_topology_hash(q4, {q4.source_key: source_dir}),
+                "abc123",
+            )
+            # a source that predates topology hashing stays None
+            _write_json(source_dir / ARTIFACT_MANIFEST_NAME, {"telemetry": {}})
+            self.assertIsNone(
+                runner._source_topology_hash(q4, {q4.source_key: source_dir})
+            )
+
+    def test_dense_artifacts_get_a_topology_hash(self) -> None:
+        # The hash was derived only from PAI's prepare_final_model, so every
+        # non-dendritic artifact went without one -- including the dense
+        # controls, which are exactly where comparing topologies pays off.
+        from dendritic_benchmark.models import build_model
+        from dendritic_benchmark.training import _topology_hash
+
+        dense = build_model("lenet5")
+        self.assertTrue(_topology_hash(dense))
+        self.assertEqual(_topology_hash(dense), _topology_hash(build_model("lenet5")))
 
     def test_source_commit_marks_a_dirty_working_tree(self) -> None:
         from unittest.mock import patch

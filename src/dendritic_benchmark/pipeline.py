@@ -17,7 +17,7 @@ from typing import Any, Literal, Protocol, cast
 import torch
 import torch.nn as nn
 
-from .artifacts import validate_artifact_manifest
+from .artifacts import ARTIFACT_MANIFEST_NAME, validate_artifact_manifest
 from .checkpointing import load_state_dict_checked
 from .compat import (
     PAI_ARTIFACT_NAME,
@@ -107,8 +107,15 @@ _PAI_VARIANTS = frozenset(
 # optimization change that record cannot represent.
 _MODEL_ARTIFACT_REVISIONS = {
     "tcn_forecaster": "dynamic11_targeted_head_v2",
-    "gru_forecaster": "dynamic11_multiscale_decoder_v2",
-    "vae_mnist": "dynamic11_fair_ternary_v2",
+    # gru_forecaster/vae_mnist/mpnn each gained the track-only modules that
+    # complete their parameter coverage (see _default_track_only_module_ids).
+    # A tracked module is wrapped by PAI where an untyped one is not, so the
+    # saved topology differs and a pre-coverage artifact cannot be reused --
+    # and it must not be, since it was trained with parameters PAI could not
+    # assign a parameter_type to.
+    "gru_forecaster": "dynamic11_multiscale_decoder_v3_covered",
+    "vae_mnist": "dynamic11_fair_ternary_v3_covered",
+    "mpnn": "optimization_gp0_full_coverage_v1",
     "resnet18_cifar10": "dynamic12_prefc_target_v1",
     "resnet18_hf_perforated_cifar10": "dynamic12_hf_perforated_gd_cifar_v1",
     "saint_adult": "dynamic12_head_target_history_v2",
@@ -198,6 +205,27 @@ def _uncovered_parameter_names(
         ):
             uncovered.append(name)
     return uncovered
+
+
+def _suggested_track_only_ids(uncovered: list[str]) -> str:
+    """A ready-to-paste track-only ID list for ``uncovered`` parameter names.
+
+    The owning module of ``layers.0.edge_mlp.0.weight`` is ``.layers.0.edge_mlp.0``.
+    Naming those instead of only the parameters turns the guard's message into
+    the edit the operator has to make, which matters most for an override --
+    GP1 and AP1 in information/optimization/03_execution_matrix.md both narrow
+    the perforate list and so must widen track-only to match. The suggestion is
+    deliberately per-owning-module rather than rolled up to a common ancestor:
+    an ancestor of a perforated module cannot be tracked, and only the caller
+    knows which ancestors those are.
+    """
+    owners = sorted({f".{name.rsplit('.', 1)[0]}" for name in uncovered if "." in name})
+    literal = sorted({f".{name}" for name in uncovered if "." not in name})
+    ids = owners + literal
+    shown = ", ".join(ids[:8])
+    if len(ids) > 8:
+        shown += f", ... (+{len(ids) - 8} more)"
+    return shown
 
 
 def _release_accelerator_memory() -> None:
@@ -627,6 +655,13 @@ class BenchmarkRunner:
             # baseline the buffer's advantages were computed against. Behind
             # them, the backbone can absorb capacity without either effect.
             "ppo_bipedalwalker": [".critic", ".actor_mean"],
+            # `.head.0` is the decoder's input LayerNorm. It is a sibling of the
+            # perforated `.head.1`, not an ancestor, so it can be tracked -- and
+            # it has to be: it was the one parameter-bearing module in neither
+            # list, which left its 384 parameters untyped. `.head.{2,3}` are
+            # GELU/Dropout and hold no parameters. The gru_gate_ablation branch
+            # tracks the whole `.head` instead, which it can because that
+            # variant perforates the recurrent gates rather than a head child.
             "gru_forecaster": (
                 [
                     ".cells.0.hidden_gates",
@@ -639,8 +674,36 @@ class BenchmarkRunner:
                     ".cells.0.hidden_gates",
                     ".cells.1.input_gates",
                     ".cells.1.hidden_gates",
+                    ".head.0",
                     ".head.4",
                 ]
+            ),
+            # MPNN had no track-only list at all, which left 28 of its 38
+            # parameters untyped -- the whole message-passing stack below the
+            # readout. The granularity here is set by the perforate list: a
+            # module may be tracked only if it is neither an ancestor nor a
+            # descendant of a perforated one, so `.layers.0`/`.layers.1` can be
+            # tracked whole while `.layers.2`/`.layers.3` must be tracked at
+            # `.edge_mlp` (their `.update.*_gates` children are perforated), and
+            # `.readout` must be tracked at `.readout.3` (`.readout.0` is
+            # perforated). `.readout_gate` is perforated, so it is absent here.
+            "mpnn": [
+                ".node_encoder",
+                ".layers.0",
+                ".layers.1",
+                ".layers.2.edge_mlp",
+                ".layers.3.edge_mlp",
+                ".readout.3",
+            ],
+            # VAE-MNIST likewise had no track-only list. The default target is
+            # `.decoder.4`, so the other two decoder Linears are named
+            # individually while the encoder can be tracked whole; the
+            # vae_latent variant perforates `.mu`/`.logvar` instead, which
+            # frees the entire decoder to be tracked as one module.
+            "vae_mnist": (
+                [".encoder", ".decoder"]
+                if self._pai_variant == "vae_latent"
+                else [".encoder", ".mu", ".logvar", ".decoder.0", ".decoder.2"]
             ),
             # MobileNetV2's final classifier Linear sits inside nn.Sequential(Dropout, Linear),
             # and the initial Conv2d sits inside Conv2dNormActivation (also an nn.Sequential);
@@ -905,7 +968,7 @@ class BenchmarkRunner:
             module_names_to_not_save=self._perforation_module_names_to_not_save(model_key),
             parameter_ids_to_track=self._perforation_parameter_ids_to_track(model_key),
         )
-        self._reject_uncovered_override_parameters(model, model_key, module_selection)
+        self._reject_uncovered_parameters(model, model_key, module_selection)
         module_output_dimensions = infer_module_output_dimensions(
             model,
             model_key,
@@ -915,46 +978,53 @@ class BenchmarkRunner:
         )
         return module_selection, module_output_dimensions
 
-    def _reject_uncovered_override_parameters(
+    def _reject_uncovered_parameters(
         self, model: Any, model_key: str, selection: PAIModuleSelection
     ) -> None:
-        """Fail fast when a ``PAIOverride`` leaves a parameter untyped.
+        """Fail fast when a target set leaves a parameter untyped.
 
         PAI assigns every parameter a ``parameter_type`` from the perforate or
         track lists; one in neither list is warned about on every p-phase step.
         This benchmark suppresses that warning and neutralizes the pdb call it
         used to carry (``compat._consume_pai_debugger_message``,
         ``_suppress_pai_debugger``), so an incomplete target set produces a
-        *silently* mistyped run rather than a visible failure.
+        *silently* mistyped run rather than a visible failure -- no warning, no
+        crash, and a result that looks ordinary.
 
         information/optimization/03_execution_matrix.md: "an alternate target
         requires matching track-only coverage and a structural smoke test, not
-        merely an ID edit". The checked-in per-model defaults already have that
-        smoke test (``tests/test_dynamic_pai_followup.py``) and three of them
-        (``mpnn``, ``gru_forecaster``, ``vae_mnist``) knowingly do not cover
-        every parameter, so this guard applies only to an override -- the one
-        target set no test has seen.
+        merely an ID edit". This guard is the runtime half of that rule and
+        applies to every ID-based selection, checked-in default or
+        ``PAIOverride`` alike. It was override-only while ``mpnn``,
+        ``gru_forecaster`` and ``vae_mnist`` still shipped incomplete defaults;
+        those are covered now, so there is no longer a registered model the
+        blanket form would refuse to run. Type-based selection is exempt
+        because it covers by class rather than by name -- see
+        ``_uncovered_parameter_names``.
         """
-        if self._pai_override is None:
-            return
-        if (
-            self._pai_override.module_ids_to_perforate is None
-            and self._pai_override.track_only_module_ids is None
-        ):
-            return
         uncovered = _uncovered_parameter_names(model, selection)
-        if uncovered:
-            shown = ", ".join(uncovered[:8])
-            if len(uncovered) > 8:
-                shown += f", ... (+{len(uncovered) - 8} more)"
-            raise ValueError(
-                f"--pai-override leaves {len(uncovered)} {model_key} parameter(s) "
-                f"neither perforated nor tracked: {shown}. Add the owning module "
-                "to track_only_module_ids (or the parameter itself to the model's "
-                "parameter_ids_to_track branch); PAI cannot assign an untyped "
-                "parameter a parameter_type, and this benchmark suppresses the "
-                "warning that would otherwise say so."
+        if not uncovered:
+            return
+        shown = ", ".join(uncovered[:8])
+        if len(uncovered) > 8:
+            shown += f", ... (+{len(uncovered) - 8} more)"
+        source = (
+            "--pai-override"
+            if self._pai_override is not None
+            and (
+                self._pai_override.module_ids_to_perforate is not None
+                or self._pai_override.track_only_module_ids is not None
             )
+            else f"the checked-in {model_key} target set"
+        )
+        raise ValueError(
+            f"{source} leaves {len(uncovered)} {model_key} parameter(s) neither "
+            f"perforated nor tracked: {shown}. Add {_suggested_track_only_ids(uncovered)} "
+            "to track_only_module_ids (or the parameter itself to the model's "
+            "parameter_ids_to_track branch); PAI cannot assign an untyped "
+            "parameter a parameter_type, and this benchmark suppresses the "
+            "warning that would otherwise say so."
+        )
 
     def _prepare_condition_model(
         self,
@@ -1542,6 +1612,96 @@ class BenchmarkRunner:
                 return False
         return True
 
+    def _paired_control_identity(
+        self,
+        model_key: str,
+        condition: ConditionSpec,
+        recipe: ModelTrainingRecipe,
+    ) -> dict[str, Any] | None:
+        """Which dense run this dendritic result must be read against.
+
+        information/optimization/00_assessment.md's validity protocol requires
+        a dendritic claim to be paired with (3) a matched dense-continuation
+        control for the extra training time and (4) a capacity-matched dense
+        control sized to the retained dendrite. Neither control run exists in
+        the runner yet, so this does not invent them. What it does record is
+        the pairing that *is* determined the moment a dendritic run starts:
+        the same model, seed, scale and results root trained without
+        dendrites, plus the two numbers a reviewer needs to tell a real control
+        from a coincidence -- the dendritic arm's own epoch budget, and whether
+        the dense artifact it names was actually found on disk.
+
+        Recorded for the dendritic arm only. A dense run is not paired with
+        anything; a quantized condition inherits its source's pairing through
+        ``source_condition_key`` rather than restating it.
+
+        ``control_status`` is deliberately a statement about this moment, not a
+        promise: ``present`` means the named dense record existed when this run
+        started, ``missing`` means it did not. A ``missing`` pairing is still
+        worth writing down -- it is exactly the case a reviewer must catch.
+        """
+        if not condition.use_dendrites:
+            return None
+        control_condition_key = "base_fp32"
+        control_dir = self.results_root / model_key / control_condition_key
+        control_record_path = control_dir / _RECORD_JSON
+        control_artifact_id: str | None = None
+        try:
+            control_record = json.loads(control_record_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            control_record = None
+        if isinstance(control_record, dict):
+            candidate = control_record.get("artifact_id")
+            if isinstance(candidate, str) and candidate:
+                control_artifact_id = candidate
+        return {
+            "control_kind": "dense_baseline",
+            "control_model_key": model_key,
+            "control_condition_key": control_condition_key,
+            "control_artifact_id": control_artifact_id,
+            "control_status": "present" if control_artifact_id else "missing",
+            "seed": self._seed,
+            "model_scale": self._model_scale,
+            # Step 3's question is "did the dendritic arm simply train longer?",
+            # which cannot be answered without both arms' budgets on record.
+            "dendritic_max_epochs": recipe.max_epochs,
+            # Steps 3 and 4 are not implemented; say so on the record rather
+            # than letting a populated field imply the controls were run.
+            "matched_continuation_control": None,
+            "capacity_matched_control": None,
+        }
+
+    @staticmethod
+    def _source_topology_hash(
+        condition: ConditionSpec, saved_dirs: dict[str, Path]
+    ) -> str | None:
+        """The ``topology_hash`` recorded by the FP32 artifact being quantized.
+
+        Read from the source artifact's manifest telemetry rather than
+        recomputed, so the PTQ and PQAT arms of one FP32 source carry the
+        identical value and "the same FP32 source topology for PTQ and PQAT"
+        (information/optimization/00_assessment.md) becomes checkable from the
+        manifests alone. ``None`` when the source has no manifest or predates
+        topology hashing -- an absent hash is reported as absent, never
+        substituted with this run's own.
+        """
+        source_dir = saved_dirs.get(condition.source_key)
+        if source_dir is None:
+            return None
+        try:
+            manifest = json.loads(
+                (source_dir / ARTIFACT_MANIFEST_NAME).read_text()
+            )
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(manifest, dict):
+            return None
+        telemetry = manifest.get("telemetry")
+        if not isinstance(telemetry, dict):
+            return None
+        value = telemetry.get("topology_hash")
+        return value if isinstance(value, str) and value else None
+
     @staticmethod
     def _saved_dendrite_audit_status(
         source_key: str, saved_dirs: dict[str, Path]
@@ -2015,6 +2175,11 @@ class BenchmarkRunner:
             artifact_id=experiment_plan.artifact_id,
             seed=experiment_plan.seed,
             quantizer_revision=(QUANTIZER_REVISION if condition.quantized else None),
+            source_topology_hash=(
+                self._source_topology_hash(condition, saved_dirs)
+                if condition.quantized
+                else None
+            ),
             module_ids_to_perforate=(
                 tuple(module_selection.module_ids_to_perforate)
                 if module_selection.module_ids_to_perforate is not None
@@ -2040,7 +2205,9 @@ class BenchmarkRunner:
             ),
             effective_recipe=asdict(training_hyperparameters),
             source_commit=self._source_commit(),
-            paired_control_identity=None,
+            paired_control_identity=self._paired_control_identity(
+                model_key, condition, training_hyperparameters
+            ),
         )
         return train_and_evaluate(
             model_key=model_key,

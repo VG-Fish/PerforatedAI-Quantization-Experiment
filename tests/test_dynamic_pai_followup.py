@@ -488,18 +488,42 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             dotted = "." + parameter_name
             return dotted == module_id or dotted.startswith(module_id + ".")
 
-        cases = {
-            "resnet18_cifar10": {},
-            "saint_adult": {"num_classes": 2},
-            "pointnet_modelnet40": {"num_classes": 40},
-            "m5": {},
-        }
+        # Every model whose PAI targets are selected by ID, and every
+        # pai_variant branch that changes those IDs. Type-selected models are
+        # excluded on purpose: they cover by class, so an ID list is not the
+        # whole picture there. distilbert is covered by the offline test below
+        # because build_model downloads a checkpoint.
+        #
+        # mpnn, gru_forecaster and vae_mnist were all failing this until their
+        # track-only lists were completed -- mpnn most seriously, with 28 of
+        # its 38 parameters untyped while being model 5 of the launch cohort.
+        cases = [
+            ("resnet18_cifar10", "default", {}),
+            ("saint_adult", "default", {"num_classes": 2}),
+            ("pointnet_modelnet40", "default", {"num_classes": 40}),
+            ("m5", "default", {}),
+            ("mpnn", "default", {}),
+            ("gru_forecaster", "default", {}),
+            ("gru_forecaster", "gru_gate_ablation", {}),
+            ("vae_mnist", "default", {}),
+            ("vae_mnist", "vae_latent", {}),
+            ("tcn_forecaster", "default", {}),
+            ("tcn_forecaster", "tcn_head_output", {}),
+            ("tcn_forecaster", "tcn_head_both", {}),
+        ]
         with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
-            runner = BenchmarkRunner(results_root=Path(root) / "results")
-            for model_key, kwargs in cases.items():
+            for model_key, pai_variant, kwargs in cases:
+                runner = BenchmarkRunner(
+                    results_root=Path(root) / f"{model_key}-{pai_variant}",
+                    pai_variant=pai_variant,
+                )
                 model = build_model(model_key, **kwargs)
+                perforate = runner._perforation_module_ids_to_perforate(model_key)
+                self.assertTrue(
+                    perforate, f"{model_key}/{pai_variant} is not ID-selected"
+                )
                 ids = [
-                    *runner._perforation_module_ids_to_perforate(model_key),
+                    *perforate,
                     *runner._perforation_track_only_module_ids(model_key),
                     *runner._perforation_parameter_ids_to_track(model_key),
                 ]
@@ -508,7 +532,11 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                     for name, _ in model.named_parameters()
                     if not any(covers(i, name) for i in ids)
                 ]
-                self.assertEqual(uncovered, [], f"{model_key} leaves parameters untyped")
+                self.assertEqual(
+                    uncovered,
+                    [],
+                    f"{model_key}/{pai_variant} leaves parameters untyped",
+                )
 
     def test_distilbert_variants_leave_no_parameter_untyped(self) -> None:
         """DistilBERT has no coverage test above because build_model("distilbert")
@@ -808,6 +836,10 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                     ".cells.0.hidden_gates",
                     ".cells.1.input_gates",
                     ".cells.1.hidden_gates",
+                    # .head.0 is the decoder's input LayerNorm, a sibling of
+                    # the perforated .head.1. Without it its 384 parameters
+                    # are untyped; see the coverage test below.
+                    ".head.0",
                     ".head.4",
                 ],
             )

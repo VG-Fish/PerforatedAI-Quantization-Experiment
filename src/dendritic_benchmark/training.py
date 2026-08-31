@@ -192,6 +192,21 @@ class TrainingConfig:
     # Identifies the weight-only projection rule (quantization.QUANTIZER_REVISION).
     # Set only for quantized conditions, mirroring quantization_evaluation_revision.
     quantizer_revision: str | None = None
+    # The topology_hash recorded by the FP32 artifact this condition was
+    # quantized from. information/optimization/00_assessment.md requires "the
+    # same FP32 source topology for PTQ and PQAT"; that could not be checked
+    # from the manifests, because a run's own topology_hash is computed after
+    # training and so describes the *quantized* result, while the before_pqat
+    # snapshot is written before the hash exists. Recomputing a hash at
+    # snapshot time would not have fixed it either: a dendritic source is a
+    # live PAI wrapper there, whose parameter set includes candidate
+    # scaffolding that prepare_final_model strips, so the value would not
+    # equal the source's own recorded hash. Copying the source's hash forward
+    # does answer the question -- the PTQ and PQAT arms of one FP32 source
+    # carry the same value here, and a mismatch means they were not quantized
+    # from the same topology. None for an unquantized condition, and None when
+    # the source artifact predates topology hashing.
+    source_topology_hash: str | None = None
     # The exact PAI target-module selection used this run (PAIModuleSelection's
     # three ID lists), recorded so a later change to a model's default targets
     # -- or to a PAIOverride -- invalidates artifacts trained under different
@@ -211,10 +226,12 @@ class TrainingConfig:
     effective_recipe: dict[str, Any] | None = None
     # Best-effort `git rev-parse HEAD` at the time this attempt started.
     source_commit: str | None = None
-    # Placeholder linking a dendritic result to its matched dense-continuation
-    # and capacity-matched dense controls (information/optimization/00_assessment.md
-    # validity protocol, step 4). Left unset until those control runs exist and
-    # can be linked by artifact_id; not populated by this training pass.
+    # Which dense run a dendritic result must be read against, built by
+    # BenchmarkRunner._paired_control_identity -- see its docstring. Set on the
+    # dendritic arm only; None for a dense run, which is paired with nothing.
+    # Its matched_continuation_control/capacity_matched_control members stay
+    # None because those two controls (information/optimization/00_assessment.md
+    # validity protocol, steps 3 and 4) are not implemented in the runner.
     paired_control_identity: dict[str, Any] | None = None
 
 
@@ -281,6 +298,7 @@ class ArtifactMetadata:
     seed: int | None = None
     source_condition_key: str | None = None
     quantizer_revision: str | None = None
+    source_topology_hash: str | None = None
     module_ids_to_perforate: tuple[str, ...] | None = None
     track_only_module_ids: tuple[str, ...] | None = None
     parameter_ids_to_track: tuple[str, ...] | None = None
@@ -1450,6 +1468,7 @@ def _write_metrics_and_history(
                 "seed": metadata.seed,
                 "source_condition_key": metadata.source_condition_key,
                 "quantizer_revision": metadata.quantizer_revision,
+                "source_topology_hash": metadata.source_topology_hash,
                 "module_ids_to_perforate": metadata.module_ids_to_perforate,
                 "track_only_module_ids": metadata.track_only_module_ids,
                 "parameter_ids_to_track": metadata.parameter_ids_to_track,
@@ -1575,6 +1594,7 @@ def _persist_stage_artifacts(
                 metadata.quantization_evaluation_revision
             ),
             "quantizer_revision": metadata.quantizer_revision,
+            "source_topology_hash": metadata.source_topology_hash,
             "module_ids_to_perforate": metadata.module_ids_to_perforate,
             "track_only_module_ids": metadata.track_only_module_ids,
             "parameter_ids_to_track": metadata.parameter_ids_to_track,
@@ -4048,6 +4068,7 @@ def _build_artifact_metadata(
         seed=config.seed,
         source_condition_key=config.source_condition_key,
         quantizer_revision=config.quantizer_revision,
+        source_topology_hash=config.source_topology_hash,
         module_ids_to_perforate=config.module_ids_to_perforate,
         track_only_module_ids=config.track_only_module_ids,
         parameter_ids_to_track=config.parameter_ids_to_track,
@@ -4105,6 +4126,7 @@ def _metadata_for_stage(
         seed=metadata.seed,
         source_condition_key=metadata.source_condition_key,
         quantizer_revision=metadata.quantizer_revision,
+        source_topology_hash=metadata.source_topology_hash,
         module_ids_to_perforate=metadata.module_ids_to_perforate,
         track_only_module_ids=metadata.track_only_module_ids,
         parameter_ids_to_track=metadata.parameter_ids_to_track,
@@ -4545,8 +4567,16 @@ def train_and_evaluate(
     final_parameter_stats = (
         _final_clean_stats[:2] if _final_clean_stats is not None else None
     )
+    # A dense model has no PAI wrapper to strip, so its topology hash is just
+    # the plain model's. Deriving it only from prepare_final_model left every
+    # non-dendritic artifact without one -- including the dense controls of
+    # 00_assessment.md's validity protocol, which are exactly where comparing
+    # two topologies pays off (a capacity-matched control is a claim about
+    # architecture, and an unhashed one cannot be checked).
     final_topology_hash = (
-        _final_clean_stats[2] if _final_clean_stats is not None else None
+        _final_clean_stats[2]
+        if _final_clean_stats is not None
+        else _topology_hash(_plain_model)
     )
     final_param_count = (
         final_parameter_stats[0]

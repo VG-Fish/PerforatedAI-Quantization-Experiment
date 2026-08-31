@@ -16,6 +16,7 @@ Read these files in order:
 2. [01_initial_five_plan.md](01_initial_five_plan.md) — recommended first five models, proposed tuning spaces, gates, and exact next actions.
 3. [02_research_and_sources.md](02_research_and_sources.md) — external research, PerforatedAI ecosystem review, and sources consulted.
 4. [03_execution_matrix.md](03_execution_matrix.md) — exact per-model hyperparameter trials, current-code limits, and decision rules.
+5. [04_implementation_review.md](04_implementation_review.md) — whether the runner actually implements what 03 requires, the defects found and fixed, and the gaps still open before a sweep. Read this before trusting any statement in 03 about what the current code does.
 
 ## Current decision
 

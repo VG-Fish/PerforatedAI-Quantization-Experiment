@@ -39,6 +39,7 @@ loop. Read it in the order its README gives; it is a plan, not a record of resul
 | [optimization/01_initial_five_plan.md](optimization/01_initial_five_plan.md) | current | per-model starting recipes, tuning spaces, gates, and the advancement checklist |
 | [optimization/02_research_and_sources.md](optimization/02_research_and_sources.md) | current | external sources consulted and the explicit non-conclusions |
 | [optimization/03_execution_matrix.md](optimization/03_execution_matrix.md) | current | the exact sweep trials, current-code limits, and required manifest fields |
+| [optimization/04_implementation_review.md](optimization/04_implementation_review.md) | current | whether the runner actually implements 03's requirements, the defects fixed, and what is still open before a sweep |
 
 ## Historical
 
