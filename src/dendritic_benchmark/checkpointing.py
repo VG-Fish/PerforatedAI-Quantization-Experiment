@@ -131,8 +131,14 @@ def load_state_dict_checked(
     )
     if not report.complete:
         raise CheckpointMismatchError(report, context=context)
-    # ``tracker_string`` is optional PerforatedAI runtime bookkeeping. The
-    # complete bidirectional comparison above has already established that all
-    # scientific tensors and buffers match.
-    model.load_state_dict(dict(source_state), strict=False)
+    # ``tracker_string`` is optional PerforatedAI runtime bookkeeping. It can
+    # legitimately change length as PAI records switch history, and PyTorch
+    # still raises on a shape mismatch even under ``strict=False``. Keep the
+    # live model's bookkeeping buffer while restoring every scientific tensor
+    # that the complete comparison above verified.
+    loadable_state = {
+        key: value for key, value in source_state.items()
+        if not is_ignorable_state_key(key)
+    }
+    model.load_state_dict(loadable_state, strict=False)
     return report

@@ -167,6 +167,23 @@ class P0ValidityTests(unittest.TestCase):
         self.assertTrue(loaded.complete)
         torch.testing.assert_close(model.weight, complete["weight"])
 
+    def test_checkpoint_load_keeps_variable_pai_tracker_buffer(self) -> None:
+        class TrackerModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(1))
+                self.register_buffer("tracker_string", torch.zeros(5))
+
+        model = TrackerModel()
+        source = {
+            "weight": torch.ones(1),
+            "tracker_string": torch.zeros(3),
+        }
+        report = load_state_dict_checked(model, source)
+        self.assertTrue(report.complete)
+        torch.testing.assert_close(model.weight, torch.ones(1))
+        torch.testing.assert_close(model.tracker_string, torch.zeros(5))
+
     def test_resume_reuses_only_the_persisted_attempt_namespace(self) -> None:
         with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             runner = BenchmarkRunner(results_root=Path(root) / "results")
