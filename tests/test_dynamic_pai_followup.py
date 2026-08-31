@@ -17,7 +17,6 @@ from dendritic_benchmark.compat import (
     PAIDynamicSchedule,
     _configure_dynamic_pai_schedule,
     _configure_pai_training_schedule,
-    pai_save_path,
     set_pai_root,
     ternary_quantize_tensor,
     ternary_quantize_tensor_per_channel,
@@ -41,9 +40,12 @@ from dendritic_benchmark.training import (
     _is_dendrite_parameter_name,
     _make_quantized_copy,
     _optimizer_param_groups,
+    _pai_epoch_milestones,
     _read_pai_architecture_log,
+    _read_pai_switch_log,
     _run_training_epochs,
     _scheduled_learning_rate,
+    _topology_hash,
     _write_pai_summary,
 )
 
@@ -269,7 +271,14 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                 "dendritic_benchmark.training.importlib.import_module",
                 return_value=_PAIUtils,
             ):
-                self.assertEqual(_final_clean_pai_parameter_stats(wrapped), (2, 1))
+                param_count, nonzero_params, topology_hash = (
+                    _final_clean_pai_parameter_stats(wrapped)
+                )
+        self.assertEqual((param_count, nonzero_params), (2, 1))
+        # The hash is of clean's topology, not wrapped's -- prepare_final_model
+        # above returned a *different* module (1 output feature, not 2).
+        self.assertEqual(topology_hash, _topology_hash(clean))
+        self.assertNotEqual(topology_hash, _topology_hash(wrapped))
 
     def test_data_worker_override_disables_multiprocessing(self) -> None:
         dataset = torch.utils.data.TensorDataset(torch.arange(4))
@@ -423,6 +432,38 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                 runner._perforation_module_ids_to_perforate("pointnet_modelnet40"),
                 [".conv3.0", ".head.0"],
             )
+            self.assertEqual(
+                runner._perforation_module_ids_to_perforate("m5"),
+                [".conv4", ".fc1"],
+            )
+            self.assertEqual(
+                runner._perforation_track_only_module_ids("m5"),
+                [".conv1", ".bn1", ".conv2", ".bn2", ".conv3", ".bn3", ".bn4"],
+            )
+            self.assertEqual(
+                runner._perforation_module_ids_to_perforate("distilbert"),
+                [".model.pre_classifier", ".model.classifier"],
+            )
+            self.assertEqual(
+                runner._perforation_track_only_module_ids("distilbert"),
+                [".model.distilbert"],
+            )
+            classifier_only_runner = BenchmarkRunner(
+                results_root=Path(root) / "distilbert-classifier-only-results",
+                pai_variant="distilbert_classifier_only",
+            )
+            self.assertEqual(
+                classifier_only_runner._perforation_module_ids_to_perforate(
+                    "distilbert"
+                ),
+                [".model.classifier"],
+            )
+            self.assertEqual(
+                classifier_only_runner._perforation_track_only_module_ids(
+                    "distilbert"
+                ),
+                [".model.distilbert", ".model.pre_classifier"],
+            )
             schedule = runner._pai_dynamic_schedule("resnet18_cifar10")
             self.assertIsNotNone(schedule)
             assert schedule is not None
@@ -451,6 +492,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             "resnet18_cifar10": {},
             "saint_adult": {"num_classes": 2},
             "pointnet_modelnet40": {"num_classes": 40},
+            "m5": {},
         }
         with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
             runner = BenchmarkRunner(results_root=Path(root) / "results")
@@ -467,6 +509,157 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                     if not any(covers(i, name) for i in ids)
                 ]
                 self.assertEqual(uncovered, [], f"{model_key} leaves parameters untyped")
+
+    def test_distilbert_variants_leave_no_parameter_untyped(self) -> None:
+        """DistilBERT has no coverage test above because build_model("distilbert")
+        downloads distilbert-base-uncased. DistilBertConfig(...) is a plain
+        Python object -- unlike .from_pretrained(...), constructing a model
+        from it touches no network -- and produces the exact same submodule
+        names (distilbert/pre_classifier/classifier/dropout) the pretrained
+        checkpoint in models.py.DistilBertClassifier has. Covers both the
+        default (NP0) and distilbert_classifier_only (NP1) target sets.
+        """
+
+        def covers(module_id: str, parameter_name: str) -> bool:
+            dotted = "." + parameter_name
+            return dotted == module_id or dotted.startswith(module_id + ".")
+
+        class _OfflineDistilBertWrapper(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                transformers = __import__("transformers")
+                # num_labels defaults to 2 on PretrainedConfig; left implicit
+                # here since transformers' stubs don't model it as a
+                # DistilBertConfig-specific kwarg.
+                config = transformers.DistilBertConfig(
+                    vocab_size=99, dim=16, hidden_dim=32, n_layers=2, n_heads=2,
+                )
+                self.model = transformers.DistilBertForSequenceClassification(config)
+
+        env = {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
+        with tempfile.TemporaryDirectory() as root, patch.dict("os.environ", env):  # type: ignore[no-matching-overload]
+            for pai_variant in ("default", "distilbert_classifier_only"):
+                runner = BenchmarkRunner(
+                    results_root=Path(root) / f"{pai_variant}-results",
+                    pai_variant=pai_variant,
+                )
+                model = _OfflineDistilBertWrapper()
+                ids = [
+                    *runner._perforation_module_ids_to_perforate("distilbert"),
+                    *runner._perforation_track_only_module_ids("distilbert"),
+                    *runner._perforation_parameter_ids_to_track("distilbert"),
+                ]
+                uncovered = [
+                    name
+                    for name, _ in model.named_parameters()
+                    if not any(covers(i, name) for i in ids)
+                ]
+                self.assertEqual(
+                    uncovered,
+                    [],
+                    f"distilbert ({pai_variant}) leaves parameters untyped",
+                )
+
+    def test_topology_hash_is_value_independent_and_structure_sensitive(self) -> None:
+        same_a = torch.nn.Linear(4, 3, bias=True)
+        same_b = torch.nn.Linear(4, 3, bias=True)
+        with torch.no_grad():
+            same_b.weight.copy_(same_a.weight + 1.0)
+            same_b.bias.copy_(same_a.bias + 1.0)
+        different_shape = torch.nn.Linear(4, 5, bias=True)
+        different_owner = torch.nn.Sequential(torch.nn.Linear(4, 3, bias=True))
+
+        self.assertEqual(_topology_hash(same_a), _topology_hash(same_b))
+        self.assertNotEqual(_topology_hash(same_a), _topology_hash(different_shape))
+        # Same parameter names/shapes, but the owning module class differs
+        # (Linear vs. the Sequential wrapping it) -- still distinguished.
+        self.assertNotEqual(_topology_hash(same_a), _topology_hash(different_owner))
+
+    def test_pai_logs_join_param_counts_and_switch_epochs_by_switch_number(
+        self,
+    ) -> None:
+        """Regression fixture from a real run's raw PAI logs.
+
+        results/top10/PAI/gcn_dendrites_fp32/ on disk: param_counts.csv has one
+        more row than switch_epochs.csv for the same run (5 vs. 4), so the join
+        below must key off each file's own "Switch Number" column rather than
+        assume equal length or matched row order.
+        """
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
+            save_name = "gcn_dendrites_fp32"
+            folder = Path(root) / save_name
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / f"{folder.name}param_counts.csv").write_text(
+                "Switch Number,Param Count\n"
+                "0,92231\n1,92231\n2,184391\n3,184391\n4,276551\n"
+            )
+            (folder / f"{folder.name}switch_epochs.csv").write_text(
+                "Switch Number,Switch Epoch\n0,36\n1,76\n2,84\n3,124\n"
+            )
+            with patch("dendritic_benchmark.training.pai_save_path", lambda _n: folder):
+                architecture = _read_pai_architecture_log(save_name)
+                switches = _read_pai_switch_log(save_name)
+
+        self.assertEqual(
+            architecture["param_count_by_switch"],
+            {0: 92231, 1: 92231, 2: 184391, 3: 184391, 4: 276551},
+        )
+        self.assertEqual(
+            switches["epoch_by_switch"], {0: 36, 1: 76, 2: 84, 3: 124}
+        )
+        milestones = _pai_epoch_milestones(
+            raw_architecture=architecture,
+            raw_switches=switches,
+            dense_param_count=92231,
+            complete_epochs=[130, 131],
+        )
+        self.assertEqual(milestones["first_candidate_epoch"], 36)
+        # Switch 0 (92231) does not exceed dense_param_count (92231); switch 1
+        # (92231) doesn't grow it either; switch 2 (184391) is the first that
+        # does, and switch 2's own epoch (84) is on record.
+        self.assertEqual(milestones["first_retention_epoch"], 84)
+        self.assertEqual(milestones["completion_epoch"], 130)
+
+    def test_pai_epoch_milestones_missing_epoch_for_the_retaining_switch(
+        self,
+    ) -> None:
+        """A retained switch with no matching row in switch_epochs.csv (the
+        two logs can end at different points, per _write_pai_summary) reports
+        None rather than guessing which epoch it happened on."""
+        milestones = _pai_epoch_milestones(
+            raw_architecture={"param_count_by_switch": {0: 100, 1: 200}},
+            raw_switches={"epoch_by_switch": {0: 5}},
+            dense_param_count=100,
+            complete_epochs=[],
+        )
+        self.assertEqual(milestones["first_candidate_epoch"], 5)
+        self.assertIsNone(milestones["first_retention_epoch"])
+        self.assertIsNone(milestones["completion_epoch"])
+
+    def test_first_candidate_epoch_falls_back_to_the_ordered_switch_epochs(
+        self,
+    ) -> None:
+        """A log with no usable "Switch Number" column still reports the epoch
+        it plainly holds, rather than None, for this one field."""
+        milestones = _pai_epoch_milestones(
+            raw_architecture={},
+            raw_switches={"switch_epochs": [36, 76], "epoch_by_switch": {}},
+            dense_param_count=100,
+            complete_epochs=[],
+        )
+        self.assertEqual(milestones["first_candidate_epoch"], 36)
+        self.assertIsNone(milestones["first_retention_epoch"])
+
+    def test_first_candidate_epoch_keys_off_the_lowest_switch_number(self) -> None:
+        # Not the lowest epoch value: the question is when the first switch
+        # happened, and the switch number is what answers it.
+        milestones = _pai_epoch_milestones(
+            raw_architecture={},
+            raw_switches={"epoch_by_switch": {1: 4, 0: 9}},
+            dense_param_count=None,
+            complete_epochs=[],
+        )
+        self.assertEqual(milestones["first_candidate_epoch"], 9)
 
     def test_dendritic_pqat_requires_a_verified_fp32_source(self) -> None:
         with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]

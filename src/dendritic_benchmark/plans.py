@@ -5,7 +5,8 @@ Keeping them outside the runner makes plan construction independently testable
 and prevents worker/artifact concerns from leaking into recipe definitions.
 """
 
-from dataclasses import dataclass, replace
+import json
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -44,6 +45,233 @@ class ModelTrainingRecipe:
         return replace(
             self, batch_size=batch_size, learning_rate=self.learning_rate * scale
         )
+
+
+def _load_override_json(cls: Any, path: Path | str) -> dict[str, Any]:
+    """Parse an override JSON file and reject any key the dataclass has no field for.
+
+    A silently-ignored typo (``"leraning_rate"``) would make a sweep trial
+    quietly run with the base recipe instead of the intended override, so an
+    unknown key is a hard error naming the offending key(s) rather than a
+    warning.
+    """
+    data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: override file must contain a JSON object")
+    valid = {f.name for f in fields(cls)}
+    unknown = sorted(set(data) - valid)
+    if unknown:
+        raise ValueError(
+            f"{path}: unknown {cls.__name__} field(s) {unknown}; valid fields are "
+            f"{sorted(valid)}"
+        )
+    return data
+
+
+@dataclass(frozen=True)
+class RecipeOverride:
+    """Optional per-sweep-trial overrides layered onto a model's hard-coded
+    :class:`ModelTrainingRecipe`.
+
+    Every field is ``None`` by default, meaning "use the recipe's own value".
+    This is the ``RecipeOverride`` object required by
+    ``information/optimization/03_execution_matrix.md`` so a base-recipe sweep
+    trial (e.g. ``R1=(.05,5e-4,.1)``) can be expressed as a JSON file instead of
+    a hand-edit to ``BenchmarkRunner._training_hyperparameters``. Load one with
+    :meth:`from_json_file` and apply it with :meth:`apply`.
+
+    ``dendrite_lr_min_factor`` lives here rather than on a PAI-side override
+    even though the tuning-grid table in
+    ``information/optimization/01_initial_five_plan.md`` groups "dendrite LR
+    floor" with PAI knobs: it is implemented as a ``ModelTrainingRecipe``
+    field, and keeping one field in exactly one override type avoids an
+    ambiguous "which override wins" question.
+    """
+
+    batch_size: int | None = None
+    max_epochs: int | None = None
+    learning_rate: float | None = None
+    optimizer_name: OptimizerName | None = None
+    momentum: float | None = None
+    weight_decay: float | None = None
+    lr_schedule: LRScheduleName | None = None
+    lr_decay_every: int | None = None
+    lr_decay_gamma: float | None = None
+    lr_min_factor: float | None = None
+    lr_schedule_epochs: int | None = None
+    dendrite_lr_min_factor: float | None = None
+    warmup_epochs: int | None = None
+    label_smoothing: float | None = None
+    regression_loss: RegressionLossName | None = None
+    grad_clip_norm: float | None = None
+    nesterov: bool | None = None
+
+    @classmethod
+    def from_json_file(cls, path: Path | str) -> "RecipeOverride":
+        return cls(**_load_override_json(cls, path))
+
+    def to_dict(self) -> dict[str, Any]:
+        """The fields this override actually sets, for artifact identity."""
+        return {
+            f.name: value
+            for f in fields(self)
+            if (value := getattr(self, f.name)) is not None
+        }
+
+    def apply(self, recipe: "ModelTrainingRecipe") -> "ModelTrainingRecipe":
+        """Return ``recipe`` with only this override's set fields replaced."""
+        changes = self.to_dict()
+        return replace(recipe, **changes) if changes else recipe
+
+
+# The PAIDynamicSchedule-shaped subset of PAIOverride's fields, in the order
+# PAIDynamicSchedule itself declares them. Shared by to_dict-style helpers
+# below so the "which fields count as schedule fields" list is written once.
+_PAI_SCHEDULE_OVERRIDE_FIELDS = (
+    "max_dendrites",
+    "n_epochs_to_switch",
+    "history_lookback",
+    "initial_history_after_switches",
+    "p_epochs_to_switch",
+    "improvement_threshold",
+    "candidate_weight_initialization_multiplier",
+)
+
+#: PAIOverride fields the JSON file supplies as arrays and this module stores as
+#: tuples (frozen dataclasses must be hashable). ``to_dict`` converts them back
+#: to lists before they reach artifact metadata -- see its docstring.
+_PAI_SEQUENCE_OVERRIDE_FIELDS = (
+    "module_ids_to_perforate",
+    "track_only_module_ids",
+    "improvement_threshold",
+)
+
+
+@dataclass(frozen=True)
+class PAIOverride:
+    """Optional per-sweep-trial overrides for one model's PAI configuration.
+
+    Required by ``information/optimization/03_execution_matrix.md`` alongside
+    :class:`RecipeOverride`. Covers the "PAI tuning grid" in
+    ``information/optimization/01_initial_five_plan.md``: target-module
+    selection plus the six :class:`~dendritic_benchmark.compat.PAIDynamicSchedule`
+    fields. A ``BenchmarkRunner`` applies at most one ``PAIOverride`` per run,
+    and only when exactly one model is selected -- these are per-model sweep
+    trials (``RP0``, ``AP1``, ``NP1``, ...), never a blanket override applied
+    identically across a multi-model run.
+    """
+
+    module_ids_to_perforate: tuple[str, ...] | None = None
+    track_only_module_ids: tuple[str, ...] | None = None
+    max_dendrites: int | None = None
+    n_epochs_to_switch: int | None = None
+    history_lookback: int | None = None
+    initial_history_after_switches: int | None = None
+    p_epochs_to_switch: int | None = None
+    improvement_threshold: tuple[float, ...] | None = None
+    candidate_weight_initialization_multiplier: float | None = None
+
+    def __post_init__(self) -> None:
+        # information/optimization/03_execution_matrix.md: "The initial-history
+        # value must equal the lookback when lookback changes, to avoid the
+        # known zero-seeded EMA bug." Enforced here rather than left to a
+        # downstream PAI warning, since that bug silently corrupts best-epoch
+        # tracking rather than raising.
+        lookback_set = self.history_lookback is not None
+        initial_set = self.initial_history_after_switches is not None
+        if lookback_set != initial_set:
+            raise ValueError(
+                "PAIOverride must set history_lookback and "
+                "initial_history_after_switches together, or set neither"
+            )
+        if lookback_set and self.history_lookback != self.initial_history_after_switches:
+            raise ValueError(
+                "PAIOverride.initial_history_after_switches "
+                f"({self.initial_history_after_switches}) must equal "
+                f"history_lookback ({self.history_lookback}) -- see the "
+                "zero-seeded EMA bug note in "
+                "information/optimization/03_execution_matrix.md"
+            )
+        # An empty list is not "no override": it is indistinguishable from an
+        # unset field everywhere downstream, and for module_ids_to_perforate it
+        # is actively dangerous -- BenchmarkRunner._perforation_modules_to_perforate
+        # falls back to type-selecting *every* Linear/Conv1d/Conv2d when the ID
+        # list is empty, which is the blanket wrapping
+        # information/optimization/01_initial_five_plan.md forbids as a primary
+        # comparison. Reject it rather than let a "[]" typo widen the target set.
+        for name in _PAI_SEQUENCE_OVERRIDE_FIELDS:
+            value = getattr(self, name)
+            if value is not None and len(value) == 0:
+                raise ValueError(
+                    f"PAIOverride.{name} must be non-empty when set; omit the "
+                    "field to keep the model's default"
+                )
+
+    @classmethod
+    def from_json_file(cls, path: Path | str) -> "PAIOverride":
+        data = _load_override_json(cls, path)
+        for key in _PAI_SEQUENCE_OVERRIDE_FIELDS:
+            if data.get(key) is not None:
+                data[key] = tuple(data[key])
+        return cls(**data)
+
+    def to_dict(self) -> dict[str, Any]:
+        """The fields this override actually sets, for artifact identity.
+
+        Sequence fields are emitted as lists, not tuples, exactly as
+        :meth:`PAIDynamicSchedule.to_dict` does. This value is written to
+        ``metrics.json`` and then read back by
+        ``BenchmarkRunner._condition_metadata_current`` to decide whether a
+        saved artifact still matches the requested configuration; JSON has no
+        tuple, so a tuple here would never compare equal to its own round-trip
+        and every rerun of a sweep trial would discard and retrain the artifact
+        it had just written.
+        """
+        return {
+            f.name: (list(value) if f.name in _PAI_SEQUENCE_OVERRIDE_FIELDS else value)
+            for f in fields(self)
+            if (value := getattr(self, f.name)) is not None
+        }
+
+    def apply_to_schedule(
+        self, base: PAIDynamicSchedule | None
+    ) -> PAIDynamicSchedule | None:
+        """Merge this override's schedule fields onto ``base``.
+
+        Returns ``base`` unchanged if this override sets no schedule field.
+        A field left unset here falls back to ``base``'s own value (``None``
+        if ``base`` is itself ``None``), matching how
+        :class:`PAIDynamicSchedule` already treats ``None`` as "use the
+        global default" via ``compat.PAI_DYNAMIC_SCHEDULE_DEFAULTS``.
+        """
+        overrides = {
+            name: getattr(self, name)
+            for name in _PAI_SCHEDULE_OVERRIDE_FIELDS
+            if getattr(self, name) is not None
+        }
+        if not overrides:
+            return base
+        merged = {
+            name: overrides.get(name, getattr(base, name) if base is not None else None)
+            for name in _PAI_SCHEDULE_OVERRIDE_FIELDS
+        }
+        return PAIDynamicSchedule(**merged)
+
+    def resolved_module_ids(
+        self, default_perforate: list[str], default_track_only: list[str]
+    ) -> tuple[list[str], list[str]]:
+        """Return the target/track-only ID lists after this override, if any."""
+        perforate = (
+            list(self.module_ids_to_perforate)
+            if self.module_ids_to_perforate is not None
+            else default_perforate
+        )
+        track_only = (
+            list(self.track_only_module_ids)
+            if self.track_only_module_ids is not None
+            else default_track_only
+        )
+        return perforate, track_only
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,8 @@
 # Automated topology-matched dense controls
 
+<!-- status-banner -->
+> **Status: current protocol proposal (2026-08-31).** Describes the control design step 4 of the validity protocol in [optimization/00_assessment.md](optimization/00_assessment.md) requires. Not yet implemented in the runner: no `dqb` flag builds these controls today.
+
 ## Purpose
 
 This protocol tests a narrower and more useful question than “does the

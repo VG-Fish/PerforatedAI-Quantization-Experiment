@@ -36,6 +36,7 @@ from .pipeline import (
     clear_epoch_checkpoints,
     run_parallel,
 )
+from .plans import PAIOverride, RecipeOverride
 from .results import (
     generate_training_graphs,
     load_training_records,
@@ -404,6 +405,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--pai-variant",
         choices=(
             "default",
+            "distilbert_classifier_only",
             "gru_gate_ablation",
             "mpnn_capacity",
             "tcn_head_both",
@@ -416,7 +418,9 @@ def build_parser() -> argparse.ArgumentParser:
             "current targeted settings; `tcn_head_output`/`tcn_head_both` "
             "screen alternate TCN head targets; `gru_gate_ablation` restores "
             "the prior gate search; `vae_latent` perforates VAE latent heads; "
-            "`mpnn_capacity` permits a fourth targeted MPNN dendrite. "
+            "`mpnn_capacity` permits a fourth targeted MPNN dendrite; "
+            "`distilbert_classifier_only` perforates only DistilBERT's final "
+            "classifier instead of the pre-classifier+classifier pair. "
             "(default: default)"
         ),
     )
@@ -430,6 +434,31 @@ def build_parser() -> argparse.ArgumentParser:
             "interval for dendritic search. HISTORY plateau detection is the "
             "default for every model because prior fixed requests were not "
             "honored by observed switch epochs."
+        ),
+    )
+    run_parser.add_argument(
+        "--recipe-override",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Load a dendritic_benchmark.plans.RecipeOverride from this JSON "
+            "file and apply it on top of the selected model's hard-coded "
+            "ModelTrainingRecipe. Requires exactly one selected --models key: "
+            "an override is one sweep trial for one model, per "
+            "information/optimization/03_execution_matrix.md."
+        ),
+    )
+    run_parser.add_argument(
+        "--pai-override",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Load a dendritic_benchmark.plans.PAIOverride from this JSON file "
+            "and apply it on top of the selected model's default PAI target "
+            "modules and dynamic schedule. Requires exactly one selected "
+            "--models key, for the same reason as --recipe-override."
         ),
     )
     run_parser.add_argument(
@@ -816,14 +845,38 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
+    recipe_override = (
+        RecipeOverride.from_json_file(args.recipe_override)
+        if args.recipe_override is not None
+        else None
+    )
+    pai_override = (
+        PAIOverride.from_json_file(args.pai_override)
+        if args.pai_override is not None
+        else None
+    )
     runner = BenchmarkRunner(
         results_root=results_root,
         comparison_root=comparison_root,
         model_scale=args.model_scale,
         pai_variant=args.pai_variant,
         pai_fixed_switch_interval=args.pai_fixed_switch_interval,
+        recipe_override=recipe_override,
+        pai_override=pai_override,
     )
     selected_models = selected_model_keys(args.models)
+    if (recipe_override is not None or pai_override is not None) and len(
+        selected_models
+    ) != 1:
+        # Catch this here, not only inside BenchmarkRunner.run(): a
+        # multi-model --jobs>1 invocation never calls .run() on this
+        # coordinator-process runner (it dispatches to run_parallel instead),
+        # so each spawned worker would otherwise apply the same override file
+        # to a different one of the several selected models.
+        raise SystemExit(
+            "--recipe-override/--pai-override require exactly one --models "
+            f"key; got {len(selected_models)}: {', '.join(selected_models)}"
+        )
 
     if (
         not args.worker
@@ -906,6 +959,14 @@ def _run_passthrough(args: Any, comparison_root: Path) -> list[str]:
         flags += ["--model-scale", str(args.model_scale)]
     if args.pai_variant != "default":
         flags += ["--pai-variant", args.pai_variant]
+    if args.recipe_override is not None:
+        # In practice unreachable today: _handle_run rejects an override with
+        # more than one selected model before run_parallel (and therefore
+        # this function) is ever called. Kept so a worker still inherits the
+        # override correctly if that guard is ever relaxed.
+        flags += ["--recipe-override", str(args.recipe_override)]
+    if args.pai_override is not None:
+        flags += ["--pai-override", str(args.pai_override)]
     if args.pai_fixed_switch_interval is not None:
         flags += [
             "--pai-fixed-switch-interval",

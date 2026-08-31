@@ -19,6 +19,14 @@ from .compat import (
 
 QuantizationGranularity = Literal["tensor", "channel"]
 
+# Identifies the weight-only projection rule itself (symmetric tensor/channel
+# scaling, the Q2 robust-scale correction, ternary/binary scale metadata) --
+# distinct from training.QUANTIZATION_EVALUATION_REVISION, which gates when a
+# *result* is reportable. This lets a future activation-calibrated quantizer
+# get its own revision without retroactively invalidating every existing
+# weight-only artifact. See information/optimization/00_assessment.md point 5.
+QUANTIZER_REVISION = "weight_only_symmetric_v1"
+
 
 class QuantizationConfig(Protocol):
     bit_width: int | None

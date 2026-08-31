@@ -1,5 +1,6 @@
 import csv
 import gc
+import hashlib
 import importlib
 import itertools
 import json
@@ -188,6 +189,33 @@ class TrainingConfig:
     # therefore never consume an earlier attempt's switch logs.
     artifact_id: str = ""
     seed: int | None = None
+    # Identifies the weight-only projection rule (quantization.QUANTIZER_REVISION).
+    # Set only for quantized conditions, mirroring quantization_evaluation_revision.
+    quantizer_revision: str | None = None
+    # The exact PAI target-module selection used this run (PAIModuleSelection's
+    # three ID lists), recorded so a later change to a model's default targets
+    # -- or to a PAIOverride -- invalidates artifacts trained under different
+    # targets instead of silently reusing them. See
+    # information/optimization/03_execution_matrix.md's manifest-fields list.
+    module_ids_to_perforate: tuple[str, ...] | None = None
+    track_only_module_ids: tuple[str, ...] | None = None
+    parameter_ids_to_track: tuple[str, ...] | None = None
+    # RecipeOverride/PAIOverride.to_dict(): only the fields a sweep trial's
+    # override file actually set, empty/None when no override was supplied.
+    recipe_override: dict[str, Any] | None = None
+    pai_override: dict[str, Any] | None = None
+    # The fully-resolved ModelTrainingRecipe actually used this run -- after
+    # any RecipeOverride and after dendritic batch-size rescaling -- so a
+    # sweep trial's real training configuration is on the record even when it
+    # differs from both the base recipe and the override file alone.
+    effective_recipe: dict[str, Any] | None = None
+    # Best-effort `git rev-parse HEAD` at the time this attempt started.
+    source_commit: str | None = None
+    # Placeholder linking a dendritic result to its matched dense-continuation
+    # and capacity-matched dense controls (information/optimization/00_assessment.md
+    # validity protocol, step 4). Left unset until those control runs exist and
+    # can be linked by artifact_id; not populated by this training pass.
+    paired_control_identity: dict[str, Any] | None = None
 
 
 @dataclass
@@ -252,6 +280,16 @@ class ArtifactMetadata:
     artifact_id: str = ""
     seed: int | None = None
     source_condition_key: str | None = None
+    quantizer_revision: str | None = None
+    module_ids_to_perforate: tuple[str, ...] | None = None
+    track_only_module_ids: tuple[str, ...] | None = None
+    parameter_ids_to_track: tuple[str, ...] | None = None
+    recipe_override: dict[str, Any] | None = None
+    pai_override: dict[str, Any] | None = None
+    effective_recipe: dict[str, Any] | None = None
+    source_commit: str | None = None
+    paired_control_identity: dict[str, Any] | None = None
+    max_dendrite_phase_epochs: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1297,7 +1335,27 @@ def _count_parameters(model: Any) -> tuple[int, int]:
     return param_count, nonzero_params
 
 
-def _final_clean_pai_parameter_stats(model: Any) -> tuple[int, int]:
+def _topology_hash(model: Any) -> str:
+    """A deterministic identity for a model's architecture, not its weights.
+
+    Hashes each parameter's dotted name, owning-module class name, and shape
+    -- never its values -- so retraining the identical architecture reproduces
+    the same hash while a real shape change (a retained-vs-rejected dendrite)
+    changes it. information/optimization/00_assessment.md: "A retained
+    dendrite is an architectural change, not merely a metric event."
+    """
+    owners = dict(model.named_modules())
+    entries = []
+    for name, param in model.named_parameters():
+        module_name, _, _leaf = name.rpartition(".")
+        owner = owners.get(module_name)
+        owner_class = type(owner).__name__ if owner is not None else ""
+        entries.append(f"{name}|{owner_class}|{tuple(param.shape)}")
+    canonical = "\n".join(sorted(entries))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _final_clean_pai_parameter_stats(model: Any) -> tuple[int, int, str]:
     """Count the inference model PAI writes as ``final_clean_pai.pt``.
 
     A live PAI wrapper retains the next candidate dendrite and its training
@@ -1307,6 +1365,10 @@ def _final_clean_pai_parameter_stats(model: Any) -> tuple[int, int]:
     scaffolding, so use the same representation for benchmark parameter
     reporting. This must run only after all training and evaluation complete:
     PAI clears processor state while constructing the copy.
+
+    Also returns this same final-clean model's :func:`_topology_hash`, so the
+    one (expensive, state-clearing) ``prepare_final_model`` call serves both
+    parameter accounting and the manifest's topology-hash field.
     """
     try:
         UPA = importlib.import_module("perforatedai.utils_perforatedai")
@@ -1324,7 +1386,8 @@ def _final_clean_pai_parameter_stats(model: Any) -> tuple[int, int]:
             "PerforatedAI could not prepare the final-clean inference model for "
             "parameter accounting."
         ) from exc
-    return _count_parameters(final_clean_model)
+    param_count, nonzero_params = _count_parameters(final_clean_model)
+    return param_count, nonzero_params, _topology_hash(final_clean_model)
 
 
 def _write_metrics_and_history(
@@ -1386,6 +1449,16 @@ def _write_metrics_and_history(
                 "artifact_id": metadata.artifact_id,
                 "seed": metadata.seed,
                 "source_condition_key": metadata.source_condition_key,
+                "quantizer_revision": metadata.quantizer_revision,
+                "module_ids_to_perforate": metadata.module_ids_to_perforate,
+                "track_only_module_ids": metadata.track_only_module_ids,
+                "parameter_ids_to_track": metadata.parameter_ids_to_track,
+                "recipe_override": metadata.recipe_override,
+                "pai_override": metadata.pai_override,
+                "effective_recipe": metadata.effective_recipe,
+                "max_dendrite_phase_epochs": metadata.max_dendrite_phase_epochs,
+                "source_commit": metadata.source_commit,
+                "paired_control_identity": metadata.paired_control_identity,
                 "artifact_path": str(stats.artifact_path),
                 "training_skipped": payload.training_skipped,
                 "skip_reason": payload.skip_reason,
@@ -1408,6 +1481,7 @@ def _persist_stage_artifacts(
     metadata: ArtifactMetadata,
     payload: ArtifactPayload,
     parameter_stats: tuple[int, int] | None = None,
+    topology_hash: str | None = None,
 ) -> tuple[Path, float, int, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / _MODEL_PT
@@ -1449,6 +1523,7 @@ def _persist_stage_artifacts(
         raise RuntimeError("artifact_id is required before persisting an artifact")
     dendrite_status = "not_applicable"
     pai_schedule_telemetry: dict[str, Any] = {}
+    pai_epoch_milestones: dict[str, Any] = {}
     if metadata.use_dendrites:
         try:
             summary = json.loads((output_dir / "pai_summary.json").read_text())
@@ -1459,6 +1534,7 @@ def _persist_stage_artifacts(
                 "requested": summary.get("requested_schedule", {}),
                 "observed": summary.get("observed_schedule", {}),
             }
+            pai_epoch_milestones = summary.get("pai_epoch_milestones", {}) or {}
         except (OSError, json.JSONDecodeError):
             dendrite_status = "unknown"
     bit_width = metadata.bit_width
@@ -1498,6 +1574,15 @@ def _persist_stage_artifacts(
             "quantization_evaluation_revision": (
                 metadata.quantization_evaluation_revision
             ),
+            "quantizer_revision": metadata.quantizer_revision,
+            "module_ids_to_perforate": metadata.module_ids_to_perforate,
+            "track_only_module_ids": metadata.track_only_module_ids,
+            "parameter_ids_to_track": metadata.parameter_ids_to_track,
+            "recipe_override": metadata.recipe_override,
+            "pai_override": metadata.pai_override,
+            "max_dendrite_phase_epochs": metadata.max_dendrite_phase_epochs,
+            "source_commit": metadata.source_commit,
+            "paired_control_identity": metadata.paired_control_identity,
         },
         pai_save_name=metadata.pai_save_name,
         validity={
@@ -1506,6 +1591,9 @@ def _persist_stage_artifacts(
         },
         telemetry={
             "pai_schedule": pai_schedule_telemetry,
+            "pai_epoch_milestones": pai_epoch_milestones,
+            "topology_hash": topology_hash,
+            "effective_recipe": metadata.effective_recipe,
             "learning_rates": {
                 "backbone": [
                     row.get("backbone_learning_rate")
@@ -1632,18 +1720,35 @@ def _read_pai_architecture_log(save_name: str | None) -> dict[str, Any]:
     param_column = next(
         (name for name in rows[0] if "param" in name.lower()), None
     )
+    switch_column = next(
+        (name for name in rows[0] if "number" in name.lower()), None
+    )
     counts: list[int] = []
+    # {switch_number: param_count}, for joining against _read_pai_switch_log's
+    # per-switch epochs (see _pai_epoch_milestones). Only populated when both
+    # columns parse; a row with an unparsable switch number is excluded rather
+    # than guessed from row order, since param_counts.csv and switch_epochs.csv
+    # are independently-lengthed logs for the same run (see MEASUREMENT_CAVEATS.md
+    # and _write_pai_summary's docstring).
+    by_switch: dict[int, int] = {}
     if param_column is not None:
         for row in rows:
             try:
-                counts.append(int(float(row[param_column])))
+                count = int(float(row[param_column]))
             except (TypeError, ValueError):
                 continue
+            counts.append(count)
+            if switch_column is not None:
+                try:
+                    by_switch[int(float(row[switch_column]))] = count
+                except (TypeError, ValueError):
+                    pass
     return {
         "status": "available",
         "path": str(path),
         "row_count": len(rows),
         "max_param_count": max(counts) if counts else None,
+        "param_count_by_switch": by_switch,
     }
 
 
@@ -1663,18 +1768,99 @@ def _read_pai_switch_log(save_name: str | None) -> dict[str, Any]:
         (name for name in (rows[0] if rows else {}) if "epoch" in name.lower()),
         None,
     )
+    switch_column = next(
+        (name for name in (rows[0] if rows else {}) if "number" in name.lower()),
+        None,
+    )
     epochs: list[int] = []
+    # {switch_number: epoch}, keyed by the CSV's own "Switch Number" column
+    # rather than row order -- see _read_pai_architecture_log's by_switch.
+    epochs_by_switch: dict[int, int] = {}
     if epoch_column is not None:
         for row in rows:
             try:
-                epochs.append(int(float(row[epoch_column])))
+                epoch = int(float(row[epoch_column]))
             except (TypeError, ValueError):
                 continue
+            epochs.append(epoch)
+            if switch_column is not None:
+                try:
+                    epochs_by_switch[int(float(row[switch_column]))] = epoch
+                except (TypeError, ValueError):
+                    pass
     return {
         "status": "available",
         "path": str(path),
         "row_count": len(rows),
         "switch_epochs": epochs,
+        "epoch_by_switch": epochs_by_switch,
+    }
+
+
+def _pai_epoch_milestones(
+    *,
+    raw_architecture: dict[str, Any],
+    raw_switches: dict[str, Any],
+    dense_param_count: int | None,
+    complete_epochs: list[int],
+) -> dict[str, int | None]:
+    """Name the three PAI lifecycle epochs the raw logs only imply.
+
+    ``first_candidate_epoch`` is the epoch of PAI's first logged switch -- "the
+    closest existing proxy" per information/optimization/03_execution_matrix.md
+    -- now given an explicit name instead of left as
+    ``observed_schedule["switch_epochs"][0]`` for every caller to reach into.
+    It falls back to the ordered ``switch_epochs`` list when the log has no
+    "Switch Number" column to key on.
+
+    ``first_retention_epoch`` is the epoch of the first switch whose
+    ``param_counts.csv`` row grew the parameter count versus the previous
+    switch (or versus ``dense_param_count``, for switch 0) -- i.e. the first
+    switch that actually kept a dendrite rather than discarding a candidate.
+    This joins ``param_counts.csv`` and ``switch_epochs.csv`` by their shared
+    "Switch Number" column rather than assuming matched row order: the two
+    logs can have different lengths for the same run (observed on disk, e.g.
+    ``results/dynamic5/PAI/actor_critic_dendrites_fp32/``), so a retained
+    switch with no matching epoch row returns ``None`` rather than a guess.
+
+    ``completion_epoch`` is the first epoch the benchmark's own
+    ``pai_training_complete`` flag was observed (authoritative history, per
+    ``_write_pai_summary``'s docstring), not derived from either raw PAI log.
+
+    Best-effort telemetry, not a verdict: see ``_dendrite_audit`` for the
+    actual retained-vs-not status this benchmark treats as evidence.
+    """
+    epoch_by_switch: dict[int, int] = raw_switches.get("epoch_by_switch") or {}
+    if epoch_by_switch:
+        # The lowest switch *number*, not the lowest epoch: those coincide in
+        # every log seen so far, but the question asked is "when did the first
+        # switch happen", and the switch number is what answers it.
+        first_candidate_epoch = epoch_by_switch[min(epoch_by_switch)]
+    else:
+        # No usable "Switch Number" column (an older or reworded log). The
+        # ordered epoch list is still a valid answer for this one field, and
+        # returning None here while switch_epochs plainly holds the epoch
+        # would be a worse report than the value it already carries.
+        switch_epochs: list[int] = raw_switches.get("switch_epochs") or []
+        first_candidate_epoch = min(switch_epochs) if switch_epochs else None
+
+    param_count_by_switch: dict[int, int] = (
+        raw_architecture.get("param_count_by_switch") or {}
+    )
+    first_retention_epoch: int | None = None
+    if param_count_by_switch:
+        previous_count = dense_param_count
+        for switch_number in sorted(param_count_by_switch):
+            count = param_count_by_switch[switch_number]
+            if previous_count is not None and count > previous_count:
+                first_retention_epoch = epoch_by_switch.get(switch_number)
+                break
+            previous_count = count
+
+    return {
+        "first_candidate_epoch": first_candidate_epoch,
+        "first_retention_epoch": first_retention_epoch,
+        "completion_epoch": min(complete_epochs) if complete_epochs else None,
     }
 
 
@@ -1735,6 +1921,12 @@ def _write_pai_summary(
         raw_architecture=raw_architecture,
         raw_switches=raw_switches,
     )
+    epoch_milestones = _pai_epoch_milestones(
+        raw_architecture=raw_architecture,
+        raw_switches=raw_switches,
+        dense_param_count=metadata.dense_param_count,
+        complete_epochs=complete_epochs,
+    )
     raw_param_count = raw_architecture.get("max_param_count")
     if raw_param_count is None:
         consistency = "unavailable"
@@ -1785,6 +1977,7 @@ def _write_pai_summary(
                 },
                 "architecture_log_consistency": consistency,
                 "dendrite_audit": dendrite_audit,
+                "pai_epoch_milestones": epoch_milestones,
             },
             indent=2,
         )
@@ -3854,6 +4047,16 @@ def _build_artifact_metadata(
         artifact_id=config.artifact_id,
         seed=config.seed,
         source_condition_key=config.source_condition_key,
+        quantizer_revision=config.quantizer_revision,
+        module_ids_to_perforate=config.module_ids_to_perforate,
+        track_only_module_ids=config.track_only_module_ids,
+        parameter_ids_to_track=config.parameter_ids_to_track,
+        recipe_override=config.recipe_override,
+        pai_override=config.pai_override,
+        effective_recipe=config.effective_recipe,
+        source_commit=config.source_commit,
+        paired_control_identity=config.paired_control_identity,
+        max_dendrite_phase_epochs=config.max_dendrite_phase_epochs,
     )
 
 
@@ -3901,6 +4104,16 @@ def _metadata_for_stage(
         artifact_id=metadata.artifact_id,
         seed=metadata.seed,
         source_condition_key=metadata.source_condition_key,
+        quantizer_revision=metadata.quantizer_revision,
+        module_ids_to_perforate=metadata.module_ids_to_perforate,
+        track_only_module_ids=metadata.track_only_module_ids,
+        parameter_ids_to_track=metadata.parameter_ids_to_track,
+        recipe_override=metadata.recipe_override,
+        pai_override=metadata.pai_override,
+        effective_recipe=metadata.effective_recipe,
+        source_commit=metadata.source_commit,
+        paired_control_identity=metadata.paired_control_identity,
+        max_dendrite_phase_epochs=metadata.max_dendrite_phase_epochs,
     )
 
 
@@ -3989,6 +4202,7 @@ def _persist_post_pqat_snapshot(
     metadata: ArtifactMetadata,
     payload: ArtifactPayload,
     parameter_stats: tuple[int, int] | None = None,
+    topology_hash: str | None = None,
 ) -> None:
     if not enabled:
         return
@@ -3998,6 +4212,7 @@ def _persist_post_pqat_snapshot(
         metadata=metadata,
         payload=payload,
         parameter_stats=parameter_stats,
+        topology_hash=topology_hash,
     )
 
 
@@ -4010,6 +4225,7 @@ def _persist_over_budget_snapshot(
     payload: ArtifactPayload,
     max_epochs: int,
     parameter_stats: tuple[int, int] | None = None,
+    topology_hash: str | None = None,
 ) -> ArtifactPayload:
     if not enabled:
         return payload
@@ -4045,6 +4261,7 @@ def _persist_over_budget_snapshot(
         metadata=metadata,
         payload=over_payload,
         parameter_stats=parameter_stats,
+        topology_hash=topology_hash,
     )
     return ArtifactPayload(
         best_metric=payload.best_metric,
@@ -4322,8 +4539,14 @@ def train_and_evaluate(
         skip_reason=skip_reason,
         stage_name="after_pqat" if pqat_enabled else None,
     )
-    final_parameter_stats = (
+    _final_clean_stats = (
         _final_clean_pai_parameter_stats(_plain_model) if use_dendrites else None
+    )
+    final_parameter_stats = (
+        _final_clean_stats[:2] if _final_clean_stats is not None else None
+    )
+    final_topology_hash = (
+        _final_clean_stats[2] if _final_clean_stats is not None else None
     )
     final_param_count = (
         final_parameter_stats[0]
@@ -4351,6 +4574,7 @@ def train_and_evaluate(
         metadata=metadata,
         payload=payload,
         parameter_stats=final_parameter_stats,
+        topology_hash=final_topology_hash,
     )
     payload = _persist_over_budget_snapshot(
         enabled=use_dendrites and config.train_dendrites_until_complete,
@@ -4360,6 +4584,7 @@ def train_and_evaluate(
         payload=payload,
         max_epochs=max_epochs,
         parameter_stats=final_parameter_stats,
+        topology_hash=final_topology_hash,
     )
 
     _, file_size_mb, param_count, nonzero_params = _persist_stage_artifacts(
@@ -4368,6 +4593,7 @@ def train_and_evaluate(
         metadata=metadata,
         payload=payload,
         parameter_stats=final_parameter_stats,
+        topology_hash=final_topology_hash,
     )
 
     record = TrainingRecord(

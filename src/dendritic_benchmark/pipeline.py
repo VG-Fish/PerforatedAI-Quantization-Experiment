@@ -9,7 +9,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
@@ -45,8 +45,11 @@ from .plans import (
     ConditionTrainingPlan,
     ExperimentPlan,
     ModelTrainingRecipe,
+    PAIOverride,
+    RecipeOverride,
     SourceCheckpointLoadConfig,
 )
+from .quantization import QUANTIZER_REVISION
 from .results import (
     load_training_records,
     save_training_record,
@@ -91,6 +94,7 @@ _MODEL_DENDRITIC_MEMORY_CLEANUP_INTERVALS = {
 _PAI_VARIANTS = frozenset(
     {
         "default",
+        "distilbert_classifier_only",
         "gru_gate_ablation",
         "mpnn_capacity",
         "tcn_head_both",
@@ -109,6 +113,13 @@ _MODEL_ARTIFACT_REVISIONS = {
     "resnet18_hf_perforated_cifar10": "dynamic12_hf_perforated_gd_cifar_v1",
     "saint_adult": "dynamic12_head_target_history_v2",
     "pointnet_modelnet40": "dynamic12_late_feature_target_v1",
+    # M5's targets moved from "every Linear/Conv1d by type" to the AP0 late
+    # pair (.conv4/.fc1) plus an explicit track-only list. The recorded
+    # module-ID fields cannot catch that on their own -- artifacts written
+    # before those fields existed read back as None and are treated as
+    # matching -- so the revision is what actually invalidates a pre-AP0 M5
+    # dendritic artifact. See information/optimization/03_execution_matrix.md.
+    "m5": "optimization_ap0_late_target_v1",
 }
 # Dynamic9 showed that the global three-dendrite schedule adds unnecessary
 # capacity to several models. These are deliberately sparse overrides; fields
@@ -159,6 +170,36 @@ def _log(msg: str, *, before: bool = False, after: bool = False) -> None:
         print()
 
 
+def _uncovered_parameter_names(
+    model: Any, selection: PAIModuleSelection
+) -> list[str]:
+    """Parameters of ``model`` that ``selection`` gives PAI no way to type.
+
+    An ID covers a parameter when it names the parameter itself or one of its
+    ancestor modules, using the leading-dot convention PAI validates
+    (``.head.0`` covers ``head.0.weight``). Type-based selection
+    (``modules_to_perforate``) covers by class rather than by name, so a
+    selection that uses it is reported as fully covered: the ID lists are not
+    the whole picture there.
+    """
+    if selection.modules_to_perforate:
+        return []
+    covering_ids = [
+        *(selection.module_ids_to_perforate or []),
+        *(selection.track_only_module_ids or []),
+        *(selection.parameter_ids_to_track or []),
+    ]
+    uncovered: list[str] = []
+    for name, _ in model.named_parameters():
+        dotted = f".{name}"
+        if not any(
+            dotted == module_id or dotted.startswith(f"{module_id}.")
+            for module_id in covering_ids
+        ):
+            uncovered.append(name)
+    return uncovered
+
+
 def _release_accelerator_memory() -> None:
     gc.collect()
     mps = getattr(torch, "mps", None)
@@ -179,6 +220,8 @@ class BenchmarkRunner:
         model_scale: float = 1.0,
         pai_variant: str = "default",
         pai_fixed_switch_interval: int | None = None,
+        recipe_override: RecipeOverride | None = None,
+        pai_override: PAIOverride | None = None,
     ):
         if not 0 < model_scale <= 1:
             raise ValueError("model_scale must be greater than zero and at most one")
@@ -200,6 +243,9 @@ class BenchmarkRunner:
         self._model_scale = model_scale
         self._pai_variant = pai_variant
         self._diagnostic_fixed_switch_interval = pai_fixed_switch_interval
+        self._recipe_override = recipe_override
+        self._pai_override = pai_override
+        self._source_commit_cache: str | None | Literal["_unset"] = "_unset"
 
     def _load_state(self, model: Any, checkpoint_path: Path) -> Any:
         if not checkpoint_path.exists():
@@ -445,6 +491,16 @@ class BenchmarkRunner:
         return list(self._perforation_track_modules())
 
     def _perforation_module_ids_to_perforate(self, model_key: str) -> list[str]:
+        default_perforate = self._default_module_ids_to_perforate(model_key)
+        if self._pai_override is None:
+            return default_perforate
+        default_track_only = self._default_track_only_module_ids(model_key)
+        perforate, _ = self._pai_override.resolved_module_ids(
+            default_perforate, default_track_only
+        )
+        return perforate
+
+    def _default_module_ids_to_perforate(self, model_key: str) -> list[str]:
         if model_key == "resnet18_cifar10":
             # Mirrors upstream exactly. PerforatedAI's published ResNet-18
             # (LPA.ResNetPAIPreFC; examples/imagenet/resnet_prefc.py, and the
@@ -476,7 +532,23 @@ class BenchmarkRunner:
             # +100%, for one dendrite, against +656,896 (+18.9%) for these two.
             return [".conv3.0", ".head.0"]
         if model_key == "distilbert":
+            # NP1 in information/optimization/03_execution_matrix.md: perforate
+            # only the final classifier, leaving the pre-classifier projection
+            # tracked. A permanent pai_variant (like tcn_head_output/
+            # gru_gate_ablation) rather than a PAIOverride, since it is a
+            # named, reproducible target-set ablation worth keeping forever,
+            # not a one-off sweep trial.
+            if self._pai_variant == "distilbert_classifier_only":
+                return [".model.classifier"]
             return list(_DISTILBERT_PAI_CLASSIFICATION_HEAD)
+        if model_key == "m5":
+            # AP0 in information/optimization/03_execution_matrix.md: the late
+            # feature convolution and the classifier. Without this branch,
+            # _perforation_modules_to_perforate falls back to type-selecting
+            # every Linear/Conv1d (conv1-conv4, fc1), spending the dendrite
+            # budget on early temporal layers instead of the late pair the
+            # execution matrix screens first.
+            return [".conv4", ".fc1"]
         if model_key == "mpnn":
             return [
                 ".readout.0",
@@ -511,6 +583,16 @@ class BenchmarkRunner:
         return []
 
     def _perforation_track_only_module_ids(self, model_key: str) -> list[str]:
+        default_track_only = self._default_track_only_module_ids(model_key)
+        if self._pai_override is None:
+            return default_track_only
+        default_perforate = self._default_module_ids_to_perforate(model_key)
+        _, track_only = self._pai_override.resolved_module_ids(
+            default_perforate, default_track_only
+        )
+        return track_only
+
+    def _default_track_only_module_ids(self, model_key: str) -> list[str]:
         return {
             # Dynamic9's only clearly efficient actor-critic candidate was the
             # second shared-backbone projection. Holding the policy/value heads
@@ -640,7 +722,18 @@ class BenchmarkRunner:
             # parameters neither perforated nor tracked. PAI cannot assign those a
             # parameter_type, so in p-phase it warns on each one and calls
             # pdb.set_trace. Tracking the backbone tags them "neuron" instead.
-            "distilbert": [".model.distilbert"],
+            # The distilbert_classifier_only variant (NP1) also tracks
+            # .model.pre_classifier, since only .model.classifier is perforated.
+            "distilbert": (
+                [".model.distilbert", ".model.pre_classifier"]
+                if self._pai_variant == "distilbert_classifier_only"
+                else [".model.distilbert"]
+            ),
+            # AP0's counterpart to the m5 perforate branch above: every
+            # parameter-bearing module M5 owns except .conv4/.fc1. Pool layers
+            # hold no parameters and are omitted, matching the ResNet/PointNet
+            # convention elsewhere in this dict.
+            "m5": [".conv1", ".bn1", ".conv2", ".bn2", ".conv3", ".bn3", ".bn4"],
         }.get(model_key, [])
 
     def _perforation_module_names_to_not_save(self, model_key: str) -> list[str]:
@@ -692,17 +785,71 @@ class BenchmarkRunner:
         return self._diagnostic_fixed_switch_interval
 
     def _pai_dynamic_schedule(self, model_key: str) -> PAIDynamicSchedule | None:
-        """Return the measured schedule for a model and optional ablation variant."""
+        """Return the measured schedule for a model and optional ablation variant.
+
+        A PAIOverride, when set, is merged on top of the resolved schedule
+        (see PAIOverride.apply_to_schedule) -- it never replaces the variant
+        lookup below, only overrides the specific fields it sets.
+        """
         variant_schedule = _PAI_VARIANT_SCHEDULES.get(self._pai_variant, {}).get(
             model_key
         )
-        if variant_schedule is not None:
-            return variant_schedule
-        return _MODEL_DYNAMIC_PAI_SCHEDULES.get(model_key)
+        base_schedule = (
+            variant_schedule
+            if variant_schedule is not None
+            else _MODEL_DYNAMIC_PAI_SCHEDULES.get(model_key)
+        )
+        if self._pai_override is None:
+            return base_schedule
+        return self._pai_override.apply_to_schedule(base_schedule)
 
     @staticmethod
     def _model_artifact_revision(model_key: str) -> str | None:
         return _MODEL_ARTIFACT_REVISIONS.get(model_key)
+
+    def _source_commit(self) -> str | None:
+        """Best-effort ``git rev-parse HEAD``, cached for the runner's lifetime.
+
+        Suffixed ``-dirty`` when the working tree has uncommitted tracked
+        changes. Without that suffix the field would name a commit whose
+        checkout does not reproduce the run -- exactly the irreproducibility
+        information/optimization/03_execution_matrix.md records the commit to
+        prevent -- and most sweep work happens on a dirty tree.
+
+        Descriptive-only ("the artifact identity must include... the source
+        commit"): recorded for every artifact but never used to decide whether
+        one is stale, so a commit made between reruns of the same recipe does
+        not force retraining.
+        """
+        if self._source_commit_cache != "_unset":
+            return self._source_commit_cache
+        commit = self._git_output("rev-parse", "HEAD") or None
+        if commit is not None:
+            # An empty status is clean; a failed status call is unknown, and
+            # must not be reported as clean.
+            status = self._git_output("status", "--porcelain", "--untracked-files=no")
+            if status is None or status:
+                commit = f"{commit}-dirty"
+        self._source_commit_cache = commit
+        return commit
+
+    @staticmethod
+    def _git_output(*args: str) -> str | None:
+        """Stripped stdout of a git command, or ``None`` if it could not run."""
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=Path(__file__).resolve().parent,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip()
 
     def _configure_perforated_model(
         self,
@@ -758,6 +905,7 @@ class BenchmarkRunner:
             module_names_to_not_save=self._perforation_module_names_to_not_save(model_key),
             parameter_ids_to_track=self._perforation_parameter_ids_to_track(model_key),
         )
+        self._reject_uncovered_override_parameters(model, model_key, module_selection)
         module_output_dimensions = infer_module_output_dimensions(
             model,
             model_key,
@@ -766,6 +914,47 @@ class BenchmarkRunner:
             module_names=[*module_ids_to_perforate],
         )
         return module_selection, module_output_dimensions
+
+    def _reject_uncovered_override_parameters(
+        self, model: Any, model_key: str, selection: PAIModuleSelection
+    ) -> None:
+        """Fail fast when a ``PAIOverride`` leaves a parameter untyped.
+
+        PAI assigns every parameter a ``parameter_type`` from the perforate or
+        track lists; one in neither list is warned about on every p-phase step.
+        This benchmark suppresses that warning and neutralizes the pdb call it
+        used to carry (``compat._consume_pai_debugger_message``,
+        ``_suppress_pai_debugger``), so an incomplete target set produces a
+        *silently* mistyped run rather than a visible failure.
+
+        information/optimization/03_execution_matrix.md: "an alternate target
+        requires matching track-only coverage and a structural smoke test, not
+        merely an ID edit". The checked-in per-model defaults already have that
+        smoke test (``tests/test_dynamic_pai_followup.py``) and three of them
+        (``mpnn``, ``gru_forecaster``, ``vae_mnist``) knowingly do not cover
+        every parameter, so this guard applies only to an override -- the one
+        target set no test has seen.
+        """
+        if self._pai_override is None:
+            return
+        if (
+            self._pai_override.module_ids_to_perforate is None
+            and self._pai_override.track_only_module_ids is None
+        ):
+            return
+        uncovered = _uncovered_parameter_names(model, selection)
+        if uncovered:
+            shown = ", ".join(uncovered[:8])
+            if len(uncovered) > 8:
+                shown += f", ... (+{len(uncovered) - 8} more)"
+            raise ValueError(
+                f"--pai-override leaves {len(uncovered)} {model_key} parameter(s) "
+                f"neither perforated nor tracked: {shown}. Add the owning module "
+                "to track_only_module_ids (or the parameter itself to the model's "
+                "parameter_ids_to_track branch); PAI cannot assign an untyped "
+                "parameter a parameter_type, and this benchmark suppresses the "
+                "warning that would otherwise say so."
+            )
 
     def _prepare_condition_model(
         self,
@@ -1122,6 +1311,11 @@ class BenchmarkRunner:
             # the FP32 phase.  A smaller step lets its full-precision shadow
             # accumulate movement between ternary projections.
             recipe = replace(recipe, learning_rate=2.0e-4)
+        if self._recipe_override is not None:
+            # BenchmarkRunner.run() rejects a recipe_override with more than
+            # one selected model, so this always applies to the model the
+            # override's sweep trial targets.
+            recipe = self._recipe_override.apply(recipe)
         dendritic_batch_size = _MODEL_DENDRITIC_BATCH_SIZES.get(model_key)
         if condition.use_dendrites and dendritic_batch_size is not None:
             return recipe.with_batch_size(dendritic_batch_size)
@@ -1191,7 +1385,10 @@ class BenchmarkRunner:
             config = json.loads(config_path.read_text())
         except json.JSONDecodeError:
             return False
-        expected_ids = set(_DISTILBERT_PAI_CLASSIFICATION_HEAD)
+        # Variant-aware: NP0 (default) and NP1 (distilbert_classifier_only)
+        # perforate a different head subset, so a hardcoded NP0-only constant
+        # here would always call an NP1 config stale (or vice versa).
+        expected_ids = set(self._perforation_module_ids_to_perforate("distilbert"))
         module_ids = set(config.get("module_ids_to_perforate") or [])
         modules_to_perforate = config.get("modules_to_perforate") or []
         correlation_batches = config.get("initial_correlation_batches")
@@ -1252,6 +1449,11 @@ class BenchmarkRunner:
         recipe = self._training_hyperparameters(model_key, condition)
         if metadata.get("lr_schedule_epochs") != recipe.lr_schedule_epochs:
             return False
+        expected_recipe_override = (
+            self._recipe_override.to_dict() if self._recipe_override is not None else None
+        )
+        if metadata.get("recipe_override") != expected_recipe_override:
+            return False
         if (
             metadata.get("quantization_granularity", "tensor")
             != self._quantization_granularity(model_key, condition)
@@ -1261,6 +1463,17 @@ class BenchmarkRunner:
             condition.quantized
             and metadata.get("quantization_evaluation_revision")
             != QUANTIZATION_EVALUATION_REVISION
+        ):
+            return False
+        # Compared only when recorded, like the module-ID checks below: this is
+        # a newly-introduced identity field, not a revision bump on an actual
+        # projection-code change, so a merely-missing value on a pre-existing
+        # quantized artifact must not force it to be requantized.
+        recorded_quantizer_revision = metadata.get("quantizer_revision")
+        if (
+            condition.quantized
+            and recorded_quantizer_revision is not None
+            and recorded_quantizer_revision != QUANTIZER_REVISION
         ):
             return False
         if condition.quantized:
@@ -1308,6 +1521,25 @@ class BenchmarkRunner:
         )
         if recorded_schedule != expected_dict:
             return False
+        expected_pai_override = (
+            self._pai_override.to_dict() if self._pai_override is not None else None
+        )
+        if metadata.get("pai_override") != expected_pai_override:
+            return False
+        # The three module-ID lists are compared only when actually recorded:
+        # every artifact trained before this field existed reads back as
+        # None here, and unlike a revision bump this is not evidence the
+        # underlying target selection changed -- treating a merely-missing
+        # field as stale would force a full retrain of every prior dendritic
+        # artifact across all 24 models the first time this code runs.
+        for field_name, expected_ids in (
+            ("module_ids_to_perforate", self._perforation_module_ids_to_perforate(model_key)),
+            ("track_only_module_ids", self._perforation_track_only_module_ids(model_key)),
+            ("parameter_ids_to_track", self._perforation_parameter_ids_to_track(model_key)),
+        ):
+            recorded_ids = metadata.get(field_name)
+            if recorded_ids is not None and recorded_ids != expected_ids:
+                return False
         return True
 
     @staticmethod
@@ -1589,6 +1821,19 @@ class BenchmarkRunner:
             model_by_key(key)
             for key in (model_keys or [spec.key for spec in MODEL_SPECS])
         ]
+        if (self._recipe_override is not None or self._pai_override is not None) and (
+            len(selected_models) != 1
+        ):
+            # A RecipeOverride/PAIOverride is one sweep trial for one model
+            # (information/optimization/03_execution_matrix.md's RP0/AP1/NP1
+            # naming is always per-model); applying it identically across
+            # several models would silently misconfigure all but the intended
+            # one instead of raising.
+            model_key_list = ", ".join(spec.key for spec in selected_models) or "(none)"
+            raise ValueError(
+                "recipe_override/pai_override require exactly one selected "
+                f"model; got {len(selected_models)}: {model_key_list}"
+            )
         selected_condition_keys = self._expand_condition_keys(condition_keys)
         selected_conditions = [condition_by_key(key) for key in selected_condition_keys]
         all_records: list[dict[str, Any]] = []
@@ -1769,6 +2014,33 @@ class BenchmarkRunner:
             pai_dynamic_schedule=experiment_plan.pai_dynamic_schedule,
             artifact_id=experiment_plan.artifact_id,
             seed=experiment_plan.seed,
+            quantizer_revision=(QUANTIZER_REVISION if condition.quantized else None),
+            module_ids_to_perforate=(
+                tuple(module_selection.module_ids_to_perforate)
+                if module_selection.module_ids_to_perforate is not None
+                else None
+            ),
+            track_only_module_ids=(
+                tuple(module_selection.track_only_module_ids)
+                if module_selection.track_only_module_ids is not None
+                else None
+            ),
+            parameter_ids_to_track=(
+                tuple(module_selection.parameter_ids_to_track)
+                if module_selection.parameter_ids_to_track is not None
+                else None
+            ),
+            recipe_override=(
+                self._recipe_override.to_dict()
+                if self._recipe_override is not None
+                else None
+            ),
+            pai_override=(
+                self._pai_override.to_dict() if self._pai_override is not None else None
+            ),
+            effective_recipe=asdict(training_hyperparameters),
+            source_commit=self._source_commit(),
+            paired_control_identity=None,
         )
         return train_and_evaluate(
             model_key=model_key,

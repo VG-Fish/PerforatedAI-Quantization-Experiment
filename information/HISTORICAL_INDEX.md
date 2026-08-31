@@ -25,6 +25,20 @@ recorded in that document's own banner.
 | [DENDRITE_EFFECT_AUDIT_2026-08-30.md](DENDRITE_EFFECT_AUDIT_2026-08-30.md) | current | the standing verdict on whether the dendrite effect beats noise and more training |
 | [MEASUREMENT_CAVEATS.md](MEASUREMENT_CAVEATS.md) | current (dated line numbers) | the eleven measurement caveats, their root causes, and which results each one invalidates |
 | [audit/audit_report.md](audit/audit_report.md) | current | the cleanup priority ledger, what P0–P2 built, what is still open, and the dead-code ledger |
+| [CAPACITY_MATCHED_DENSE_CONTROLS.md](CAPACITY_MATCHED_DENSE_CONTROLS.md) | current (proposal) | the topology-matched dense-control design — not yet implemented in the runner |
+
+## Optimization plan (2026-08-31)
+
+`information/optimization/` is the working memory for the next selection/optimization
+loop. Read it in the order its README gives; it is a plan, not a record of results.
+
+| document | status | cite it for |
+|---|---|---|
+| [optimization/README.md](optimization/README.md) | current | the launch cohort, the reading order, and the reportability rule |
+| [optimization/00_assessment.md](optimization/00_assessment.md) | current | machine profile, model-selection reasoning, and the five-step validity protocol |
+| [optimization/01_initial_five_plan.md](optimization/01_initial_five_plan.md) | current | per-model starting recipes, tuning spaces, gates, and the advancement checklist |
+| [optimization/02_research_and_sources.md](optimization/02_research_and_sources.md) | current | external sources consulted and the explicit non-conclusions |
+| [optimization/03_execution_matrix.md](optimization/03_execution_matrix.md) | current | the exact sweep trials, current-code limits, and required manifest fields |
 
 ## Historical
 
