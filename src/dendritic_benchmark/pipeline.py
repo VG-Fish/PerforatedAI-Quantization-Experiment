@@ -29,7 +29,6 @@ from .compat import (
     attach_module_output_dimensions,
     choose_device,
     configure_pai_candidate_graph,
-    dynamic_schedule_field,
     latest_pai_switch_checkpoint,
     load_pai_system_checkpoint,
     pai_system_checkpoint_exists,
@@ -65,7 +64,6 @@ from .specs import (
 )
 from .training import (
     DENDRITE_AUDIT_REVISION,
-    MAX_DENDRITE_PHASE_EPOCHS,
     QUANTIZATION_EVALUATION_REVISION,
     TrainingConfig,
     TrainingRecord,
@@ -1140,39 +1138,6 @@ class BenchmarkRunner:
         )
         return max(1, min(10, math.ceil(recipe.max_epochs * 0.30)))
 
-    # A retained dendrite has to (a) finish its candidate phase and (b) train
-    # long enough for the validation metric to show whether it earned its
-    # parameters.  Twenty epochs of (b) is the smallest window in which any
-    # model in this suite has ever moved its metric by more than run-to-run
-    # noise.
-    _DENDRITE_ADAPTATION_EPOCHS = 20
-
-    @staticmethod
-    def _dynamic_training_epoch_cap(
-        training_plan: ConditionTrainingPlan,
-        dynamic_schedule: PAIDynamicSchedule | None = None,
-    ) -> int | None:
-        """Bound a dynamic PAI run without undercutting its paired control.
-
-        The old flat ``+16`` could not fit even one dendrite.  A switch costs
-        the candidate phase (``p_epochs_to_switch``, itself bounded by
-        ``max_dendrite_phase_epochs=8`` in training.py) plus an adaptation
-        window, and it is charged once per dendrite.  At the dynamic12 defaults
-        -- ``p_epochs_to_switch=10``, ``max_dendrites=1`` -- +16 left at most
-        eight epochs of adaptation, and on ResNet-18 all sixteen fell past the
-        cosine floor where the learning rate is exactly 0.0.  Deriving the tail
-        from the schedule keeps the bound tight for a one-dendrite run while
-        still holding a runaway no-improvement tracker to a finite budget.
-        """
-        if not training_plan.update_dendrites_during_training:
-            return None
-        max_dendrites = dynamic_schedule_field(dynamic_schedule, "max_dendrites")
-        p_epochs = dynamic_schedule_field(dynamic_schedule, "p_epochs_to_switch")
-        per_dendrite = min(p_epochs, MAX_DENDRITE_PHASE_EPOCHS) + (
-            BenchmarkRunner._DENDRITE_ADAPTATION_EPOCHS
-        )
-        return training_plan.max_epochs + max(16, max_dendrites * per_dendrite)
-
     @staticmethod
     def _quantization_granularity(
         model_key: str, condition: ConditionSpec
@@ -1770,9 +1735,6 @@ class BenchmarkRunner:
             lr_min_factor=training_hyperparameters.lr_min_factor,
             lr_schedule_epochs=training_hyperparameters.lr_schedule_epochs,
             dendrite_lr_min_factor=training_hyperparameters.dendrite_lr_min_factor,
-            max_dynamic_training_epochs=self._dynamic_training_epoch_cap(
-                training_plan, dynamic_schedule
-            ),
             quantization_evaluation_revision=(
                 experiment_plan.quantization_evaluation_revision
             ),

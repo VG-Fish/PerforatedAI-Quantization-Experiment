@@ -1165,15 +1165,15 @@ coherent explanation for `no_retained_insertion` on both ResNet-18 and SAINT.
   meaning. `mobilenetv2_cifar10` has the same cosine-to-zero recipe and the
   same latent problem; it is deliberately left alone until it is re-run.
 
-- **`_dynamic_training_epoch_cap`** is derived from the PAI schedule instead of
-  a flat `+16`, which could not fit even one dendrite: a switch costs its
-  candidate phase (bounded by `MAX_DENDRITE_PHASE_EPOCHS = 8`, not by the
-  configured `p_epochs_to_switch = 10`) plus an adaptation window. For the
-  priority models the cap is now `+28`.
+- **Dynamic completion has no total-epoch cap.** A dynamic dendritic condition
+  runs until PAI returns `training_complete=True`, for every model. The
+  independent `MAX_DENDRITE_PHASE_EPOCHS = 8` guard remains: it bounds one
+  candidate phase and forces PAI to decide on that candidate, but never ends
+  the full dynamic run.
 
 The dynamic-schedule defaults moved into a single
-`PAI_DYNAMIC_SCHEDULE_DEFAULTS` table in `compat.py`, read by both the PAI
-configuration path and the cap, so the two cannot drift.
+`PAI_DYNAMIC_SCHEDULE_DEFAULTS` table in `compat.py`, read by the PAI
+configuration path.
 
 ### What the fix is, and is not, measured to do
 

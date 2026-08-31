@@ -17,17 +17,17 @@ from dendritic_benchmark.compat import (
     PAIDynamicSchedule,
     _configure_dynamic_pai_schedule,
     _configure_pai_training_schedule,
+    pai_save_path,
     set_pai_root,
     ternary_quantize_tensor,
     ternary_quantize_tensor_per_channel,
 )
 from dendritic_benchmark.data import _make_loader
 from dendritic_benchmark.models import MPNNLayer, GRUForecaster, TCNForecaster, build_model
-from dendritic_benchmark.pipeline import BenchmarkRunner, ConditionTrainingPlan
+from dendritic_benchmark.pipeline import BenchmarkRunner
 from dendritic_benchmark.specs import condition_by_key
 from dendritic_benchmark.training import (
     ArtifactMetadata,
-    MAX_DENDRITE_PHASE_EPOCHS,
     PAI_DENDRITE_PARAM_GROUP_KEY,
     TrainingConfig,
     _apply_lr_schedule,
@@ -40,6 +40,7 @@ from dendritic_benchmark.training import (
     _is_dendrite_parameter_name,
     _make_quantized_copy,
     _optimizer_param_groups,
+    _read_pai_architecture_log,
     _scheduled_learning_rate,
     _write_pai_summary,
 )
@@ -198,6 +199,56 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             raw_switches={"status": "available", "row_count": 2, "switch_epochs": [1, 9]},
         )
         self.assertEqual(verified["status"], "verified_retained")
+
+    def test_dendrite_audit_reads_pai_param_counts_not_stale_best_scores(self) -> None:
+        save_name = "dendrite_csv_test"
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            set_pai_root(root_path / "PAI")
+            raw_pai_dir = root_path / "PAI" / save_name
+            raw_pai_dir.mkdir(parents=True)
+            (raw_pai_dir / f"{save_name}_best_arch_scores.csv").write_text(
+                "Param Counts,Max Valid Scores\n1000,0.8\n"
+            )
+            (raw_pai_dir / f"{save_name}param_counts.csv").write_text(
+                "Switch Number,Param Count\n0,1000\n1,1000\n2,1120\n"
+            )
+            (raw_pai_dir / f"{save_name}switch_epochs.csv").write_text(
+                "Switch Number,Switch Epoch\n0,9\n1,17\n"
+            )
+            metadata = ArtifactMetadata(
+                model_key="gcn",
+                condition_key="dendrites_fp32",
+                display_name="+Dendrites",
+                metric_name="MAE",
+                metric_direction="minimize",
+                primary_metric_key="mae",
+                use_dendrites=True,
+                use_pruning=False,
+                bit_width=32,
+                use_qat=False,
+                fine_tune_epochs=0,
+                regression_loss="smooth_l1",
+                enable_pai_dendrite_updates=True,
+                train_dendrites_until_complete=True,
+                freeze_dendrite_updates_fraction=0.2,
+                pai_candidate_graph_batch_limit=None,
+                memory_cleanup_interval_batches=None,
+                model_scale=0.75,
+                pai_variant="default",
+                pai_fixed_switch_interval=None,
+                pai_dynamic_schedule={"max_dendrites": 1},
+                pai_save_name=save_name,
+                dense_param_count=1000,
+            )
+            raw_architecture = _read_pai_architecture_log(save_name)
+            self.assertTrue(raw_architecture["path"].endswith("param_counts.csv"))
+            self.assertEqual(raw_architecture["max_param_count"], 1120)
+            self.assertEqual(
+                _dendrite_audit(metadata=metadata, param_count=1120)["status"],
+                "verified_retained",
+            )
+        set_pai_root(Path.cwd() / "PAI")
 
     def test_dendritic_parameter_stats_use_final_clean_pai_model(self) -> None:
         wrapped = torch.nn.Linear(2, 2, bias=False)
@@ -740,29 +791,9 @@ class DynamicPAIFollowupTests(unittest.TestCase):
         ]
         self.assertEqual(moved, [False, False, True, True])
 
-    def test_dynamic_epoch_cap_fits_a_whole_dendrite(self) -> None:
-        plan = ConditionTrainingPlan(
-            max_epochs=200, use_qat=False, fine_tune_epochs=0,
-            update_dendrites_during_training=True,
-        )
-        schedule = PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=10)
-        cap = BenchmarkRunner._dynamic_training_epoch_cap(plan, schedule)
-        assert cap is not None
-        # Candidate phase is bounded by MAX_DENDRITE_PHASE_EPOCHS, not by the
-        # configured p_epochs_to_switch of 10.
-        self.assertEqual(
-            cap, 200 + MAX_DENDRITE_PHASE_EPOCHS + BenchmarkRunner._DENDRITE_ADAPTATION_EPOCHS
-        )
-        self.assertGreater(cap, 200 + 16)
-        self.assertIsNone(
-            BenchmarkRunner._dynamic_training_epoch_cap(
-                ConditionTrainingPlan(
-                    max_epochs=200, use_qat=False, fine_tune_epochs=0,
-                    update_dendrites_during_training=False,
-                ),
-                schedule,
-            )
-        )
+    def test_dynamic_training_has_no_total_epoch_cap(self) -> None:
+        self.assertNotIn("max_dynamic_training_epochs", TrainingConfig.__dataclass_fields__)
+        self.assertFalse(hasattr(BenchmarkRunner, "_dynamic_training_epoch_cap"))
 
     def test_changed_model_revision_invalidates_prior_dynamic11_record(self) -> None:
         with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
@@ -792,8 +823,8 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             set_pai_root(root_path / "PAI")
             raw_pai_dir = root_path / "PAI" / "gcn_dendrites_fp32"
             raw_pai_dir.mkdir(parents=True)
-            (raw_pai_dir / "gcn_dendrites_fp32_best_arch_scores.csv").write_text(
-                "Param Counts,Max Valid Scores\n100,0.8\n"
+            (raw_pai_dir / "gcn_dendrites_fp32param_counts.csv").write_text(
+                "Switch Number,Param Count\n0,100\n"
             )
             metadata = ArtifactMetadata(
                 model_key="gcn",

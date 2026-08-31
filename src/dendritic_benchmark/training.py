@@ -60,7 +60,9 @@ _MEMORY_GUARD_CHECK_INTERVAL_BATCHES = 16
 # that a coarse metric on a small validation split can sit still without tripping.
 _COLLAPSE_GUARD_EPOCHS = 12
 QUANTIZATION_EVALUATION_REVISION = "single_projection_v1"
-DENDRITE_AUDIT_REVISION = "retained_dendrite_v1"
+# ``v2`` verifies final retained topology from PAI's raw switch-count log,
+# rather than its best-score table. The latter can retain only the dense row.
+DENDRITE_AUDIT_REVISION = "retained_dendrite_v2"
 _FALLBACK_MODULE_OUTPUT_DIMENSIONS: dict[str, dict[str, list[int]]] = {
     "gcn": {
         ".conv1.linear": [-1, -1, 0],
@@ -80,7 +82,7 @@ _FALLBACK_MODULE_OUTPUT_DIMENSIONS: dict[str, dict[str, list[int]]] = {
 # Hard ceiling on a single PAI dendrite ("p") phase, in epochs.  PAI's own
 # pai_improvement_threshold gates do not reliably end the phase (raising them
 # changed nothing on 91 of 92 switch checks), so this is what actually bounds
-# it.  pipeline.py reads it when sizing the dynamic epoch cap.
+# one candidate phase. It is not a cap on total dynamic training time.
 MAX_DENDRITE_PHASE_EPOCHS = 8
 
 
@@ -172,11 +174,6 @@ class TrainingConfig:
     # guard, so the forced switch happens while the run is still alive.
     # 0 disables the guard.
     max_dendrite_phase_epochs: int = MAX_DENDRITE_PHASE_EPOCHS
-    # Open-ended PAI completion is useful only while it remains close to the
-    # paired dense budget.  A no-improvement tracker can otherwise keep an
-    # already-degraded architecture training forever.  ``None`` retains the
-    # legacy behavior; Dynamic12 supplies an explicit cap per model.
-    max_dynamic_training_epochs: int | None = None
     # Stored only for quantized artifacts. QAT validation already evaluates the
     # projected weights; final evaluation must not quantize them a second time.
     quantization_evaluation_revision: str | None = None
@@ -248,7 +245,6 @@ class ArtifactMetadata:
     dataset_revision: str | None = None
     lr_schedule_epochs: int | None = None
     model_revision: str | None = None
-    max_dynamic_training_epochs: int | None = None
     quantization_evaluation_revision: str | None = None
     dendrite_audit_revision: str | None = None
     dense_param_count: int | None = None
@@ -1365,7 +1361,6 @@ def _write_metrics_and_history(
                 "fine_tune_epochs": metadata.fine_tune_epochs,
                 "regression_loss": metadata.regression_loss,
                 "lr_schedule_epochs": metadata.lr_schedule_epochs,
-                "max_dynamic_training_epochs": metadata.max_dynamic_training_epochs,
                 "quantization_evaluation_revision": (
                     metadata.quantization_evaluation_revision
                 ),
@@ -1607,11 +1602,24 @@ def _load_continued_history(output_dir: Path) -> list[dict[str, Any]]:
 
 
 def _read_pai_architecture_log(save_name: str | None) -> dict[str, Any]:
-    """Read the PAI-owned architecture CSV without treating it as ground truth."""
+    """Read PAI's raw retained-topology count CSV.
+
+    ``*_best_arch_scores.csv`` is a score-selection report, not a topology
+    ledger: after a retained dendrite performs worse than its dense parent it
+    can contain only the earlier dense row. PAI's ``param_counts.csv`` records
+    the architecture at each switch and is the raw evidence needed to compare
+    with the exported final-clean model.
+    """
     if not save_name:
         return {"status": "not_configured"}
     folder = pai_save_path(save_name)
-    path = folder / f"{folder.name}_best_arch_scores.csv"
+    # PAI 3.x writes ``<save>param_counts.csv``. Retain the camel-case form
+    # solely for older PAI artifacts; do not fall back to best_arch_scores.
+    path = folder / f"{folder.name}param_counts.csv"
+    if not path.exists():
+        legacy_path = folder / f"{folder.name}paramCounts.csv"
+        if legacy_path.exists():
+            path = legacy_path
     if not path.exists():
         return {"status": "missing", "path": str(path)}
     try:
@@ -3788,17 +3796,6 @@ def _run_training_epochs(
                 "stopping this condition rather than training a dead network."
             )
             break
-        if (
-            run_until_pai_complete
-            and context.config.max_dynamic_training_epochs is not None
-            and epoch + 1 >= context.config.max_dynamic_training_epochs
-        ):
-            history_row["training_termination_reason"] = "dynamic_epoch_cap"
-            print(
-                f"[PAI cap] {context.run_label}: reached dynamic completion cap "
-                f"at epoch {epoch + 1}; retaining the best validation checkpoint."
-            )
-            break
         # A dynamic condition used to stop the moment PAI finished, sometimes
         # after only a handful of epochs while its dense control received the
         # whole recipe.  Finish PAI when it can, but always give both paired
@@ -3855,7 +3852,6 @@ def _build_artifact_metadata(
         pai_save_name=config.pai_save_name,
         quantization_granularity=config.quantization_granularity,
         lr_schedule_epochs=config.lr_schedule_epochs,
-        max_dynamic_training_epochs=config.max_dynamic_training_epochs,
         quantization_evaluation_revision=config.quantization_evaluation_revision,
         dendrite_audit_revision=config.dendrite_audit_revision,
         dense_param_count=config.dense_param_count,
@@ -3903,7 +3899,6 @@ def _metadata_for_stage(
         pai_save_name=metadata.pai_save_name,
         quantization_granularity=metadata.quantization_granularity,
         lr_schedule_epochs=metadata.lr_schedule_epochs,
-        max_dynamic_training_epochs=metadata.max_dynamic_training_epochs,
         quantization_evaluation_revision=metadata.quantization_evaluation_revision,
         dendrite_audit_revision=metadata.dendrite_audit_revision,
         dense_param_count=metadata.dense_param_count,
