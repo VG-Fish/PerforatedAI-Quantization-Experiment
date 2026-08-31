@@ -1,5 +1,8 @@
 # Measurement caveats: root causes and fixes
 
+<!-- status-banner -->
+> **Status: current reference, dated line numbers.** The caveats and their root causes still hold; the file/line citations point at the commits named in each section and have moved since. Pair it with [DENDRITE_EFFECT_AUDIT_2026-08-30.md](DENDRITE_EFFECT_AUDIT_2026-08-30.md).
+
 Three measurement caveats were recorded (without being fixed) during the `dynamic5`
 run — see `experiments/dynamic5/reference/BENCHMARKS.md` §"The quantization kernels"
 and `experiments/dynamic5/report.md` §6.6. This document traces each one to the

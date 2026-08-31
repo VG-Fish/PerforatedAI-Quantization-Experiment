@@ -1,5 +1,8 @@
 # Model Reference
 
+<!-- status-banner -->
+> **Status: historical reference.** The per-model hyperparameters, dataset preprocessing, and PAI targeting notes here remain the fullest per-model narrative, but the roster, metrics, and metric directions are generated in [CURRENT_GUIDE.md](CURRENT_GUIDE.md) and win any disagreement.
+
 This file centralizes the current per-model configuration used by the benchmark code.
 
 Sources of truth:

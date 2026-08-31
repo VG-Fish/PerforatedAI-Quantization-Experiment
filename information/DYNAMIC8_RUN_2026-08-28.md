@@ -1,5 +1,8 @@
 # dynamic8 run — 2026-08-28 (first post-§8-fix run)
 
+<!-- status-banner -->
+> **Status: historical run report (2026-08-28).** Evidence of what dynamic8 produced. Its numbers were measured before the artifact-manifest and quantization-evaluation revisions, so they are not reportable results; see [EVIDENCE_INDEX.md](EVIDENCE_INDEX.md).
+
 Run facts: commit `49d8f0c`, seed 0, 5 workers (one per model), launched 14:24:56,
 full pipeline (train → compare → graphs → benchmarks → tables) done 14:44:44 —
 **~20 min wall-clock for 60/60 conditions, zero crashes, zero worker restarts.**

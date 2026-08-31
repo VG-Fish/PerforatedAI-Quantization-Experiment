@@ -1,5 +1,8 @@
 # dynamic9 run — 2026-08-28 (first full run under the §10 EMA fix)
 
+<!-- status-banner -->
+> **Status: historical run report (2026-08-28).** Evidence of what dynamic9 produced. Its numbers predate the artifact manifest and are not reportable results; see [EVIDENCE_INDEX.md](EVIDENCE_INDEX.md).
+
 Run facts: commit `d008fcb`, seed 0, 7 workers (one per model), launched 16:05:54,
 full pipeline (verify-gate → train → compare → graphs → benchmarks → tables) done
 17:09:56 — **~64 min wall-clock for 84/84 conditions, zero crashes, zero worker

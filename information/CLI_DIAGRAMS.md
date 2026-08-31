@@ -1,5 +1,8 @@
 # CLI Command Diagrams
 
+<!-- status-banner -->
+> **Status: historical reference.** The flowcharts still describe how each command moves through the pipeline. The option and default tables are superseded by the generated command reference in [CURRENT_GUIDE.md](CURRENT_GUIDE.md), which is rendered from the CLI's own registry.
+
 Mermaid flowcharts for all `uv run dqb` commands.
 
 ---

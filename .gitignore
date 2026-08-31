@@ -17,7 +17,12 @@ sonar-project.properties
 .scannerwork/
 .uv-cache/
 .uv-tools/
-.github/
+# Ignore local GitHub scratch, but track the CI workflow: it is the definition
+# of what has to pass, and scripts/ci.sh runs the same checks locally.
+.github/*
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/ci.yml
 benchmarks/
 .dqb/
 PAI Skills/

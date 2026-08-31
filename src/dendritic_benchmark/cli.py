@@ -19,8 +19,16 @@ from .compat import (
     set_pai_root,
 )
 from .data import DATA_ROOT_ENV, DEFAULT_DATA_ROOT, build_task_bundle, dataset_exists
+from .docs import CURRENT_GUIDE_PATH, current_guide_is_current, write_current_guide
+from .evidence import (
+    EVIDENCE_INDEX_JSON,
+    EVIDENCE_INDEX_MARKDOWN,
+    build_evidence_index,
+    index_roots,
+    write_evidence_index,
+)
 from .log_utils import setup_logging, validate_output_path
-from .model_adapters import selected_model_keys
+from .model_adapters import ALL_MODEL_KEYS, selected_model_keys
 from .pipeline import (
     DEFAULT_JOBS,
     DEFAULT_PROGRESS_INTERVAL,
@@ -36,7 +44,8 @@ from .results import (
     write_model_reports,
     write_per_model_benchmark_plots,
 )
-from .specs import MODEL_SPECS
+from .specs import CONDITION_SPECS, MODEL_SPECS
+from .statistics import MINIMUM_PAIRED_SEEDS
 
 try:
     import argcomplete as _argcomplete
@@ -51,20 +60,11 @@ def _log(msg: str) -> None:
     print(f"[{ts}] {msg}")
 
 
-_MODEL_KEYS: str = (
-    "lenet5, m5, lstm_forecaster, textcnn, gcn, tabnet, mpnn, actor_critic, "
-    "lstm_autoencoder, distilbert, dqn_lunarlander, ppo_bipedalwalker, "
-    "attentivefp_freesolv, gin_imdbb, tcn_forecaster, gru_forecaster, "
-    "pointnet_modelnet40, vae_mnist, snn_nmnist, resnet18_cifar10, "
-    "resnet18_hf_perforated_cifar10, "
-    "mobilenetv2_cifar10, saint_adult, capsnet_mnist"
-)
+# Help text is rendered from the registries so that adding a model or a
+# condition cannot leave the CLI describing a roster that no longer exists.
+_MODEL_KEYS: str = ", ".join(ALL_MODEL_KEYS)
 
-_CONDITION_KEYS: str = (
-    "base_fp32, base_q8, base_q4, base_q2, base_q1_58, base_q1, "
-    "dendrites_fp32, dendrites_q8, dendrites_q4, dendrites_q2, "
-    "dendrites_q1_58, dendrites_q1"
-)
+_CONDITION_KEYS: str = ", ".join(spec.key for spec in CONDITION_SPECS)
 
 _CLEAN_CONFIG_PATH = Path(".dqb") / "command_config.json"
 _CLEAN_CONFIG_VERSION = 1
@@ -600,6 +600,20 @@ def build_parser() -> argparse.ArgumentParser:
             f"Valid keys: {_MODEL_KEYS}"
         ),
     )
+    compare_parser.add_argument(
+        "--seed-roots",
+        nargs="+",
+        metavar="DIR",
+        help=(
+            "Additional results roots holding the same models and conditions "
+            "under different seeds. Their records join the seed-paired "
+            "statistics in comparison/dendrite_effect_statistics.csv and the "
+            "effect columns of dendrite_audit.csv; they do not change the "
+            f"plots. A dendrite effect is only claimable with {MINIMUM_PAIRED_SEEDS} "
+            "paired seeds, so without this the statistics stay at "
+            "'insufficient_seeds' whenever each seed has its own root."
+        ),
+    )
 
     generate_graphs_parser: argparse.ArgumentParser = subparsers.add_parser(
         "generate_graphs",
@@ -723,6 +737,79 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Print the paths that would be removed without deleting anything.",
+    )
+
+    docs_parser: argparse.ArgumentParser = subparsers.add_parser(
+        "docs",
+        help="Regenerate the current-state guide from the code registries.",
+        description=(
+            "Renders information/CURRENT_GUIDE.md from the model/condition specs, "
+            "the artifact-validity rules, and this CLI's own option registry, so "
+            "the current documentation cannot drift from the code that runs the "
+            "experiment. Hand-written history under information/ is indexed by "
+            "information/HISTORICAL_INDEX.md and is never regenerated."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    docs_parser.add_argument(
+        "--output",
+        type=Path,
+        default=CURRENT_GUIDE_PATH,
+        help=(
+            "Path to write the generated guide to. "
+            f"(default: {CURRENT_GUIDE_PATH})"
+        ),
+    )
+    docs_parser.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Do not write anything; exit non-zero when the checked-in guide no "
+            "longer matches the registries. Intended for CI."
+        ),
+    )
+
+    evidence_parser: argparse.ArgumentParser = subparsers.add_parser(
+        "evidence_index",
+        help="Index the generated result trees before archiving or deleting them.",
+        description=(
+            "Walks the generated roots, records every training record it finds "
+            "with its run namespace, artifact id, seed, metric, and manifest "
+            "verdict, and writes both a machine-readable JSON index and a "
+            "markdown summary. Run this before removing any generated tree: the "
+            "index is what survives the deletion."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    evidence_parser.add_argument(
+        "--roots",
+        nargs="+",
+        default=None,
+        help=(
+            "Generated roots to index. (default: results, experiments, "
+            "comparison, logs, logs_top10, logs_dynamic5, archive)"
+        ),
+    )
+    evidence_parser.add_argument(
+        "--verify",
+        action="store_true",
+        help=(
+            "Re-hash every manifest-owned file instead of only reading the "
+            "provenance files. Slow, and required before archiving or deleting "
+            "a tree."
+        ),
+    )
+    evidence_parser.add_argument(
+        "--json-output",
+        type=Path,
+        default=EVIDENCE_INDEX_JSON,
+        help=f"Path for the machine-readable index. (default: {EVIDENCE_INDEX_JSON})",
+    )
+    evidence_parser.add_argument(
+        "--markdown-output",
+        type=Path,
+        default=EVIDENCE_INDEX_MARKDOWN,
+        help=f"Path for the readable summary. (default: {EVIDENCE_INDEX_MARKDOWN})",
     )
 
     return parser
@@ -877,7 +964,22 @@ def _handle_compare(args: Any, results_root: Path, comparison_root: Path) -> Non
         model_records = [record for record in records if record["model_key"] == model_spec.key]
         if model_records:
             write_model_reports(model_spec.display_name, model_records, results_root / model_spec.key)
-    write_comparison_reports(records, comparison_root, model_keys=getattr(args, "models", None))
+    # One results root holds one seed. The other seeds' roots are loaded only
+    # for the seed-paired statistics; the plots stay on this run's records.
+    seed_records: list[dict[str, Any]] = []
+    for raw_root in getattr(args, "seed_roots", None) or []:
+        seed_root = Path(raw_root)
+        if seed_root.resolve() == results_root.resolve():
+            continue
+        loaded = load_training_records(seed_root)
+        _log(f"[compare] Loaded {len(loaded)} record(s) from seed root {seed_root}.")
+        seed_records.extend(loaded)
+    write_comparison_reports(
+        records,
+        comparison_root,
+        model_keys=getattr(args, "models", None),
+        seed_records=seed_records or None,
+    )
     write_per_model_benchmark_plots(Path(getattr(args, "benchmark_root", "benchmarks")), comparison_root)
 
 
@@ -928,6 +1030,40 @@ def _handle_clean(args: Any) -> None:
     _log(f"[clean] Complete. Removed {removed} target(s), skipped {skipped}.")
 
 
+def _handle_docs(args: Any) -> None:
+    output = Path(args.output)
+    if args.check:
+        if current_guide_is_current(output):
+            _log(f"[docs] {output} is current.")
+            return
+        _log(
+            f"[docs] {output} is stale or missing. "
+            "Run 'uv run dqb docs' and commit the result."
+        )
+        sys.exit(1)
+    written = write_current_guide(output)
+    _log(f"[docs] Wrote {written}.")
+
+
+def _handle_evidence_index(args: Any) -> None:
+    roots = index_roots(args.roots)
+    _log(
+        f"[evidence] Indexing {', '.join(roots)}"
+        + (" with manifest hash verification." if args.verify else ".")
+    )
+    index = build_evidence_index(roots, verify=args.verify)
+    json_path, markdown_path = write_evidence_index(
+        index,
+        json_path=Path(args.json_output),
+        markdown_path=Path(args.markdown_output),
+    )
+    _log(
+        f"[evidence] Indexed {len(index.artifacts)} training record(s) across "
+        f"{sum(1 for summary in index.roots if summary.exists)} root(s)."
+    )
+    _log(f"[evidence] Wrote {json_path} and {markdown_path}.")
+
+
 def main() -> None:
     os.environ.update(load_project_environment())
     torch.multiprocessing.set_sharing_strategy("file_system")
@@ -935,8 +1071,17 @@ def main() -> None:
     if argcomplete is not None:
         argcomplete.autocomplete(parser)
     args = parser.parse_args()
+    # These commands describe or inventory the repository itself. They own no
+    # result namespace, so they run before any results root is resolved or any
+    # log directory is created.
     if args.command == "clean":
         _handle_clean(args)
+        return
+    if args.command == "docs":
+        _handle_docs(args)
+        return
+    if args.command == "evidence_index":
+        _handle_evidence_index(args)
         return
 
     try:

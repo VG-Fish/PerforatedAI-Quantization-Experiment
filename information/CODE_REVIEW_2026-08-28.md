@@ -1,5 +1,8 @@
 # Full-code deep dive — 2026-08-28
 
+<!-- status-banner -->
+> **Status: historical (2026-08-28).** A point-in-time review whose fixes are already in the tree. Current open findings live in [audit/audit_report.md](audit/audit_report.md).
+
 Scope: every line of `src/dendritic_benchmark/` (12 modules, 14,318 lines), read
 end-to-end in one pass, looking for correctness bugs ahead of the next training
 run. Uncommitted §8 fixes (training.py) were already in the tree and are treated

@@ -4,6 +4,7 @@ import unittest
 from copy import deepcopy
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import torch
@@ -637,7 +638,12 @@ class DynamicPAIFollowupTests(unittest.TestCase):
         )
         # The floor is opt-in: the default must reproduce the old schedule.
         self.assertEqual(TrainingConfig().dendrite_lr_min_factor, 0.0)
-        optimizer = type("_Opt", (), {})()
+        # A minimal stand-in for torch.optim.Optimizer: _apply_lr_schedule only
+        # ever reads and writes param_groups.
+        class _Opt:
+            param_groups: list[dict[str, Any]]
+
+        optimizer = _Opt()
         optimizer.param_groups = [
             {"lr": 0.0, PAI_DENDRITE_PARAM_GROUP_KEY: False},
             {"lr": 0.0, PAI_DENDRITE_PARAM_GROUP_KEY: True},
@@ -741,6 +747,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
         )
         schedule = PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=10)
         cap = BenchmarkRunner._dynamic_training_epoch_cap(plan, schedule)
+        assert cap is not None
         # Candidate phase is bounded by MAX_DENDRITE_PHASE_EPOCHS, not by the
         # configured p_epochs_to_switch of 10.
         self.assertEqual(

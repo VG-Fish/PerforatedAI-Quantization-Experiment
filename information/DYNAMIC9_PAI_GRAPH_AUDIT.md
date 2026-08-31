@@ -1,5 +1,8 @@
 # dynamic9 mid-run PAI graph audit — 2026-08-28 (~16:50, run still in progress)
 
+<!-- status-banner -->
+> **Status: superseded (2026-08-30).** Its finding that dendrites are inserted and retained still stands; its verdict that perforation is therefore *working* does not — it never tested the effect against noise. See [DENDRITE_EFFECT_AUDIT_2026-08-30.md](DENDRITE_EFFECT_AUDIT_2026-08-30.md).
+
 Prompted by the user's concern that "the models are not being properly perforated."
 Method: the seven skills in `PAI Skills/skills/` (chiefly `perforatedai-analyze`) applied
 to `experiments/dynamic9/results/PAI/*` — switch_epochs, param_counts, best_arch_scores,

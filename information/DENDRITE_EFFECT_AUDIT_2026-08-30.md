@@ -1,5 +1,8 @@
 # Dendrite effect audit: does perforation beat noise and more training?
 
+<!-- status-banner -->
+> **Status: current scientific verdict (2026-08-30).** This is the standing answer to whether dendrites beat run noise and more training. It supersedes the verdict in [DYNAMIC9_PAI_GRAPH_AUDIT.md](DYNAMIC9_PAI_GRAPH_AUDIT.md).
+
 **Date:** 2026-08-30
 **Scope:** every `dendrites_fp32` run under `experiments/dynamic12/`
 **Question:** not "were dendrites added?" but "did they *help*, by more than this run's own

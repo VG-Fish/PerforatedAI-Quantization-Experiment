@@ -1,5 +1,8 @@
 # Dendritic Quantization Benchmark: Documentation
 
+<!-- status-banner -->
+> **Status: historical reference.** Written before the 2026-08-30 audits. The model roster, condition grid, and command reference here are superseded by the generated [CURRENT_GUIDE.md](CURRENT_GUIDE.md); its experiment rationale, PerforatedAI integration notes, and quantization background are still the fullest account and are cited as such. Where the two disagree, the generated guide is the current state.
+
 This document consolidates all project documentation: the experiment plan, extended model proposals, script architecture, and CLI usage guide.
 
 ---

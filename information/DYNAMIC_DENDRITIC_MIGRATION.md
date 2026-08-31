@@ -1,5 +1,8 @@
 # Dynamic Dendritic Run — Migration Guide
 
+<!-- status-banner -->
+> **Status: historical migration plan.** The migration it proposes is done: HISTORY scheduling is the default and fixed-interval switching is diagnostic-only. Remaining proposals in this file are not current plans; read them as the reasoning behind a completed change.
+
 Migration plan for switching from the current bounded (FIXED_SWITCH) dendritic pipeline to a proper dynamic (DOING_HISTORY) run driven by PerforatedAI's own completion signal. Also enables saving PAI-generated training graphs, which are currently suppressed.
 
 Everything in this doc is grounded in the current codebase and the 23-model result set in `results/`. File and line references point to the exact spots that need editing.

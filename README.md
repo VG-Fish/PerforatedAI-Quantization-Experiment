@@ -46,6 +46,23 @@ uv sync
 
 The benchmark downloads public datasets on first use and caches them under `data/` by default. Set `DQB_DATA_ROOT=/path/to/cache` if you want the datasets stored somewhere else.
 
+`uv sync` installs the runtime dependencies plus the `dev` group (`pytest`, `ty`). The
+static-analysis tools are a separate group: `uv sync --group audit` adds `vulture`,
+`bandit`, and `deadcode`.
+
+## Checks
+
+```bash
+./scripts/ci.sh
+```
+
+Runs `ty check`, the test suite, and the generated-documentation check — the same three
+steps `.github/workflows/ci.yml` runs on push and pull request. Everything in it is
+offline and CPU-only: no dataset is downloaded, no model is built, and no result tree is
+written. The suite includes a smoke matrix over all 24 models × 12 conditions, property
+tests on the artifact manifest that decides what is reportable, and the seed-paired
+statistics that gate every dendrite claim.
+
 ## Run
 
 ```bash
@@ -194,6 +211,13 @@ uv run dqb benchmark_models --batch-sizes 1 32 --num-runs 10
 uv run dqb benchmark_models --benchmark-root my_benchmarks
 uv run dqb benchmark_models --comparison-root comparison
 
+# Regenerate the current-state guide (and verify it in CI)
+uv run dqb docs
+uv run dqb docs --check
+
+# Inventory the generated evidence trees before archiving or deleting them
+uv run dqb evidence_index
+
 # Remove generated outputs recorded in .dqb/command_config.json
 uv run dqb clean --dry-run
 uv run dqb clean
@@ -217,24 +241,30 @@ an existing terminal does not pick up completion immediately, open a new shell.
 
 ## Documentation
 
-The repository includes extended documentation under the `information/` directory. Below are short summaries with links to the full markdown files.
+Start with the generated current-state guide. It is rendered from the code that runs
+the experiment — the model/condition registries, the artifact-validity rules, and this
+CLI's own option registry — so it cannot drift from what the repository actually does:
 
-- `information/DOCUMENTATION.md` — Comprehensive project documentation (recommended start):
-	- Experiment plan for the full 25-model benchmark condition grid (per-model and cross-model graphs).
-	- Execution strategy targeting Apple M3 Pro (MPS) and PyTorch integration notes.
-	- Detailed PerforatedAI (PAI) integration steps, quantization (`torchao`) and pruning examples, and training loop hooks.
-	- Round-2 expansion with 15 additional models and research findings from a preliminary run.
+- [information/CURRENT_GUIDE.md](information/CURRENT_GUIDE.md) — model roster, condition
+  grid, what makes a result reportable, and the full command reference.
+  Regenerate with `uv run dqb docs`; CI runs `uv run dqb docs --check`.
 
-- `information/CLI_DIAGRAMS.md` — CLI reference and diagrams:
-	- Command summaries and Mermaid flowcharts for `uv run dqb run`, `uv run dqb download_data`, `uv run dqb compare`, `uv run dqb generate_graphs`, `uv run dqb benchmark_models`, and `uv run dqb clean`.
-	- Global CLI flags and the recommended output directory layout.
+Everything else under `information/` is hand-written and indexed by status:
 
-Read the full documents for architecture details, hypotheses, and example commands:
+- [information/HISTORICAL_INDEX.md](information/HISTORICAL_INDEX.md) — every document,
+  whether it is current, historical, or superseded, and what it may still be cited for.
+- [information/RETENTION_POLICY.md](information/RETENTION_POLICY.md) — which generated
+  trees may be archived or deleted, and what must exist first.
+- [information/EVIDENCE_INDEX.md](information/EVIDENCE_INDEX.md) — the generated
+  inventory of every training record on disk, its run namespace, and its manifest
+  verdict. Rebuild with `uv run dqb evidence_index`.
+- [information/DENDRITE_EFFECT_AUDIT_2026-08-30.md](information/DENDRITE_EFFECT_AUDIT_2026-08-30.md)
+  — the standing verdict on whether the dendrite effect beats noise and more training.
+- [information/audit/audit_report.md](information/audit/audit_report.md) — the cleanup
+  priority ledger and its implementation updates.
 
-[DOCUMENTATION.md](information/DOCUMENTATION.md)
-
-[CLI_DIAGRAMS.md](information/CLI_DIAGRAMS.md)
-
+Historical documents keep their original numbers on purpose. When one disagrees with
+the generated guide, the generated guide is the current state.
 
 ## Available commands (uv run dqb)
 
@@ -268,13 +298,18 @@ The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` f
 
 - `uv run dqb compare`
 	- Rebuilds comparison charts and summary reports from saved `record.json` files in `results/` without retraining.
-	- Useful flags: `--manifest` (write a manifest CSV), `--results-root`, `--results-directory`, `--comparison-root`.
+	- Also writes two audit tables to `--comparison-root`: `dendrite_audit.csv` (per-arm validity, requested vs observed switch schedule, termination reason, effect verdict) and `dendrite_effect_statistics.csv` (paired seeds, noise floor, mean improvement, p-value, verdict).
+	- Useful flags: `--manifest` (write a manifest CSV), `--seed-roots` (other seeds' results roots), `--results-root`, `--results-directory`, `--comparison-root`.
+	- `--seed-roots` is what makes the statistics usable: one results root holds one seed, and a dendrite effect is only claimable on three paired seeds. Without it every effect verdict stays `insufficient_seeds`.
 	- Examples:
         ```bash
         uv run dqb compare
         uv run dqb --results-directory experiment_a compare
         uv run dqb compare --manifest
         uv run dqb compare --results-root results --comparison-root comparison
+        uv run dqb --results-root experiments/dynamic12/tcn_audited_default/seed_0/results compare \
+            --seed-roots experiments/dynamic12/tcn_audited_default/seed_1/results \
+                         experiments/dynamic12/tcn_audited_default/seed_2/results
         ```
 
 - `uv run dqb generate_graphs`
@@ -312,6 +347,24 @@ The CLI exposes several helpful subcommands. See `information/CLI_DIAGRAMS.md` f
         ```bash
         uv run dqb clean --dry-run
         uv run dqb clean
+        ```
+
+- `uv run dqb docs`
+	- Regenerates `information/CURRENT_GUIDE.md` from the model/condition registries, the artifact-validity rules, and the CLI option registry. Hand-written history under `information/` is never regenerated.
+	- `--check` writes nothing and exits non-zero when the checked-in guide no longer matches the code. This is what CI runs.
+	- Examples:
+        ```bash
+        uv run dqb docs
+        uv run dqb docs --check
+        ```
+
+- `uv run dqb evidence_index`
+	- Walks the generated roots (`results`, `experiments`, `comparison`, `logs*`, `archive`) and writes `information/evidence_index.json` plus `information/EVIDENCE_INDEX.md`: every training record on disk with its run namespace, artifact id, seed, metric, and manifest verdict.
+	- `--verify` re-hashes every manifest-owned file. Run it before archiving or deleting any tree — see `information/RETENTION_POLICY.md`.
+	- Examples:
+        ```bash
+        uv run dqb evidence_index
+        uv run dqb evidence_index --verify --roots experiments/dynamic12
         ```
 
 - `uv run dqb --help`

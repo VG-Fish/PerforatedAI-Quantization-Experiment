@@ -127,3 +127,56 @@ The first P1 implementation pass established explicit policy boundaries without 
 - The open correctness/security findings for unchecked OFF loop bounds, implicit reductions, exact float comparisons, the redundant exception, and unused parameters were addressed and covered by focused P1 tests.
 
 The larger recipe table, PAI targeting policy, metric implementations, and epoch engine remain candidates for subsequent extraction; this pass does not claim that every P1 complexity finding is eliminated.
+
+## P2 implementation update (2026-08-31)
+
+The P2 pass closed both P2 objectives without deleting any generated material.
+
+**Documentation consolidation.** `docs.py` renders `information/CURRENT_GUIDE.md` from the
+registries that own the truth — `specs.py`/`model_adapters.py` for the roster, `artifacts.py`
+and `statistics.py` for the validity contract, and the `cli.py` argparse registry for the
+command reference — so the current documentation can no longer drift from the code.
+`uv run dqb docs --check` fails when the checked-in guide is stale and runs in CI. The CLI's
+own model/condition help strings are now derived from the registries instead of being
+restated. Every hand-written document under `information/` carries a status banner
+(current / historical / superseded) and is listed in `information/HISTORICAL_INDEX.md` with
+what it may still be cited for; `tests/test_p2_docs.py` fails if a document is unbanded or
+unindexed.
+
+**Evidence indexing and retention.** `evidence.py` plus `dqb evidence_index` walk the
+generated roots and write `information/evidence_index.json` and `EVIDENCE_INDEX.md`: every
+training record on disk with its run namespace, artifact id, seed, metric, and manifest
+verdict, plus per-root size and file counts. The first index found **537 training records
+across 26.6 GB, every one of them reporting `unknown`** — all stored evidence predates the
+artifact manifest and cannot be made reportable without being re-run. That result is
+precisely why nothing was deleted. `information/RETENTION_POLICY.md` records the categories,
+the deletion prerequisites, and the current disposition of each tree; `--verify` re-hashes
+manifest-owned files and is required before any tree is archived or removed.
+
+**Statistical validation.** `statistics.py` owns the seed-paired effect estimate: paired
+differences signed by metric direction, the dense control's own seed spread as the noise
+floor, an exact Student-t p-value (verified against published critical values), and a
+verdict that is `insufficient_seeds` below three paired seeds no matter how large the
+difference looks. `compare` now writes `dendrite_effect_statistics.csv` next to the
+comparison plots, and `dendrite_audit.csv` gained `paired_seed_count`, `mean_improvement`,
+`noise_floor`, `effect_p_value`, and `effect_verdict`. Arms whose artifact does not validate
+are dropped from the statistics rather than contributing a stale number.
+
+**Tests and tooling.** The suite went from 35 tests to 87 tests and 716 subtests:
+`test_p2_matrix_smoke.py` walks all 24 models × 12 conditions (minus the intended HF
+exclusions) through recipe resolution, condition planning, constructor kwargs, dependency
+ordering, and PAI namespace minting without training anything;
+`test_p2_artifact_properties.py` attacks the manifest file-by-file and field-by-field;
+`test_p2_statistics.py` pins the arithmetic and the three-seed gate; `test_p2_docs.py`
+enforces documentation sync. `ty check` now reports **0 diagnostics** (was 13 under the
+alpha, 6 under ty 0.0.59), with the version pinned in the `dev` dependency group and the
+interpreter pinned to the package's 3.12 support floor. Developer and audit tooling moved
+out of the runtime dependencies into `dev`/`audit` dependency groups.
+`sonar-project.properties` lost its duplicate `sonar.projectKey` and its obsolete
+`issuesReport` settings, declares `sonar.tests`, and analyses against 3.12/3.13 instead of
+3.8–3.14. `scripts/ci.sh` runs `ty check`, the tests, and the documentation check, and
+`.github/workflows/ci.yml` runs that same script on push and pull request.
+
+Not done in this pass, and deliberately so: no generated tree, archive, log root, or
+dataset cache was deleted. The audit's own precondition — an index and a retention policy —
+now exists, so deletion is a separate, reviewable change.

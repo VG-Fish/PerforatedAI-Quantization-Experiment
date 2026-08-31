@@ -1,5 +1,8 @@
 # Remaining Comparability Fixes — Handoff
 
+<!-- status-banner -->
+> **Status: historical handoff (2026-08-07).** Provenance for the baseline-quality pass. Do not read as current instructions; §3's outstanding retraining is tracked by the audit ledger in [audit/audit_report.md](audit/audit_report.md).
+
 Status as of 2026-08-07. This document is a handoff to an agent picking up work
 on making this benchmark's FP32 baselines comparable to published results.
 

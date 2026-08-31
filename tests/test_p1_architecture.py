@@ -99,7 +99,7 @@ class P1ArchitectureTests(unittest.TestCase):
         self.assertEqual(plan.identity()["dataset_revision"], "data-1")
         self.assertEqual(plan.identity()["source_condition_key"], "dendrites_fp32")
         with self.assertRaises(FrozenInstanceError):
-            plan.seed = 8  # type: ignore[misc]
+            setattr(plan, "seed", 8)
 
     def test_off_parser_rejects_unbounded_or_truncated_counts(self) -> None:
         with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]

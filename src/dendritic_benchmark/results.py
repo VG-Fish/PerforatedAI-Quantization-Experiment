@@ -1,5 +1,6 @@
 import csv
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,13 @@ from .plots import (
     winner_heatmap,
 )
 from .specs import CONDITION_SPECS, MODEL_SPECS, condition_by_key
+from .statistics import (
+    VERDICT_INSUFFICIENT_SEEDS,
+    EffectEstimate,
+    SeedObservation,
+    estimate_all_effects,
+    group_seed_observations,
+)
 from .training import QUANTIZATION_EVALUATION_REVISION, TrainingRecord
 
 _BEST_MODEL_STATS_CSV = "best_model_stats.csv"
@@ -174,15 +182,17 @@ def _dendrite_audit_status(record: dict[str, Any]) -> str:
     return "unknown"
 
 
+def _identity_field(record: dict[str, Any], name: str) -> str | None:
+    value = record.get(name)
+    return value if isinstance(value, str) and value else None
+
+
 def _artifact_verdict(record: dict[str, Any]) -> ArtifactVerdict:
-    artifact_dir = record.get("artifact_dir")
-    artifact_id = record.get("artifact_id")
-    model_key = record.get("model_key")
-    condition_key = record.get("condition_key")
-    if not all(
-        isinstance(value, str) and value
-        for value in (artifact_dir, artifact_id, model_key, condition_key)
-    ):
+    artifact_dir = _identity_field(record, "artifact_dir")
+    artifact_id = _identity_field(record, "artifact_id")
+    model_key = _identity_field(record, "model_key")
+    condition_key = _identity_field(record, "condition_key")
+    if artifact_dir is None or artifact_id is None or model_key is None or condition_key is None:
         return ArtifactVerdict(
             "unknown", "record is not bound to an artifact manifest identity"
         )
@@ -192,6 +202,37 @@ def _artifact_verdict(record: dict[str, Any]) -> ArtifactVerdict:
         expected_model_key=model_key,
         expected_condition_key=condition_key,
     )
+
+
+def _verdict_key(record: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(record.get("artifact_dir", "")),
+        str(record.get("artifact_id", "")),
+    )
+
+
+def _verdicts_for(records: list[dict[str, Any]]) -> dict[tuple[str, str], ArtifactVerdict]:
+    """Validate each artifact once per reporting pass.
+
+    Validation re-hashes every manifest-owned file, ``model.pt`` included, so
+    the audit table, the reportability filter and the seed statistics share one
+    verdict per artifact instead of re-reading gigabytes three times over.
+    """
+    verdicts: dict[tuple[str, str], ArtifactVerdict] = {}
+    for record in records:
+        key = _verdict_key(record)
+        if key not in verdicts:
+            verdicts[key] = _artifact_verdict(record)
+    return verdicts
+
+
+def _cached_verdict(
+    record: dict[str, Any],
+    verdicts: dict[tuple[str, str], ArtifactVerdict] | None,
+) -> ArtifactVerdict:
+    if verdicts is None:
+        return _artifact_verdict(record)
+    return verdicts.get(_verdict_key(record)) or _artifact_verdict(record)
 
 
 def _condition_is_quantized(record: dict[str, Any]) -> bool:
@@ -239,12 +280,50 @@ def _record_is_reportable(
     return True
 
 
-def _write_dendrite_audit(records: list[dict[str, Any]], output_dir: Path) -> None:
+def _effect_columns(estimate: EffectEstimate | None) -> dict[str, Any]:
+    """Seed-paired effect columns for one dendritic row of the audit CSV."""
+    if estimate is None:
+        return {
+            "paired_seed_count": 0,
+            "mean_improvement": "",
+            "noise_floor": "",
+            "effect_p_value": "",
+            "effect_verdict": VERDICT_INSUFFICIENT_SEEDS,
+        }
+    return {
+        "paired_seed_count": estimate.seed_count,
+        "mean_improvement": estimate.mean_improvement,
+        "noise_floor": estimate.noise_floor,
+        "effect_p_value": "" if estimate.p_value is None else estimate.p_value,
+        "effect_verdict": estimate.verdict,
+    }
+
+
+def _write_dendrite_audit(
+    records: list[dict[str, Any]],
+    output_dir: Path,
+    statistics_records: list[dict[str, Any]] | None = None,
+    verdicts: dict[tuple[str, str], ArtifactVerdict] | None = None,
+) -> None:
+    # The effect columns are computed from reportable arms only: an unverified
+    # artifact may appear as an audited row, but must never contribute to the
+    # seed statistics that a dendrite claim rests on. ``statistics_records``
+    # carries the other seeds' arms, which live in sibling result roots.
+    pool = records if statistics_records is None else statistics_records
+    reportable = [
+        record
+        for record in pool
+        if _record_is_reportable(record, _cached_verdict(record, verdicts))
+    ]
+    effects = {
+        (estimate.model_key, estimate.condition_key): estimate
+        for estimate in dendrite_effect_estimates(reportable, verdicts)
+    }
     rows: list[dict[str, Any]] = []
     for record in records:
         if not str(record.get("condition_key", "")).startswith("dendrites_"):
             continue
-        verdict = _artifact_verdict(record)
+        verdict = _cached_verdict(record, verdicts)
         manifest = verdict.manifest or {}
         schedule = manifest.get("telemetry", {}).get("pai_schedule", {})
         requested = schedule.get("requested", {})
@@ -274,6 +353,14 @@ def _write_dendrite_audit(records: list[dict[str, Any]], output_dir: Path) -> No
                     "termination_reason", "unknown"
                 ),
                 "reportable": _record_is_reportable(record, verdict),
+                **_effect_columns(
+                    effects.get(
+                        (
+                            str(record.get("model_key", "")),
+                            str(record.get("condition_key", "")),
+                        )
+                    )
+                ),
             }
         )
     with (output_dir / "dendrite_audit.csv").open("w", newline="") as fh:
@@ -283,6 +370,71 @@ def _write_dendrite_audit(records: list[dict[str, Any]], output_dir: Path) -> No
         writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _seed_observation(
+    record: dict[str, Any], verdict: ArtifactVerdict
+) -> tuple[str, str, SeedObservation] | None:
+    """Return one statistical observation, or ``None`` if the arm cannot pair.
+
+    The seed lives in the artifact manifest identity rather than the record, so
+    an arm whose manifest is unverified is silently unusable for statistics —
+    exactly the outcome we want, since an unverified artifact must never enter
+    an effect claim.
+    """
+    manifest = verdict.manifest
+    if not verdict.valid or manifest is None:
+        return None
+    identity = manifest.get("identity")
+    seed = identity.get("seed") if isinstance(identity, dict) else None
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        return None
+    model_key = record.get("model_key")
+    condition_key = record.get("condition_key")
+    if not isinstance(model_key, str) or not isinstance(condition_key, str):
+        return None
+    try:
+        metric_value = float(record["metric_value"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(metric_value):
+        return None
+    return (
+        model_key,
+        condition_key,
+        SeedObservation(seed=seed, metric_value=metric_value),
+    )
+
+
+def dendrite_effect_estimates(
+    records: list[dict[str, Any]],
+    verdicts: dict[tuple[str, str], ArtifactVerdict] | None = None,
+) -> list[EffectEstimate]:
+    """Pair every dendritic arm with its dense control across seeds."""
+    observations = []
+    for record in records:
+        observation = _seed_observation(record, _cached_verdict(record, verdicts))
+        if observation is not None:
+            observations.append(observation)
+    return estimate_all_effects(group_seed_observations(observations))
+
+
+def _write_effect_statistics(
+    records: list[dict[str, Any]],
+    output_dir: Path,
+    verdicts: dict[tuple[str, str], ArtifactVerdict] | None = None,
+) -> list[EffectEstimate]:
+    """Write the seed-paired effect table used to judge dendrite claims."""
+    estimates = dendrite_effect_estimates(records, verdicts)
+    with (output_dir / "dendrite_effect_statistics.csv").open("w", newline="") as fh:
+        if not estimates:
+            fh.write("")
+            return estimates
+        rows = [estimate.to_row() for estimate in estimates]
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    return estimates
 
 
 def write_model_reports(
@@ -421,6 +573,7 @@ def write_comparison_reports(
     records: list[dict[str, Any]],
     output_dir: Path,
     model_keys: list[str] | None = None,
+    seed_records: list[dict[str, Any]] | None = None,
 ) -> None:
     """Write cross-model comparison plots and summary.csv to ``output_dir``.
 
@@ -428,10 +581,29 @@ def write_comparison_reports(
     subset (in ``MODEL_SPECS`` order) instead of the full roster — e.g. so a
     heatmap over a handful of trained models doesn't carry blank rows for
     every model that was never run.
+
+    ``seed_records`` supplies the arms from other seeds. One results root holds
+    one seed, so without it the seed-paired statistics could never reach the
+    three paired seeds a dendrite claim requires. The plots stay on ``records``:
+    they compare conditions within one run.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    _write_dendrite_audit(records, output_dir)
-    records = [record for record in records if _record_is_reportable(record)]
+    statistics_pool = records if seed_records is None else [*records, *seed_records]
+    verdicts = _verdicts_for(statistics_pool)
+    _write_dendrite_audit(
+        records, output_dir, statistics_records=statistics_pool, verdicts=verdicts
+    )
+    reportable_pool = [
+        record
+        for record in statistics_pool
+        if _record_is_reportable(record, _cached_verdict(record, verdicts))
+    ]
+    _write_effect_statistics(reportable_pool, output_dir, verdicts)
+    records = [
+        record
+        for record in records
+        if _record_is_reportable(record, _cached_verdict(record, verdicts))
+    ]
     baselines = _baseline_lookup(records)
     model_specs = (
         [spec for spec in MODEL_SPECS if spec.key in set(model_keys)]
