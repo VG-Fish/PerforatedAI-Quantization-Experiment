@@ -28,6 +28,7 @@ from dendritic_benchmark.pipeline import BenchmarkRunner
 from dendritic_benchmark.specs import condition_by_key
 from dendritic_benchmark.training import (
     ArtifactMetadata,
+    EpochTrainingContext,
     PAI_DENDRITE_PARAM_GROUP_KEY,
     TrainingConfig,
     _apply_lr_schedule,
@@ -41,6 +42,7 @@ from dendritic_benchmark.training import (
     _make_quantized_copy,
     _optimizer_param_groups,
     _read_pai_architecture_log,
+    _run_training_epochs,
     _scheduled_learning_rate,
     _write_pai_summary,
 )
@@ -300,6 +302,66 @@ class DynamicPAIFollowupTests(unittest.TestCase):
 
         self.assertEqual(pc.values["set_switch_mode"], "history")
 
+    def test_dynamic_completion_stops_immediately(self) -> None:
+        """An open-ended PAI run must stop on its completion epoch."""
+
+        class _EpochProgress:
+            def __iter__(self):
+                return iter(range(5))
+
+            def close(self) -> None:
+                pass
+
+        context = EpochTrainingContext(
+            model=torch.nn.Linear(1, 1),
+            model_key="gcn",
+            bundle=None,
+            device=torch.device("cpu"),
+            criterion=None,
+            torch=torch,
+            max_epochs=3,
+            run_label="gcn | dendrites_fp32",
+            config=TrainingConfig(
+                use_dendrites=True,
+                enable_pai_dendrite_updates=True,
+                train_dendrites_until_complete=True,
+            ),
+            metric_name="Accuracy",
+            primary_metric_key="accuracy",
+            metric_direction="maximize",
+        )
+
+        def record_epoch(*, state, epoch, **_kwargs):
+            row = {"epoch": epoch + 1, "val_metric": 0.5}
+            state.history.append(row)
+            return row, 0.5
+
+        def complete_pai_once(*, optimizer, pai_tracker, **_kwargs):
+            return optimizer, None, pai_tracker is not None
+
+        with (
+            patch("dendritic_benchmark.training._epoch_progress", return_value=_EpochProgress()),
+            patch("dendritic_benchmark.training._apply_lr_schedule"),
+            patch(
+                "dendritic_benchmark.training._run_training_pass_oom_guarded",
+                return_value=(0.0, {}),
+            ),
+            patch("dendritic_benchmark.training._run_validation_pass", return_value=(0.0, {})),
+            patch("dendritic_benchmark.training._record_epoch_result", side_effect=record_epoch),
+            patch(
+                "dendritic_benchmark.training._apply_pai_epoch_update",
+                side_effect=complete_pai_once,
+            ),
+            patch("dendritic_benchmark.training._run_memory_guard_cleanup_if_needed"),
+            patch("dendritic_benchmark.training._update_epoch_progress"),
+            patch("dendritic_benchmark.training._training_collapsed", return_value=False),
+            patch("dendritic_benchmark.training._set_pai_candidate_graph_for_context"),
+        ):
+            history, *_ = _run_training_epochs(context, optimizer=object(), pai_tracker=object())
+
+        self.assertEqual([row["epoch"] for row in history], [1])
+        self.assertEqual(history[-1]["training_termination_reason"], "pai_training_complete")
+
     def test_fixed_switching_requires_an_explicit_diagnostic_interval(self) -> None:
         pc = _RecordingPC()
         _configure_dynamic_pai_schedule(pc, fixed_switch_interval=8)
@@ -365,6 +427,10 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             self.assertIsNotNone(schedule)
             assert schedule is not None
             self.assertEqual(schedule.max_dendrites, 1)
+            gcn_schedule = runner._pai_dynamic_schedule("gcn")
+            self.assertIsNotNone(gcn_schedule)
+            assert gcn_schedule is not None
+            self.assertEqual(gcn_schedule.max_dendrites, 1)
 
     def test_priority_models_leave_no_parameter_untyped(self) -> None:
         """Every parameter must be perforated or tracked, or PAI drops into pdb.

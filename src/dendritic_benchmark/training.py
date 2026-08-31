@@ -3796,16 +3796,11 @@ def _run_training_epochs(
                 "stopping this condition rather than training a dead network."
             )
             break
-        # A dynamic condition used to stop the moment PAI finished, sometimes
-        # after only a handful of epochs while its dense control received the
-        # whole recipe.  Finish PAI when it can, but always give both paired
-        # arms at least the declared training budget; only an unfinished PAI
-        # schedule is allowed to extend beyond it.
-        if (
-            pai_training_complete
-            and run_until_pai_complete
-            and epoch + 1 >= context.max_epochs
-        ):
+        # In dynamic dendritic mode PAI owns the stopping decision. Its
+        # completion signal is emitted only once, immediately before the
+        # tracker is cleared, so stop on this epoch rather than continuing an
+        # open-ended iterator without a live PAI schedule.
+        if pai_training_complete and run_until_pai_complete:
             history_row["training_termination_reason"] = "pai_training_complete"
             break
     epoch_progress.close()
