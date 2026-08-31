@@ -6,6 +6,7 @@ import itertools
 import json
 import math
 import os
+import random
 import shutil
 import subprocess
 import time
@@ -22,6 +23,7 @@ from .checkpointing import (
     inspect_state_dict,
     load_state_dict_checked,
 )
+from .capacity_control import dense_backbone_state_from_pai
 from .compat import (
     MODULE_OUTPUT_DIMENSIONS_ATTR,
     PAI_ARTIFACT_NAME,
@@ -233,6 +235,17 @@ class TrainingConfig:
     # None because those two controls (information/optimization/00_assessment.md
     # validity protocol, steps 3 and 4) are not implemented in the runner.
     paired_control_identity: dict[str, Any] | None = None
+    # Written exactly when PAI first enters candidate optimisation.  Controls
+    # resume from this dense backbone; they never inherit final dendrite weights.
+    capacity_control_fork_path: str | None = None
+    control_kind: str | None = None
+    control_of_artifact_id: str | None = None
+    fork_checkpoint_sha256: str | None = None
+    topology_spec_sha256: str | None = None
+    base_trainable_params: int | None = None
+    dendritic_trainable_params: int | None = None
+    capacity_dense_trainable_params: int | None = None
+    capacity_control_status: str = "not_requested"
 
 
 @dataclass
@@ -307,6 +320,15 @@ class ArtifactMetadata:
     effective_recipe: dict[str, Any] | None = None
     source_commit: str | None = None
     paired_control_identity: dict[str, Any] | None = None
+    capacity_control_fork_path: str | None = None
+    control_kind: str | None = None
+    control_of_artifact_id: str | None = None
+    fork_checkpoint_sha256: str | None = None
+    topology_spec_sha256: str | None = None
+    base_trainable_params: int | None = None
+    dendritic_trainable_params: int | None = None
+    capacity_dense_trainable_params: int | None = None
+    capacity_control_status: str = "not_requested"
     max_dendrite_phase_epochs: int | None = None
 
 
@@ -1478,6 +1500,15 @@ def _write_metrics_and_history(
                 "max_dendrite_phase_epochs": metadata.max_dendrite_phase_epochs,
                 "source_commit": metadata.source_commit,
                 "paired_control_identity": metadata.paired_control_identity,
+                "capacity_control_fork_path": metadata.capacity_control_fork_path,
+                "control_kind": metadata.control_kind,
+                "control_of_artifact_id": metadata.control_of_artifact_id,
+                "fork_checkpoint_sha256": metadata.fork_checkpoint_sha256,
+                "topology_spec_sha256": metadata.topology_spec_sha256,
+                "base_trainable_params": metadata.base_trainable_params,
+                "dendritic_trainable_params": metadata.dendritic_trainable_params,
+                "capacity_dense_trainable_params": metadata.capacity_dense_trainable_params,
+                "capacity_control_status": metadata.capacity_control_status,
                 "artifact_path": str(stats.artifact_path),
                 "training_skipped": payload.training_skipped,
                 "skip_reason": payload.skip_reason,
@@ -1603,6 +1634,15 @@ def _persist_stage_artifacts(
             "max_dendrite_phase_epochs": metadata.max_dendrite_phase_epochs,
             "source_commit": metadata.source_commit,
             "paired_control_identity": metadata.paired_control_identity,
+            "capacity_control_fork_path": metadata.capacity_control_fork_path,
+            "control_kind": metadata.control_kind,
+            "control_of_artifact_id": metadata.control_of_artifact_id,
+            "fork_checkpoint_sha256": metadata.fork_checkpoint_sha256,
+            "topology_spec_sha256": metadata.topology_spec_sha256,
+            "base_trainable_params": metadata.base_trainable_params,
+            "dendritic_trainable_params": metadata.dendritic_trainable_params,
+            "capacity_dense_trainable_params": metadata.capacity_dense_trainable_params,
+            "capacity_control_status": metadata.capacity_control_status,
         },
         pai_save_name=metadata.pai_save_name,
         validity={
@@ -1629,7 +1669,12 @@ def _persist_stage_artifacts(
         },
         additional_files=tuple(
             name
-            for name in ("pai_summary.json", "PAI_config.json", "artifact_attempt.json")
+            for name in (
+                "pai_summary.json",
+                "PAI_config.json",
+                "artifact_attempt.json",
+                "capacity_control_fork.pt",
+            )
             if (output_dir / name).is_file()
         ),
     )
@@ -3938,6 +3983,39 @@ def _apply_lr_schedule(
         )
 
 
+def _capture_capacity_control_fork(context: EpochTrainingContext, epoch: int) -> None:
+    """Persist the dense fork at the first candidate-optimisation epoch.
+
+    This is deliberately before the batch loop.  Saving after a p-phase epoch
+    would let the control observe trained candidate weights, which is exactly
+    the leakage the topology-matched protocol excludes.
+    """
+    if not context.config.use_dendrites or context.output_dir is None:
+        return
+    path = context.output_dir / "capacity_control_fork.pt"
+    if path.exists() or _pai_tracker_in_neuron_mode() or _pai_model_has_dendrites(context.model):
+        return
+    raw_state = {
+        key: value.detach().cpu().clone()
+        for key, value in _unwrap_compiled(context.model).state_dict().items()
+        if isinstance(value, torch.Tensor)
+    }
+    dense_state = dense_backbone_state_from_pai(raw_state)
+    if not dense_state:
+        return
+    payload = {
+        "schema_version": 1,
+        "fork_epoch": epoch,
+        "dense_state_dict": dense_state,
+        "pai_state_dict": raw_state,
+        "python_rng_state": random.getstate(),
+        "torch_rng_state": torch.get_rng_state(),
+    }
+    torch.save(payload, path)
+    context.config.capacity_control_fork_path = str(path)
+    print(f"[capacity-control] captured pre-branch fork at epoch {epoch + 1}: {path}")
+
+
 def _run_training_epochs(
     context: EpochTrainingContext,
     optimizer: Any,
@@ -3967,6 +4045,7 @@ def _run_training_epochs(
             pai_tracker = None
             _release_accelerator_cache(context.torch)
             pai_status = PAIUpdateStatus(frozen=True, active=False)
+        _capture_capacity_control_fork(context, epoch)
         _apply_lr_schedule(optimizer, context.config, epoch, context.max_epochs)
         train_loss, train_metrics = _run_training_pass_oom_guarded(
             context, optimizer, epoch, pai_status
@@ -4077,6 +4156,15 @@ def _build_artifact_metadata(
         effective_recipe=config.effective_recipe,
         source_commit=config.source_commit,
         paired_control_identity=config.paired_control_identity,
+        capacity_control_fork_path=config.capacity_control_fork_path,
+        control_kind=config.control_kind,
+        control_of_artifact_id=config.control_of_artifact_id,
+        fork_checkpoint_sha256=config.fork_checkpoint_sha256,
+        topology_spec_sha256=config.topology_spec_sha256,
+        base_trainable_params=config.base_trainable_params,
+        dendritic_trainable_params=config.dendritic_trainable_params,
+        capacity_dense_trainable_params=config.capacity_dense_trainable_params,
+        capacity_control_status=config.capacity_control_status,
         max_dendrite_phase_epochs=config.max_dendrite_phase_epochs,
     )
 
@@ -4135,6 +4223,15 @@ def _metadata_for_stage(
         effective_recipe=metadata.effective_recipe,
         source_commit=metadata.source_commit,
         paired_control_identity=metadata.paired_control_identity,
+        capacity_control_fork_path=metadata.capacity_control_fork_path,
+        control_kind=metadata.control_kind,
+        control_of_artifact_id=metadata.control_of_artifact_id,
+        fork_checkpoint_sha256=metadata.fork_checkpoint_sha256,
+        topology_spec_sha256=metadata.topology_spec_sha256,
+        base_trainable_params=metadata.base_trainable_params,
+        dendritic_trainable_params=metadata.dendritic_trainable_params,
+        capacity_dense_trainable_params=metadata.capacity_dense_trainable_params,
+        capacity_control_status=metadata.capacity_control_status,
         max_dendrite_phase_epochs=metadata.max_dendrite_phase_epochs,
     )
 

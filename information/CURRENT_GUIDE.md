@@ -44,7 +44,7 @@ Sources of truth: `src/dendritic_benchmark/specs.py`, `model_adapters.py`, `arti
 
 ## Condition grid
 
-12 conditions isolate two factors: dendritic augmentation and quantization. Each condition trains from the checkpoint named in its source column, so an omitted source condition skips every condition that depends on it.
+24 conditions isolate two factors: dendritic augmentation and quantization. Each condition trains from the checkpoint named in its source column, so an omitted source condition skips every condition that depends on it.
 
 | key | display name | source | bits | mode | dendrites | QAT | quantized |
 |---|---|---|---|---|---|---|---|
@@ -60,8 +60,20 @@ Sources of truth: `src/dendritic_benchmark/specs.py`, `model_adapters.py`, `arti
 | `dendrites_q2` | +Dendrites + Q2 | `dendrites_fp32` | 2 | int | yes | no | yes |
 | `dendrites_q1_58` | +Dendrites + Q1.58 | `dendrites_fp32` | 2 | ternary | yes | no | yes |
 | `dendrites_q1` | +Dendrites + Q1 | `dendrites_fp32` | 1 | binary | yes | no | yes |
+| `base_more_training_fp32` | Base + Matched Training | `dendrites_fp32` | 32 | — | no | no | no |
+| `base_more_training_q8` | Base + Matched Training + Q8 | `base_more_training_fp32` | 8 | int | no | no | yes |
+| `base_more_training_q4` | Base + Matched Training + Q4 | `base_more_training_fp32` | 4 | int | no | no | yes |
+| `base_more_training_q2` | Base + Matched Training + Q2 | `base_more_training_fp32` | 2 | int | no | no | yes |
+| `base_more_training_q1_58` | Base + Matched Training + Q1.58 | `base_more_training_fp32` | 2 | ternary | no | no | yes |
+| `base_more_training_q1` | Base + Matched Training + Q1 | `base_more_training_fp32` | 1 | binary | no | no | yes |
+| `capacity_dense_fp32` | Topology-Matched Dense | `dendrites_fp32` | 32 | — | no | no | no |
+| `capacity_dense_q8` | Topology-Matched Dense + Q8 | `capacity_dense_fp32` | 8 | int | no | no | yes |
+| `capacity_dense_q4` | Topology-Matched Dense + Q4 | `capacity_dense_fp32` | 4 | int | no | no | yes |
+| `capacity_dense_q2` | Topology-Matched Dense + Q2 | `capacity_dense_fp32` | 2 | int | no | no | yes |
+| `capacity_dense_q1_58` | Topology-Matched Dense + Q1.58 | `capacity_dense_fp32` | 2 | ternary | no | no | yes |
+| `capacity_dense_q1` | Topology-Matched Dense + Q1 | `capacity_dense_fp32` | 1 | binary | no | no | yes |
 
-The full matrix is 24 models × 12 conditions − 6 unsupported pairs = **282 attempts**.
+The full matrix is 24 models × 24 conditions − 6 unsupported pairs = **570 attempts**.
 
 Unsupported pairs (skipped rather than trained):
 

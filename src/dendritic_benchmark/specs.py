@@ -25,6 +25,9 @@ class ConditionSpec:
     use_qat: bool
     prune_amount: float = 0.4
     fine_tune_epochs: int = 0
+    # ``None`` is an ordinary base/dendritic condition.  The two controls use
+    # the retained dendritic artifact's saved fork rather than its final weights.
+    control_kind: Literal["base_more_training", "capacity_dense"] | None = None
 
     @property
     def quantized(self) -> bool:
@@ -78,6 +81,18 @@ CONDITION_SPECS: list[ConditionSpec] = [
     ConditionSpec("dendrites_q2", "+Dendrites + Q2", "dendrites_fp32", 2, "int", True, False, False),
     ConditionSpec("dendrites_q1_58", "+Dendrites + Q1.58", "dendrites_fp32", 2, "ternary", True, False, False),
     ConditionSpec("dendrites_q1", "+Dendrites + Q1", "dendrites_fp32", 1, "binary", True, False, False),
+    ConditionSpec("base_more_training_fp32", "Base + Matched Training", "dendrites_fp32", 32, None, False, False, False, control_kind="base_more_training"),
+    ConditionSpec("base_more_training_q8", "Base + Matched Training + Q8", "base_more_training_fp32", 8, "int", False, False, False, control_kind="base_more_training"),
+    ConditionSpec("base_more_training_q4", "Base + Matched Training + Q4", "base_more_training_fp32", 4, "int", False, False, False, control_kind="base_more_training"),
+    ConditionSpec("base_more_training_q2", "Base + Matched Training + Q2", "base_more_training_fp32", 2, "int", False, False, False, control_kind="base_more_training"),
+    ConditionSpec("base_more_training_q1_58", "Base + Matched Training + Q1.58", "base_more_training_fp32", 2, "ternary", False, False, False, control_kind="base_more_training"),
+    ConditionSpec("base_more_training_q1", "Base + Matched Training + Q1", "base_more_training_fp32", 1, "binary", False, False, False, control_kind="base_more_training"),
+    ConditionSpec("capacity_dense_fp32", "Topology-Matched Dense", "dendrites_fp32", 32, None, False, False, False, control_kind="capacity_dense"),
+    ConditionSpec("capacity_dense_q8", "Topology-Matched Dense + Q8", "capacity_dense_fp32", 8, "int", False, False, False, control_kind="capacity_dense"),
+    ConditionSpec("capacity_dense_q4", "Topology-Matched Dense + Q4", "capacity_dense_fp32", 4, "int", False, False, False, control_kind="capacity_dense"),
+    ConditionSpec("capacity_dense_q2", "Topology-Matched Dense + Q2", "capacity_dense_fp32", 2, "int", False, False, False, control_kind="capacity_dense"),
+    ConditionSpec("capacity_dense_q1_58", "Topology-Matched Dense + Q1.58", "capacity_dense_fp32", 2, "ternary", False, False, False, control_kind="capacity_dense"),
+    ConditionSpec("capacity_dense_q1", "Topology-Matched Dense + Q1", "capacity_dense_fp32", 1, "binary", False, False, False, control_kind="capacity_dense"),
 ]
 
 

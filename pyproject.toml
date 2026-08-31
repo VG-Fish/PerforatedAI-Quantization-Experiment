@@ -29,8 +29,8 @@ dependencies = [
     "pillow>=11.0.0",
     "tonic>=1.5.0",
     "torch-geometric>=2.6.0",
-    "perforatedai>=3.2.6",
-    "perforatedbp>=3.2.6",
+    "perforatedai>=3.2.7",
+    "perforatedbp>=3.2.7",
 ]
 
 # Development and audit tooling is not a runtime dependency of the benchmark.

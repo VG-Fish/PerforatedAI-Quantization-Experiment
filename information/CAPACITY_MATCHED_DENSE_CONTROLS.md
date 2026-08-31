@@ -1,7 +1,11 @@
 # Automated topology-matched dense controls
 
 <!-- status-banner -->
-> **Status: current protocol proposal (2026-08-31).** Describes the control design step 4 of the validity protocol in [optimization/00_assessment.md](optimization/00_assessment.md) requires. Not yet implemented in the runner: no `dqb` flag builds these controls today.
+> **Status: first implementation (2026-08-31).** The runner now has
+> `base_more_training_*` and `capacity_dense_*` condition families.  The
+> capacity extractor currently supports the isolated ResNet-first protocol's
+> one retained `Linear` branch and fails closed for other PAI layouts; it does
+> not substitute a width-scaled model.
 
 ## Purpose
 

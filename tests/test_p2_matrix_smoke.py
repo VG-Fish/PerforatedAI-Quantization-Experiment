@@ -156,6 +156,11 @@ class MatrixSmokeTests(unittest.TestCase):
                     # The dendritic FP32 arm grows out of the dense FP32
                     # baseline: that shared start is what makes it a control.
                     self.assertEqual(condition.source_key, "base_fp32")
+                elif condition.control_kind is not None:
+                    # The two FP32 validity controls intentionally fork from
+                    # the audited dendritic source; their own quantized
+                    # descendants still source their corresponding FP32 arm.
+                    self.assertEqual(condition.source_key, "dendrites_fp32")
                 else:
                     self.assertEqual(condition.source_key, condition.key)
 

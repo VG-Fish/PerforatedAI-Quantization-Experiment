@@ -826,8 +826,8 @@ requires-dist = [
     { name = "gymnasium", extras = ["classic-control", "box2d"], specifier = ">=1.0.0" },
     { name = "huggingface-hub", specifier = ">=0.30.0" },
     { name = "matplotlib", specifier = ">=3.10.9" },
-    { name = "perforatedai", specifier = ">=3.2.6" },
-    { name = "perforatedbp", specifier = ">=3.2.6" },
+    { name = "perforatedai", specifier = ">=3.2.7" },
+    { name = "perforatedbp", specifier = ">=3.2.7" },
     { name = "pillow", specifier = ">=11.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "safetensors", specifier = ">=0.5.0" },
@@ -2090,7 +2090,7 @@ wheels = [
 
 [[package]]
 name = "perforatedai"
-version = "3.2.6"
+version = "3.2.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
@@ -2098,20 +2098,21 @@ dependencies = [
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14'" },
     { name = "pandas", version = "3.0.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14'" },
     { name = "pyyaml" },
+    { name = "requests" },
     { name = "safetensors" },
     { name = "torch" },
     { name = "torchvision" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2a/1a/148faf4f9aeb3ae7bc32470afc711e7b944451d08f80e36efa13953fe42e/perforatedai-3.2.6-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:a1b534810e684251ce3f24ca4a7699a890dc2093e6398d98da90982ef7a8cf05", size = 2179145, upload-time = "2026-08-09T05:37:59.998Z" },
-    { url = "https://files.pythonhosted.org/packages/57/70/eff17304a66bf3198f41affc5461d9aee48c18be1d850221c74432515f87/perforatedai-3.2.6-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:394cad5f8bbc189a7d95f3a7bcd3a3bdb68d054dbf6f13c7feed7004037700c1", size = 7618292, upload-time = "2026-08-09T05:38:51.2Z" },
-    { url = "https://files.pythonhosted.org/packages/ca/c8/f07be6de4583c757f1c42fb9dddb30786e617270993a085a3deef7746687/perforatedai-3.2.6-cp312-cp312-win_amd64.whl", hash = "sha256:5e1c80f09664815eab04dfacd946e350278a849b9aa03999a2743543353a7f6f", size = 898254, upload-time = "2026-08-09T05:38:59.006Z" },
-    { url = "https://files.pythonhosted.org/packages/22/e5/6fbc73a9561454ef7a6f9710f852b2f3512845b79db7805e138152f52d5e/perforatedai-3.2.6-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:7d1be882511815bf6971e3b98d1901b35a624cff500ab742d8a69bdbe0a569f0", size = 2162510, upload-time = "2026-08-09T05:39:14.687Z" },
+    { url = "https://files.pythonhosted.org/packages/01/63/1d55a8f82830e69c81f5c7541a58716aa919321bcda45c02f3729348e804/perforatedai-3.2.7-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:69befbd5ca2193dc0676e3b60061a338eed1b114ce15864c5719b8d3ca22b257", size = 2379541, upload-time = "2026-08-28T22:03:36.867Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/b9/f17af48135dfeeabba5e48bdb08c3442a0ecf3bb7177a5f97e0fe2719c8d/perforatedai-3.2.7-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:6e85101d429e8974bd73a4ddb851a4623f02dca604b8c28ea82b5bfd485506c0", size = 8014166, upload-time = "2026-08-28T22:03:38.956Z" },
+    { url = "https://files.pythonhosted.org/packages/71/b1/9fbdbe328bd4e1fa91788ef52326d82960252c99ffaf9dc570f9ef262c55/perforatedai-3.2.7-cp312-cp312-win_amd64.whl", hash = "sha256:3500087d32e289c746d86986e6390b1bb7a08c8db42fd63ec2c88956c4745c3a", size = 951522, upload-time = "2026-08-28T22:03:40.396Z" },
+    { url = "https://files.pythonhosted.org/packages/92/9e/a6cfc79a4c83baf85223a46a60b128c1595b53e961dfdf7fd786e426279b/perforatedai-3.2.7-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:7a282a2a603617ca749c0d4780b263dc2bf57e9986498c3d563dbfdd35b3e2a9", size = 2360039, upload-time = "2026-08-28T22:03:41.813Z" },
 ]
 
 [[package]]
 name = "perforatedbp"
-version = "3.2.6"
+version = "3.2.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
@@ -2124,10 +2125,10 @@ dependencies = [
     { name = "torchvision" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/11/6c/3c015934f7eb17d914331a54ab5979dafea3269bcbe6c8656ca2e664d60c/perforatedbp-3.2.6-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:35a3d2080dbbf2096d95dae937bb22bf53be090fa3ab1a150bba6fce029cb1be", size = 934338, upload-time = "2026-08-09T05:44:04.867Z" },
-    { url = "https://files.pythonhosted.org/packages/bf/da/085ab034de490635a9f7d30cf4308054155bdc73273c1c35fb6695402743/perforatedbp-3.2.6-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:8542bb3e513422c01729b5ec9666fccbb8bbd6d81dcea85237f36bb105e66f87", size = 3122989, upload-time = "2026-08-09T05:44:16.564Z" },
-    { url = "https://files.pythonhosted.org/packages/ff/62/b37d745ebf0e29e04d36345a5346b577b03aaab12e7d77fd9523d346d823/perforatedbp-3.2.6-cp312-cp312-win_amd64.whl", hash = "sha256:8b795be7a803f4e3b68f5988f0bb100415984f52af9ae42145d4112cb0a67f92", size = 396426, upload-time = "2026-08-09T05:44:20.341Z" },
-    { url = "https://files.pythonhosted.org/packages/4c/5a/a7b9b2c33f1917d57444b467ce910fad5419f58b5475d3020df94ea175f2/perforatedbp-3.2.6-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:bfc7f620e0e6a76857034d3593994be74722297503bb120c97102ebfc177b1f2", size = 924855, upload-time = "2026-08-09T05:44:26.944Z" },
+    { url = "https://files.pythonhosted.org/packages/41/2c/a746549224489b6bbab9e368e888ff0f1201933bf0e51b056af07a668562/perforatedbp-3.2.7-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:332526f88988a3a9540beb89b5ce2154b89910d42b4e84eb38f4ccf3da610c0d", size = 1029793, upload-time = "2026-08-28T21:49:55.423Z" },
+    { url = "https://files.pythonhosted.org/packages/db/12/87dd96b347f8d1e4475c9d95d5a7f522e1d50942fd46575deacfa53e4b43/perforatedbp-3.2.7-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:663161a6255e231909092278e8f97347716e8c12f368c5e823daada467374973", size = 3357219, upload-time = "2026-08-28T21:49:56.869Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/00/e053e0ac8c2336dae118a8de5a7111f1178de954ecfecd26d872166b97e5/perforatedbp-3.2.7-cp312-cp312-win_amd64.whl", hash = "sha256:e8c71abbad60400b7f2050ba399d855b5d1935a04959cb7878f143fd96341321", size = 420641, upload-time = "2026-08-28T21:49:58.315Z" },
+    { url = "https://files.pythonhosted.org/packages/fc/b6/0751e05359725ac4a8d617145964f201ec1c53a51d305ba747b17d025cbc/perforatedbp-3.2.7-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:153ee990efe145308cfee2524f3911e0f672750bf36d169b8c6881fcc3891e2f", size = 1019570, upload-time = "2026-08-28T21:49:59.427Z" },
 ]
 
 [[package]]

@@ -1,7 +1,9 @@
 import functools
 import gc
+import hashlib
 import json
 import math
+import csv
 import re
 import shutil
 import subprocess
@@ -19,6 +21,12 @@ import torch.nn as nn
 
 from .artifacts import ARTIFACT_MANIFEST_NAME, validate_artifact_manifest
 from .checkpointing import load_state_dict_checked
+from .capacity_control import (
+    UnsupportedTopology,
+    apply_capacity_dense_control,
+    retained_topology_from_state_dict,
+    save_topology_spec,
+)
 from .compat import (
     PAI_ARTIFACT_NAME,
     PAI_DIRECTORY_NAME,
@@ -1110,6 +1118,67 @@ class BenchmarkRunner:
         configure_pai_candidate_graph(training_plan.update_dendrites_during_training)
         return self._configure_perforated_model(model, module_output_dimensions)
 
+    def _prepare_control_model(
+        self,
+        model: nn.Module,
+        model_key: str,
+        condition: ConditionSpec,
+        saved_dirs: dict[str, Path],
+    ) -> tuple[nn.Module, dict[str, Any]]:
+        """Rebuild an FP32 control from the source dendrite's pre-branch fork."""
+        source_dir = saved_dirs.get("dendrites_fp32")
+        if source_dir is None:
+            raise UnsupportedTopology("capacity controls require dendrites_fp32")
+        try:
+            source_record = json.loads((source_dir / _RECORD_JSON).read_text())
+            fork_path = source_dir / "capacity_control_fork.pt"
+            fork_bytes = fork_path.read_bytes()
+            fork = torch.load(fork_path, map_location="cpu", weights_only=False)
+            source_state = torch.load(source_dir / _MODEL_PT, map_location="cpu", weights_only=True)
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise UnsupportedTopology(f"cannot load capacity-control source: {exc}") from exc
+        if source_record.get("dendrite_audit_status") != "verified_retained":
+            raise UnsupportedTopology("source dendrite artifact is not verified_retained")
+        dense_state = fork.get("dense_state_dict") if isinstance(fork, dict) else None
+        fork_epoch = fork.get("fork_epoch") if isinstance(fork, dict) else None
+        if not isinstance(dense_state, dict) or not isinstance(fork_epoch, int):
+            raise UnsupportedTopology("capacity-control fork has no dense state or epoch")
+        load_state_dict_checked(model, dense_state, context="capacity-control fork")
+        metadata: dict[str, Any] = {
+            "control_kind": condition.control_kind,
+            "control_of_artifact_id": source_record.get("artifact_id"),
+            "fork_checkpoint_sha256": hashlib.sha256(fork_bytes).hexdigest(),
+            "base_trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
+            "dendritic_trainable_params": source_record.get("param_count"),
+            "capacity_control_status": "generated",
+            "fork_epoch": fork_epoch,
+        }
+        if condition.control_kind == "capacity_dense":
+            topology = retained_topology_from_state_dict(source_state)
+            save_topology_spec(self.results_root / model_key / condition.key / "topology_spec.json", topology)
+            model = apply_capacity_dense_control(model, topology, seed=self._seed)
+            metadata["topology_spec_sha256"] = topology.sha256
+            metadata["capacity_dense_trainable_params"] = sum(
+                p.numel() for p in model.parameters() if p.requires_grad
+            )
+            if metadata["dendritic_trainable_params"] != metadata["capacity_dense_trainable_params"]:
+                raise UnsupportedTopology(
+                    "final PAI and ordinary capacity parameter counts differ: "
+                    f"{metadata['dendritic_trainable_params']} != "
+                    f"{metadata['capacity_dense_trainable_params']}"
+                )
+        return model, metadata
+
+    @staticmethod
+    def _control_post_fork_epochs(source_dir: Path, fork_epoch: int) -> int:
+        try:
+            history = json.loads((source_dir / "metrics.json").read_text()).get("train_history_columns")
+            rows = list(csv.DictReader((source_dir / "history.csv").open()))
+        except (OSError, json.JSONDecodeError):
+            return 0
+        del history
+        return max(0, len([row for row in rows if row.get("epoch")]) - fork_epoch)
+
     def _training_hyperparameters(
         self, model_key: str, condition: ConditionSpec
     ) -> ModelTrainingRecipe:
@@ -2057,25 +2126,41 @@ class BenchmarkRunner:
             model_key, condition, training_hyperparameters, allow_pqat
         )
         model = build_model(model_key, **self._model_kwargs(model_key))
+        control_metadata: dict[str, Any] = {}
+        # FP32 controls begin at the saved dense fork, not at the final
+        # dendritic checkpoint.  Quantized descendants use the normal source
+        # loading path below and therefore quantize their own FP32 control.
+        if condition.control_kind is not None and not condition.quantized:
+            model, control_metadata = self._prepare_control_model(
+                model, model_key, condition, saved_dirs
+            )
+            source_dir = saved_dirs["dendrites_fp32"]
+            remaining = self._control_post_fork_epochs(
+                source_dir, int(control_metadata["fork_epoch"])
+            )
+            if remaining <= 0:
+                raise UnsupportedTopology("source dendrite history has no post-fork epochs")
+            training_plan = replace(training_plan, max_epochs=remaining)
         dense_param_count = sum(parameter.numel() for parameter in model.parameters())
         pai_config_snapshot = condition_dir / "PAI_config.json"
         batches_per_epoch = self._batches_per_epoch(bundle)
         module_selection, module_output_dimensions = (
             self._dendrite_initialization_metadata(model, model_key, bundle, condition)
         )
-        model = self._prepare_condition_model(
-            model=model,
-            model_key=model_key,
-            metric_direction=metric_direction,
-            condition=condition,
-            saved_dirs=saved_dirs,
-            pai_config_snapshot=pai_config_snapshot,
-            training_plan=training_plan,
-            batches_per_epoch=batches_per_epoch,
-            module_selection=module_selection,
-            module_output_dimensions=module_output_dimensions,
-            pai_save_name=pai_save_name,
-        )
+        if condition.control_kind is None or condition.quantized:
+            model = self._prepare_condition_model(
+                model=model,
+                model_key=model_key,
+                metric_direction=metric_direction,
+                condition=condition,
+                saved_dirs=saved_dirs,
+                pai_config_snapshot=pai_config_snapshot,
+                training_plan=training_plan,
+                batches_per_epoch=batches_per_epoch,
+                module_selection=module_selection,
+                module_output_dimensions=module_output_dimensions,
+                pai_save_name=pai_save_name,
+            )
 
         weight_decay = training_hyperparameters.weight_decay
         pai_candidate_graph_batch_limit = (
@@ -2207,6 +2292,20 @@ class BenchmarkRunner:
             source_commit=self._source_commit(),
             paired_control_identity=self._paired_control_identity(
                 model_key, condition, training_hyperparameters
+            ),
+            capacity_control_fork_path=(
+                str(condition_dir / "capacity_control_fork.pt")
+                if condition.use_dendrites else None
+            ),
+            control_kind=control_metadata.get("control_kind"),
+            control_of_artifact_id=control_metadata.get("control_of_artifact_id"),
+            fork_checkpoint_sha256=control_metadata.get("fork_checkpoint_sha256"),
+            topology_spec_sha256=control_metadata.get("topology_spec_sha256"),
+            base_trainable_params=control_metadata.get("base_trainable_params"),
+            dendritic_trainable_params=control_metadata.get("dendritic_trainable_params"),
+            capacity_dense_trainable_params=control_metadata.get("capacity_dense_trainable_params"),
+            capacity_control_status=(
+                control_metadata.get("capacity_control_status", "not_requested")
             ),
         )
         return train_and_evaluate(
