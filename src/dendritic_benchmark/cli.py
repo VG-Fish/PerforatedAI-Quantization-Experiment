@@ -875,9 +875,12 @@ def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
         pai_override=pai_override,
     )
     selected_models = selected_model_keys(args.models)
-    selected_condition_keys = runner._expand_condition_keys(args.conditions)
     if args.pai_capacity_check:
-        if selected_condition_keys != ["dendrites_fp32"]:
+        # The runner expands this public source condition with its required
+        # ``base_fp32`` dependency.  Validate the user-facing request here,
+        # not that expanded execution list, otherwise the only valid capacity
+        # invocation rejects itself before it can reuse the dense source.
+        if args.conditions != ["dendrites_fp32"]:
             raise SystemExit(
                 "--pai-capacity-check requires exactly "
                 "--conditions dendrites_fp32; run production/PQAT conditions "
