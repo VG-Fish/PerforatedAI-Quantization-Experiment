@@ -281,6 +281,8 @@ class BenchmarkRunner:
         self._diagnostic_fixed_switch_interval = pai_fixed_switch_interval
         self._recipe_override = recipe_override
         self._pai_override = pai_override
+        self._pai_capacity_check = False
+        self._pai_train_until_complete = False
         self._source_commit_cache: str | None | Literal["_unset"] = "_unset"
 
     def _load_state(self, model: Any, checkpoint_path: Path) -> Any:
@@ -1048,6 +1050,7 @@ class BenchmarkRunner:
         module_selection: PAIModuleSelection,
         module_output_dimensions: dict[str, list[int]] | None,
         pai_save_name: str,
+        pai_capacity_check: bool,
     ) -> Any:
         dendrite_training_max_epochs = (
             training_plan.max_epochs
@@ -1113,6 +1116,7 @@ class BenchmarkRunner:
                 initial_correlation_batches_limit=initial_correlation_batches_limit,
                 fixed_switch_interval=fixed_switch_interval,
                 dynamic_schedule=dynamic_schedule,
+                testing_dendrite_capacity=pai_capacity_check,
             ),
         )
         configure_pai_candidate_graph(training_plan.update_dendrites_during_training)
@@ -1665,6 +1669,15 @@ class BenchmarkRunner:
         )
         if metadata.get("pai_override") != expected_pai_override:
             return False
+        expects_live_pai = condition.use_dendrites and not condition.quantized
+        if bool(metadata.get("train_dendrites_until_complete", False)) != (
+            expects_live_pai and self._pai_train_until_complete
+        ):
+            return False
+        if bool(metadata.get("pai_testing_dendrite_capacity", False)) != (
+            expects_live_pai and self._pai_capacity_check
+        ):
+            return False
         # The three module-ID lists are compared only when actually recorded:
         # every artifact trained before this field existed reads back as
         # None here, and unlike a revision bump this is not evidence the
@@ -1895,6 +1908,7 @@ class BenchmarkRunner:
         saved_dirs: dict[str, Path],
         allow_pqat: bool,
         dynamic_dendritic_training: bool,
+        pai_capacity_check: bool,
     ) -> bool:
         condition_dir = self.results_root / model_spec.key / condition.key
         # This method is called only for conditions that
@@ -1918,6 +1932,7 @@ class BenchmarkRunner:
             saved_dirs,
             allow_pqat,
             dynamic_dendritic_training,
+            pai_capacity_check,
         )
         save_training_record(record, condition_dir)
         _log(
@@ -1939,6 +1954,7 @@ class BenchmarkRunner:
         all_records: list[dict[str, Any]],
         allow_pqat: bool,
         dynamic_dendritic_training: bool,
+        pai_capacity_check: bool,
     ) -> bool:
         unsupported_conditions = [
             condition
@@ -2011,7 +2027,7 @@ class BenchmarkRunner:
                 if self._train_pending_condition(
                     model_spec, condition, bundle,
                     model_records, all_records, saved_dirs, allow_pqat,
-                    dynamic_dendritic_training,
+                    dynamic_dendritic_training, pai_capacity_check,
                 ):
                     newly_trained = True
                 _release_accelerator_memory()
@@ -2030,6 +2046,7 @@ class BenchmarkRunner:
         ignore_saved: bool = False,
         allow_pqat: bool = False,
         dynamic_dendritic_training: bool = False,
+        pai_capacity_check: bool = False,
         write_reports: bool = True,
         seed: int | None = None,
     ) -> list[dict[str, Any]]:
@@ -2046,6 +2063,13 @@ class BenchmarkRunner:
         after the last worker exits. Per-model reports stay on: each lands in
         its own model's directory, which exactly one worker ever writes to.
         """
+        if pai_capacity_check and not dynamic_dendritic_training:
+            # The diagnostic has the same PAI-controlled completion contract as
+            # a production continuation; turning it on must also disable the
+            # fixed epoch budget and final-epoch insertion freeze.
+            dynamic_dendritic_training = True
+        self._pai_capacity_check = pai_capacity_check
+        self._pai_train_until_complete = dynamic_dendritic_training
         selected_models = [
             model_by_key(key)
             for key in (model_keys or [spec.key for spec in MODEL_SPECS])
@@ -2078,6 +2102,7 @@ class BenchmarkRunner:
                 all_records,
                 allow_pqat,
                 dynamic_dendritic_training,
+                pai_capacity_check,
             )
             print("-" * 50)
             if newly_trained and write_reports:
@@ -2116,6 +2141,7 @@ class BenchmarkRunner:
         saved_dirs: dict[str, Path],
         allow_pqat: bool,
         dynamic_dendritic_training: bool,
+        pai_capacity_check: bool,
     ) -> TrainingRecord:
         condition_dir = self.results_root / model_key / condition.key
         artifact_id, pai_save_name = self._artifact_attempt(
@@ -2160,6 +2186,7 @@ class BenchmarkRunner:
                 module_selection=module_selection,
                 module_output_dimensions=module_output_dimensions,
                 pai_save_name=pai_save_name,
+                pai_capacity_check=pai_capacity_check,
             )
 
         weight_decay = training_hyperparameters.weight_decay
@@ -2245,7 +2272,10 @@ class BenchmarkRunner:
             enable_pai_dendrite_updates=training_plan.update_dendrites_during_training,
             train_dendrites_until_complete=(
                 training_plan.update_dendrites_during_training
-                and dynamic_dendritic_training
+                and (dynamic_dendritic_training or pai_capacity_check)
+            ),
+            pai_testing_dendrite_capacity=(
+                training_plan.update_dendrites_during_training and pai_capacity_check
             ),
             freeze_dendrite_updates_fraction=0.20,
             pai_candidate_graph_batch_limit=pai_candidate_graph_batch_limit,

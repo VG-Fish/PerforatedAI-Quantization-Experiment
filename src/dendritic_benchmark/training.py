@@ -140,6 +140,10 @@ class TrainingConfig:
     source_condition_key: str | None = None
     enable_pai_dendrite_updates: bool = False
     train_dendrites_until_complete: bool = False
+    # True only for PAI's built-in seven-epoch capacity diagnostic.  It is
+    # recorded separately from normal open-ended PAI training so a diagnostic
+    # artifact can never be mistaken for a production result.
+    pai_testing_dendrite_capacity: bool = False
     freeze_dendrite_updates_fraction: float = 0.20
     pai_candidate_graph_batch_limit: int | None = None
     memory_cleanup_interval_batches: int | None = None
@@ -299,6 +303,7 @@ class ArtifactMetadata:
     pai_fixed_switch_interval: int | None
     pai_dynamic_schedule: dict[str, Any] | None
     pai_save_name: str | None
+    pai_testing_dendrite_capacity: bool = False
     quantization_granularity: str = "tensor"
     dataset_revision: str | None = None
     lr_schedule_epochs: int | None = None
@@ -1474,6 +1479,9 @@ def _write_metrics_and_history(
                 ),
                 "enable_pai_dendrite_updates": metadata.enable_pai_dendrite_updates,
                 "train_dendrites_until_complete": metadata.train_dendrites_until_complete,
+                "pai_testing_dendrite_capacity": (
+                    metadata.pai_testing_dendrite_capacity
+                ),
                 "freeze_dendrite_updates_fraction": (
                     metadata.freeze_dendrite_updates_fraction
                 ),
@@ -4076,7 +4084,14 @@ def _run_training_epochs(
                 output_dir, epoch, state, optimizer, context.model, context.torch
             )
         _update_epoch_progress(epoch_progress, context, state, val_metric)
-        if _training_collapsed(state, context.metric_direction):
+        # In either PAI-controlled mode (the capacity diagnostic or production
+        # continuation), PAI is the authority on when the dendritic search is
+        # complete.  A benchmark-side validation-collapse heuristic can fire
+        # before its seven-epoch diagnostic has exercised restructuring, or
+        # before a production search emits training_complete.
+        if not run_until_pai_complete and _training_collapsed(
+            state, context.metric_direction
+        ):
             history_row["training_termination_reason"] = "validation_collapse"
             print(
                 f"[collapse] {context.run_label}: validation "
@@ -4127,6 +4142,7 @@ def _build_artifact_metadata(
         regression_loss=config.regression_loss,
         enable_pai_dendrite_updates=config.enable_pai_dendrite_updates,
         train_dendrites_until_complete=config.train_dendrites_until_complete,
+        pai_testing_dendrite_capacity=config.pai_testing_dendrite_capacity,
         freeze_dendrite_updates_fraction=config.freeze_dendrite_updates_fraction,
         pai_candidate_graph_batch_limit=config.pai_candidate_graph_batch_limit,
         memory_cleanup_interval_batches=config.memory_cleanup_interval_batches,
@@ -4194,6 +4210,7 @@ def _metadata_for_stage(
         regression_loss=metadata.regression_loss,
         enable_pai_dendrite_updates=metadata.enable_pai_dendrite_updates,
         train_dendrites_until_complete=metadata.train_dendrites_until_complete,
+        pai_testing_dendrite_capacity=metadata.pai_testing_dendrite_capacity,
         freeze_dendrite_updates_fraction=metadata.freeze_dendrite_updates_fraction,
         pai_candidate_graph_batch_limit=metadata.pai_candidate_graph_batch_limit,
         memory_cleanup_interval_batches=metadata.memory_cleanup_interval_batches,

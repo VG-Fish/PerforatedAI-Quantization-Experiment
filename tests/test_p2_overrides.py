@@ -10,9 +10,15 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from dendritic_benchmark.cli import build_parser
-from dendritic_benchmark.compat import PAIDynamicSchedule
+from dendritic_benchmark.compat import (
+    PAIDynamicSchedule,
+    PAIModuleSelection,
+    _configure_pai_trackers,
+)
 from dendritic_benchmark.pipeline import BenchmarkRunner
 from dendritic_benchmark.plans import (
     CLEAR,
@@ -594,6 +600,42 @@ class CLIOverrideFlagTests(unittest.TestCase):
         parser = build_parser()
         args = parser.parse_args(["run", "--pai-variant", "distilbert_classifier_only"])
         self.assertEqual(args.pai_variant, "distilbert_classifier_only")
+
+    def test_run_parser_accepts_pai_capacity_check(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["run", "--pai-capacity-check"])
+        self.assertTrue(args.pai_capacity_check)
+
+
+class PAICapacityDiagnosticTests(unittest.TestCase):
+    def test_capacity_diagnostic_reaches_pai_configuration(self) -> None:
+        pc = MagicMock()
+        _configure_pai_trackers(
+            SimpleNamespace(pc=pc),
+            PAIModuleSelection(),
+            confirm_unwrapped_modules=True,
+            testing_dendrite_capacity=True,
+        )
+        pc.set_testing_dendrite_capacity.assert_called_once_with(True)
+
+    def test_capacity_diagnostic_forces_pai_controlled_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
+            runner = BenchmarkRunner(results_root=Path(root) / "results")
+            model_spec = SimpleNamespace(key="unit", display_name="Unit")
+            with patch(
+                "dendritic_benchmark.pipeline.model_by_key",
+                return_value=model_spec,
+            ), patch.object(
+                runner, "_process_one_model_spec", return_value=False
+            ) as process:
+                runner.run(
+                    model_keys=["unit"],
+                    pai_capacity_check=True,
+                    write_reports=False,
+                )
+        self.assertTrue(runner._pai_capacity_check)
+        self.assertTrue(runner._pai_train_until_complete)
+        self.assertTrue(process.call_args.args[-2])
 
 
 def _condition(key: str):

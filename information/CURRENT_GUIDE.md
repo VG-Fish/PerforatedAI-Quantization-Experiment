@@ -116,6 +116,7 @@ Runs the full benchmark pipeline: trains each selected model under each selected
 | `--ignore-saved-models` | flag | Redo training for all selected model/condition pairs even if a record.json already exists on disk. |
 | `--allow-PQAT` | flag | Enable post-quantization-aware training for all quantized conditions. |
 | `--dynamic-dendritic-training` | flag | Use PerforatedAI's open-ended dynamic FP32 dendritic training mode. |
+| `--pai-capacity-check` | flag | Run PAI's built-in seven-epoch dendrite-capacity diagnostic. |
 | `--model-scale` | `1.0` | Scale the width of the compact-capable benchmark models before training. |
 | `--pai-variant` | `default` | Select a measured PAI targeting ablation. |
 | `--pai-fixed-switch-interval` | — | Diagnostic only: force PAI's fixed-switch mode at the requested interval for dendritic search. |

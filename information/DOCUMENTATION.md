@@ -123,7 +123,7 @@ The library's active `PAI/PAI_config.json` is also snapshotted after each
 perforation as `PAI/<model>_<condition>_PAI_config.json` and, for the run
 artifact, as `results/<model>/<condition>/PAI_config.json`.
 
-This benchmark suite itself saves the best model state it evaluated to `results/<model>/<condition>/model.pt` and uses that file for comparisons and file-size reporting. For dendritic FP32 runs, the default mode treats the configured `max_epochs` value as a hard budget matching the base model. `--dynamic-dendritic-training` restores the open-ended PerforatedAI completion mode; if PerforatedAI needs more epochs to reach `training_complete=True`, those later epochs are saved separately in `results/<model>/<condition>/continued_until_complete/`. If PerforatedAI changes bookkeeping tensor shapes during live restructuring, the restore step reloads only shape-compatible tensors and leaves incompatible tracker metadata at the current model value.
+This benchmark suite itself saves the best model state it evaluated to `results/<model>/<condition>/model.pt` and uses that file for comparisons and file-size reporting. For dendritic FP32 runs, the default mode treats the configured `max_epochs` value as a hard budget matching the base model. Before a new target set is used in production, `--pai-capacity-check --conditions dendrites_fp32` enables PAI's built-in seven-epoch capacity diagnostic; the benchmark leaves PAI live until it reports completion and marks the resulting artifact as diagnostic, so it cannot be reused as a production result. `--dynamic-dendritic-training` restores the open-ended production completion mode; if PerforatedAI needs more epochs to reach `training_complete=True`, those later epochs are saved separately in `results/<model>/<condition>/continued_until_complete/`. If PerforatedAI changes bookkeeping tensor shapes during live restructuring, the restore step reloads only shape-compatible tensors and leaves incompatible tracker metadata at the current model value.
 
 ***
 ## PyTorch Implementation Notes
@@ -177,10 +177,13 @@ loop for FP32 dendritic training. By default, dendritic FP32 runs use
 `range(max_epochs)`: `add_validation_score(...)` is called only during the
 first 80% of epochs, PAI switch hyperparameters are shortened for that active
 window, and dendrite insertion is frozen for the final 20% of epochs.
-`--dynamic-dendritic-training` switches back to the open-ended loop that keeps
-calling `add_validation_score(...)` until PerforatedAI reports
-`training_complete=True`; any epochs after the canonical budget are isolated
-under `continued_until_complete/`.
+`--pai-capacity-check --conditions dendrites_fp32` first exercises PAI's
+built-in seven-epoch integration diagnostic. It also uses the open-ended loop,
+but its explicitly marked diagnostic artifact must not be used for a production
+comparison. `--dynamic-dendritic-training` then switches to the same
+open-ended loop for production, keeping `add_validation_score(...)` active
+until PerforatedAI reports `training_complete=True`; any epochs after the
+canonical budget are isolated under `continued_until_complete/`.
 
 ```python
 epoch = -1
@@ -204,7 +207,7 @@ for epoch in range(max_epochs):
     # non-dendritic and PTQ/PQAT runs use a fixed epoch budget
 
 while not training_complete:
-    # only with --dynamic-dendritic-training
+    # with --pai-capacity-check or --dynamic-dendritic-training
     # epochs greater than max_epochs are saved in continued_until_complete/
 ```
 

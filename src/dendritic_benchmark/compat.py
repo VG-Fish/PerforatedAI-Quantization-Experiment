@@ -164,6 +164,9 @@ class PAIRuntimeOptions:
     initial_correlation_batches_limit: int | None = None
     fixed_switch_interval: int | None = None
     dynamic_schedule: PAIDynamicSchedule | None = None
+    # PAI's built-in seven-epoch integration diagnostic.  This must be an
+    # explicit opt-in: it deliberately replaces the normal search policy.
+    testing_dendrite_capacity: bool = False
 
 
 def _call_if_available(target: Any, method_name: str, *args: Any) -> None:
@@ -228,13 +231,16 @@ def _configure_pai_trackers(
     confirm_unwrapped_modules: bool,
     no_backward_workaround: bool = False,
     candidate_graph_enabled: bool = True,
+    testing_dendrite_capacity: bool = False,
 ) -> None:
     selection = module_selection or PAIModuleSelection()
     pc = gpa.pc
     _clear_pai_tracker_lists(pc)
     _append_pai_module_selection(pc, selection)
     _call_if_available(pc, "set_device", choose_device())
-    _call_if_available(pc, "set_testing_dendrite_capacity", False)
+    _call_if_available(
+        pc, "set_testing_dendrite_capacity", testing_dendrite_capacity
+    )
     _call_if_available(pc, "set_debugging_memory_leak", False)
     _call_if_available(pc, "set_candidate_graph_mode", candidate_graph_enabled)
     _call_if_available(pc, "set_dashboard_events_enabled", True)
@@ -793,6 +799,9 @@ def perforate_model(
                 confirm_unwrapped_modules,
                 no_backward_workaround=runtime_options.no_backward_workaround,
                 candidate_graph_enabled=runtime_options.candidate_graph_enabled,
+                testing_dendrite_capacity=(
+                    runtime_options.testing_dendrite_capacity
+                ),
             )
             if dendrite_training_max_epochs is not None:
                 _configure_pai_training_schedule(

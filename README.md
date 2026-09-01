@@ -32,7 +32,7 @@ smoothing, and gradient clipping) instead of a flat rate for the whole run.
 `information/DOCUMENTATION.md` has the full account of what was changed and why;
 `information/MODEL_REFERENCE.md` lists the per-model settings.
 
-Dendritic FP32 training defaults to the same fixed epoch budget as the matching non-dendritic model. PerforatedAI uses HISTORY plateau detection for every model; dendrite insertion is active during the first 80% of the budget, then frozen for the final 20% so the selected architecture can settle. Pass `--dynamic-dendritic-training` to keep the same HISTORY schedule open until `training_complete=True`; any epochs beyond the canonical budget are written under `results/<model>/<condition>/continued_until_complete/`. Fixed switching is available only as an explicit schedule diagnostic through `--pai-fixed-switch-interval EPOCHS`, and requested versus observed switches are recorded in `pai_summary.json`.
+Dendritic FP32 training defaults to the same fixed epoch budget as the matching non-dendritic model. PerforatedAI uses HISTORY plateau detection for every model; dendrite insertion is active during the first 80% of the budget, then frozen for the final 20% so the selected architecture can settle. Before a new target set or model is used for a production claim, run `--pai-capacity-check --conditions dendrites_fp32`: this enables PAI's seven-epoch wrapper/optimizer diagnostic and keeps the loop open until PAI reports completion. Its output is marked as diagnostic and cannot be reused as a production artifact. After it succeeds, pass `--dynamic-dendritic-training` to keep the real HISTORY schedule open until `training_complete=True`; any epochs beyond the canonical budget are written under `results/<model>/<condition>/continued_until_complete/`. Fixed switching is available only as an explicit schedule diagnostic through `--pai-fixed-switch-interval EPOCHS`, and requested versus observed switches are recorded in `pai_summary.json`.
 
 For Apple Silicon runs, the training path selects MPS automatically, disables CUDA-only pinned memory, keeps DataLoader workers persistent, uses larger per-model batch sizes, sets high float32 matmul precision where supported, and compiles non-dendritic MPS models with `torch.compile(..., backend="aot_eager")` when available. Long dendritic runs periodically clear PerforatedAI processor buffers and the accelerator cache to avoid MPS memory pressure during late epochs.
 
@@ -183,6 +183,7 @@ uv run dqb run --models lenet5 textcnn
 uv run dqb run --models all
 uv run dqb run --conditions base_fp32 dendrites_fp32
 uv run dqb run --allow-PQAT
+uv run dqb run --models distilbert --conditions dendrites_fp32 --pai-capacity-check
 uv run dqb run --dynamic-dendritic-training
 uv run dqb run --pai-fixed-switch-interval 8  # diagnostic only
 uv run dqb run --ignore-saved-models
@@ -274,7 +275,7 @@ The CLI exposes several helpful subcommands. Every option, with its default, is 
 	- Train models across one or more conditions. A bare run uses the evidence-backed default roster (`lenet5`, `tcn_forecaster`, `pointnet_modelnet40`, `resnet18_cifar10`, and `saint_adult`) across every condition. Use `--models all` to opt into the full exploratory 24-model roster.
 	- Splits the selected models across 4 worker processes by default and prints a live progress table until they all exit. Training is compute-bound rather than data-bound, so this cuts wall-clock close to linearly — the full 23-model FP32 pass is ~24h sequentially. Each model keeps all of its conditions in one worker, so the `dendrites_q8` → `dendrites_fp32` dependency order still holds. Worker output goes to `<logging-dir>/streams/stream_N.log`, and every progress table is appended to `<logging-dir>/run_progress.log`.
 	- Ctrl-C detaches the progress display without stopping training. Stop training with `pkill -f 'dqb run'`.
-	- Useful flags: `--models`, `--conditions`, `--results-root`, `--results-directory`, `--comparison-root`, `--ignore-saved-models`, `--allow-PQAT`, `--dynamic-dendritic-training`, `--jobs` (1 trains in-process and prints to the terminal), `--fresh` (delete stale `epoch_checkpoint.pt` files first — `--ignore-saved-models` does *not* cover those), `--detach`, `--status`, `-i/--interval`.
+	- Useful flags: `--models`, `--conditions`, `--results-root`, `--results-directory`, `--comparison-root`, `--ignore-saved-models`, `--allow-PQAT`, `--pai-capacity-check` (FP32 dendritic source only), `--dynamic-dendritic-training`, `--jobs` (1 trains in-process and prints to the terminal), `--fresh` (delete stale `epoch_checkpoint.pt` files first — `--ignore-saved-models` does *not* cover those), `--detach`, `--status`, `-i/--interval`.
 	- Examples:
         ```bash
         uv run dqb run
@@ -282,6 +283,7 @@ The CLI exposes several helpful subcommands. Every option, with its default, is 
         uv run dqb run --models lenet5 textcnn
         uv run dqb run --conditions base_fp32 dendrites_fp32
         uv run dqb run --allow-PQAT
+        uv run dqb run --models distilbert --conditions dendrites_fp32 --pai-capacity-check
         uv run dqb run --dynamic-dendritic-training
         uv run dqb run --ignore-saved-models
         ```

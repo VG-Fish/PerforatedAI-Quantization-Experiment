@@ -391,6 +391,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run_parser.add_argument(
+        "--pai-capacity-check",
+        action="store_true",
+        help=(
+            "Run PAI's built-in seven-epoch dendrite-capacity diagnostic. "
+            "This is restricted to the FP32 dendritic source condition, keeps "
+            "PAI live until it reports completion, and records a diagnostic "
+            "artifact that is not reusable as a production result."
+        ),
+    )
+    run_parser.add_argument(
         "--model-scale",
         type=float,
         default=1.0,
@@ -865,6 +875,16 @@ def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
         pai_override=pai_override,
     )
     selected_models = selected_model_keys(args.models)
+    selected_condition_keys = runner._expand_condition_keys(args.conditions)
+    if args.pai_capacity_check:
+        if selected_condition_keys != ["dendrites_fp32"]:
+            raise SystemExit(
+                "--pai-capacity-check requires exactly "
+                "--conditions dendrites_fp32; run production/PQAT conditions "
+                "only after the diagnostic succeeds."
+            )
+        if args.allow_pqat:
+            raise SystemExit("--pai-capacity-check cannot be combined with --allow-PQAT")
     if (recipe_override is not None or pai_override is not None) and len(
         selected_models
     ) != 1:
@@ -904,6 +924,7 @@ def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
             ignore_saved=args.ignore_saved_models,
             allow_pqat=args.allow_pqat,
             dynamic_dendritic_training=args.dynamic_dendritic_training,
+            pai_capacity_check=args.pai_capacity_check,
             write_reports=False,
             seed=args.seed,
         )
@@ -916,6 +937,7 @@ def _handle_run(args: Any, results_root: Path, comparison_root: Path) -> None:
             ignore_saved=args.ignore_saved_models,
             allow_pqat=args.allow_pqat,
             dynamic_dendritic_training=args.dynamic_dendritic_training,
+            pai_capacity_check=args.pai_capacity_check,
             seed=args.seed,
         )
         return
@@ -955,6 +977,8 @@ def _run_passthrough(args: Any, comparison_root: Path) -> list[str]:
         flags.append("--allow-PQAT")
     if args.dynamic_dendritic_training:
         flags.append("--dynamic-dendritic-training")
+    if args.pai_capacity_check:
+        flags.append("--pai-capacity-check")
     if not math.isclose(args.model_scale, 1.0):
         flags += ["--model-scale", str(args.model_scale)]
     if args.pai_variant != "default":

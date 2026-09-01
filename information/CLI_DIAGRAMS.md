@@ -17,7 +17,7 @@ never by condition, so the dependency chain below stays inside one worker.
 
 ```mermaid
 flowchart TD
-    A([uv run dqb run]) --> B["Parse args<br>--models, --conditions,<br>--ignore-saved-models,<br>--allow-PQAT,<br>--dynamic-dendritic-training,<br>--jobs, --fresh, --detach, --status"]
+    A([uv run dqb run]) --> B["Parse args<br>--models, --conditions,<br>--ignore-saved-models,<br>--allow-PQAT,<br>--pai-capacity-check,<br>--dynamic-dendritic-training,<br>--jobs, --fresh, --detach, --status"]
     B --> C["Load .env credentials<br>via compat.py"]
     C --> PJ{"--jobs > 1<br>and more than<br>one model?"}
     PJ -->|"No — or --worker,<br>set on spawned processes"| D["BenchmarkRunner<br>pipeline.py"]
