@@ -282,8 +282,8 @@ class BenchmarkRunnerOverrideWiringTests(unittest.TestCase):
             schedule = runner._pai_dynamic_schedule("resnet18_cifar10")
         assert schedule is not None
         self.assertEqual(schedule.p_epochs_to_switch, 6)
-        # resnet18_cifar10's own default (max_dendrites=1) is preserved.
-        self.assertEqual(schedule.max_dendrites, 1)
+        # Unset fields remain unset so the installed PAI library owns them.
+        self.assertIsNone(schedule.max_dendrites)
 
     def test_no_override_leaves_resolved_values_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]

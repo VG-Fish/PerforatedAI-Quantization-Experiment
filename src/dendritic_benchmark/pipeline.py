@@ -104,7 +104,6 @@ _PAI_VARIANTS = frozenset(
         "default",
         "distilbert_classifier_only",
         "gru_gate_ablation",
-        "mpnn_capacity",
         "tcn_head_both",
         "tcn_head_output",
         "vae_latent",
@@ -135,38 +134,6 @@ _MODEL_ARTIFACT_REVISIONS = {
     # matching -- so the revision is what actually invalidates a pre-AP0 M5
     # dendritic artifact. See information/optimization/03_execution_matrix.md.
     "m5": "optimization_ap0_late_target_v1",
-}
-# Dynamic9 showed that the global three-dendrite schedule adds unnecessary
-# capacity to several models. These are deliberately sparse overrides; fields
-# omitted here keep the well-tested global defaults in compat.py.
-_MODEL_DYNAMIC_PAI_SCHEDULES = {
-    "gcn": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=6),
-    "actor_critic": PAIDynamicSchedule(max_dendrites=2, p_epochs_to_switch=6),
-    "lenet5": PAIDynamicSchedule(max_dendrites=1),
-    "tcn_forecaster": PAIDynamicSchedule(max_dendrites=1),
-    "mpnn": PAIDynamicSchedule(max_dendrites=3),
-    "vae_mnist": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=6),
-    "gru_forecaster": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=6),
-    # Keep the first three replacement experiments capacity-conservative.  A
-    # single retained dendrite makes a parameter-matched dense control practical
-    # if any configuration shows a credible gain.  Note this diverges from
-    # upstream for ResNet-18: PerforatedAI's published model retains 5
-    # dendrites on .pre_fc (--dendrite-mode 1 -> max_dendrites=5), so a result
-    # here is not a reproduction of their ImageNet number even before the
-    # dataset difference.
-    "resnet18_cifar10": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=10),
-    "saint_adult": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=10),
-    "pointnet_modelnet40": PAIDynamicSchedule(max_dendrites=1, p_epochs_to_switch=10),
-}
-_PAI_VARIANT_SCHEDULES = {
-    "mpnn_capacity": {
-        "mpnn": PAIDynamicSchedule(max_dendrites=4),
-    },
-    # Retain the recurrent-gate configuration only as a labelled ablation; it
-    # must not silently stand in for the new decoder-target default.
-    "gru_gate_ablation": {
-        "gru_forecaster": PAIDynamicSchedule(max_dendrites=1, n_epochs_to_switch=8),
-    },
 }
 # Full-transformer PAI wrapping makes DistilBERT's candidate forward exceed
 # Apple Silicon MPS memory. Keep dendrite search on the task-specific head.
@@ -721,9 +688,9 @@ class BenchmarkRunner:
             "mobilenetv2_cifar10": [".classifier.1", ".features.0.0"],
             # Every conv inside the 4 TemporalBlocks (.net.*) scored 0.017-0.023
             # Best-PBScore on the 2026-08-03 dynamic run, 7-10x below .head's
-            # 0.166; perforating all of them just spreads the max_dendrites=3
-            # budget across near-noise candidates instead of the layer that
-            # actually correlates with the learning signal.
+            # 0.166; perforating all of them spreads PAI's candidate search
+            # across near-noise modules instead of the layer that actually
+            # correlates with the learning signal.
             "tcn_forecaster": (
                 [".net", ".head.0"]
                 if self._pai_variant == "tcn_head_output"
@@ -858,23 +825,11 @@ class BenchmarkRunner:
         return self._diagnostic_fixed_switch_interval
 
     def _pai_dynamic_schedule(self, model_key: str) -> PAIDynamicSchedule | None:
-        """Return the measured schedule for a model and optional ablation variant.
-
-        A PAIOverride, when set, is merged on top of the resolved schedule
-        (see PAIOverride.apply_to_schedule) -- it never replaces the variant
-        lookup below, only overrides the specific fields it sets.
-        """
-        variant_schedule = _PAI_VARIANT_SCHEDULES.get(self._pai_variant, {}).get(
-            model_key
-        )
-        base_schedule = (
-            variant_schedule
-            if variant_schedule is not None
-            else _MODEL_DYNAMIC_PAI_SCHEDULES.get(model_key)
-        )
+        """Return only explicit caller overrides; PAI owns the default policy."""
+        _ = model_key
         if self._pai_override is None:
-            return base_schedule
-        return self._pai_override.apply_to_schedule(base_schedule)
+            return None
+        return self._pai_override.apply_to_schedule(None)
 
     @staticmethod
     def _model_artifact_revision(model_key: str) -> str | None:
@@ -1655,10 +1610,9 @@ class BenchmarkRunner:
             return False
         expected_schedule = self._pai_dynamic_schedule(model_key)
         recorded_schedule = metadata.get("pai_dynamic_schedule")
-        # Compare both directions of the None boundary too: adding or removing a
-        # _MODEL_DYNAMIC_PAI_SCHEDULES override is a None-to-dict transition, and
-        # for models absent from _MODEL_ARTIFACT_REVISIONS this is the only guard
-        # that would catch the artifact being trained under the other schedule.
+        # Compare both directions of the None boundary: explicit schedule
+        # overrides are part of artifact identity, while None means the
+        # installed PAI library owned the policy.
         expected_dict = (
             expected_schedule.to_dict() if expected_schedule is not None else None
         )
@@ -1668,6 +1622,8 @@ class BenchmarkRunner:
             self._pai_override.to_dict() if self._pai_override is not None else None
         )
         if metadata.get("pai_override") != expected_pai_override:
+            return False
+        if metadata.get("max_dendrite_phase_epochs") != 0:
             return False
         expects_live_pai = condition.use_dendrites and not condition.quantized
         if bool(metadata.get("train_dendrites_until_complete", False)) != (

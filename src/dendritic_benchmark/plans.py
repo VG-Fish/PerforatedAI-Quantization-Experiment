@@ -310,9 +310,8 @@ class PAIOverride:
 
         Returns ``base`` unchanged if this override sets no schedule field.
         A field left unset here falls back to ``base``'s own value (``None``
-        if ``base`` is itself ``None``), matching how
-        :class:`PAIDynamicSchedule` already treats ``None`` as "use the
-        global default" via ``compat.PAI_DYNAMIC_SCHEDULE_DEFAULTS``.
+        if ``base`` is itself ``None``). Unset schedule fields are left to the
+        installed PerforatedAI library.
         """
         overrides = {
             name: getattr(self, name)

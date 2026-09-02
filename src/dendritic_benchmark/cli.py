@@ -417,7 +417,6 @@ def build_parser() -> argparse.ArgumentParser:
             "default",
             "distilbert_classifier_only",
             "gru_gate_ablation",
-            "mpnn_capacity",
             "tcn_head_both",
             "tcn_head_output",
             "vae_latent",
@@ -428,7 +427,6 @@ def build_parser() -> argparse.ArgumentParser:
             "current targeted settings; `tcn_head_output`/`tcn_head_both` "
             "screen alternate TCN head targets; `gru_gate_ablation` restores "
             "the prior gate search; `vae_latent` perforates VAE latent heads; "
-            "`mpnn_capacity` permits a fourth targeted MPNN dendrite; "
             "`distilbert_classifier_only` perforates only DistilBERT's final "
             "classifier instead of the pre-classifier+classifier pair. "
             "(default: default)"
@@ -466,9 +464,10 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help=(
             "Load a dendritic_benchmark.plans.PAIOverride from this JSON file "
-            "and apply it on top of the selected model's default PAI target "
-            "modules and dynamic schedule. Requires exactly one selected "
-            "--models key, for the same reason as --recipe-override."
+            "to override the selected model's target modules or explicitly "
+            "override PerforatedAI's library-owned schedule. Requires exactly "
+            "one selected --models key, for the same reason as "
+            "--recipe-override."
         ),
     )
     run_parser.add_argument(

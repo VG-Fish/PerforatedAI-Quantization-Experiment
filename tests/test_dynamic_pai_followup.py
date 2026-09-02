@@ -43,6 +43,7 @@ from dendritic_benchmark.training import (
     _pai_epoch_milestones,
     _read_pai_architecture_log,
     _read_pai_switch_log,
+    _run_dynamic_dendrite_update,
     _run_training_epochs,
     _scheduled_learning_rate,
     _topology_hash,
@@ -322,7 +323,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
         self.assertEqual(loader.num_workers, 0)
         self.assertFalse(loader.persistent_workers)
 
-    def test_schedule_override_scales_thresholds_with_dendrite_cap(self) -> None:
+    def test_schedule_override_sets_only_explicit_fields(self) -> None:
         pc = _RecordingPC()
         _configure_dynamic_pai_schedule(
             pc,
@@ -331,9 +332,9 @@ class DynamicPAIFollowupTests(unittest.TestCase):
 
         self.assertEqual(pc.values["set_max_dendrites"], 1)
         self.assertEqual(pc.values["set_p_epochs_to_switch"], 6)
-        self.assertEqual(pc.values["set_improvement_threshold"], [0.005, 0.002])
+        self.assertNotIn("set_improvement_threshold", pc.values)
 
-    def test_bounded_and_open_ended_training_share_history_schedule(self) -> None:
+    def test_no_override_leaves_schedule_to_pai(self) -> None:
         pc = _RecordingPC()
 
         class _GPA:
@@ -343,7 +344,41 @@ class DynamicPAIFollowupTests(unittest.TestCase):
         gpa = _GPA(pc)
         _configure_pai_training_schedule(gpa)
 
-        self.assertEqual(pc.values["set_switch_mode"], "history")
+        self.assertEqual(pc.values, {})
+
+    def test_library_schedule_defaults_are_restored_without_copied_values(self) -> None:
+        pc = _RecordingPC()
+        library_values = {
+            "switch_mode": "library-history",
+            "first_fixed_switch_num": 7,
+            "fixed_switch_num": 70,
+            "n_epochs_to_switch": 11,
+            "history_lookback": 3,
+            "initial_history_after_switches": 0,
+            "p_epochs_to_switch": 4,
+            "improvement_threshold": [0.02, 0.01],
+            "reset_best_score_on_switch": True,
+            "candidate_weight_initialization_multiplier": 0.25,
+            "max_dendrites": 17,
+        }
+
+        class _LibraryConfig:
+            def __init__(self) -> None:
+                for name, value in library_values.items():
+                    setattr(self, name, value)
+
+        class _GPA:
+            PAIConfig = _LibraryConfig
+
+            def __init__(self, pai_config: _RecordingPC) -> None:
+                self.pc = pai_config
+
+        _configure_pai_training_schedule(_GPA(pc))
+
+        self.assertEqual(
+            pc.values,
+            {f"set_{name}": value for name, value in library_values.items()},
+        )
 
     def test_dynamic_completion_stops_immediately(self) -> None:
         """An open-ended PAI run must stop on its completion epoch."""
@@ -404,6 +439,43 @@ class DynamicPAIFollowupTests(unittest.TestCase):
 
         self.assertEqual([row["epoch"] for row in history], [1])
         self.assertEqual(history[-1]["training_termination_reason"], "pai_training_complete")
+
+    def test_dynamic_update_never_forces_a_pai_switch(self) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        class _Tracker:
+            def add_validation_score(self, *args: object):
+                calls.append(args)
+                return args[1], False, False
+
+        model = torch.nn.Linear(1, 1)
+        context = EpochTrainingContext(
+            model=model,
+            model_key="gcn",
+            bundle=None,
+            device=torch.device("cpu"),
+            criterion=None,
+            torch=torch,
+            max_epochs=3,
+            run_label="gcn | dendrites_fp32",
+            config=TrainingConfig(use_dendrites=True),
+            metric_name="Accuracy",
+            primary_metric_key="accuracy",
+            metric_direction="maximize",
+        )
+
+        with (
+            patch("dendritic_benchmark.training.pai_working_directory", nullcontext),
+            patch("dendritic_benchmark.training._configure_dendrite_output_dimensions"),
+        ):
+            _run_dynamic_dendrite_update(
+                context=context,
+                optimizer=object(),
+                pai_tracker=_Tracker(),
+                val_metric=0.5,
+            )
+
+        self.assertEqual(calls, [(0.5, model)])
 
     def test_fixed_switching_requires_an_explicit_diagnostic_interval(self) -> None:
         pc = _RecordingPC()
@@ -499,13 +571,9 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                 [".model.distilbert", ".model.pre_classifier"],
             )
             schedule = runner._pai_dynamic_schedule("resnet18_cifar10")
-            self.assertIsNotNone(schedule)
-            assert schedule is not None
-            self.assertEqual(schedule.max_dendrites, 1)
+            self.assertIsNone(schedule)
             gcn_schedule = runner._pai_dynamic_schedule("gcn")
-            self.assertIsNotNone(gcn_schedule)
-            assert gcn_schedule is not None
-            self.assertEqual(gcn_schedule.max_dendrites, 1)
+            self.assertIsNone(gcn_schedule)
 
     def test_priority_models_leave_no_parameter_untyped(self) -> None:
         """Every parameter must be perforated or tracked, or PAI drops into pdb.
@@ -1202,7 +1270,9 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             self.assertEqual(summary["history"]["training_complete_epochs"], [20])
             self.assertEqual(summary["architecture_log_consistency"], "stale")
             self.assertIsNone(summary["fixed_switch_interval"])
-            self.assertEqual(summary["requested_schedule"]["mode"], "history")
+            self.assertEqual(
+                summary["requested_schedule"]["mode"], "history_override"
+            )
             self.assertEqual(
                 summary["observed_schedule"]["forced_switches"],
                 [{"epoch": 10, "reason": "candidate_phase_timeout"}],

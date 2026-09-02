@@ -121,7 +121,7 @@ Runs the full benchmark pipeline: trains each selected model under each selected
 | `--pai-variant` | `default` | Select a measured PAI targeting ablation. |
 | `--pai-fixed-switch-interval` | — | Diagnostic only: force PAI's fixed-switch mode at the requested interval for dendritic search. |
 | `--recipe-override` | — | Load a dendritic_benchmark.plans.RecipeOverride from this JSON file and apply it on top of the selected model's hard-coded ModelTrainingRecipe. |
-| `--pai-override` | — | Load a dendritic_benchmark.plans.PAIOverride from this JSON file and apply it on top of the selected model's default PAI target modules and dynamic schedule. |
+| `--pai-override` | — | Load a dendritic_benchmark.plans.PAIOverride from this JSON file to override the selected model's target modules or explicitly override PerforatedAI's library-owned schedule. |
 | `-j`, `--jobs` | `4` | Number of worker processes to split the selected models across. |
 | `-i`, `--interval` | `60` | Seconds between progress tables while waiting on the workers. |
 | `--fresh` | flag | Delete any leftover epoch_checkpoint.pt (and its condition directory) for the selected pairs before launching. |

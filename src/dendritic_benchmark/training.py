@@ -95,13 +95,6 @@ _FALLBACK_MODULE_OUTPUT_DIMENSIONS: dict[str, dict[str, list[int]]] = {
 # "linear"   decays it linearly to learning_rate*lr_min_factor (BERT-style).
 # All three honour warmup_epochs first. See ModelTrainingRecipe in pipeline.py.
 
-# Hard ceiling on a single PAI dendrite ("p") phase, in epochs.  PAI's own
-# pai_improvement_threshold gates do not reliably end the phase (raising them
-# changed nothing on 91 of 92 switch checks), so this is what actually bounds
-# one candidate phase. It is not a cap on total dynamic training time.
-MAX_DENDRITE_PHASE_EPOCHS = 8
-
-
 @dataclass
 class TrainingConfig:
     bit_width: int | None = None
@@ -171,29 +164,9 @@ class TrainingConfig:
     dataset_revision: str | None = None
     pai_fixed_switch_interval: int | None = None
     pai_dynamic_schedule: dict[str, Any] | None = None
-    # Ceiling on a single dendrite ("p") phase in dynamic mode, and the only
-    # thing that bounds one.  PAI leaves the phase once no node's correlation
-    # has improved for p_epochs_to_switch epochs, but those scores keep drifting
-    # up on noise long after they have converged, so the patience counter resets
-    # almost every epoch: measured at 91 of 92 dendrite-mode switch checks, vs
-    # 27 of 52 in neuron mode where the counter behaves.  Left alone the phase
-    # runs unbounded — 207+ epochs on lstm_autoencoder without ever adding a
-    # dendrite, and 198/175/169 on mpnn/tabnet/lstm_forecaster.  Raising PAI's
-    # own pai_improvement_threshold(_raw) does not help (see compat.py).
-    #
-    # Lowered 50 -> 8 on 2026-08-28.  At 50 this guard could never fire at all:
-    # a dendrite phase freezes validation bit-for-bit by construction (the parent
-    # net is frozen and the candidates are not wired into the output yet), so
-    # _training_collapsed tripped at _COLLAPSE_GUARD_EPOCHS = 12 and killed the
-    # run 38 epochs before the ceiling was reached.  Across the 2026-08-28 seed-0
-    # run that cost six of seven models their entire dendrite schedule -- mpnn
-    # stopped at 24 epochs against its base arm's 200, having never switched a
-    # single dendrite in -- and "Forcing the switch" has never once appeared in
-    # any log.  8 sits above the longest phase that has ever ended on its own
-    # (3 epochs, gcn, the one model that did complete) and below the collapse
-    # guard, so the forced switch happens while the run is still alive.
-    # 0 disables the guard.
-    max_dendrite_phase_epochs: int = MAX_DENDRITE_PHASE_EPOCHS
+    # Kept in artifact metadata for compatibility with historical runs. Zero
+    # means the benchmark never forces PAI out of a candidate phase.
+    max_dendrite_phase_epochs: int = 0
     # Stored only for quantized artifacts. QAT validation already evaluates the
     # projected weights; final evaluation must not quantize them a second time.
     quantization_evaluation_revision: str | None = None
@@ -1659,6 +1632,16 @@ def _write_metrics_and_history(
         writer.writerows(payload.history)
 
 
+def _pai_switch_mode_label(metadata: ArtifactMetadata) -> str:
+    if not metadata.enable_pai_dendrite_updates:
+        return "not_applicable"
+    if metadata.pai_fixed_switch_interval is not None:
+        return "fixed_diagnostic"
+    if metadata.pai_dynamic_schedule is not None:
+        return "history_override"
+    return "pai_library"
+
+
 def _persist_stage_artifacts(
     *,
     output_dir: Path,
@@ -1748,13 +1731,7 @@ def _persist_stage_artifacts(
             "model_scale": metadata.model_scale,
             "seed": metadata.seed,
             "pai_variant": metadata.pai_variant,
-            "pai_switch_mode": (
-                "fixed_diagnostic"
-                if metadata.pai_fixed_switch_interval is not None
-                else "history"
-            )
-            if metadata.enable_pai_dendrite_updates
-            else "not_applicable",
+            "pai_switch_mode": _pai_switch_mode_label(metadata),
             "pai_fixed_switch_interval": metadata.pai_fixed_switch_interval,
             "pai_dynamic_schedule": metadata.pai_dynamic_schedule,
             "dendrite_audit_revision": metadata.dendrite_audit_revision,
@@ -2149,11 +2126,7 @@ def _write_pai_summary(
                 "fixed_switch_interval": metadata.pai_fixed_switch_interval,
                 "dynamic_schedule": metadata.pai_dynamic_schedule,
                 "requested_schedule": {
-                    "mode": (
-                        "fixed_diagnostic"
-                        if metadata.pai_fixed_switch_interval is not None
-                        else "history"
-                    ),
+                    "mode": _pai_switch_mode_label(metadata),
                     "fixed_switch_interval": metadata.pai_fixed_switch_interval,
                     "dynamic_schedule": metadata.pai_dynamic_schedule,
                 },
@@ -3666,31 +3639,12 @@ def _pai_dendrite_phase_epochs(pai_tracker: Any) -> int | None:
         return None
 
 
-def _pai_dendrite_phase_stalled(
-    context: EpochTrainingContext, pai_tracker: Any
-) -> bool:
-    """True when the dendrite phase has overrun its ceiling and must be cut short."""
-    limit = context.config.max_dendrite_phase_epochs
-    if limit <= 0:
-        return False
-    phase_epochs = _pai_dendrite_phase_epochs(pai_tracker)
-    if phase_epochs is None or phase_epochs < limit:
-        return False
-    print(
-        f"[pai] {context.run_label}: dendrite phase has run {phase_epochs} epochs "
-        f"(limit {limit}) without PAI electing to switch. Forcing the switch so "
-        "the candidate dendrites are evaluated instead of training on noise."
-    )
-    return True
-
-
 def _run_dynamic_dendrite_update(
     *,
     context: EpochTrainingContext,
     optimizer: Any,
     pai_tracker: Any,
     val_metric: float,
-    force_switch: bool = False,
 ) -> tuple[Any, Any | None, bool, bool]:
     import pdb as _pdb
     from typing import Any, Callable
@@ -3706,13 +3660,8 @@ def _run_dynamic_dendrite_update(
             context.model, MODULE_OUTPUT_DIMENSIONS_ATTR, None
         )
         with pai_working_directory():
-            # The unforced path passes no third argument at all, so PAI builds
-            # without force_switch behave exactly as before; the forced path
-            # passes it positionally so it does not depend on the parameter name.
-            model, restructured, training_complete = (
-                pai_tracker.add_validation_score(val_metric, context.model, True)
-                if force_switch
-                else pai_tracker.add_validation_score(val_metric, context.model)
+            model, restructured, training_complete = pai_tracker.add_validation_score(
+                val_metric, context.model
             )
         attach_module_output_dimensions(model, module_dimensions)
         context.model = model.to(context.device)
@@ -3932,13 +3881,12 @@ def _run_active_pai_update(
     optimizer: Any,
     pai_tracker: Any,
     val_metric: float,
-    force_switch: bool,
 ) -> tuple[Any, Any | None, bool, bool]:
     _set_pai_candidate_graph_for_context(context, True)
     try:
         return _run_dynamic_dendrite_update(
             context=context, optimizer=optimizer, pai_tracker=pai_tracker,
-            val_metric=val_metric, force_switch=force_switch,
+            val_metric=val_metric,
         )
     finally:
         _set_pai_candidate_graph_for_context(context, False)
@@ -3961,16 +3909,11 @@ def _apply_pai_epoch_update(
     history_row["pai_dendrite_phase"] = (
         _pai_dendrite_phase_epochs(pai_tracker) is not None
     )
-    force_switch = _pai_dendrite_phase_stalled(context, pai_tracker)
     optimizer, pai_tracker, restructured, training_complete = _run_active_pai_update(
         context=context, optimizer=optimizer, pai_tracker=pai_tracker,
-        val_metric=val_metric, force_switch=force_switch,
+        val_metric=val_metric,
     )
-    history_row["pai_switch_reason"] = (
-        "candidate_phase_timeout"
-        if force_switch
-        else ("pai_schedule" if restructured else "")
-    )
+    history_row["pai_switch_reason"] = "pai_schedule" if restructured else ""
     history_row["pai_restructured"] = restructured
     history_row["pai_training_complete"] = training_complete
     # The model may have been replaced (e.g. best-model import on PAI switch) or
@@ -4032,9 +3975,8 @@ def _training_collapsed(state: EpochTrainingState, metric_direction: str) -> boo
     the output, so identical validation is the *expected* signature, not a dead
     network -- the two are indistinguishable from the metric alone.  Without
     this exemption the guard fired on six of seven models in the 2026-08-28
-    run and truncated every one of them mid-phase.  ``max_dendrite_phase_epochs``
-    (8) bounds the phase well inside this window, so exempting these epochs
-    cannot let a genuinely stuck run train forever.
+    run and truncated every one of them mid-phase. Open-ended dendritic runs
+    leave phase completion to PAI and stop only on its completion signal.
     """
     if len(state.history) < _COLLAPSE_GUARD_EPOCHS:
         return False

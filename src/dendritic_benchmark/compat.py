@@ -6,6 +6,7 @@ import random
 import re
 import shutil
 import sys
+from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -119,12 +120,11 @@ class PAIModuleSelection:
 
 @dataclass(frozen=True)
 class PAIDynamicSchedule:
-    """Optional per-model overrides for the dynamic PAI schedule.
+    """Explicit caller overrides for PAI's dynamic schedule.
 
-    The defaults remain deliberately centralized in
-    :func:`_configure_dynamic_pai_schedule`.  A benchmark should override only
-    the knobs supported by measured behavior, rather than fork the whole PAI
-    configuration for every model.
+    Unset fields are deliberately left to the installed PerforatedAI library.
+    The benchmark does not supply model-specific growth limits or synthesize a
+    second set of schedule defaults.
     """
 
     max_dendrites: int | None = None
@@ -299,44 +299,39 @@ def _configure_interval_pai_schedule(pc: Any, *, switch_interval: int) -> None:
     )
 
 
-def _default_dynamic_improvement_thresholds(max_dendrites: int) -> list[float]:
-    """Return one positive plateau threshold for every possible dendrite count."""
-    if max_dendrites < 1:
-        raise ValueError("max_dendrites must be at least one")
-    defaults = [0.005, 0.002, 0.001, 0.001]
-    required = max_dendrites + 1
-    if required <= len(defaults):
-        return defaults[:required]
-    return [*defaults, *([defaults[-1]] * (required - len(defaults)))]
+_PAI_LIBRARY_SCHEDULE_FIELDS = (
+    "switch_mode",
+    "first_fixed_switch_num",
+    "fixed_switch_num",
+    "n_epochs_to_switch",
+    "history_lookback",
+    "initial_history_after_switches",
+    "p_epochs_to_switch",
+    "improvement_threshold",
+    "reset_best_score_on_switch",
+    "candidate_weight_initialization_multiplier",
+    "max_dendrites",
+)
 
 
-# One source of truth for the dynamic-schedule defaults.  _configure_dynamic_
-# pai_schedule applies them to PAI; pipeline.py reads the same numbers when it
-# sizes the dynamic epoch cap, so the two cannot drift apart.
-PAI_DYNAMIC_SCHEDULE_DEFAULTS: dict[str, Any] = {
-    "max_dendrites": 3,
-    "n_epochs_to_switch": 10,
-    "history_lookback": 8,
-    "initial_history_after_switches": 8,
-    "p_epochs_to_switch": 2,
-    "candidate_weight_initialization_multiplier": 0.005,
-}
+def _restore_pai_library_schedule_defaults(gpa: Any) -> None:
+    """Reset schedule state from a fresh library config, without copied values.
 
-
-def _schedule_value(
-    schedule: PAIDynamicSchedule | None, field: str, default: Any
-) -> Any:
-    if schedule is None:
-        return default
-    value = getattr(schedule, field)
-    return default if value is None else value
-
-
-def dynamic_schedule_field(schedule: PAIDynamicSchedule | None, field: str) -> Any:
-    """Effective value of a dynamic-schedule field, override or default."""
-    if field not in PAI_DYNAMIC_SCHEDULE_DEFAULTS:
-        raise KeyError(f"no dynamic schedule default registered for {field!r}")
-    return _schedule_value(schedule, field, PAI_DYNAMIC_SCHEDULE_DEFAULTS[field])
+    PerforatedAI stores configuration globally.  An explicit override from an
+    earlier run in the same process must not leak into a later default run, but
+    spelling the defaults here would merely move ownership back into the
+    benchmark.  Read them from a new library-owned config instead.
+    """
+    config_factory = getattr(gpa, "PAIConfig", None)
+    if config_factory is None:
+        return
+    defaults = config_factory()
+    current = gpa.pc
+    for field in _PAI_LIBRARY_SCHEDULE_FIELDS:
+        value = getattr(defaults, field, None)
+        setter = getattr(current, f"set_{field}", None)
+        if value is not None and setter is not None:
+            setter(deepcopy(value))
 
 
 def _configure_dynamic_pai_schedule(
@@ -346,87 +341,40 @@ def _configure_dynamic_pai_schedule(
     fixed_switch_interval: int | None = None,
     schedule: PAIDynamicSchedule | None = None,
 ) -> None:
-    max_dendrites = dynamic_schedule_field(schedule, "max_dendrites")
-    if not isinstance(max_dendrites, int) or max_dendrites < 1:
-        raise ValueError("PAI dynamic max_dendrites must be a positive integer")
-    thresholds = _schedule_value(
-        schedule,
-        "improvement_threshold",
-        tuple(_default_dynamic_improvement_thresholds(max_dendrites)),
-    )
-    if len(thresholds) < max_dendrites + 1:
-        raise ValueError(
-            "PAI dynamic improvement_threshold needs max_dendrites + 1 entries"
-        )
     if fixed_switch_interval is not None:
         _configure_interval_pai_schedule(pc, switch_interval=fixed_switch_interval)
-    else:
+    elif schedule is not None:
+        if schedule.max_dendrites is not None and (
+            not isinstance(schedule.max_dendrites, int)
+            or schedule.max_dendrites < 1
+        ):
+            raise ValueError("PAI dynamic max_dendrites must be a positive integer")
+        if (
+            schedule.improvement_threshold is not None
+            and not schedule.improvement_threshold
+        ):
+            raise ValueError("PAI dynamic improvement_threshold must be non-empty")
         _set_pai_switch_mode(pc, "DOING_HISTORY")
-        _apply_pai_schedule_values(
-            pc,
-            {
-                "set_n_epochs_to_switch": dynamic_schedule_field(
-                    schedule, "n_epochs_to_switch"
-                ),
-                # PAI names the plateau-detection window "history_lookback"; the
-                # default of 1 switches on transient noise.
-                "set_history_lookback": dynamic_schedule_field(
-                    schedule, "history_lookback"
-                ),
-                # MUST accompany any history_lookback > 1. PAI's running
-                # average only seeds from the first real score while
-                # epochs_since_cycle_switch < initial_history_after_switches;
-                # at the default 0 that branch never runs and the EMA warms up
-                # from ZERO — a better-than-anything-real score for every
-                # metric that is not positive-maximize (ELBO ~ -92 under
-                # maximize, MAE/RMSE under minimize), so PAI pins its best
-                # model at epoch ~1 and restore-on-complete ships a
-                # barely-trained network (MEASUREMENT_CAVEATS §10; dynamic8's
-                # vae/tcn/mpnn dendritic arms). Matching the lookback gives a
-                # cumulative-mean warm-up over the same window after every
-                # switch.
-                "set_initial_history_after_switches": dynamic_schedule_field(
-                    schedule, "initial_history_after_switches"
-                ),
-                # Indexed by dendrites added (globals_perforatedai getter_val), so
-                # this needs max_dendrites + 1 entries. The final entry must stay
-                # above zero: at a threshold of 0 only improvement_threshold_raw
-                # (1e-5) separates a real gain from validation jitter, and the
-                # plateau detector never sees n_epochs_to_switch quiet epochs.
-                "set_improvement_threshold": list(thresholds),
-            },
-        )
-    _apply_pai_schedule_values(
-        pc,
-        {
-            "set_p_epochs_to_switch": dynamic_schedule_field(
-                schedule, "p_epochs_to_switch"
+        setters = {
+            "set_max_dendrites": schedule.max_dendrites,
+            "set_n_epochs_to_switch": schedule.n_epochs_to_switch,
+            "set_history_lookback": schedule.history_lookback,
+            "set_initial_history_after_switches": (
+                schedule.initial_history_after_switches
             ),
-            # Dendrites stopped paying for themselves well before the sixth on
-            # every model measured so far, and each extra one costs ~100 epochs
-            # at a steadily worse seconds-per-epoch.
-            "set_max_dendrites": max_dendrites,
-            # Zeroing the best score on switch also zeroes running_accuracy,
-            # which is an EMA over history_lookback epochs. Climbing back from
-            # 0 to a ~0.99 metric takes ~70 epochs, and every one of them
-            # registers as an improvement, so epoch_last_improved is refreshed
-            # continuously and the switch trigger cannot fire.
-            "set_reset_best_score_on_switch": False,
+            "set_p_epochs_to_switch": schedule.p_epochs_to_switch,
+            "set_improvement_threshold": (
+                list(schedule.improvement_threshold)
+                if schedule.improvement_threshold is not None
+                else None
+            ),
             "set_candidate_weight_initialization_multiplier": (
-                dynamic_schedule_field(
-                    schedule, "candidate_weight_initialization_multiplier"
-                )
+                schedule.candidate_weight_initialization_multiplier
             ),
-            # Not set here: pai_improvement_threshold / _raw, which gate how much
-            # a node's correlation must gain in one epoch to keep the dendrite
-            # phase alive.  Raising them from the (0.1, 1e-4) defaults to
-            # (0.2, 1e-3) was measured to change nothing — the dendrite-phase
-            # patience counter still reset on 91 of 92 switch checks — so the
-            # override was dropped rather than left as unexplained config.
-            # max_dendrite_phase_epochs in training.py is what actually bounds
-            # the phase.
-        },
-    )
+        }
+        _apply_pai_schedule_values(
+            pc, {name: value for name, value in setters.items() if value is not None}
+        )
     correlation_batches = _initial_correlation_batches(
         batches_per_epoch, initial_correlation_batches_limit
     )
@@ -442,9 +390,7 @@ def _configure_pai_training_schedule(
     fixed_switch_interval: int | None = None,
     dynamic_schedule: PAIDynamicSchedule | None = None,
 ) -> None:
-    # Bounded and open-ended training differ only in when the benchmark stops
-    # accepting live PAI updates. They use the same HISTORY plateau schedule.
-    # Fixed mode is reachable solely through the explicit diagnostic interval.
+    _restore_pai_library_schedule_defaults(gpa)
     _configure_dynamic_pai_schedule(
         gpa.pc,
         batches_per_epoch=batches_per_epoch,
