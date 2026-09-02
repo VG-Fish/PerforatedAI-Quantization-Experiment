@@ -80,6 +80,24 @@ MODEL_ADAPTERS: dict[str, ModelAdapter] = {
         _adapter("mobilenetv2_cifar10", "classification", "accuracy", num_classes=10),
         _adapter("saint_adult", "classification", "accuracy", num_classes=2, categorical_input=True, default_enabled=True),
         _adapter("capsnet_mnist", "classification", "accuracy", num_classes=10),
+        # --- PerforatedAI upstream base examples ---------------------------
+        # default_enabled for all five: they are the roster this experiment
+        # was re-scoped onto, so a bare `dqb run` selects exactly them plus
+        # the previously evidence-backed models.
+        _adapter(
+            "mnist_pai", "classification", "accuracy",
+            num_classes=10, default_enabled=True,
+        ),
+        _adapter(
+            "resnet18_hf_perforated_cifar100", "classification", "accuracy",
+            num_classes=100, default_enabled=True,
+        ),
+        _adapter(
+            "resnet18_kd_cifar100", "classification", "accuracy",
+            num_classes=100, default_enabled=True,
+        ),
+        _adapter("unet_carvana", "segmentation", "dice", default_enabled=True),
+        _adapter("unet_supervisely", "segmentation", "miou", default_enabled=True),
     )
 }
 

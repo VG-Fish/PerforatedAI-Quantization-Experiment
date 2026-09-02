@@ -65,6 +65,34 @@ MODEL_SPECS: list[ModelSpec] = [
     ModelSpec("mobilenetv2_cifar10", "MobileNetV2", "CIFAR-10", "Accuracy", "maximize"),
     ModelSpec("saint_adult", "SAINT", "Adult Income", "Accuracy", "maximize"),
     ModelSpec("capsnet_mnist", "CapsNet", "MNIST", "Accuracy", "maximize"),
+    # --- PerforatedAI upstream base examples -------------------------------
+    # Ported from PerforatedAI/PerforatedAI @ 0a5967b, the five examples whose
+    # published results show a dendritic gain.  See
+    # information/base_examples/01_UPSTREAM_AUDIT.md for the per-example audit
+    # and every declared departure.
+    ModelSpec("mnist_pai", "PAI MNIST CNN", "MNIST", "Accuracy", "maximize"),
+    ModelSpec(
+        "resnet18_hf_perforated_cifar100",
+        "HF Perforated ResNet-18 (CIFAR-100)",
+        "CIFAR-100",
+        "Accuracy",
+        "maximize",
+    ),
+    ModelSpec(
+        "resnet18_kd_cifar100",
+        "ResNet-18 + KD",
+        "CIFAR-100",
+        "Accuracy",
+        "maximize",
+    ),
+    ModelSpec("unet_carvana", "U-Net (Carvana)", "Carvana", "Dice", "maximize"),
+    ModelSpec(
+        "unet_supervisely",
+        "MobileNetV2 U-Net",
+        "Supervisely Person",
+        "mIoU",
+        "maximize",
+    ),
 ]
 
 
@@ -97,19 +125,41 @@ CONDITION_SPECS: list[ConditionSpec] = [
 
 
 HF_PERFORATED_RESNET18_KEY = "resnet18_hf_perforated_cifar10"
+HF_PERFORATED_RESNET18_CIFAR100_KEY = "resnet18_hf_perforated_cifar100"
+
+#: Models whose checkpoint already contains a trained PerforatedAI graph.
+#: Converting one again would stack a second search graph on top of the
+#: published one, which is not a meaningful control.
+PRE_PERFORATED_MODEL_KEYS: frozenset[str] = frozenset(
+    {HF_PERFORATED_RESNET18_KEY, HF_PERFORATED_RESNET18_CIFAR100_KEY}
+)
 
 
 def condition_supported_by_model(model_key: str, condition_key: str) -> bool:
     """Return whether a condition represents a distinct model comparison.
 
-    The Hugging Face ResNet checkpoint already contains its trained dendritic
-    graph.  Its ``base_*`` conditions are therefore the perforated model;
-    another ``dendrites_*`` conversion would stack a second search graph on
-    top and would not be a meaningful control.
+    The Hugging Face ResNet checkpoints already contain their trained
+    dendritic graph.  Their ``base_*`` conditions are therefore the perforated
+    model; another ``dendrites_*`` conversion would stack a second search graph
+    on top and would not be a meaningful control.  See
+    :data:`PRE_PERFORATED_MODEL_KEYS`.
+
+    The two *control* families go with them.  Both are defined relative to a
+    ``dendrites_fp32`` run -- ``base_more_training`` resumes that run's saved
+    pre-candidate fork for the same extra epochs, and ``capacity_dense`` widens
+    the dense model to match the topology that run ended at (see
+    ``ConditionSpec.control_kind`` and ``capacity_control``).  With no
+    ``dendrites_fp32`` in the matrix there is no fork to resume and no topology
+    to match, and the run dies in ``_prepare_control_model`` with
+    ``UnsupportedTopology: capacity controls require dendrites_fp32``.  That is
+    the correct refusal, but it should happen when the matrix is *planned*
+    rather than after the base family has already trained.
     """
+    if model_key not in PRE_PERFORATED_MODEL_KEYS:
+        return True
     return not (
-        model_key == HF_PERFORATED_RESNET18_KEY
-        and condition_key.startswith("dendrites_")
+        condition_key.startswith("dendrites_")
+        or condition_by_key(condition_key).control_kind is not None
     )
 
 

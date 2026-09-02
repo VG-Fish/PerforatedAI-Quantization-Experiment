@@ -12,9 +12,9 @@ from typing import Any, Literal
 
 from .compat import PAIDynamicSchedule, PAIModuleSelection
 
-OptimizerName = Literal["adam", "adamw", "sgd"]
+OptimizerName = Literal["adam", "adamw", "sgd", "adadelta", "rmsprop"]
 RegressionLossName = Literal["mse", "mae", "smooth_l1"]
-LRScheduleName = Literal["constant", "step", "cosine", "linear"]
+LRScheduleName = Literal["constant", "step", "cosine", "linear", "plateau", "poly"]
 
 
 @dataclass(frozen=True)
@@ -36,6 +36,17 @@ class ModelTrainingRecipe:
     regression_loss: RegressionLossName = "mse"
     grad_clip_norm: float | None = None
     nesterov: bool = False
+    lr_plateau_factor: float = 0.1
+    lr_plateau_patience: int = 5
+    lr_plateau_mode: Literal["min", "max"] = "max"
+    lr_poly_power: float = 0.9
+    # Upstream PAI examples register their scheduler with the tracker. PAI then
+    # steps it and rebuilds/replays it whenever a dendrite changes the model.
+    pai_owns_lr_schedule: bool = False
+    # Supervisely is the exception: it gives PAI an already-built optimizer
+    # instance and performs its polynomial schedule in the trainer itself.
+    pai_setup_optimizer: bool = True
+    pai_restructure_lr_multiplier: float = 1.0
 
     def with_batch_size(
         self, batch_size: int, *, scale_learning_rate: bool = True
@@ -146,6 +157,13 @@ class RecipeOverride:
     regression_loss: RegressionLossName | None = None
     grad_clip_norm: float | _ClearSentinel | None = None
     nesterov: bool | None = None
+    lr_plateau_factor: float | None = None
+    lr_plateau_patience: int | None = None
+    lr_plateau_mode: Literal["min", "max"] | None = None
+    lr_poly_power: float | None = None
+    pai_owns_lr_schedule: bool | None = None
+    pai_setup_optimizer: bool | None = None
+    pai_restructure_lr_multiplier: float | None = None
 
     def __post_init__(self) -> None:
         for f in fields(self):
