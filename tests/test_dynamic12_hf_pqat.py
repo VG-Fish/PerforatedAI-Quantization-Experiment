@@ -36,8 +36,16 @@ HF_CHECKPOINT = (
 )
 
 
+#: The dynamic12 sweep's own post-run checker. It lives with that sweep's
+#: scripts, which are deleted once the sweep is archived, so the test that
+#: exercises it skips rather than fails when the tree is gone.
+VERIFY_PQAT_SCRIPT = (
+    PROJECT_ROOT / "experiments" / "dynamic12" / "scripts" / "verify_pqat.py"
+)
+
+
 def _load_verifier() -> Any:
-    path = PROJECT_ROOT / "experiments" / "dynamic12" / "scripts" / "verify_pqat.py"
+    path = VERIFY_PQAT_SCRIPT
     spec = importlib.util.spec_from_file_location("dynamic12_verify_pqat", path)
     if spec is None:
         raise RuntimeError(f"could not load {path}")
@@ -176,6 +184,9 @@ class Dynamic12HFPQATTests(unittest.TestCase):
                 )
             )
 
+    @unittest.skipUnless(
+        VERIFY_PQAT_SCRIPT.exists(), "dynamic12 sweep scripts are not checked out"
+    )
     def test_post_run_verifier_rejects_missing_pqat_stage(self) -> None:
         verifier = _load_verifier()
         with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]

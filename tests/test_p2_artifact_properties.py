@@ -23,9 +23,16 @@ from dendritic_benchmark.artifacts import (
     validate_artifact_manifest,
     write_artifact_manifest,
 )
+from dendritic_benchmark.compat import pai_save_path, set_pai_root
 from dendritic_benchmark.results import _record_is_reportable
 from dendritic_benchmark.specs import CONDITION_SPECS
-from dendritic_benchmark.training import QUANTIZATION_EVALUATION_REVISION
+from dendritic_benchmark.training import (
+    QUANTIZATION_EVALUATION_REVISION,
+    ArtifactMetadata,
+    ArtifactPayload,
+    _export_final_pai_artifact,
+    _persist_stage_artifacts,
+)
 
 _MANIFEST_OWNED_FILES = (
     "model.pt",
@@ -254,6 +261,161 @@ class ArtifactPropertyTests(unittest.TestCase):
                     self.assertEqual(
                         _record_is_reportable(stale), not condition.quantized
                     )
+
+    def test_a_dendritic_run_publishes_an_artifact_without_pais_final_export(
+        self,
+    ) -> None:
+        """A budget-terminated dendritic run is publishable, not a crash.
+
+        PerforatedAI writes ``final_clean_pai.pt`` only from
+        ``process_final_network``, i.e. only on its own ``TRAINING_COMPLETE``
+        transition.  The benchmark's documented default is a fixed epoch budget
+        that freezes the tracker for the final 20% of epochs, so that
+        transition is structurally unreachable there and the file is absent for
+        every default-mode dendritic run.  Commit ``9de8880`` raised on the
+        absent file and took out the whole default mode; the shipped
+        ``distilbert / dendrites_fp32`` artifact (``epoch_budget``, zero
+        switches, no ``final_clean_pai.pt``, ``no_retained_insertion``) is the
+        pre-regression proof that this is a labelled outcome instead.
+
+        Also pins the format half of the same regression: ``model.pt`` has to
+        stay a ``torch.save`` state dict, because ``pipeline._load_state``
+        rebuilds every ``dendrites_q*`` condition from it with
+        ``torch.load(..., weights_only=True)`` and there is no safetensors
+        reader on that path.
+        """
+        save_name = "lenet5_dendrites_fp32"
+        # No public getter for the PAI root; derive it from a probe save name
+        # so the ambient root is restored exactly, not guessed.
+        previous_pai_root = pai_save_path("probe").parent
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
+            root_path = Path(root)
+            set_pai_root(root_path / "PAI")
+            try:
+                pai_dir = pai_save_path(save_name)
+                pai_dir.mkdir(parents=True)
+                # What PAI leaves behind after a budget-terminated run: the
+                # dense parameter count it started from, a switch log that
+                # never got past its header, and no final-clean export.
+                (pai_dir / f"{pai_dir.name}param_counts.csv").write_text(
+                    "Switch Number,Param Count\n0,15\n"
+                )
+                (pai_dir / f"{pai_dir.name}switch_epochs.csv").write_text(
+                    "Switch Number,Switch Epoch\n"
+                )
+
+                export_path = root_path / "unused.safetensors"
+                self.assertFalse(_export_final_pai_artifact(save_name, export_path))
+                self.assertFalse(export_path.exists())
+
+                condition_dir = root_path / "lenet5" / "dendrites_fp32"
+                model = torch.nn.Linear(4, 3)
+                param_count = sum(p.numel() for p in model.parameters())
+                artifact_id = "artifact-lenet5-dendrites_fp32-0"
+                metadata = ArtifactMetadata(
+                    model_key="lenet5",
+                    condition_key="dendrites_fp32",
+                    display_name="+Dendrites",
+                    metric_name="Accuracy",
+                    metric_direction="maximize",
+                    primary_metric_key="accuracy",
+                    use_dendrites=True,
+                    use_pruning=False,
+                    bit_width=32,
+                    use_qat=False,
+                    fine_tune_epochs=0,
+                    regression_loss="smooth_l1",
+                    enable_pai_dendrite_updates=True,
+                    train_dendrites_until_complete=False,
+                    freeze_dendrite_updates_fraction=0.2,
+                    pai_candidate_graph_batch_limit=None,
+                    memory_cleanup_interval_batches=None,
+                    model_scale=1.0,
+                    pai_variant="default",
+                    pai_fixed_switch_interval=None,
+                    pai_dynamic_schedule=None,
+                    pai_save_name=save_name,
+                    dense_param_count=param_count,
+                    artifact_id=artifact_id,
+                    seed=0,
+                    quantization_evaluation_revision=QUANTIZATION_EVALUATION_REVISION,
+                )
+                payload = ArtifactPayload(
+                    best_metric=0.99,
+                    final_metric=0.99,
+                    best_epoch=1,
+                    history=[
+                        {
+                            "epoch": 1,
+                            "val_primary_metric": 0.99,
+                            "training_termination_reason": "epoch_budget",
+                        }
+                    ],
+                    test_loss=0.01,
+                    test_metrics={"accuracy": 0.99},
+                    training_skipped=False,
+                    skip_reason="",
+                )
+                _persist_stage_artifacts(
+                    output_dir=condition_dir,
+                    plain_model=model,
+                    metadata=metadata,
+                    payload=payload,
+                    # What the fallback accounting source reports for a run
+                    # that never inserted a dendrite: the dense topology.
+                    parameter_stats=(param_count, param_count),
+                    topology_hash="0" * 64,
+                )
+
+                checkpoint = condition_dir / "model.pt"
+                self.assertTrue(checkpoint.is_file())
+                state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+                self.assertEqual(set(state), set(model.state_dict()))
+                self.assertTrue((condition_dir / "metrics.json").is_file())
+                json.loads((condition_dir / "metrics.json").read_text())
+                # PAI wrote no final-clean export, so no sibling copy exists and
+                # nothing claimed model.pt before the state dict was saved.
+                self.assertFalse(
+                    (condition_dir / "final_clean_pai.safetensors").exists()
+                )
+
+                summary = json.loads((condition_dir / "pai_summary.json").read_text())
+                self.assertEqual(
+                    summary["dendrite_audit"]["status"], "no_retained_insertion"
+                )
+
+                record: dict[str, object] = {
+                    "artifact_id": artifact_id,
+                    "artifact_dir": str(condition_dir),
+                    "model_key": "lenet5",
+                    "condition_key": "dendrites_fp32",
+                    "metric_name": "Accuracy",
+                    "metric_value": 0.99,
+                    "dendrite_audit_status": "no_retained_insertion",
+                }
+                (condition_dir / "record.json").write_text(json.dumps(record))
+                with (condition_dir / "record.csv").open("w", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=list(record))
+                    writer.writeheader()
+                    writer.writerow(record)
+                (condition_dir / "best_model_stats.csv").write_text(
+                    "metric_value\n0.99\n"
+                )
+                finalize_artifact_manifest(condition_dir, artifact_id=artifact_id)
+
+                verdict = validate_artifact_manifest(condition_dir)
+                self.assertTrue(verdict.valid, verdict.reason)
+                assert verdict.manifest is not None
+                self.assertEqual(
+                    verdict.manifest["validity"]["dendrite_status"],
+                    "no_retained_insertion",
+                )
+                # The artifact is complete and sealed, and honestly says it
+                # retained nothing -- so it is published but never counted as
+                # dendritic evidence.
+                self.assertFalse(_record_is_reportable(record))
+            finally:
+                set_pai_root(previous_pai_root)
 
 
 if __name__ == "__main__":

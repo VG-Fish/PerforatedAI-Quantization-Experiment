@@ -44,6 +44,16 @@ class P1ArchitectureTests(unittest.TestCase):
                 "pointnet_modelnet40",
                 "resnet18_cifar10",
                 "saint_adult",
+                # The five PerforatedAI upstream base examples. They are
+                # default-enabled because they are the roster this experiment
+                # was re-scoped onto; see
+                # information/base_examples/02_OPEN_DECISIONS.md D10 for why
+                # the original five keep their flag rather than being dropped.
+                "mnist_pai",
+                "resnet18_hf_perforated_cifar100",
+                "resnet18_kd_cifar100",
+                "unet_carvana",
+                "unet_supervisely",
             ),
         )
         self.assertEqual(selected_model_keys(None), list(DEFAULT_MODEL_KEYS))

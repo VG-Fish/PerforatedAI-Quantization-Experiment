@@ -12,18 +12,27 @@ runnable offline in CI.
 import tempfile
 import unittest
 from pathlib import Path
+from typing import get_args
 
 from dendritic_benchmark.model_adapters import ALL_MODEL_KEYS, model_adapter
 from dendritic_benchmark.pipeline import BenchmarkRunner
-from dendritic_benchmark.plans import ConditionTrainingPlan, ModelTrainingRecipe
+from dendritic_benchmark.plans import (
+    ConditionTrainingPlan,
+    LRScheduleName,
+    ModelTrainingRecipe,
+    OptimizerName,
+)
 from dendritic_benchmark.specs import (
     CONDITION_SPECS,
-    HF_PERFORATED_RESNET18_KEY,
     MODEL_SPECS,
+    PRE_PERFORATED_MODEL_KEYS,
     condition_by_key,
     condition_supported_by_model,
     model_by_key,
 )
+
+_OPTIMIZER_NAMES = frozenset(get_args(OptimizerName))
+_LR_SCHEDULE_NAMES = frozenset(get_args(LRScheduleName))
 
 _CONDITION_KEYS = [spec.key for spec in CONDITION_SPECS]
 
@@ -63,16 +72,41 @@ class MatrixSmokeTests(unittest.TestCase):
         self.assertEqual(
             len(pairs), len(MODEL_SPECS) * len(CONDITION_SPECS) - len(excluded)
         )
-        # The only intended exclusion: the published HF checkpoint is already
-        # perforated, so a second dendrite graph would not be a control.
+        # The only intended exclusions: the published HF checkpoints already
+        # carry a trained dendrite graph, so a second one would not be a
+        # control -- and neither are the two control families, which are both
+        # defined relative to a dendrites_fp32 run these models never have.
         self.assertEqual(
             sorted(excluded),
             sorted(
-                (HF_PERFORATED_RESNET18_KEY, key)
+                (model_key, key)
+                for model_key in PRE_PERFORATED_MODEL_KEYS
                 for key in _CONDITION_KEYS
                 if key.startswith("dendrites_")
+                or condition_by_key(key).control_kind is not None
             ),
         )
+
+    def test_pre_perforated_models_keep_exactly_the_six_base_conditions(self) -> None:
+        """A pre-perforated model's matrix is base_* and nothing else.
+
+        Regression guard for a run that trained all six base conditions and
+        then died in ``_prepare_control_model`` with "capacity controls require
+        dendrites_fp32" -- the refusal was right, but it came hours after the
+        planner should have excluded the pair.
+        """
+        for model_key in PRE_PERFORATED_MODEL_KEYS:
+            supported = [
+                key
+                for key in _CONDITION_KEYS
+                if condition_supported_by_model(model_key, key)
+            ]
+            self.assertEqual(
+                supported,
+                [key for key in _CONDITION_KEYS if key.startswith("base_")
+                 and condition_by_key(key).control_kind is None],
+                msg=model_key,
+            )
 
     def test_every_pair_resolves_a_usable_training_recipe(self) -> None:
         for model_key, condition_key in _supported_pairs():
@@ -84,10 +118,11 @@ class MatrixSmokeTests(unittest.TestCase):
                 self.assertGreater(recipe.batch_size, 0)
                 self.assertGreater(recipe.max_epochs, 0)
                 self.assertGreater(recipe.learning_rate, 0.0)
-                self.assertIn(recipe.optimizer_name, {"adam", "adamw", "sgd"})
-                self.assertIn(
-                    recipe.lr_schedule, {"constant", "step", "cosine", "linear"}
-                )
+                # Derived from the Literals rather than retyped: a recipe naming an
+                # optimizer the builders do not implement is the bug worth catching,
+                # and a hard-coded set here only catches "the registry grew".
+                self.assertIn(recipe.optimizer_name, _OPTIMIZER_NAMES)
+                self.assertIn(recipe.lr_schedule, _LR_SCHEDULE_NAMES)
                 self.assertGreaterEqual(recipe.warmup_epochs, 0)
 
     def test_condition_plans_follow_the_two_factor_design(self) -> None:
