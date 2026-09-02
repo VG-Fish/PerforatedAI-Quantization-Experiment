@@ -2,6 +2,7 @@ import csv
 import importlib
 import math
 import os
+import random
 import tarfile
 import urllib.request
 import zipfile
@@ -33,7 +34,7 @@ from .models import (
 
 DATA_ROOT_ENV: str = "DQB_DATA_ROOT"
 DEFAULT_DATA_ROOT: str = "data"
-DATA_PIPELINE_REVISION: str = "dqb_preprocessing_2026_08_30_v1"
+DATA_PIPELINE_REVISION: str = "upstream_base_examples_2026_09_02_v2"
 EXTRACTED_MARKER: str = ".extracted"
 # Versioned: a cached rollout file records whichever heuristic produced it and
 # whatever payload schema was current when it was written. Reusing one after
@@ -241,7 +242,13 @@ def _require_dependency(import_name: str, package_name: str | None = None) -> An
 
 
 def _make_loader(
-    dataset: Any, batch_size: int, shuffle: bool = False, *, num_workers: int = 2
+    dataset: Any,
+    batch_size: int,
+    shuffle: bool = False,
+    *,
+    num_workers: int = 2,
+    drop_last: bool = False,
+    collate_fn: Any | None = None,
 ) -> Any:
     """Build a DataLoader tuned for Apple Silicon MPS.
 
@@ -269,7 +276,10 @@ def _make_loader(
         "shuffle": shuffle,
         "num_workers": num_workers,
         "pin_memory": False,
+        "drop_last": drop_last,
     }
+    if collate_fn is not None:
+        loader_kwargs["collate_fn"] = collate_fn
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = 2
         loader_kwargs["persistent_workers"] = True
@@ -444,11 +454,26 @@ def _bundle_from_splits(
     input_description: str,
     *,
     num_workers: int = 2,
+    eval_batch_size: int | None = None,
+    val_drop_last: bool = False,
+    train_collate_fn: Any | None = None,
 ) -> TaskBundle:
+    eval_batch_size = eval_batch_size or batch_size
     return TaskBundle(
-        _make_loader(train_ds, batch_size, shuffle=True, num_workers=num_workers),
-        _make_loader(val_ds, batch_size, num_workers=num_workers),
-        _make_loader(test_ds, batch_size, num_workers=num_workers),
+        _make_loader(
+            train_ds,
+            batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=train_collate_fn,
+        ),
+        _make_loader(
+            val_ds,
+            eval_batch_size,
+            num_workers=num_workers,
+            drop_last=val_drop_last,
+        ),
+        _make_loader(test_ds, eval_batch_size, num_workers=num_workers),
         metric_name,
         metric_direction,
         input_description,
@@ -531,6 +556,36 @@ def _hf_dataset_cache() -> str:
 # method. As mentioned above, helpers reused across domains stay outside.
 
 class VisionDatasets:
+    @staticmethod
+    def mnist_pai(batch_size: int) -> TaskBundle:
+        """The split and normalization used by PAI's MNIST base example."""
+        torchvision = _require_dependency("torchvision")
+        transforms: Any = __import__("torchvision.transforms", fromlist=["transforms"])
+        transform = getattr(transforms, "Compose")(
+            [
+                getattr(transforms, "ToTensor")(),
+                getattr(transforms, "Normalize")((0.1307,), (0.3081,)),
+            ]
+        )
+        root: Path = _data_root() / "mnist"
+        root.mkdir(parents=True, exist_ok=True)
+        train_ds = torchvision.datasets.MNIST(
+            root=str(root), train=True, download=True, transform=transform
+        )
+        eval_ds = torchvision.datasets.MNIST(
+            root=str(root), train=False, download=True, transform=transform
+        )
+        return _bundle_from_splits(
+            train_ds,
+            eval_ds,
+            eval_ds,
+            batch_size,
+            "Accuracy",
+            "maximize",
+            "MNIST handwritten digit images normalized with mean 0.1307 and std 0.3081",
+            eval_batch_size=1000,
+        )
+
     @staticmethod
     def mnist(batch_size: int, *, augment: bool = False) -> TaskBundle:
         """MNIST, optionally with the 2-pixel-shift augmentation.
@@ -2702,6 +2757,588 @@ class MedicalDatasets:
 
 
 
+# --------------------------------------------------------------------------
+#   PerforatedAI upstream base-example datasets
+# --------------------------------------------------------------------------
+
+#: ImageNet channel statistics. Upstream's transfer-learning script normalizes
+#: CIFAR-100 with these (not CIFAR's own) because the backbone is an ImageNet
+#: checkpoint; ``train_from_hf_sweep.load_dataset`` hard-codes them.
+_IMAGENET_MEAN: tuple[float, float, float] = (0.485, 0.456, 0.406)
+_IMAGENET_STD: tuple[float, float, float] = (0.229, 0.224, 0.225)
+
+#: CIFAR-100 statistics, used by the KD example's own ``load_data`` branch.
+_CIFAR_MEAN: tuple[float, float, float] = (0.4914, 0.4822, 0.4465)
+_CIFAR_STD: tuple[float, float, float] = (0.2470, 0.2435, 0.2616)
+
+#: ``--train-label-fraction`` and the two split seeds from
+#: ``train_perforated_resnet_KD.get_args_parser``.
+KD_TRAIN_LABEL_FRACTION: float = 0.25
+KD_LABEL_SUBSET_SEED: int = 42
+KD_VAL_TEST_SPLIT_SEED: int = 42
+
+
+def _stratified_subset_indices(
+    labels: list[int], fraction: float, seed: int
+) -> list[int]:
+    """Upstream's ``stratified_subset_by_class``: keep *fraction* of each class.
+
+    Reimplemented rather than imported so the benchmark does not depend on the
+    example's module tree, but the contract is the same -- per-class shuffle
+    with a fixed seed, then ``ceil``-free ``int(len * fraction)`` truncation
+    with at least one sample kept per class.
+    """
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError(f"fraction must be in (0, 1], got {fraction}")
+    if fraction == 1.0:
+        return list(range(len(labels)))
+    by_class: dict[int, list[int]] = {}
+    for index, label in enumerate(labels):
+        by_class.setdefault(int(label), []).append(index)
+    generator = random.Random(seed)
+    kept: list[int] = []
+    for label in sorted(by_class):
+        indices = list(by_class[label])
+        generator.shuffle(indices)
+        keep = max(1, int(len(indices) * fraction))
+        kept.extend(indices[:keep])
+    kept.sort()
+    return kept
+
+
+def _stratified_halves(labels: list[int], seed: int) -> tuple[list[int], list[int]]:
+    """Upstream's ``split_eval_dataset_stratified``: class-balanced 50/50 split."""
+    by_class: dict[int, list[int]] = {}
+    for index, label in enumerate(labels):
+        by_class.setdefault(int(label), []).append(index)
+    generator = random.Random(seed)
+    first: list[int] = []
+    second: list[int] = []
+    for label in sorted(by_class):
+        indices = list(by_class[label])
+        generator.shuffle(indices)
+        midpoint = len(indices) // 2
+        first.extend(indices[:midpoint])
+        second.extend(indices[midpoint:])
+    first.sort()
+    second.sort()
+    return first, second
+
+
+def _cifar100_splits(
+    batch_size: int,
+    *,
+    train_transform: Any,
+    eval_transform: Any,
+    label_fraction: float,
+    split_evaluation: bool,
+    input_description: str,
+    train_collate_fn: Any | None = None,
+) -> TaskBundle:
+    """CIFAR-100 using the split convention selected by its upstream script."""
+    torchvision = _require_dependency("torchvision")
+    root: Path = _data_root() / "cifar100"
+    root.mkdir(parents=True, exist_ok=True)
+
+    train_full = torchvision.datasets.CIFAR100(
+        root=str(root), train=True, download=True, transform=train_transform
+    )
+    eval_full = torchvision.datasets.CIFAR100(
+        root=str(root), train=False, download=True, transform=eval_transform
+    )
+
+    train_ds: Any = train_full
+    if label_fraction < 1.0:
+        train_ds = torch.utils.data.Subset(
+            train_full,
+            _stratified_subset_indices(
+                list(train_full.targets), label_fraction, KD_LABEL_SUBSET_SEED
+            ),
+        )
+
+    if split_evaluation:
+        val_indices, test_indices = _stratified_halves(
+            list(eval_full.targets), KD_VAL_TEST_SPLIT_SEED
+        )
+        val_ds = torch.utils.data.Subset(eval_full, val_indices)
+        test_ds = torch.utils.data.Subset(eval_full, test_indices)
+    else:
+        val_ds = eval_full
+        test_ds = eval_full
+    return _bundle_from_splits(
+        train_ds,
+        val_ds,
+        test_ds,
+        batch_size,
+        "Accuracy",
+        "maximize",
+        input_description,
+        train_collate_fn=train_collate_fn,
+    )
+
+
+def _build_cifar100_transfer(batch_size: int) -> TaskBundle:
+    """CIFAR-100 as ``examples/transfer_learning`` preprocesses it.
+
+    ``train_from_hf_sweep.load_dataset`` at ``img_size = 32``:
+    ``RandomResizedCrop(32, bilinear)`` + ``RandomHorizontalFlip`` for training,
+    and ``Resize(32)`` + ``CenterCrop(32)`` for evaluation (``val_resize_size``
+    collapses to ``img_size`` because ``img_size <= 32``), both normalized with
+    ImageNet statistics because the backbone is an ImageNet checkpoint.
+    """
+    transforms: Any = __import__("torchvision.transforms", fromlist=["transforms"])
+    interpolation = getattr(
+        __import__("torchvision.transforms", fromlist=["InterpolationMode"]),
+        "InterpolationMode",
+    ).BILINEAR
+    compose = getattr(transforms, "Compose")
+    to_tensor = getattr(transforms, "ToTensor")
+    normalize = getattr(transforms, "Normalize")
+    train_transform = compose(
+        [
+            getattr(transforms, "RandomResizedCrop")(32, interpolation=interpolation),
+            getattr(transforms, "RandomHorizontalFlip")(),
+            to_tensor(),
+            normalize(_IMAGENET_MEAN, _IMAGENET_STD),
+        ]
+    )
+    eval_transform = compose(
+        [
+            getattr(transforms, "Resize")(32, interpolation=interpolation),
+            getattr(transforms, "CenterCrop")(32),
+            to_tensor(),
+            normalize(_IMAGENET_MEAN, _IMAGENET_STD),
+        ]
+    )
+    return _cifar100_splits(
+        batch_size,
+        train_transform=train_transform,
+        eval_transform=eval_transform,
+        label_fraction=1.0,
+        split_evaluation=False,
+        input_description=(
+            "CIFAR-100 32x32 natural images, ImageNet-normalized for transfer "
+            "from the published PerforatedAI ResNet-18 backbone"
+        ),
+    )
+
+
+def _kd_mixup_cutmix_collate(batch: list[Any]) -> tuple[Any, Any]:
+    """Upstream's reported KD run: RandomChoice(MixUp(.2), CutMix(.6))."""
+    default_collate = torch.utils.data.default_collate
+    images, labels = default_collate(batch)
+    images = images.clone()
+    labels = torch.nn.functional.one_hot(labels, num_classes=100).to(images.dtype)
+    rolled_images = images.roll(1, 0)
+    rolled_labels = labels.roll(1, 0)
+    transform = random.choices(("mixup", "cutmix"), k=1)[0]
+    alpha = 0.2 if transform == "mixup" else 0.6
+    lambda_param = float(
+        torch._sample_dirichlet(torch.tensor([alpha, alpha]))[0]
+    )
+    if transform == "mixup":
+        images.mul_(lambda_param).add_(rolled_images, alpha=1.0 - lambda_param)
+    else:
+        height, width = images.shape[-2:]
+        center_x = int(torch.randint(width, (1,)).item())
+        center_y = int(torch.randint(height, (1,)).item())
+        radius = 0.5 * math.sqrt(1.0 - lambda_param)
+        half_width = int(radius * width)
+        half_height = int(radius * height)
+        x1, x2 = max(0, center_x - half_width), min(width, center_x + half_width)
+        y1, y2 = max(0, center_y - half_height), min(height, center_y + half_height)
+        images[:, :, y1:y2, x1:x2] = rolled_images[:, :, y1:y2, x1:x2]
+        lambda_param = 1.0 - ((x2 - x1) * (y2 - y1) / (width * height))
+    labels.mul_(lambda_param).add_(rolled_labels, alpha=1.0 - lambda_param)
+    return images, labels
+
+
+def _build_cifar100_kd(batch_size: int) -> TaskBundle:
+    """CIFAR-100 as ``train_perforated_resnet_KD.load_data`` builds it.
+
+    ``RandomCrop(32, padding=4)`` + ``RandomHorizontalFlip`` with CIFAR
+    statistics, and a 25% stratified label subset -- upstream's
+    ``--train-label-fraction 0.25``, which is what makes the distillation
+    signal worth having. Note that upstream's CIFAR-100 branch builds its own
+    transform list and so ignores ``--auto-augment`` and ``--random-erase``
+    even when they are passed. Its reported command does apply MixUp(0.2) or
+    CutMix(0.6), chosen independently for every collated training batch.
+    """
+    transforms: Any = __import__("torchvision.transforms", fromlist=["transforms"])
+    compose = getattr(transforms, "Compose")
+    to_tensor = getattr(transforms, "ToTensor")
+    normalize = getattr(transforms, "Normalize")
+    train_transform = compose(
+        [
+            getattr(transforms, "RandomCrop")(32, padding=4),
+            getattr(transforms, "RandomHorizontalFlip")(),
+            to_tensor(),
+            normalize(_CIFAR_MEAN, _CIFAR_STD),
+        ]
+    )
+    eval_transform = compose([to_tensor(), normalize(_CIFAR_MEAN, _CIFAR_STD)])
+    return _cifar100_splits(
+        batch_size,
+        train_transform=train_transform,
+        eval_transform=eval_transform,
+        label_fraction=KD_TRAIN_LABEL_FRACTION,
+        split_evaluation=True,
+        train_collate_fn=_kd_mixup_cutmix_collate,
+        input_description=(
+            f"CIFAR-100 32x32 natural images, {KD_TRAIN_LABEL_FRACTION:.0%} "
+            "stratified train label subset, for ResNet-50 -> ResNet-18 distillation"
+        ),
+    )
+
+
+# ----------------------------------------------------------- Carvana -------
+
+CARVANA_COMPETITION: str = "carvana-image-masking-challenge"
+CARVANA_RULES_URL: str = (
+    f"https://www.kaggle.com/c/{CARVANA_COMPETITION}/rules"
+)
+#: Upstream's ``dir_img`` / ``dir_mask`` and ``--scale``.
+CARVANA_IMAGE_DIRNAME: str = "train_hq"
+CARVANA_MASK_DIRNAME: str = "train_masks"
+CARVANA_SCALE: float = 0.5
+
+
+class _CarvanaDataset(torch.utils.data.Dataset[tuple[Any, Any]]):
+    """Carvana image/mask pairs at upstream's ``--scale 0.5``.
+
+    Mirrors ``utils.data_loading.BasicDataset``: the image is resized by
+    ``scale`` with bicubic interpolation and the mask with nearest, the image
+    is scaled to [0, 1], and the mask is returned as a ``long`` class index map
+    (Carvana masks are binary GIFs, so the classes are {0, 1} and upstream's
+    ``n_classes=2`` cross-entropy applies).
+    """
+
+    def __init__(self, image_dir: Path, mask_dir: Path, scale: float = CARVANA_SCALE):
+        self.image_dir = image_dir
+        self.mask_dir = mask_dir
+        self.scale = scale
+        self.ids: list[str] = sorted(
+            path.stem for path in image_dir.iterdir()
+            if path.is_file() and not path.name.startswith(".")
+        )
+        if not self.ids:
+            raise RuntimeError(f"No Carvana images found under {image_dir}")
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def _resized(self, image: Any, *, is_mask: bool) -> Any:
+        pil_image: Any = __import__("PIL.Image", fromlist=["Image"])
+        width, height = image.size
+        new_width, new_height = int(self.scale * width), int(self.scale * height)
+        if new_width < 1 or new_height < 1:
+            raise ValueError(f"scale {self.scale} is too small for a {width}x{height} image")
+        resample = pil_image.NEAREST if is_mask else pil_image.BICUBIC
+        return image.resize((new_width, new_height), resample=resample)
+
+    def __getitem__(self, index: int) -> tuple[Any, Any]:
+        pil_image: Any = __import__("PIL.Image", fromlist=["Image"])
+        numpy = _require_dependency("numpy")
+        name = self.ids[index]
+        image_path = next(self.image_dir.glob(f"{name}.*"))
+        mask_path = next(self.mask_dir.glob(f"{name}_mask.*"))
+
+        image = self._resized(pil_image.open(image_path).convert("RGB"), is_mask=False)
+        mask = self._resized(pil_image.open(mask_path).convert("L"), is_mask=True)
+
+        image_t = torch.from_numpy(
+            numpy.asarray(image, dtype="float32").transpose(2, 0, 1) / 255.0
+        )
+        mask_array = numpy.asarray(mask)
+        mask_t = torch.from_numpy((mask_array > 127).astype("int64"))
+        return image_t.contiguous(), mask_t.contiguous()
+
+
+def _build_carvana(batch_size: int) -> TaskBundle:
+    """Carvana Image Masking Challenge, as ``pytorch_unet`` consumes it.
+
+    The competition data is gated behind rule acceptance; this raises with the
+    acceptance URL rather than silently substituting a re-encoded mirror, which
+    would change the pixels a published Dice score is measured on. See
+    02_OPEN_DECISIONS.md D2.
+    """
+    root: Path = _data_root() / "carvana"
+    image_dir = root / CARVANA_IMAGE_DIRNAME
+    mask_dir = root / CARVANA_MASK_DIRNAME
+    if not image_dir.is_dir() or not mask_dir.is_dir():
+        raise RuntimeError(
+            f"Carvana data not found under {root}. It is a gated Kaggle "
+            f"competition: accept the rules at {CARVANA_RULES_URL} with the "
+            "account whose token is in ~/.kaggle/kaggle.json, then run "
+            "`dqb download-data --models unet_carvana`."
+        )
+    dataset = _CarvanaDataset(image_dir, mask_dir)
+    val_count = int(len(dataset) * 0.1)
+    train_ds, val_ds = torch.utils.data.random_split(
+        dataset,
+        [len(dataset) - val_count, val_count],
+        generator=torch.Generator().manual_seed(0),
+    )
+    return _bundle_from_splits(
+        train_ds,
+        val_ds,
+        val_ds,
+        batch_size,
+        "Dice",
+        "maximize",
+        f"Carvana car images and binary masks at {CARVANA_SCALE:g}x resolution",
+        # Same reasoning as _build_supervisely: 1918x1280 JPEG decode plus a
+        # bicubic half-scale resize per sample is pure CPU work that must not
+        # sit in the training process.
+        num_workers=4,
+        val_drop_last=True,
+    )
+
+
+# ------------------------------------------------------- Supervisely -------
+
+#: The Google Drive archive the example's README links, and the layout it
+#: unpacks to. Pair files inside the archive use paths relative to the archive
+#: root, so the dataset root below is the working directory they resolve from.
+SUPERVISELY_DRIVE_ID: str = "1Y1atvePuMx1pyIOVJNGgJ_jVNBy_Bds8"
+SUPERVISELY_TRAIN_PAIRS: str = "dataset/train_supervisely.txt"
+SUPERVISELY_VALID_PAIRS: str = "dataset/valid_supervisely.txt"
+#: ``config/config_UNet.json`` -> ``train_loader.args``. This is the "full"
+#: resolution the request asks for; ``--resolution-scale half/quarter`` would
+#: scale it, and is deliberately not exposed.
+SUPERVISELY_RESIZE: int = 320
+SUPERVISELY_PADDING_VALUE: int = 0
+SUPERVISELY_NOISE_STD: int = 3
+SUPERVISELY_CROP_RANGE: tuple[float, float] = (0.90, 1.0)
+SUPERVISELY_FLIP_HOR: float = 0.5
+SUPERVISELY_ROTATE: float = 0.0
+SUPERVISELY_ANGLE: int = 10
+SUPERVISELY_VAL_TEST_SPLIT_SEED: int = 42
+
+
+
+_CV2_THREADS_DISABLED: bool = False
+
+
+def _cv2() -> Any:
+    """Import cv2 with its internal thread pool disabled, once per process.
+
+    OpenCV defaults to one thread per core. Inside DataLoader workers that
+    multiplies -- 4 workers x 8 OpenCV threads oversubscribes the machine and
+    measured *slower* than a single worker. Disabling it is the standard fix
+    and is what makes num_workers actually scale here.
+    """
+    global _CV2_THREADS_DISABLED
+    cv2 = _require_dependency("cv2", "opencv-python-headless")
+    if not _CV2_THREADS_DISABLED:
+        cv2.setNumThreads(0)
+        _CV2_THREADS_DISABLED = True
+    return cv2
+
+
+def _supervisely_resize(image: Any, expected_size: int, pad_value: int, mode: Any) -> Any:
+    """Upstream's ``transforms.resize_image``: fit the long side, pad the short one."""
+    cv2 = _cv2()
+    numpy = _require_dependency("numpy")
+    height, width = image.shape[:2]
+    if width == height:
+        return cv2.resize(image, (expected_size, expected_size), interpolation=mode)
+    if width > height:
+        new_width = int(expected_size)
+        new_height = int(height * new_width / width)
+        resized = cv2.resize(image, (new_width, new_height), interpolation=mode)
+        pad_before = (new_width - new_height) // 2
+        pad_after = new_width - new_height - pad_before
+        pad_width: Any = (
+            ((pad_before, pad_after), (0, 0), (0, 0))
+            if resized.ndim == 3
+            else ((pad_before, pad_after), (0, 0))
+        )
+    else:
+        new_height = int(expected_size)
+        new_width = int(width * new_height / height)
+        resized = cv2.resize(image, (new_width, new_height), interpolation=mode)
+        pad_before = (new_height - new_width) // 2
+        pad_after = new_height - new_width - pad_before
+        pad_width = (
+            ((0, 0), (pad_before, pad_after), (0, 0))
+            if resized.ndim == 3
+            else ((0, 0), (pad_before, pad_after))
+        )
+    return numpy.pad(resized, pad_width=pad_width, mode="constant", constant_values=pad_value)
+
+
+class _SuperviselyDataset:
+    """Upstream's ``SegmentationDataset`` for the Supervisely Person pairs.
+
+    Reproduces ``dataloaders/dataloader.py`` exactly, including the training
+    augmentation order (noise -> horizontal flip -> 90-degree rotate ->
+    small-angle rotate -> random crop), the long-side resize with centred
+    padding, ImageNet normalization, and the ``label[label > 0] = 1``
+    binarization that turns the grayscale mask into the {0, 1} class map
+    ``dice_loss`` and ``miou`` both expect.
+
+    Returns ``(image[3,H,W] float32, label[H,W] float32)``. The label is float,
+    not long, because upstream's ``dice_loss``/``miou`` ``scatter_`` it into a
+    ``zeros_like(logits)`` and index tensors are cast inside those functions.
+    """
+
+    def __init__(
+        self,
+        pairs: list[tuple[Path, Path]],
+        *,
+        is_training: bool,
+        resize: int = SUPERVISELY_RESIZE,
+    ) -> None:
+        numpy = _require_dependency("numpy")
+        self.pairs = pairs
+        self.is_training = is_training
+        self.resize = resize
+        self.mean = numpy.array(list(_IMAGENET_MEAN))[None, None, :]
+        self.std = numpy.array(list(_IMAGENET_STD))[None, None, :]
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def _augment(self, image: Any, label: Any) -> tuple[Any, Any]:
+        cv2 = _cv2()
+        numpy = _require_dependency("numpy")
+        if SUPERVISELY_NOISE_STD:
+            noisy = image.astype("float64") + numpy.random.normal(
+                0, SUPERVISELY_NOISE_STD, size=image.shape
+            )
+            image = numpy.clip(noisy, 0, 255).astype("uint8")
+        if SUPERVISELY_FLIP_HOR and numpy.random.random() < SUPERVISELY_FLIP_HOR:
+            image = numpy.flip(image, axis=1)
+            label = numpy.flip(label, axis=1)
+        # SUPERVISELY_ROTATE is 0.0 in config_UNet.json, so upstream's
+        # rotate_90 is a no-op here; the small-angle rotation below is not.
+        if SUPERVISELY_ANGLE:
+            angle = float(
+                numpy.random.choice(
+                    numpy.linspace(-SUPERVISELY_ANGLE, SUPERVISELY_ANGLE, num=21)
+                )
+            )
+            height, width = image.shape[:2]
+            centre = (width // 2, height // 2)
+            matrix = cv2.getRotationMatrix2D(centre, angle, 1.0)
+            cos, sin = abs(matrix[0, 0]), abs(matrix[0, 1])
+            new_width = int((height * sin) + (width * cos))
+            new_height = int((height * cos) + (width * sin))
+            matrix[0, 2] += (new_width / 2) - centre[0]
+            matrix[1, 2] += (new_height / 2) - centre[1]
+            image = cv2.warpAffine(
+                numpy.ascontiguousarray(image), matrix, (new_width, new_height)
+            )
+            label = cv2.warpAffine(
+                numpy.ascontiguousarray(label), matrix, (new_width, new_height)
+            )
+        low, high = SUPERVISELY_CROP_RANGE
+        if not (low == high == 1.0):
+            ratio = float(numpy.random.choice(numpy.linspace(low, high, num=10)))
+            height, width = label.shape
+            size = int(min(height, width) * ratio)
+            row = int(numpy.random.randint(0, height - size + 1))
+            column = int(numpy.random.randint(0, width - size + 1))
+            image = image[row : row + size, column : column + size, :]
+            label = label[row : row + size, column : column + size]
+        return image, label
+
+    def __getitem__(self, index: int) -> tuple[Any, Any]:
+        cv2 = _cv2()
+        numpy = _require_dependency("numpy")
+        image_path, label_path = self.pairs[index]
+        image = cv2.imread(str(image_path))
+        label = cv2.imread(str(label_path), 0)
+        if image is None or label is None:
+            raise RuntimeError(f"Unreadable Supervisely pair: {image_path}, {label_path}")
+        # BGR -> RGB, upstream's `cv2.imread(...)[..., ::-1]`. Kept after the
+        # readability check: subscripting first turns an unreadable file into a
+        # bare `TypeError: 'NoneType' object is not subscriptable`, which names
+        # neither file.
+        image = image[..., ::-1]
+
+        if self.is_training:
+            image, label = self._augment(image, label)
+
+        image = _supervisely_resize(
+            numpy.ascontiguousarray(image),
+            self.resize,
+            SUPERVISELY_PADDING_VALUE,
+            cv2.INTER_LINEAR,
+        )
+        label = _supervisely_resize(
+            numpy.ascontiguousarray(label),
+            self.resize,
+            SUPERVISELY_PADDING_VALUE,
+            cv2.INTER_NEAREST,
+        )
+
+        image = image.astype("float32") / 255.0
+        image = (image - self.mean) / self.std
+        image = numpy.transpose(image, axes=(2, 0, 1))
+
+        label = numpy.array(label)
+        label[label > 0] = 1
+        return (
+            torch.tensor(image.copy(), dtype=torch.float32),
+            torch.tensor(label.copy(), dtype=torch.float32),
+        )
+
+
+def _read_supervisely_pairs(root: Path, pairs_file: Path) -> list[tuple[Path, Path]]:
+    pairs: list[tuple[Path, Path]] = []
+    for line in pairs_file.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        image_name, label_name = line.split(", ")
+        pairs.append((root / image_name, root / label_name))
+    missing = [path for pair in pairs for path in pair if not path.exists()]
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} Supervisely file(s) named in {pairs_file} are missing, "
+            f"first: {missing[0]}"
+        )
+    return pairs
+
+
+def _build_supervisely(batch_size: int) -> TaskBundle:
+    """Supervisely Person at the example's full 320px resolution.
+
+    Upstream ships fixed train/valid pair files and evaluates on that entire
+    valid list. The benchmark's test pass therefore reuses the same fixed list.
+    """
+    root: Path = _data_root() / "supervisely"
+    train_pairs_file = root / SUPERVISELY_TRAIN_PAIRS
+    valid_pairs_file = root / SUPERVISELY_VALID_PAIRS
+    if not train_pairs_file.exists() or not valid_pairs_file.exists():
+        raise RuntimeError(
+            f"Supervisely pair files not found under {root}. Download "
+            f"'Human Segmentation Dataset.zip' from Google Drive id "
+            f"{SUPERVISELY_DRIVE_ID} (linked from the example's README) and "
+            f"extract it so that {SUPERVISELY_TRAIN_PAIRS} resolves under {root}."
+        )
+
+    train_pairs = _read_supervisely_pairs(root, train_pairs_file)
+    eval_pairs = _read_supervisely_pairs(root, valid_pairs_file)
+
+    return _bundle_from_splits(
+        _SuperviselyDataset(train_pairs, is_training=True),
+        _SuperviselyDataset(eval_pairs, is_training=False),
+        _SuperviselyDataset(eval_pairs, is_training=False),
+        batch_size,
+        "mIoU",
+        "maximize",
+        f"Supervisely Person portraits and masks at {SUPERVISELY_RESIZE}px (full resolution)",
+        # Decode + augment dominates: measured 2.37 s/batch single-process
+        # against 0.47 s/batch at four workers (eight was worse -- OpenCV
+        # oversubscription, which _cv2 now also guards against). This is the
+        # difference between a ~7h and a ~1.5h training arm.
+        num_workers=4,
+    )
+
+
 # Per-model batch sizes tuned for Apple Silicon MPS throughput.
 # Larger batches amortise Python-loop and host-to-device transfer overhead,
 # keeping the GPU busy for longer between CPU round-trips.  Each value was
@@ -2741,6 +3378,12 @@ _BATCH_SIZES: dict[str, int] = {
     "mobilenetv2_cifar10": 128,  # CIFAR SGD recipe batch size.
     "saint_adult": 256,  # Official SAINT implementation default.
     "capsnet_mnist": 128,  # CapsNet MNIST recipe.
+    # --- PerforatedAI upstream base examples -------------------------------
+    "mnist_pai": 64,  # Upstream mnist example's --batch-size default.
+    "resnet18_hf_perforated_cifar100": 128,  # transfer_learning cifar100 config.
+    "resnet18_kd_cifar100": 32,  # train_perforated_resnet_KD --batch-size default.
+    "unet_carvana": 1,
+    "unet_supervisely": 16,  # config_UNet.json train_loader.batch_size.
 }
 
 
@@ -2788,6 +3431,17 @@ def dataset_exists(model_key: str) -> bool:
         ],
         "snn_nmnist":           [root / "nmnist"],
         "unet_isic":            [root / "isic2018" / "images" / EXTRACTED_MARKER],
+        "mnist_pai":            [root / "mnist"],
+        "resnet18_hf_perforated_cifar100": [root / "cifar100"],
+        "resnet18_kd_cifar100": [root / "cifar100"],
+        "unet_carvana":         [
+            root / "carvana" / CARVANA_IMAGE_DIRNAME,
+            root / "carvana" / CARVANA_MASK_DIRNAME,
+        ],
+        "unet_supervisely":     [
+            root / "supervisely" / SUPERVISELY_TRAIN_PAIRS,
+            root / "supervisely" / SUPERVISELY_VALID_PAIRS,
+        ],
     }
     paths: list[Path] | None = sentinels.get(model_key)
     if paths is None:
@@ -2827,6 +3481,14 @@ def build_task_bundle(model_key: str, batch_size: int | None = None) -> TaskBund
         "mobilenetv2_cifar10": VisionDatasets.cifar10,
         "saint_adult": _build_adult,
         "capsnet_mnist": VisionDatasets.mnist_augmented,
+        # --- PerforatedAI upstream base examples ---------------------------
+        # Upstream's mnist example applies ToTensor + Normalize and no
+        # augmentation, which is VisionDatasets.mnist's un-augmented form.
+        "mnist_pai": VisionDatasets.mnist_pai,
+        "resnet18_hf_perforated_cifar100": _build_cifar100_transfer,
+        "resnet18_kd_cifar100": _build_cifar100_kd,
+        "unet_carvana": _build_carvana,
+        "unet_supervisely": _build_supervisely,
     }
     if model_key not in builders:
         raise KeyError(f"Unknown model key: {model_key}")
