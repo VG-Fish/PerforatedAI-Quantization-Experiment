@@ -584,6 +584,42 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    kd_parser: argparse.ArgumentParser = subparsers.add_parser(
+        "pretrain_kd_teacher",
+        parents=[common_options],
+        help="Fine-tune the ResNet-50 distillation teacher that resnet18_kd_cifar100 needs.",
+        description=(
+            "Reproduces `train_perforated_resnet_KD.py --pre-train-teacher` from "
+            "PerforatedAI's resnet example: an ImageNet ResNet-50 with a fresh "
+            "100-way head, fine-tuned on the same CIFAR-100 train subset the "
+            "student sees, checkpointed at its best validation accuracy.\n\n"
+            "This is a one-time step outside the model x condition matrix. The "
+            "student refuses to train without it, exactly as upstream refuses "
+            "--use-kd on a non-ImageNet dataset with no teacher checkpoint."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    kd_parser.add_argument(
+        "--epochs",
+        type=int,
+        default=90,
+        help="Teacher fine-tuning epochs (upstream default: 90).",
+    )
+    kd_parser.add_argument(
+        "--batch-size", type=int, default=32, help="Teacher batch size (upstream: 32)."
+    )
+    kd_parser.add_argument(
+        "--lr",
+        type=float,
+        default=0.0125,
+        help="Teacher SGD learning rate (upstream: 0.0125 with StepLR(30, 0.1)).",
+    )
+    kd_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Retrain and overwrite an existing teacher checkpoint.",
+    )
+
     compare_parser: argparse.ArgumentParser = subparsers.add_parser(
         "compare",
         parents=[common_options],
@@ -1003,6 +1039,79 @@ def _run_passthrough(args: Any, comparison_root: Path) -> list[str]:
     return flags
 
 
+
+def _handle_pretrain_kd_teacher(args: Any) -> None:
+    """Fine-tune and checkpoint the CIFAR-100 ResNet-50 distillation teacher.
+
+    Mirrors ``train_perforated_resnet_KD.pretrain_teacher``: train on the same
+    stratified 25% subset the student uses, validate on the same validation
+    half, and keep the best-validation checkpoint under the key ``"model"``
+    that ``_kd_teacher`` reads back.
+    """
+    import torch
+    from tqdm import tqdm
+
+    from .data import build_task_bundle
+    from .models import build_kd_teacher_resnet50, kd_teacher_checkpoint_path
+    from .training import _resolve_device
+
+    checkpoint = kd_teacher_checkpoint_path()
+    if checkpoint.exists() and not args.force:
+        _log(f"[kd] teacher already present at {checkpoint}; pass --force to retrain.")
+        return
+
+    device = _resolve_device("resnet18_kd_cifar100", torch)
+    bundle = build_task_bundle("resnet18_kd_cifar100", batch_size=args.batch_size)
+    teacher = build_kd_teacher_resnet50(num_classes=100).to(device)
+
+    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = torch.optim.SGD(
+        teacher.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-3
+    )
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+
+    _log(f"[kd] device        : {device}")
+    _log(f"[kd] epochs        : {args.epochs}")
+    _log(f"[kd] checkpoint    : {checkpoint}")
+
+    best_accuracy = -1.0
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    for epoch in range(1, args.epochs + 1):
+        teacher.train()
+        for images, targets in tqdm(
+            bundle.train_loader, desc=f"kd-teacher epoch {epoch}/{args.epochs}"
+        ):
+            images, targets = images.to(device), targets.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            criterion(teacher(images), targets).backward()
+            optimizer.step()
+        scheduler.step()
+
+        teacher.eval()
+        correct = total = 0
+        with torch.no_grad():
+            for images, targets in bundle.val_loader:
+                images, targets = images.to(device), targets.to(device)
+                correct += int((teacher(images).argmax(dim=1) == targets).sum().item())
+                total += int(targets.numel())
+        accuracy = correct / max(1, total)
+        _log(f"[kd] epoch {epoch:3d}  val acc {accuracy:.4f}")
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            torch.save(
+                {
+                    "model": teacher.state_dict(),
+                    "epoch": epoch,
+                    "val_accuracy": accuracy,
+                    "num_classes": 100,
+                },
+                str(checkpoint),
+            )
+            _log(f"[kd] saved new best ({accuracy:.4f}) to {checkpoint}")
+
+    _log(f"[kd] done. best val accuracy {best_accuracy:.4f}")
+
+
 def _handle_download_data(args: Any) -> None:
     selected = args.models or [spec.key for spec in MODEL_SPECS]
     total = len(selected)
@@ -1189,6 +1298,8 @@ def main() -> None:
         _handle_run(args, results_root, comparison_root)
     elif args.command == "download_data":
         _handle_download_data(args)
+    elif args.command == "pretrain_kd_teacher":
+        _handle_pretrain_kd_teacher(args)
     elif args.command == "compare":
         _handle_compare(args, results_root, comparison_root)
     elif args.command == "generate_graphs":
