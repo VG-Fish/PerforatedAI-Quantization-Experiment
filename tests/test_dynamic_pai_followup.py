@@ -422,7 +422,7 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             patch("dendritic_benchmark.training._apply_lr_schedule"),
             patch(
                 "dendritic_benchmark.training._run_training_pass_oom_guarded",
-                return_value=(0.0, {}),
+                return_value=(0.0, {}, object(), False, False),
             ),
             patch("dendritic_benchmark.training._run_validation_pass", return_value=(0.0, {})),
             patch("dendritic_benchmark.training._record_epoch_result", side_effect=record_epoch),
@@ -1281,6 +1281,126 @@ class DynamicPAIFollowupTests(unittest.TestCase):
                 summary["observed_schedule"]["termination_reason"],
                 "pai_training_complete",
             )
+
+
+class UnavailableConditionsAreRecordedNotFatalTests(unittest.TestCase):
+    """A prerequisite a condition can never have is an outcome, not a crash.
+
+    Three real cases motivated this and all three used to abort a whole sweep
+    from inside one condition (see the sweep loop in
+    ``BenchmarkRunner._process_one_model_spec`` for the measured evidence):
+    a pre-perforated checkpoint's two controls, whose declared
+    ``dendrites_fp32`` source that model never runs; ``capacity_dense_*`` on a
+    model whose retained branch is a conv, which
+    ``retained_topology_from_state_dict`` refuses by design; and
+    ``dendrites_q*`` after a ``no_retained_insertion`` FP32 arm.
+    """
+
+    def _run_sweep(self, failing_condition: str) -> tuple[list[str], Path]:
+        from types import SimpleNamespace
+
+        from dendritic_benchmark.capacity_control import UnsupportedTopology
+        from dendritic_benchmark.specs import CONDITION_SPECS
+
+        root = Path(tempfile.mkdtemp())
+        runner = BenchmarkRunner(results_root=root / "results")
+        runner._seed = None
+        model_spec = SimpleNamespace(key="lenet5", display_name="LeNet-5")
+        trained: list[str] = []
+
+        def fake_train(spec, condition, bundle, model_records, all_records,
+                       saved_dirs, *args, **kwargs):
+            if condition.key == failing_condition:
+                raise UnsupportedTopology(
+                    f"{condition.key}: only Linear branches are currently supported"
+                )
+            trained.append(condition.key)
+            saved_dirs[condition.key] = runner.results_root / spec.key / condition.key
+            return True
+
+        with patch.object(
+            runner, "_condition_record_usable", return_value=False
+        ), patch.object(
+            runner, "_train_pending_condition", side_effect=fake_train
+        ), patch(
+            "dendritic_benchmark.pipeline.build_task_bundle", return_value=object()
+        ), patch(
+            "dendritic_benchmark.pipeline.write_model_reports"
+        ):
+            runner._process_one_model_spec(
+                model_spec,
+                list(CONDITION_SPECS),
+                False,
+                [],
+                False,
+                False,
+                False,
+            )
+        return trained, runner.results_root / "lenet5"
+
+    def test_an_unsupported_control_skips_itself_and_its_quantized_children(self) -> None:
+        trained, model_dir = self._run_sweep("capacity_dense_fp32")
+
+        # Everything up to the refused control still ran ...
+        self.assertIn("base_fp32", trained)
+        self.assertIn("dendrites_q8", trained)
+        self.assertIn("base_more_training_fp32", trained)
+        # ... and nothing under the refused control did.  The descendants
+        # matter most: ``_prepare_condition_model`` loads a source checkpoint
+        # only ``if condition.source_key in saved_dirs`` and otherwise falls
+        # through to the freshly *initialised* model, so a capacity_dense_q8
+        # allowed to run here would quantize random weights and publish the
+        # number as a result.
+        for key in (
+            "capacity_dense_fp32", "capacity_dense_q8", "capacity_dense_q4",
+            "capacity_dense_q2", "capacity_dense_q1_58", "capacity_dense_q1",
+        ):
+            self.assertNotIn(key, trained)
+
+        recorded = json.loads((model_dir / "unavailable_conditions.json").read_text())
+        self.assertEqual(recorded["model_key"], "lenet5")
+        self.assertEqual(
+            sorted(recorded["conditions"]),
+            [
+                "capacity_dense_fp32", "capacity_dense_q1", "capacity_dense_q1_58",
+                "capacity_dense_q2", "capacity_dense_q4", "capacity_dense_q8",
+            ],
+        )
+        self.assertIn(
+            "only Linear branches",
+            recorded["conditions"]["capacity_dense_fp32"],
+        )
+
+    def test_a_refused_dendritic_pqat_source_does_not_stop_the_controls(self) -> None:
+        trained, model_dir = self._run_sweep("dendrites_fp32")
+
+        # dendrites_q* and both controls all declare dendrites_fp32 upstream,
+        # so all eleven go, but the six base_* arms are untouched.
+        self.assertEqual(
+            trained,
+            ["base_fp32", "base_q8", "base_q4", "base_q2", "base_q1_58", "base_q1"],
+        )
+        recorded = json.loads((model_dir / "unavailable_conditions.json").read_text())
+        # dendrites_fp32 itself, its five PQAT children, and both
+        # six-condition controls that declare it as their source.
+        self.assertEqual(len(recorded["conditions"]), 18)
+        self.assertEqual(
+            recorded["conditions"]["capacity_dense_q1"],
+            "source capacity_dense_fp32 unavailable: dendrites_fp32: "
+            "only Linear branches are currently supported",
+        )
+
+    def test_the_pqat_source_guard_raises_the_recognisable_type(self) -> None:
+        from dendritic_benchmark.pipeline import ConditionPrerequisiteUnmet
+
+        with tempfile.TemporaryDirectory() as root:  # type: ignore[no-matching-overload]
+            runner = BenchmarkRunner(results_root=Path(root) / "results")
+            # Subclasses RuntimeError on purpose, so the older assertion in
+            # test_dendritic_pqat_requires_a_verified_fp32_source still holds.
+            with self.assertRaises(ConditionPrerequisiteUnmet):
+                runner._require_verified_dendritic_pqat_source(
+                    "saint_adult", condition_by_key("dendrites_q8"), {}
+                )
 
 
 if __name__ == "__main__":

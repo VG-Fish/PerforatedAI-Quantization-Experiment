@@ -88,6 +88,18 @@ _RECORD_JSON = "record.json"
 _MODEL_PT = "model.pt"
 _ARTIFACT_ATTEMPT_JSON = "artifact_attempt.json"
 _EPOCH_CHECKPOINT_PT = "epoch_checkpoint.pt"
+_UNAVAILABLE_CONDITIONS_JSON = "unavailable_conditions.json"
+
+
+class ConditionPrerequisiteUnmet(RuntimeError):
+    """A condition cannot run because an *audited* prerequisite is absent.
+
+    Distinct from an ordinary ``RuntimeError`` so the sweep loop can tell
+    "this arm has no admissible source, record that and move on" apart from
+    "training itself failed", and stop the whole run only for the second.
+    Subclasses ``RuntimeError`` so callers (and tests) that already catch or
+    assert on that type keep working unchanged.
+    """
 _DEFAULT_PAI_INITIAL_CORRELATION_BATCH_LIMIT = 32
 _MODEL_PAI_INITIAL_CORRELATION_BATCH_LIMITS = {
     "distilbert": 4,
@@ -134,7 +146,15 @@ _MODEL_ARTIFACT_REVISIONS = {
     # matching -- so the revision is what actually invalidates a pre-AP0 M5
     # dendritic artifact. See information/optimization/03_execution_matrix.md.
     "m5": "optimization_ap0_late_target_v1",
+    "mnist_pai": "upstream_base_equivalence_v2",
+    "resnet18_hf_perforated_cifar100": "upstream_base_equivalence_v2",
+    "resnet18_kd_cifar100": "upstream_base_equivalence_v2",
+    "unet_carvana": "upstream_base_equivalence_v2",
+    "unet_supervisely": "upstream_base_equivalence_v2",
 }
+_UPSTREAM_PAI_BASE_MODEL_KEYS = frozenset(
+    {"mnist_pai", "resnet18_kd_cifar100", "unet_carvana", "unet_supervisely"}
+)
 # Full-transformer PAI wrapping makes DistilBERT's candidate forward exceed
 # Apple Silicon MPS memory. Keep dendrite search on the task-specific head.
 _DISTILBERT_PAI_CLASSIFICATION_HEAD = [
@@ -354,6 +374,7 @@ class BenchmarkRunner:
                     ),
                     fixed_switch_interval=load_config.fixed_switch_interval,
                     dynamic_schedule=load_config.dynamic_schedule,
+                    **self._upstream_pai_runtime_kwargs(model_key),
                 ),
             )
             model = self._configure_perforated_model(
@@ -403,6 +424,7 @@ class BenchmarkRunner:
                     ),
                     fixed_switch_interval=load_config.fixed_switch_interval,
                     dynamic_schedule=load_config.dynamic_schedule,
+                    **self._upstream_pai_runtime_kwargs(model_key),
                 ),
             )
             model = self._configure_perforated_model(
@@ -444,6 +466,10 @@ class BenchmarkRunner:
         if preferred.exists():
             return preferred
         # Backwards compatibility for older runs that wrote multiple checkpoint names.
+        # Extensionless legacy artifact names only. ``final_clean_pai.safetensors``
+        # (training._FINAL_CLEAN_PAI_EXPORT) is deliberately absent: it is PAI's
+        # safetensors accounting evidence, and _load_state below can only read a
+        # ``torch.save`` state dict.
         if prefer_dendritic:
             for name in ["best_model", "final_clean_pai"]:
                 path = condition_dir / name
@@ -506,6 +532,63 @@ class BenchmarkRunner:
         return perforate
 
     def _default_module_ids_to_perforate(self, model_key: str) -> list[str]:
+        if model_key == "resnet18_kd_cifar100":
+            # Upstream runs the KD example with --convert-count 0, which tracks
+            # .layer1..4 outright and adds .conv1/.bn1/.fc to the track list,
+            # leaving .pre_fc as the sole perforated module. Identical to the
+            # resnet18_cifar10 branch below, and deliberately so: the KD arm
+            # and the plain arm must differ only in the distillation term.
+            #
+            # The wrapper is `resnet_double.ResNetPAI` (`import resnet_double
+            # as custom_resnet`), not the same-named class in `resnet.py`.
+            # Only resnet_double's has the `pre_fc`; resnet.py's folds conv1
+            # and bn1 into a `.b1` PAISequential instead, and reading that one
+            # by mistake points this target at the stem. The README's
+            # 11,490,981-parameter baseline settles which is built: a 101-way
+            # ResNet-18 is 11,228,325 and the gap is pre_fc's 262,656.
+            return [".pre_fc"]
+        if model_key == "unet_carvana":
+            # Upstream perforates through GPA.PAISequential([Conv2d,
+            # BatchNorm2d]) inside every DoubleConv, and tracks ConvTranspose2d
+            # by name. Those PAISequential pairs are `.block1`/`.block2` here
+            # (models.UNetDoubleConv), so naming them reproduces the same
+            # target set without the base model importing perforatedai.
+            return [
+                ".inc.block1", ".inc.block2",
+                ".down1.conv.block1", ".down1.conv.block2",
+                ".down2.conv.block1", ".down2.conv.block2",
+                ".down3.conv.block1", ".down3.conv.block2",
+                ".down4.conv.block1", ".down4.conv.block2",
+                ".up1.conv.block1", ".up1.conv.block2",
+                ".up2.conv.block1", ".up2.conv.block2",
+                ".up3.conv.block1", ".up3.conv.block2",
+                ".up4.conv.block1", ".up4.conv.block2",
+                # Upstream leaves modules_to_perforate at its default, which
+                # type-selects Conv2d, so the bare 1x1 output conv is
+                # perforated too. Only ConvTranspose2d is pulled out, into the
+                # track list below.
+                ".outc",
+            ]
+        if model_key == "unet_supervisely":
+            # Upstream selects by *type name*:
+            # set_module_names_to_perforate(['InvertedResidual', 'DecoderBlock',
+            # 'Linear', 'Conv2d']) and tracks only the stem and the final
+            # transition. Expressed here as ids because this benchmark records
+            # the resolved target set in every artifact manifest, and a type
+            # selection would not name what was actually perforated. The four
+            # decoders and the seventeen backbone InvertedResiduals are the
+            # union of upstream's two class names minus the two tracked ids.
+            return [
+                f".backbone.features.{index}" for index in range(1, 18)
+            ] + [
+                # 'Conv2d' is in upstream's perforate list, so the transition
+                # convolution and both head convolutions are perforated. Its
+                # BatchNorm sibling (.18.1) is tracked instead -- upstream
+                # names exactly that one id, not the whole .18 block.
+                ".backbone.features.18.0",
+                ".decoder1", ".decoder2", ".decoder3", ".decoder4",
+                ".conv_last.0", ".conv_last.1",
+            ]
         if model_key == "resnet18_cifar10":
             # Mirrors upstream exactly. PerforatedAI's published ResNet-18
             # (LPA.ResNetPAIPreFC; examples/imagenet/resnet_prefc.py, and the
@@ -611,6 +694,20 @@ class BenchmarkRunner:
             # backbone as ordinary neurons and restrict candidate growth to the
             # added pre-classifier projection.
             "resnet18_cifar10": [
+                ".conv1",
+                ".bn1",
+                ".layer1",
+                ".layer2",
+                ".layer3",
+                ".layer4",
+                ".fc",
+            ],
+            # Upstream's KD example resolves --convert-count 0 to exactly this
+            # list: `for i in range(4): append_module_ids_to_track(['.layer'+i])`
+            # then `append_module_ids_to_track(['.conv1', '.bn1', '.fc'])`.
+            # Identical to resnet18_cifar10 above by construction -- the two
+            # arms must differ only in the distillation term and the dataset.
+            "resnet18_kd_cifar100": [
                 ".conv1",
                 ".bn1",
                 ".layer1",
@@ -774,6 +871,17 @@ class BenchmarkRunner:
             # hold no parameters and are omitted, matching the ResNet/PointNet
             # convention elsewhere in this dict.
             "m5": [".conv1", ".bn1", ".conv2", ".bn2", ".conv3", ".bn3", ".bn4"],
+            # --- PerforatedAI upstream base examples -----------------------
+            # pytorch_unet: append_module_names_to_track(['ConvTranspose2d']).
+            # The four upsampling transposed convolutions are the only
+            # ConvTranspose2d in this net; naming them by id records in the
+            # manifest what a type-name selection would leave implicit.
+            "unet_carvana": [".up1.up", ".up2.up", ".up3.up", ".up4.up"],
+            # segmentation-image-resolution:
+            # append_module_ids_to_track(['.backbone.features.0',
+            # '.backbone.features.18.1']) -- "skip only stem and transition
+            # layers (keep output layer for dendrites)".
+            "unet_supervisely": [".backbone.features.0", ".backbone.features.18.1"],
         }.get(model_key, [])
 
     def _perforation_module_names_to_not_save(self, model_key: str) -> list[str]:
@@ -809,6 +917,20 @@ class BenchmarkRunner:
     def _use_pai_runtime_guard(self) -> bool:
         return True
 
+    @staticmethod
+    def _upstream_pai_runtime_kwargs(model_key: str) -> dict[str, Any]:
+        if model_key == "resnet18_kd_cifar100":
+            return {
+                "weight_decay_accepted": True,
+                "cap_at_n": True,
+                "test_saves": True,
+                "perforated_backpropagation": True,
+                "pai_forward_function": "relu",
+            }
+        if model_key == "unet_carvana":
+            return {"weight_decay_accepted": True}
+        return {}
+
     def _pai_initial_correlation_batches_limit(self, model_key: str) -> int:
         return _MODEL_PAI_INITIAL_CORRELATION_BATCH_LIMITS.get(
             model_key, _DEFAULT_PAI_INITIAL_CORRELATION_BATCH_LIMIT
@@ -821,15 +943,38 @@ class BenchmarkRunner:
         retained only to reproduce and diagnose PAI schedule behavior; the old
         per-model defaults were not honored by the observed runs.
         """
-        _ = model_key
-        return self._diagnostic_fixed_switch_interval
+        if self._diagnostic_fixed_switch_interval is not None:
+            return self._diagnostic_fixed_switch_interval
+        return 80 if model_key == "unet_supervisely" else None
 
     def _pai_dynamic_schedule(self, model_key: str) -> PAIDynamicSchedule | None:
-        """Return only explicit caller overrides; PAI owns the default policy."""
-        _ = model_key
+        """Return the schedule configured by the corresponding upstream example."""
+        base = {
+            "resnet18_kd_cifar100": PAIDynamicSchedule(
+                max_dendrites=5,
+                n_epochs_to_switch=40,
+                initial_history_after_switches=2,
+                p_epochs_to_switch=40,
+                improvement_threshold=(0.001, 0.0001, 0.0),
+                candidate_weight_initialization_multiplier=0.1,
+            ),
+            "unet_carvana": PAIDynamicSchedule(
+                max_dendrites=2,
+                n_epochs_to_switch=25,
+                p_epochs_to_switch=25,
+            ),
+        }.get(model_key)
         if self._pai_override is None:
-            return None
-        return self._pai_override.apply_to_schedule(None)
+            return base
+        return self._pai_override.apply_to_schedule(base)
+
+    @staticmethod
+    def _pai_maximizing_score(model_key: str, metric_direction: str) -> bool:
+        # Supervisely drives PAI with validation loss even though benchmark
+        # reporting and checkpoint selection use mIoU.
+        if model_key == "unet_supervisely":
+            return False
+        return metric_direction == "maximize"
 
     @staticmethod
     def _model_artifact_revision(model_key: str) -> str | None:
@@ -1040,7 +1185,9 @@ class BenchmarkRunner:
                 condition.use_dendrites,
                 SourceCheckpointLoadConfig(
                     save_name=pai_save_name,
-                    maximizing_score=metric_direction == "maximize",
+                    maximizing_score=self._pai_maximizing_score(
+                        model_key, metric_direction
+                    ),
                     module_selection=module_selection,
                     config_snapshot_path=pai_config_snapshot,
                     dendrite_training_max_epochs=dendrite_training_max_epochs,
@@ -1060,7 +1207,7 @@ class BenchmarkRunner:
             model,
             save_name=pai_save_name,
             doing_pai=True,
-            maximizing_score=metric_direction == "maximize",
+            maximizing_score=self._pai_maximizing_score(model_key, metric_direction),
             module_selection=module_selection,
             config_snapshot_path=pai_config_snapshot,
             dendrite_training_max_epochs=dendrite_training_max_epochs,
@@ -1072,6 +1219,7 @@ class BenchmarkRunner:
                 fixed_switch_interval=fixed_switch_interval,
                 dynamic_schedule=dynamic_schedule,
                 testing_dendrite_capacity=pai_capacity_check,
+                **self._upstream_pai_runtime_kwargs(model_key),
             ),
         )
         configure_pai_candidate_graph(training_plan.update_dendrites_during_training)
@@ -1387,6 +1535,60 @@ class BenchmarkRunner:
             "capsnet_mnist": ModelTrainingRecipe(
                 128, 30, 1.0e-3, "adam", 0.9, 0.0,
                 lr_schedule="step", lr_decay_every=1, lr_decay_gamma=0.96,
+            ),
+            # --- PerforatedAI upstream base examples -----------------------
+            # Every recipe below is the upstream example's own configuration.
+            # information/base_examples/01_UPSTREAM_AUDIT.md records the source
+            # line for each value; 02_OPEN_DECISIONS.md records the departures.
+            #
+            # mnist_perforatedai.py: Adadelta(lr=1) and StepLR(1, .7), with
+            # both objects registered through PAI. Tracker ownership is
+            # essential: it rebuilds/replays the scheduler after a switch.
+            "mnist_pai": ModelTrainingRecipe(
+                64, 20, 1.0, "adadelta", 0.9, 0.0,
+                lr_schedule="step", lr_decay_every=1, lr_decay_gamma=0.7,
+                pai_owns_lr_schedule=True,
+            ),
+            # train_from_hf_sweep.get_dataset_config('cifar100'): 200 epochs,
+            # batch 128, lr 0.1, cosine, label smoothing 0.1, no warmup. The
+            # weight decay is 1e-4 because train_single_run hard-codes it --
+            # the config's 5e-4 is dead code upstream, and copying the dead
+            # value would silently change the recipe.
+            "resnet18_hf_perforated_cifar100": ModelTrainingRecipe(
+                128, 200, 1.0e-1, "sgd", 0.9, 1.0e-4,
+                lr_schedule="cosine", label_smoothing=0.1,
+            ),
+            # train_perforated_resnet_KD: SGD 0.0125 / momentum 0.9, batch 32,
+            # 90 epochs, StepLR(30, 0.1). The README's reported run overrides
+            # weight decay to 1e-3, label smoothing to 0.1 and dropout to 0.2;
+            # the first two are recipe fields, the third is in the model
+            # factory. Upstream multiplies args.lr by ten only for optimizers
+            # reconstructed after a topology change.
+            "resnet18_kd_cifar100": ModelTrainingRecipe(
+                32, 90, 1.25e-2, "sgd", 0.9, 1.0e-3,
+                lr_schedule="step", lr_decay_every=30, lr_decay_gamma=0.1,
+                label_smoothing=0.1,
+                pai_owns_lr_schedule=True,
+                pai_restructure_lr_multiplier=10.0,
+            ),
+            # pytorch_unet train_perforatedai.py: RMSprop(lr=1e-5, wd=1e-8,
+            # momentum=0.999) with ReduceLROnPlateau(max, patience=5) and
+            # gradient clipping at 1.0. Validation runs five times per epoch,
+            # and those same calls drive PAI and the plateau scheduler.
+            "unet_carvana": ModelTrainingRecipe(
+                1, 40, 1.0e-5, "rmsprop", 0.999, 1.0e-8,
+                lr_schedule="plateau", grad_clip_norm=1.0,
+                lr_plateau_mode="max", lr_plateau_patience=5,
+                pai_owns_lr_schedule=True,
+            ),
+            # config_UNet.json: SGD(1e-2, momentum 0.9, wd 1e-8), batch 16,
+            # 80 epochs. The configured StepLR has gamma=1 and is inert; the
+            # actual trainer applies a power-0.9 polynomial after each batch
+            # and restarts it when PAI reconstructs the optimizer.
+            "unet_supervisely": ModelTrainingRecipe(
+                16, 80, 1.0e-2, "sgd", 0.9, 1.0e-8,
+                lr_schedule="poly", lr_poly_power=0.9,
+                pai_setup_optimizer=False,
             ),
         }
         recipe = recipes.get(
@@ -1790,7 +1992,7 @@ class BenchmarkRunner:
         status = self._saved_dendrite_audit_status(condition.source_key, saved_dirs)
         if status == "verified_retained":
             return
-        raise RuntimeError(
+        raise ConditionPrerequisiteUnmet(
             f"{model_key} / {condition.key} requires a verified retained "
             f"{condition.source_key} source before PQAT; found {status or 'no source record'}. "
             "Run the FP32 dendritic source, inspect its raw PAI switch and "
@@ -1902,6 +2104,35 @@ class BenchmarkRunner:
         saved_dirs[condition.key] = condition_dir
         return newly_trained
 
+    def _record_unavailable_conditions(
+        self, model_key: str, unavailable: dict[str, str]
+    ) -> None:
+        """Persist why a selected condition produced no record.
+
+        A skipped condition leaves no ``record.json``, so without this file the
+        only difference between "this control is impossible for this
+        architecture" and "nobody ever ran it" is a line in a log that gets
+        rotated. Written per model, next to the per-model reports, so the
+        absence stays explainable from the result tree alone.
+        """
+        model_dir = self.results_root / model_key
+        try:
+            model_dir.mkdir(parents=True, exist_ok=True)
+            (model_dir / _UNAVAILABLE_CONDITIONS_JSON).write_text(
+                json.dumps(
+                    {
+                        "model_key": model_key,
+                        "recorded_at": datetime.now().isoformat(timespec="seconds"),
+                        "conditions": dict(sorted(unavailable.items())),
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+        except OSError as exc:
+            # Never let bookkeeping about a skip turn into a failure of its own.
+            _log(f"[warn] could not record unavailable conditions for {model_key}: {exc}")
+
     def _process_one_model_spec(
         self,
         model_spec: Any,
@@ -1967,7 +2198,69 @@ class BenchmarkRunner:
         newly_trained = False
         if pending:
             bundles_by_batch_size: dict[int, Any] = {}
+            # A condition whose prerequisite is legitimately unavailable is an
+            # *outcome*, not a crash.  Three such outcomes exist and all three
+            # used to abort the whole sweep from inside one condition:
+            #
+            #   1. ``base_more_training_*`` / ``capacity_dense_*`` on a
+            #      pre-perforated checkpoint.  Both controls declare
+            #      ``source_key="dendrites_fp32"``, and PRE_PERFORATED_MODEL_KEYS
+            #      models never run a dendritic arm, so
+            #      ``_prepare_control_model`` raises "capacity controls require
+            #      dendrites_fp32" the moment base_* finishes.  Measured on
+            #      resnet18_hf_perforated_cifar100: 18 conditions planned, 6
+            #      trainable, and the run would have died ~6 h in with all six
+            #      base_* records already on disk.
+            #   2. ``capacity_dense_*`` on any model whose retained branch is
+            #      not a Linear.  ``retained_topology_from_state_dict`` refuses
+            #      conv branches on purpose (capacity_control.py's docstring:
+            #      "callers must record that status rather than widen a model
+            #      as a substitute control") -- so mnist_pai (type-selected
+            #      Conv2d/Linear), unet_carvana (.block1/.block2 conv pairs)
+            #      and unet_supervisely (InvertedResidual/DecoderBlock) can
+            #      never have this control.  Reproduced directly:
+            #      a ``(32,1,3,3)`` branch weight raises
+            #      "only Linear branches are currently supported".
+            #   3. ``dendrites_q*`` after a ``no_retained_insertion`` FP32 arm,
+            #      refused by _require_verified_dendritic_pqat_source.  That
+            #      guard is correct and stays exactly as strict; only its blast
+            #      radius changes.
+            #
+            # The same reasoning the report builder already carries applies
+            # here -- "training results are already on disk, and a failure must
+            # not make the run look like it lost them".
+            unavailable: dict[str, str] = {}
+            # The *root* reason, kept separately so a fourth-generation
+            # descendant reports "source capacity_dense_fp32 unavailable: only
+            # Linear branches are currently supported" rather than three
+            # nested repetitions of the same sentence.
+            root_cause: dict[str, str] = {}
             for condition in pending:
+                # Skipping the descendants is not cosmetic.  ``_prepare_condition_model``
+                # only loads a source checkpoint ``if condition.source_key in
+                # saved_dirs``; with the source absent it silently falls through
+                # and returns the freshly *initialised* model, so e.g.
+                # capacity_dense_q8 would quantize random weights and publish
+                # the result as a real number.  Refusing to run a condition
+                # whose declared source never produced an artifact is the only
+                # thing standing between a skipped control and a fabricated one.
+                if (
+                    condition.source_key != condition.key
+                    and condition.source_key not in saved_dirs
+                ):
+                    reason = root_cause.get(
+                        condition.source_key,
+                        "it was never selected, or its model does not run it",
+                    )
+                    root_cause[condition.key] = reason
+                    unavailable[condition.key] = (
+                        f"source {condition.source_key} unavailable: {reason}"
+                    )
+                    _log(
+                        f"[skip] {model_spec.key} / {condition.key} — "
+                        f"{unavailable[condition.key]}"
+                    )
+                    continue
                 recipe = self._training_hyperparameters(model_spec.key, condition)
                 bundle = bundles_by_batch_size.get(recipe.batch_size)
                 if bundle is None:
@@ -1980,13 +2273,24 @@ class BenchmarkRunner:
                         model_spec.key, batch_size=recipe.batch_size
                     )
                     bundles_by_batch_size[recipe.batch_size] = bundle
-                if self._train_pending_condition(
-                    model_spec, condition, bundle,
-                    model_records, all_records, saved_dirs, allow_pqat,
-                    dynamic_dendritic_training, pai_capacity_check,
-                ):
-                    newly_trained = True
+                try:
+                    if self._train_pending_condition(
+                        model_spec, condition, bundle,
+                        model_records, all_records, saved_dirs, allow_pqat,
+                        dynamic_dendritic_training, pai_capacity_check,
+                    ):
+                        newly_trained = True
+                except (UnsupportedTopology, ConditionPrerequisiteUnmet) as exc:
+                    # Both exception types are raised only while *preparing* a
+                    # condition, never from inside training, so nothing partial
+                    # has been written.  Narrow on purpose: a genuine training
+                    # failure must still stop the run.
+                    unavailable[condition.key] = str(exc)
+                    root_cause[condition.key] = str(exc)
+                    _log(f"[skip] {model_spec.key} / {condition.key} — {exc}")
                 _release_accelerator_memory()
+            if unavailable:
+                self._record_unavailable_conditions(model_spec.key, unavailable)
 
         write_model_reports(
             model_spec.display_name,
@@ -2224,11 +2528,24 @@ class BenchmarkRunner:
             label_smoothing=training_hyperparameters.label_smoothing,
             regression_loss=training_hyperparameters.regression_loss,
             grad_clip_norm=training_hyperparameters.grad_clip_norm,
+            lr_plateau_factor=training_hyperparameters.lr_plateau_factor,
+            lr_plateau_patience=training_hyperparameters.lr_plateau_patience,
+            lr_plateau_mode=training_hyperparameters.lr_plateau_mode,
+            lr_poly_power=training_hyperparameters.lr_poly_power,
+            pai_owns_lr_schedule=training_hyperparameters.pai_owns_lr_schedule,
+            pai_setup_optimizer=training_hyperparameters.pai_setup_optimizer,
+            pai_restructure_lr_multiplier=(
+                training_hyperparameters.pai_restructure_lr_multiplier
+            ),
             source_condition_key=experiment_plan.source_condition_key,
             enable_pai_dendrite_updates=training_plan.update_dendrites_during_training,
             train_dendrites_until_complete=(
                 training_plan.update_dendrites_during_training
-                and (dynamic_dendritic_training or pai_capacity_check)
+                and (
+                    dynamic_dendritic_training
+                    or pai_capacity_check
+                    or model_key in _UPSTREAM_PAI_BASE_MODEL_KEYS
+                )
             ),
             pai_testing_dendrite_capacity=(
                 training_plan.update_dendrites_during_training and pai_capacity_check
@@ -2389,6 +2706,29 @@ _MODEL_COST_HOURS: dict[str, float] = {
     "vae_mnist": 0.2,
     "dqn_lunarlander": 0.2,
     "lstm_autoencoder": 0.2,
+    # --- PerforatedAI upstream base examples --------------------------------
+    # First estimates, used only to balance workers across parallel streams.
+    # Scaled from the measured neighbours above by epoch count and per-step
+    # cost; they should be replaced with measurements after the first sweep.
+    #
+    # 320px segmentation over 2,134 pairs at batch 16 for 80 epochs; the
+    # closest measured analogue is mobilenetv2_cifar10 at 8.0h, and this has
+    # 100x the pixels per sample against 25x fewer samples and 2.5x fewer
+    # epochs.
+    "unet_supervisely": 9.0,
+    # 1918x1280 -> half-scale segmentation over ~4,580 images at *batch 1*
+    # (upstream's default) for 40 epochs, so ~183k optimizer steps, plus the
+    # five full validation passes per epoch that upstream's division_step
+    # clock forces. Dominated by JPEG decode + resize on the CPU side.
+    "unet_carvana": 12.0,
+    # ResNet-18 at 32px for 90 epochs at batch 32, plus a frozen ResNet-50
+    # teacher forward on every training batch -- roughly 2.5x a plain
+    # ResNet-18 step -- over a 12,500-image quarter subset.
+    "resnet18_kd_cifar100": 4.0,
+    # Same shape as resnet18_hf_perforated_cifar10 (2.5h at 50 epochs), at
+    # 200 epochs.
+    "resnet18_hf_perforated_cifar100": 9.0,
+    "mnist_pai": 0.4,
 }
 _DEFAULT_COST_HOURS = 0.1
 
