@@ -280,6 +280,40 @@ class DynamicPAIFollowupTests(unittest.TestCase):
         self.assertEqual(topology_hash, _topology_hash(clean))
         self.assertNotEqual(topology_hash, _topology_hash(wrapped))
 
+    def test_dendritic_parameter_stats_excludes_unserialized_pai_scaffolding(self) -> None:
+        wrapped = torch.nn.Linear(2, 2, bias=False)
+
+        class _CleanWithScaffolding(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.inference = torch.nn.Parameter(torch.tensor([1.0, 0.0]))
+                # PAI can keep this registered after final cleaning, but its
+                # serializer intentionally omits it from the inference model.
+                self.scaffolding = torch.nn.Parameter(torch.ones(3))
+
+            def state_dict(self, *args: object, **kwargs: object) -> dict[str, torch.Tensor]:
+                del args, kwargs
+                return {"inference": self.inference.detach()}
+
+        clean = _CleanWithScaffolding()
+
+        class _PAIUtils:
+            @staticmethod
+            def prepare_final_model(model: torch.nn.Module) -> torch.nn.Module:
+                return clean
+
+        with patch("dendritic_benchmark.training.pai_runtime_guard", nullcontext):
+            with patch(
+                "dendritic_benchmark.training.importlib.import_module",
+                return_value=_PAIUtils,
+            ):
+                param_count, nonzero_params, topology_hash = (
+                    _final_clean_pai_parameter_stats(wrapped)
+                )
+        self.assertEqual((param_count, nonzero_params), (2, 1))
+        self.assertEqual(topology_hash, _topology_hash(clean, {"inference"}))
+        self.assertNotEqual(topology_hash, _topology_hash(clean))
+
     def test_data_worker_override_disables_multiprocessing(self) -> None:
         dataset = torch.utils.data.TensorDataset(torch.arange(4))
         with patch.dict("os.environ", {"DQB_DATA_NUM_WORKERS": "0"}):

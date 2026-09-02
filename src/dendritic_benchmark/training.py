@@ -8,8 +8,10 @@ import math
 import os
 import random
 import shutil
+import struct
 import subprocess
 import time
+from collections.abc import Collection
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -54,6 +56,17 @@ from .quantization import (
 )
 
 _MODEL_PT: str = "model.pt"
+_PAI_SERIALIZATION_BUFFER_NAMES = frozenset(
+    {
+        "module_id",
+        "node_index",
+        "num_batches_tracked",
+        "num_cycles",
+        "running_mean",
+        "running_var",
+        "view_tuple",
+    }
+)
 _BEST_MODEL_STATS_CSV: str = "best_model_stats.csv"
 _EPOCH_CHECKPOINT_PT: str = "epoch_checkpoint.pt"
 _MEMORY_GUARD_THRESHOLD_BYTES = 20 * 1024**3
@@ -1380,18 +1393,24 @@ def _count_parameters(model: Any) -> tuple[int, int]:
     return param_count, nonzero_params
 
 
-def _topology_hash(model: Any) -> str:
+def _topology_hash(
+    model: Any, parameter_names: Collection[str] | None = None
+) -> str:
     """A deterministic identity for a model's architecture, not its weights.
 
     Hashes each parameter's dotted name, owning-module class name, and shape
     -- never its values -- so retraining the identical architecture reproduces
     the same hash while a real shape change (a retained-vs-rejected dendrite)
-    changes it. information/optimization/00_assessment.md: "A retained
+    changes it. When ``parameter_names`` is supplied, hashes only that
+    serialized inference subset. information/optimization/00_assessment.md: "A retained
     dendrite is an architectural change, not merely a metric event."
     """
     owners = dict(model.named_modules())
+    included_names = None if parameter_names is None else set(parameter_names)
     entries = []
     for name, param in model.named_parameters():
+        if included_names is not None and name not in included_names:
+            continue
         module_name, _, _leaf = name.rpartition(".")
         owner = owners.get(module_name)
         owner_class = type(owner).__name__ if owner is not None else ""
@@ -1400,7 +1419,9 @@ def _topology_hash(model: Any) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _final_clean_pai_parameter_stats(model: Any) -> tuple[int, int, str]:
+def _prepare_final_clean_pai_model(
+    model: Any,
+) -> tuple[Any, tuple[int, int, str]]:
     """Count the inference model PAI writes as ``final_clean_pai.pt``.
 
     A live PAI wrapper retains the next candidate dendrite and its training
@@ -1431,8 +1452,114 @@ def _final_clean_pai_parameter_stats(model: Any) -> tuple[int, int, str]:
             "PerforatedAI could not prepare the final-clean inference model for "
             "parameter accounting."
         ) from exc
-    param_count, nonzero_params = _count_parameters(final_clean_model)
-    return param_count, nonzero_params, _topology_hash(final_clean_model)
+    # ``model.parameters()`` is not the inference-parameter contract for a
+    # PAI-cleaned model. Some PAI wrappers retain registered
+    # dendrite-to-top/scaffolding tensors after ``prepare_final_model`` even
+    # though PAI's final serializer omits them. Counting those tensors made
+    # MPNN and actor_critic disagree with PAI's raw retained-topology ledger.
+    #
+    # The artifact we publish is this final-clean object's ``state_dict``.
+    # Its parameter-name intersection is consequently the exact model
+    # parameter set that will be serialized. It excludes non-persistent PAI
+    # scaffolding while excluding buffers such as ``num_cycles``. PAI 3.2.7's
+    # ``get_pai_network_params()`` empties after ``prepare_final_model()``, and
+    # its ``count_params()`` still includes this scaffolding, so neither is a
+    # reliable final-inference accounting source here.
+    try:
+        serialized_names = set(final_clean_model.state_dict())
+    except Exception as exc:
+        raise RuntimeError(
+            "PerforatedAI could not inspect the final-clean inference "
+            "serialization for audit accounting."
+        ) from exc
+    serialized_parameters = [
+        param
+        for name, param in final_clean_model.named_parameters()
+        if name in serialized_names
+    ]
+    param_count = sum(int(param.numel()) for param in serialized_parameters)
+    if param_count <= 0:
+        raise RuntimeError(
+            "The final-clean PAI serialization contains no model parameters; "
+            "refusing to write an ambiguous dendritic artifact."
+        )
+    nonzero_params = sum(
+        int((param != 0).sum().item()) for param in serialized_parameters
+    )
+    return final_clean_model, (
+        param_count,
+        nonzero_params,
+        _topology_hash(final_clean_model, serialized_names),
+    )
+
+
+def _final_clean_pai_parameter_stats(model: Any) -> tuple[int, int, str]:
+    """Return final-clean PAI statistics without exposing the cleaned model.
+
+    The training path uses :func:`_prepare_final_clean_pai_model` directly so
+    it can persist that exact inference object. This small wrapper keeps the
+    counting contract independently testable.
+    """
+    _final_clean_model, stats = _prepare_final_clean_pai_model(model)
+    return stats
+
+
+def _export_final_pai_artifact(pai_save_name: str, checkpoint_path: Path) -> None:
+    """Copy PAI's final-clean serialization to the benchmark artifact path."""
+    # ``save_system`` writes this after PAI performs its final conversion. In
+    # contrast, ``save_pai_net`` preserves residual skip weights. This file is
+    # therefore PAI's actual distributable inference topology.
+    pai_path = pai_save_path(pai_save_name) / "final_clean_pai.pt"
+    if not pai_path.is_file():
+        raise RuntimeError(
+            "PerforatedAI did not write its final-clean inference artifact."
+        )
+    shutil.copy2(pai_path, checkpoint_path)
+
+
+def _final_pai_artifact_stats(path: Path) -> tuple[int, int, str]:
+    """Read PAI's safetensor-like final artifact without counting buffers.
+
+    PAI's final writer removes training scaffolding *during serialization*.
+    Its header records every retained tensor's dtype and shape, letting the
+    benchmark audit the exact published artifact rather than a mutable wrapper.
+    """
+    try:
+        with path.open("rb") as fh:
+            header_size = struct.unpack("<Q", fh.read(8))[0]
+            header = json.loads(fh.read(header_size))
+    except (OSError, ValueError, struct.error, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "PerforatedAI's final-clean artifact has an unreadable tensor header."
+        ) from exc
+    entries: list[tuple[str, tuple[int, ...], str]] = []
+    for name, metadata in header.items():
+        if name == "__metadata__" or not isinstance(metadata, dict):
+            continue
+        shape = metadata.get("shape")
+        dtype = metadata.get("dtype")
+        if not isinstance(shape, list) or not isinstance(dtype, str):
+            raise RuntimeError(
+                "PerforatedAI's final-clean artifact has malformed tensor metadata."
+            )
+        if name.rsplit(".", 1)[-1] in _PAI_SERIALIZATION_BUFFER_NAMES:
+            continue
+        entries.append((name, tuple(int(dim) for dim in shape), dtype))
+    param_count = sum(math.prod(shape) for _name, shape, _dtype in entries)
+    if param_count <= 0:
+        raise RuntimeError(
+            "PerforatedAI's final-clean artifact contains no inference parameters."
+        )
+    canonical = "\n".join(
+        f"{name}|{shape}|{dtype}" for name, shape, dtype in sorted(entries)
+    )
+    return (
+        param_count,
+        # The safetensors header intentionally does not contain values. This
+        # is an FP32 final artifact, so every serialized parameter is retained.
+        param_count,
+        hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    )
 
 
 def _write_metrics_and_history(
@@ -1540,10 +1667,12 @@ def _persist_stage_artifacts(
     payload: ArtifactPayload,
     parameter_stats: tuple[int, int] | None = None,
     topology_hash: str | None = None,
+    checkpoint_already_written: bool = False,
 ) -> tuple[Path, float, int, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / _MODEL_PT
-    torch.save(plain_model.state_dict(), checkpoint_path)
+    if not checkpoint_already_written:
+        torch.save(plain_model.state_dict(), checkpoint_path)
     artifact_path = _artifact_path(output_dir, metadata.use_dendrites)
     file_size_mb = artifact_path.stat().st_size / (1024 * 1024)
     param_count, nonzero_params = parameter_stats or _count_parameters(plain_model)
@@ -4675,9 +4804,17 @@ def train_and_evaluate(
         skip_reason=skip_reason,
         stage_name="after_pqat" if pqat_enabled else None,
     )
-    _final_clean_stats = (
-        _final_clean_pai_parameter_stats(_plain_model) if use_dendrites else None
-    )
+    final_checkpoint_path = output_dir / _MODEL_PT
+    _final_clean_stats = None
+    if use_dendrites:
+        # PAI removes a final bit of branch scaffolding in the final-clean
+        # file emitted by ``save_system``, not in ``prepare_final_model`` or
+        # ``save_pai_net``. Copy it first, then derive all topology evidence
+        # from the exact bytes the benchmark will publish.
+        if not pai_save_name:
+            raise RuntimeError("dendritic final export requires a PAI save name")
+        _export_final_pai_artifact(pai_save_name, final_checkpoint_path)
+        _final_clean_stats = _final_pai_artifact_stats(final_checkpoint_path)
     final_parameter_stats = (
         _final_clean_stats[:2] if _final_clean_stats is not None else None
     )
@@ -4738,6 +4875,7 @@ def train_and_evaluate(
         payload=payload,
         parameter_stats=final_parameter_stats,
         topology_hash=final_topology_hash,
+        checkpoint_already_written=use_dendrites,
     )
 
     record = TrainingRecord(
