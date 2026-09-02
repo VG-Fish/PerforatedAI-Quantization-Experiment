@@ -43,7 +43,7 @@ from .compat import (
     set_module_output_dimensions,
 )
 from .data import _explained_variance
-from .model_adapters import model_adapter
+from .model_adapters import ALL_MODEL_KEYS, model_adapter
 from .plans import LRScheduleName, OptimizerName, RegressionLossName
 from .quantization import (
     make_quantized_copy as _make_quantized_copy,
@@ -56,6 +56,21 @@ from .quantization import (
 )
 
 _MODEL_PT: str = "model.pt"
+# PerforatedAI's own final-clean inference serialization, written inside
+# ``PAI/<save_name>/``.  It is emitted only by
+# ``tracker_perforatedai.process_final_network``, i.e. only on PAI's
+# ``TRAINING_COMPLETE`` transition, so it is legitimately absent from most runs
+# (see _export_final_pai_artifact).
+_FINAL_CLEAN_PAI_PT: str = "final_clean_pai.pt"
+# The benchmark's copy of that file, kept *beside* model.pt rather than as
+# model.pt.  PAI writes it in safetensors form, but a dendritic ``model.pt`` is
+# read back by ``pipeline._load_state`` with
+# ``torch.load(..., weights_only=True)`` for every ``dendrites_q*`` condition
+# and nothing on that path can read safetensors.  Two encodings under one
+# filename is not viable, so the accounting source and the published checkpoint
+# get separate names: the audit only ever needed the *counts* in PAI's tensor
+# header, not the file location.
+_FINAL_CLEAN_PAI_EXPORT: str = "final_clean_pai.safetensors"
 _PAI_SERIALIZATION_BUFFER_NAMES = frozenset(
     {
         "module_id",
@@ -143,6 +158,15 @@ class TrainingConfig:
     # models may opt into a loss that matches their reported MAE metric.
     regression_loss: RegressionLossName = "mse"
     grad_clip_norm: float | None = None
+    lr_plateau_factor: float = 0.1
+    lr_plateau_patience: int = 5
+    lr_plateau_mode: Literal["min", "max"] = "max"
+    lr_poly_power: float = 0.9
+    pai_owns_lr_schedule: bool = False
+    pai_setup_optimizer: bool = True
+    pai_restructure_lr_multiplier: float = 1.0
+    # Local epoch at which a trainer-owned polynomial schedule last restarted.
+    lr_schedule_restart_epoch: int = 0
     source_condition_key: str | None = None
     enable_pai_dendrite_updates: bool = False
     train_dendrites_until_complete: bool = False
@@ -552,17 +576,11 @@ def _ppo_metrics(outputs: Any, targets: Any) -> dict[str, float]:
         }
 
 
+# Derived from the adapter registry rather than hand-listed: a model cannot be
+# registered in model_adapters without also declaring its primary metric key,
+# so re-typing the roster here only created a way for the two to disagree.
 _PRIMARY_METRIC_KEY: dict[str, str] = {
-    key: model_adapter(key).primary_metric_key
-    for key in (
-        "lenet5", "m5", "lstm_forecaster", "textcnn", "gcn", "tabnet",
-        "mpnn", "actor_critic", "lstm_autoencoder", "distilbert",
-        "dqn_lunarlander", "ppo_bipedalwalker", "attentivefp_freesolv",
-        "gin_imdbb", "tcn_forecaster", "gru_forecaster",
-        "pointnet_modelnet40", "vae_mnist", "snn_nmnist",
-        "resnet18_cifar10", "resnet18_hf_perforated_cifar10",
-        "mobilenetv2_cifar10", "saint_adult", "capsnet_mnist",
-    )
+    key: model_adapter(key).primary_metric_key for key in ALL_MODEL_KEYS
 }
 # Kept outside the registered roster until its dataset support is promoted.
 _PRIMARY_METRIC_KEY["unet_isic"] = "dice"
@@ -603,6 +621,174 @@ class CapsuleMarginLoss(torch.nn.Module):
         return loss.sum(dim=-1).mean()
 
 
+
+# ----------------------------------------- upstream base-example objectives --
+
+
+def _softmax_dice_loss(logits: Any, targets: Any, smooth: float = 1.0) -> Any:
+    """Upstream's ``evaluation/losses.dice_loss`` from segmentation-image-resolution.
+
+    ``logits`` are [N, C, H, W]; ``targets`` are [N, H, W] holding class indices
+    in {0, ..., C-1}. Scatters the target into a one-hot of the logits' own
+    shape and returns ``1 - Dice`` averaged over batch and class.
+    """
+    outputs = torch.nn.functional.softmax(logits, dim=1)
+    index = targets.unsqueeze(dim=1).type(torch.int64)
+    onehot = torch.zeros_like(logits).scatter_(dim=1, index=index, value=1.0)
+    intersection = outputs * onehot
+    dice = 1 - (
+        (2 * intersection.sum(dim=(2, 3)) + smooth)
+        / (outputs.sum(dim=(2, 3)) + onehot.sum(dim=(2, 3)) + smooth)
+    )
+    return dice.mean()
+
+
+def _miou_from_logits(logits: Any, targets: Any, eps: float = 1e-6) -> float:
+    """Upstream's ``evaluation/metrics.miou``.
+
+    Argmax the logits, one-hot both prediction and target, then mean the
+    per-class intersection-over-union over batch *and* class -- including the
+    background class, which is what the example's reported 0.8420 is.
+    """
+    outputs = torch.argmax(logits, dim=1, keepdim=True).type(torch.int64)
+    index = targets.unsqueeze(dim=1).type(torch.int64)
+    predicted = torch.zeros_like(logits).scatter_(dim=1, index=outputs, value=1.0).type(torch.int8)
+    actual = torch.zeros_like(logits).scatter_(dim=1, index=index, value=1.0).type(torch.int8)
+    intersection = (predicted & actual).type(torch.float32).sum(dim=(2, 3))
+    union = (predicted | actual).type(torch.float32).sum(dim=(2, 3))
+    return float((intersection / (union + eps)).mean().item())
+
+
+def _multiclass_dice_from_logits(logits: Any, targets: Any, eps: float = 1e-6) -> float:
+    """Upstream's ``utils.dice_score.multiclass_dice_coeff``, foreground only.
+
+    ``pytorch_unet``'s ``evaluate()`` one-hots the argmax prediction and the
+    target, then scores ``[:, 1:]`` -- every class but the background. For
+    Carvana's ``n_classes=2`` that is the car mask alone, which is the number
+    the example reports.
+    """
+    num_classes = logits.shape[1]
+    predicted = torch.nn.functional.one_hot(
+        logits.argmax(dim=1), num_classes
+    ).permute(0, 3, 1, 2).float()
+    actual = torch.nn.functional.one_hot(
+        targets.long(), num_classes
+    ).permute(0, 3, 1, 2).float()
+    predicted, actual = predicted[:, 1:], actual[:, 1:]
+    intersection = 2.0 * (predicted * actual).sum(dim=(-1, -2))
+    sets = predicted.sum(dim=(-1, -2)) + actual.sum(dim=(-1, -2))
+    # Upstream's dice_coeff substitutes the intersection for an empty union so
+    # an all-background tile scores 1 rather than 0.
+    sets = torch.where(sets == 0, intersection, sets)
+    return float(((intersection + eps) / (sets + eps)).mean().item())
+
+
+class CarvanaUNetLoss(torch.nn.Module):
+    """Cross-entropy plus soft Dice, exactly as ``pytorch_unet``'s train loop.
+
+    ``loss = CrossEntropyLoss(logits, target) + dice_loss(softmax(logits),
+    one_hot(target), multiclass=True)``. The Dice term there scores every class
+    including background (unlike the *metric*, which drops it), so this uses
+    the same all-class soft Dice.
+
+    The reduction matters and is easy to get wrong.  ``dice_loss`` calls
+    ``multiclass_dice_coeff(..., reduce_batch_first=True)``, which flattens
+    ``(N, C, H, W)`` to ``(N*C, H, W)`` and *then*, because the input is now
+    3-D and ``reduce_batch_first`` is set, sums over ``(-1, -2, -3)``: one
+    global intersection and one global union for the whole batch, giving a
+    single scalar Dice.  Averaging per-(sample, class) Dice scores instead is a
+    different, better-conditioned objective -- it upweights images where the
+    car is small -- and would not reproduce upstream's numbers.
+    """
+
+    def forward(self, logits: Any, targets: Any) -> Any:
+        targets = targets.long()
+        cross_entropy = torch.nn.functional.cross_entropy(logits, targets)
+        probabilities = torch.nn.functional.softmax(logits, dim=1)
+        onehot = torch.nn.functional.one_hot(
+            targets, logits.shape[1]
+        ).permute(0, 3, 1, 2).float()
+        # flatten(0, 1) then reduce every remaining axis, per the note above.
+        probabilities = probabilities.flatten(0, 1)
+        onehot = onehot.flatten(0, 1)
+        intersection = 2.0 * (probabilities * onehot).sum()
+        sets = probabilities.sum() + onehot.sum()
+        sets = torch.where(sets == 0, intersection, sets)
+        dice = (intersection + 1e-6) / (sets + 1e-6)
+        return cross_entropy + (1.0 - dice)
+
+
+class SuperviselyDiceLoss(torch.nn.Module):
+    """``config_UNet.json`` names ``dice_loss``; this is upstream's, unchanged."""
+
+    def forward(self, logits: Any, targets: Any) -> Any:
+        return _softmax_dice_loss(logits, targets)
+
+
+# ------------------------------------------------------- knowledge distillation
+
+
+#: ``train_perforated_resnet_KD.KD_ALPHA`` / ``KD_TEMPERATURE``.
+KD_ALPHA: float = 0.4
+KD_TEMPERATURE: float = 4.0
+
+#: Models whose *training* loss adds a distillation term. Validation and test
+#: stay plain cross-entropy, matching upstream, where KD lives only in
+#: ``train_one_epoch``.
+_KD_MODELS: frozenset[str] = frozenset({"resnet18_kd_cifar100"})
+
+#: Frozen teachers, keyed by (model_key, device string). Deliberately *not* a
+#: child module of the student: PAI would try to perforate it, quantization
+#: would project its weights, and it would land in every checkpoint.
+_KD_TEACHER_CACHE: dict[tuple[str, str], Any] = {}
+
+
+def _kd_teacher(model_key: str, device: Any) -> Any:
+    """Load, freeze and cache the distillation teacher for *model_key*."""
+    cache_key = (model_key, str(device))
+    cached = _KD_TEACHER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    from .models import build_kd_teacher_resnet50, kd_teacher_checkpoint_path
+
+    checkpoint = kd_teacher_checkpoint_path()
+    if not checkpoint.exists():
+        raise RuntimeError(
+            f"{model_key} needs a distillation teacher fine-tuned on its own "
+            f"dataset, and {checkpoint} does not exist. Upstream refuses to run "
+            "--use-kd on a non-ImageNet dataset without one. Build it with "
+            "`dqb pretrain-kd-teacher`."
+        )
+    teacher = build_kd_teacher_resnet50(num_classes=100)
+    state = torch.load(str(checkpoint), map_location="cpu", weights_only=True)
+    teacher.load_state_dict(state["model"] if "model" in state else state)
+    teacher.to(device)
+    teacher.eval()
+    for parameter in teacher.parameters():
+        parameter.requires_grad = False
+    _KD_TEACHER_CACHE[cache_key] = teacher
+    return teacher
+
+
+def _kd_teacher_logits(model_key: str, batch: Any, device: Any) -> Any | None:
+    """Teacher logits for this batch, or ``None`` when the model does not distil."""
+    if model_key not in _KD_MODELS:
+        return None
+    teacher = _kd_teacher(model_key, device)
+    with torch.no_grad():
+        return teacher(batch[0])
+
+
+def _kd_loss(student_logits: Any, teacher_logits: Any, supervised: Any) -> Any:
+    """``(1 - a) * CE + a * KL(student/T || teacher/T) * T^2``, upstream's form."""
+    distillation = torch.nn.functional.kl_div(
+        torch.nn.functional.log_softmax(student_logits / KD_TEMPERATURE, dim=1),
+        torch.nn.functional.softmax(teacher_logits / KD_TEMPERATURE, dim=1),
+        reduction="batchmean",
+    ) * (KD_TEMPERATURE * KD_TEMPERATURE)
+    return (1.0 - KD_ALPHA) * supervised + KD_ALPHA * distillation
+
+
 def _binary_or_multi_loss(model_key: str, config: TrainingConfig | None = None) -> Any:
     if model_key in {"tcn_forecaster", "gru_forecaster"}:
         # Both forecasters report MAE, so the training loss is a recipe choice
@@ -623,6 +809,14 @@ def _binary_or_multi_loss(model_key: str, config: TrainingConfig | None = None) 
         return torch.nn.MSELoss()
     if model_key == "unet_isic":
         return torch.nn.BCEWithLogitsLoss()
+    if model_key == "mnist_pai":
+        # Upstream's Net ends in log_softmax and trains with F.nll_loss.
+        # CrossEntropyLoss would apply a second log-softmax over log-probs.
+        return torch.nn.NLLLoss()
+    if model_key == "unet_carvana":
+        return CarvanaUNetLoss()
+    if model_key == "unet_supervisely":
+        return SuperviselyDiceLoss()
     # These build their objective from the model's own multi-part output rather
     # than a criterion over (prediction, target): the VAE's ELBO, and PPO's
     # clipped surrogate + value + entropy. See _compute_loss.
@@ -718,6 +912,11 @@ def _best_f1_threshold(
 
 def _classification_metrics(logits: Any, targets: Any) -> dict[str, float]:
     logits = logits.float()
+    # The upstream KD recipe applies MixUp/CutMix in the collate function, so
+    # CrossEntropyLoss receives soft one-hot labels. Its displayed train-side
+    # accuracy uses the dominant class from those labels.
+    if targets.ndim > 1:
+        targets = targets.argmax(dim=-1)
     targets = targets.long().flatten()
     predictions = logits.argmax(dim=-1)
     probs = torch.softmax(logits, dim=-1)
@@ -1050,6 +1249,16 @@ def _compute_all_metrics(
     task_kind = (
         "segmentation" if model_key == "unet_isic" else model_adapter(model_key).task_kind
     )
+    # unet_isic is a 1-channel sigmoid head scored with a thresholded Dice.
+    # The two PerforatedAI segmentation examples are 2-channel softmax heads
+    # with class-index targets, and each reports its own upstream metric:
+    # foreground-only multiclass Dice for Carvana, all-class mIoU for
+    # Supervisely. Dispatching on the head shape rather than the model name
+    # would be wrong -- the metrics genuinely differ, not just the activation.
+    if model_key == "unet_carvana":
+        return {"dice": _multiclass_dice_from_logits(outputs, targets)}
+    if model_key == "unet_supervisely":
+        return {"miou": _miou_from_logits(outputs, targets)}
     if model_key == "actor_critic" and isinstance(outputs, tuple):
         outputs = outputs[0]
     if task_kind == "regression":
@@ -1175,6 +1384,48 @@ def _first_tensor(value: Any) -> Any | None:
     return None
 
 
+#: Layer types whose feature axis is axis 1 of a rank>=3 activation, i.e. the
+#: ``(N, C, ...)`` channels-first convention.  Normalizations count: they are
+#: what a convolution is grouped *with* when a module is perforated as a unit,
+#: and they carry the same channel count.
+_CHANNEL_FIRST_LAYER_TYPES: tuple[str, ...] = (
+    "conv",
+    "batchnorm",
+    "instancenorm",
+    "groupnorm",
+)
+
+
+def _emits_channels_first(module: Any) -> bool:
+    """Whether ``module`` puts its features on axis 1 rather than the last axis.
+
+    The module's own class name settles it when it is a convolution.  When it is
+    a container -- ``nn.Sequential(Conv2d, BatchNorm2d)``, ``InvertedResidual``,
+    ``DecoderBlock`` -- the name says nothing, so the *last parameter-bearing
+    descendant* decides, because that is the layer whose output shape the
+    container returns.
+
+    This matters because perforating a convolution means perforating it
+    together with the normalization that follows it, so the target module is
+    almost always a container: upstream's U-Net examples both call
+    ``set_output_dimensions([-1, 0, -1, -1])`` for exactly this reason, and the
+    ResNet/KD example's ``.b1`` is ``PAISequential([conv1, bn1])``.  Reading the
+    container's class name instead would put the node axis on ``W``, and PAI
+    would then build a dendrite per output *column* of the feature map.
+    """
+    if any(name in type(module).__name__.lower() for name in _CHANNEL_FIRST_LAYER_TYPES):
+        return True
+    last: Any = None
+    for child in module.modules():
+        if child is module:
+            continue
+        if any(True for _ in child.parameters(recurse=False)):
+            last = child
+    return last is not None and any(
+        name in type(last).__name__.lower() for name in _CHANNEL_FIRST_LAYER_TYPES
+    )
+
+
 def _dimension_vector_for_module_output(module: Any, output: Any) -> list[int] | None:
     tensor = _first_tensor(output)
     if tensor is None:
@@ -1183,8 +1434,7 @@ def _dimension_vector_for_module_output(module: Any, output: Any) -> list[int] |
     if rank < 2:
         return None
     dimensions = [-1] * rank
-    module_type = type(module).__name__.lower()
-    output_axis = 1 if "conv" in module_type and rank > 1 else rank - 1
+    output_axis = 1 if rank > 2 and _emits_channels_first(module) else rank - 1
     dimensions[output_axis] = 0
     return dimensions
 
@@ -1290,8 +1540,17 @@ def _pointnet_feature_transform_penalty(model: Any) -> Any | None:
 
 
 def _compute_loss(
-    model_key: str, criterion: Any, outputs: Any, targets: Any, model: Any = None
+    model_key: str,
+    criterion: Any,
+    outputs: Any,
+    targets: Any,
+    model: Any = None,
+    teacher_outputs: Any = None,
 ) -> Any:
+    if teacher_outputs is not None:
+        # Upstream applies KD in train_one_epoch only; every evaluation path
+        # leaves teacher_outputs None and therefore scores plain CE.
+        return _kd_loss(outputs, teacher_outputs, criterion(outputs, targets))
     if model_key == "actor_critic":
         return criterion(outputs[0], targets)
     if model_key == "vae_mnist":
@@ -1344,6 +1603,10 @@ def _artifact_path(output_dir: Path, use_dendrites: bool) -> Path:
     if preferred.exists():
         return preferred
     # Backwards compatibility for older runs that wrote multiple checkpoint names.
+    # These are extensionless *artifact* names from older layouts; the modern
+    # ``_FINAL_CLEAN_PAI_EXPORT`` sibling is deliberately not listed here,
+    # because it is safetensors-encoded accounting evidence and must never be
+    # handed to a caller that expects a loadable benchmark checkpoint.
     if use_dendrites:
         for candidate in ("best_model", "final_clean_pai"):
             path = output_dir / candidate
@@ -1477,17 +1740,40 @@ def _final_clean_pai_parameter_stats(model: Any) -> tuple[int, int, str]:
     return stats
 
 
-def _export_final_pai_artifact(pai_save_name: str, checkpoint_path: Path) -> None:
-    """Copy PAI's final-clean serialization to the benchmark artifact path."""
-    # ``save_system`` writes this after PAI performs its final conversion. In
-    # contrast, ``save_pai_net`` preserves residual skip weights. This file is
-    # therefore PAI's actual distributable inference topology.
-    pai_path = pai_save_path(pai_save_name) / "final_clean_pai.pt"
+def _export_final_pai_artifact(pai_save_name: str, export_path: Path) -> bool:
+    """Copy PAI's final-clean serialization beside the benchmark artifact.
+
+    Returns ``True`` when PAI had written that file and it was copied, ``False``
+    when PAI never produced one.  **Absence is a normal outcome, not an error.**
+    ``save_system`` emits ``final_clean_pai.pt`` only from
+    ``tracker_perforatedai.process_final_network``, which runs only on PAI's own
+    ``TRAINING_COMPLETE`` transition.  The benchmark's documented default mode
+    (``cli.py`` ``--dynamic-dendritic-training``: "By default, dendritic FP32
+    runs use the same fixed epoch budget as the matching non-dendritic run and
+    freeze dendrite insertion for the final 20% of epochs") tears the tracker
+    down for that final fraction, so a default-mode dendritic run structurally
+    cannot reach the transition however long its budget is.  A completed switch
+    is not the trigger either: the stored ``resnet18_cifar10`` run has two
+    switches and no such file.
+
+    Raising here instead (commit ``9de8880``) made every default-mode dendritic
+    run crash before it could publish anything.  The shipped ``distilbert /
+    dendrites_fp32`` artifact is the pre-regression proof that this case is a
+    publishable result rather than a failure: it terminated on ``epoch_budget``
+    with zero switches, has no ``final_clean_pai.pt``, and records
+    ``"dendrite_audit_status": "no_retained_insertion"``.  Full evidence in
+    ``information/base_examples/04_DIAGNOSIS_pai_final_artifact.md``.
+
+    When the file *does* exist it remains the preferred accounting source:
+    PAI performs its final conversion during this write, whereas
+    ``save_pai_net`` preserves residual skip weights, so this is PAI's actual
+    distributable inference topology.
+    """
+    pai_path = pai_save_path(pai_save_name) / _FINAL_CLEAN_PAI_PT
     if not pai_path.is_file():
-        raise RuntimeError(
-            "PerforatedAI did not write its final-clean inference artifact."
-        )
-    shutil.copy2(pai_path, checkpoint_path)
+        return False
+    shutil.copy2(pai_path, export_path)
+    return True
 
 
 def _final_pai_artifact_stats(path: Path) -> tuple[int, int, str]:
@@ -1650,12 +1936,20 @@ def _persist_stage_artifacts(
     payload: ArtifactPayload,
     parameter_stats: tuple[int, int] | None = None,
     topology_hash: str | None = None,
-    checkpoint_already_written: bool = False,
 ) -> tuple[Path, float, int, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / _MODEL_PT
-    if not checkpoint_already_written:
-        torch.save(plain_model.state_dict(), checkpoint_path)
+    # model.pt is unconditionally a ``torch.save`` state dict, dendritic or not.
+    # Every downstream condition rebuilds itself from this file through
+    # ``pipeline._load_state`` -> ``torch.load(..., weights_only=True)``, and no
+    # safetensors reader exists on that path, so substituting PAI's own
+    # safetensors export under this name (commit ``9de8880``) silently broke the
+    # ``dendrites_fp32 -> dendrites_q*`` chain -- and left
+    # ``continued_until_complete/model.pt`` a torch zip beside a safetensors
+    # ``model.pt``, two encodings under one filename.  PAI's export is copied to
+    # ``_FINAL_CLEAN_PAI_EXPORT`` beside this file instead, purely for
+    # parameter/topology accounting.
+    torch.save(plain_model.state_dict(), checkpoint_path)
     artifact_path = _artifact_path(output_dir, metadata.use_dendrites)
     file_size_mb = artifact_path.stat().st_size / (1024 * 1024)
     param_count, nonzero_params = parameter_stats or _count_parameters(plain_model)
@@ -1788,6 +2082,10 @@ def _persist_stage_artifacts(
                 "PAI_config.json",
                 "artifact_attempt.json",
                 "capacity_control_fork.pt",
+                # Present only when PAI reached TRAINING_COMPLETE. It is the
+                # evidence behind this artifact's parameter counts and topology
+                # hash, so seal it when it exists.
+                _FINAL_CLEAN_PAI_EXPORT,
             )
             if (output_dir / name).is_file()
         ),
@@ -2406,12 +2704,19 @@ def _optimizer_param_groups(model: Any, config: TrainingConfig) -> Any:
     ]
 
 
-def _build_optimizer(model: Any, torch: Any, config: TrainingConfig) -> Any:
+def _build_optimizer(
+    model: Any,
+    torch: Any,
+    config: TrainingConfig,
+    *,
+    learning_rate: float | None = None,
+) -> Any:
     params = _optimizer_param_groups(model, config)
+    lr = config.learning_rate if learning_rate is None else learning_rate
     if config.optimizer_name == "sgd":
         return torch.optim.SGD(
             params,
-            lr=config.learning_rate,
+            lr=lr,
             momentum=config.momentum,
             weight_decay=config.weight_decay,
             nesterov=config.nesterov and config.momentum > 0.0,
@@ -2419,12 +2724,28 @@ def _build_optimizer(model: Any, torch: Any, config: TrainingConfig) -> Any:
     if config.optimizer_name == "adamw":
         return torch.optim.AdamW(
             params,
-            lr=config.learning_rate,
+            lr=lr,
+            weight_decay=config.weight_decay,
+        )
+    if config.optimizer_name == "adadelta":
+        # Upstream's MNIST example (examples/base_examples/mnist) trains with
+        # Adadelta(lr=1.0) + StepLR(1, 0.7). Adadelta has no momentum term,
+        # so config.momentum is deliberately unread here.
+        return torch.optim.Adadelta(
+            params,
+            lr=lr,
+            weight_decay=config.weight_decay,
+        )
+    if config.optimizer_name == "rmsprop":
+        return torch.optim.RMSprop(
+            params,
+            lr=lr,
+            momentum=config.momentum,
             weight_decay=config.weight_decay,
         )
     return torch.optim.Adam(
         params,
-        lr=config.learning_rate,
+        lr=lr,
         weight_decay=config.weight_decay,
     )
 
@@ -2434,19 +2755,57 @@ def _optimizer_class(torch: Any, config: TrainingConfig) -> Any:
         return torch.optim.SGD
     if config.optimizer_name == "adamw":
         return torch.optim.AdamW
+    if config.optimizer_name == "adadelta":
+        return torch.optim.Adadelta
+    if config.optimizer_name == "rmsprop":
+        return torch.optim.RMSprop
     return torch.optim.Adam
 
 
-def _optimizer_args(model: Any, config: TrainingConfig) -> dict[str, Any]:
+def _optimizer_args(
+    model: Any,
+    config: TrainingConfig,
+    *,
+    learning_rate: float | None = None,
+) -> dict[str, Any]:
     args: dict[str, Any] = {
         "params": _optimizer_param_groups(model, config),
-        "lr": config.learning_rate,
+        "lr": config.learning_rate if learning_rate is None else learning_rate,
         "weight_decay": config.weight_decay,
     }
     if config.optimizer_name == "sgd":
         args["momentum"] = config.momentum
         args["nesterov"] = config.nesterov and config.momentum > 0.0
+    elif config.optimizer_name == "rmsprop":
+        args["momentum"] = config.momentum
     return args
+
+
+def _pai_scheduler_spec(
+    torch: Any, config: TrainingConfig
+) -> tuple[Any | None, dict[str, Any]]:
+    """Return the scheduler class/kwargs PAI should own for this recipe."""
+    if not config.pai_owns_lr_schedule:
+        return None, {}
+    if config.lr_schedule == "step":
+        if not config.lr_decay_every:
+            raise ValueError("a PAI-owned step schedule requires lr_decay_every")
+        return torch.optim.lr_scheduler.StepLR, {
+            "step_size": config.lr_decay_every,
+            "gamma": config.lr_decay_gamma,
+        }
+    if config.lr_schedule == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR, {
+            "T_max": config.lr_schedule_epochs or config.max_epochs,
+            "eta_min": config.learning_rate * config.lr_min_factor,
+        }
+    if config.lr_schedule == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau, {
+            "mode": config.lr_plateau_mode,
+            "factor": config.lr_plateau_factor,
+            "patience": config.lr_plateau_patience,
+        }
+    return None, {}
 
 
 def _pai_tracker() -> Any | None:
@@ -2556,8 +2915,15 @@ def _setup_pai_optimizer(
     model: Any,
     torch: Any,
     config: TrainingConfig,
+    *,
+    restructured: bool = False,
 ) -> tuple[Any, Any | None]:
-    optimizer = _build_optimizer(model, torch, config)
+    learning_rate = config.learning_rate * (
+        config.pai_restructure_lr_multiplier if restructured else 1.0
+    )
+    optimizer = _build_optimizer(
+        model, torch, config, learning_rate=learning_rate
+    )
     if (
         not config.use_dendrites
         or config.max_epochs <= 0
@@ -2570,15 +2936,28 @@ def _setup_pai_optimizer(
     _validate_pai_training_model(model)
     try:
         with _pai_pdb_suppressed(), pai_working_directory():
+            if not config.pai_setup_optimizer:
+                tracker.set_optimizer_instance(optimizer)
+                return optimizer, tracker
             tracker.set_optimizer(_optimizer_class(torch, config))
+            scheduler_class, scheduler_args = _pai_scheduler_spec(torch, config)
+            # Only when the recipe actually hands PAI a schedule. Every one of
+            # the pre-upstream models leaves `pai_owns_lr_schedule` unset and
+            # drives the LR itself through `_apply_lr_schedule`, and their call
+            # into `setup_optimizer` has to stay exactly what it always was.
+            if scheduler_class is not None and hasattr(tracker, "set_scheduler"):
+                tracker.set_scheduler(scheduler_class)
             setup_result = tracker.setup_optimizer(
-                model, _optimizer_args(model, config), {}
+                model,
+                _optimizer_args(model, config, learning_rate=learning_rate),
+                scheduler_args,
             )
     except TypeError:
         try:
             with _pai_pdb_suppressed(), pai_working_directory():
                 setup_result = tracker.setup_optimizer(
-                    model, _optimizer_args(model, config)
+                    model,
+                    _optimizer_args(model, config, learning_rate=learning_rate),
                 )
         except Exception as exc:
             _warn_pai_optimizer_fallback(exc)
@@ -2964,7 +3343,14 @@ def _run_training_batch(
     # No-op for every other condition (_should_quantize_for_training is False).
     _qat_project_for_forward(model, config)
     outputs, targets, metric_targets = _forward(model_key, model, batch)
-    loss = _compute_loss(model_key, criterion, outputs, targets, model=model)
+    loss = _compute_loss(
+        model_key,
+        criterion,
+        outputs,
+        targets,
+        model=model,
+        teacher_outputs=_kd_teacher_logits(model_key, batch, device),
+    )
     _backward_and_step(
         loss,
         optimizer,
@@ -3065,7 +3451,9 @@ def _run_epoch_batches(
     config: "TrainingConfig",
     metric_name: str,
     clear_pai_buffers: bool = False,
-) -> tuple[float, dict[str, Any]]:
+    intra_epoch_callback: Any | None = None,
+    intra_epoch_interval: int | None = None,
+) -> tuple[float, dict[str, Any], Any, bool, bool]:
     model.train()
     if clear_pai_buffers:
         clear_pai_processor_buffers(model)
@@ -3096,6 +3484,8 @@ def _run_epoch_batches(
     candidate_graph_batch_limit = _candidate_graph_batch_limit(
         config, clear_pai_buffers=clear_pai_buffers, model=model
     )
+    restructured_during_epoch = False
+    training_complete_during_epoch = False
     for batch_index, batch in enumerate(batch_progress):
         _maybe_disable_candidate_graph_for_batch(
             batch_index, candidate_graph_batch_limit
@@ -3119,7 +3509,36 @@ def _run_epoch_batches(
             metric_targets=metric_targets,
             loss=loss,
         )
+        if config.lr_schedule == "poly":
+            batches_per_epoch = max(1, len(bundle.train_loader))
+            relative_epoch = max(0, epoch - config.lr_schedule_restart_epoch)
+            current_iteration = batch_index + relative_epoch * batches_per_epoch
+            maximum_iterations = max(1, batches_per_epoch * max_epochs)
+            progress = min(1.0, current_iteration / maximum_iterations)
+            scheduled_lr = config.learning_rate * (
+                (1.0 - progress) ** config.lr_poly_power
+            )
+            for group in optimizer.param_groups:
+                group["lr"] = scheduled_lr
         del outputs, targets, metric_targets, loss
+        if (
+            intra_epoch_callback is not None
+            and intra_epoch_interval is not None
+            and (batch_index + 1) % intra_epoch_interval == 0
+        ):
+            (
+                model,
+                optimizer,
+                restructured,
+                training_complete,
+            ) = intra_epoch_callback(model, optimizer)
+            restructured_during_epoch = (
+                restructured_during_epoch or bool(restructured)
+            )
+            training_complete_during_epoch = bool(training_complete)
+            model.train()
+            if training_complete_during_epoch:
+                break
         guard_cleaned = False
         if _memory_guard_check_due(batch_index):
             guard_cleaned = _run_memory_guard_cleanup_if_needed(
@@ -3150,7 +3569,13 @@ def _run_epoch_batches(
     # diagnostics computed above, and are the only ones expressed in the
     # environment's own units.
     train_metrics.update(rollout_metrics)
-    return train_loss, train_metrics
+    return (
+        train_loss,
+        train_metrics,
+        optimizer,
+        restructured_during_epoch,
+        training_complete_during_epoch,
+    )
 
 
 def _release_accelerator_cache(torch: Any, *, collect_python: bool = True) -> None:
@@ -3319,6 +3744,7 @@ def _save_epoch_checkpoint(
     optimizer: Any,
     model: Any,
     torch: Any,
+    scheduler: Any | None = None,
 ) -> None:
     ckpt = {
         "epoch": epoch,
@@ -3332,6 +3758,8 @@ def _save_epoch_checkpoint(
         "best_epoch": state.best_epoch,
         "best_state": state.best_state,
     }
+    if scheduler is not None:
+        ckpt["scheduler_state_dict"] = scheduler.state_dict()
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(ckpt, output_dir / _EPOCH_CHECKPOINT_PT)
 
@@ -3357,6 +3785,7 @@ def _apply_epoch_checkpoint(
     state: "EpochTrainingState",
     model: Any,
     optimizer: Any,
+    scheduler: Any | None = None,
 ) -> int:
     resume_epoch = int(ckpt["epoch"]) + 1
     if not _load_compatible_best_state(model, ckpt["model_state_dict"]):
@@ -3371,6 +3800,8 @@ def _apply_epoch_checkpoint(
             "epoch checkpoint optimizer state is incompatible; refusing to "
             "resume with a reset optimizer. Use --fresh to start a new attempt."
         ) from exc
+    if scheduler is not None and "scheduler_state_dict" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     state.history = list(ckpt.get("history", []))
     state.best_metric = ckpt["best_metric"]
     state.best_epoch = int(ckpt["best_epoch"])
@@ -3437,8 +3868,16 @@ def _restore_pai_resume_state(
         context.device,
     )
     clear_pai_processor_buffers(context.model)
-    optimizer, _ = _setup_pai_optimizer(context.model, context.torch, context.config)
     member_vars = getattr(_pai_tracker(), "member_vars", None) or {}
+    switch_epochs = member_vars.get("switch_epochs") or []
+    if context.config.lr_schedule == "poly" and switch_epochs:
+        context.config.lr_schedule_restart_epoch = int(switch_epochs[-1])
+    optimizer, _ = _setup_pai_optimizer(
+        context.model,
+        context.torch,
+        context.config,
+        restructured=bool(member_vars.get("num_cycles", 0)),
+    )
     print(
         "[pai-state] restored PAI schedule: "
         f"{member_vars.get('num_dendrites_added', '?')} dendrite(s), "
@@ -3672,7 +4111,12 @@ def _run_dynamic_dendrite_update(
             context.device,
         )
         if restructured:
-            optimizer, _ = _setup_pai_optimizer(context.model, context.torch, context.config)
+            optimizer, _ = _setup_pai_optimizer(
+                context.model,
+                context.torch,
+                context.config,
+                restructured=True,
+            )
         return optimizer, pai_tracker, bool(restructured), bool(training_complete)
     except SystemExit as pai_exit:
         if pai_exit.code != -1:
@@ -3692,6 +4136,46 @@ def _run_dynamic_dendrite_update(
         ) from pai_exc
     finally:
         setattr(pdb_module, "set_trace", _orig_set_trace)
+
+
+def _pai_validation_score(
+    context: EpochTrainingContext, *, val_metric: float, val_loss: float
+) -> float:
+    """Translate benchmark reporting values to each upstream PAI signal."""
+    if context.model_key == "unet_supervisely":
+        return val_loss
+    if context.model_key in {"mnist_pai", "resnet18_kd_cifar100"}:
+        return val_metric * 100.0
+    return val_metric
+
+
+#: The label each upstream example passes to ``add_extra_score`` for its
+#: training accuracy. Extra scores never affect a switch -- only
+#: ``add_validation_score`` does -- but they are the second series on PAI's
+#: own graph, so the name is what makes that graph comparable to the one in
+#: the example's README.
+_UPSTREAM_PAI_TRAIN_SCORE_LABELS: dict[str, str] = {
+    # mnist_perforatedai.train: add_extra_score(100. * correct / n, 'train')
+    "mnist_pai": "train",
+    # train_perforated_resnet_KD.train_one_epoch:
+    # add_extra_score(metric_logger.acc1.global_avg, "Train Acc 1")
+    "resnet18_kd_cifar100": "Train Acc 1",
+}
+
+
+def _add_upstream_pai_extra_score(
+    context: EpochTrainingContext,
+    pai_tracker: Any | None,
+    train_metrics: dict[str, Any],
+) -> None:
+    if pai_tracker is None or not hasattr(pai_tracker, "add_extra_score"):
+        return
+    label = _UPSTREAM_PAI_TRAIN_SCORE_LABELS.get(context.model_key)
+    if label is None:
+        return
+    accuracy = train_metrics.get("accuracy")
+    if accuracy is not None:
+        pai_tracker.add_extra_score(float(accuracy) * 100.0, label)
 
 
 def _dendrite_freeze_start_epoch(max_epochs: int, freeze_fraction: float) -> int | None:
@@ -3817,7 +4301,9 @@ def _run_training_pass(
     optimizer: Any,
     epoch: int,
     pai_status: PAIUpdateStatus,
-) -> tuple[float, dict[str, Any]]:
+    intra_epoch_callback: Any | None = None,
+    intra_epoch_interval: int | None = None,
+) -> tuple[float, dict[str, Any], Any, bool, bool]:
     _set_pai_candidate_graph_for_context(context, pai_status.active)
     try:
         return _run_epoch_batches(
@@ -3825,6 +4311,8 @@ def _run_training_pass(
             context.criterion, optimizer, context.torch, epoch, context.max_epochs,
             context.run_label, context.config, context.metric_name,
             clear_pai_buffers=context.config.use_dendrites and not pai_status.active,
+            intra_epoch_callback=intra_epoch_callback,
+            intra_epoch_interval=intra_epoch_interval,
         )
     finally:
         _set_pai_candidate_graph_for_context(context, False)
@@ -3899,6 +4387,8 @@ def _apply_pai_epoch_update(
     pai_tracker: Any | None,
     history_row: dict[str, Any],
     val_metric: float,
+    val_loss: float,
+    epoch: int,
     pai_status: PAIUpdateStatus,
 ) -> tuple[Any, Any | None, bool]:
     if not pai_status.active:
@@ -3909,13 +4399,19 @@ def _apply_pai_epoch_update(
     history_row["pai_dendrite_phase"] = (
         _pai_dendrite_phase_epochs(pai_tracker) is not None
     )
+    pai_score = _pai_validation_score(
+        context, val_metric=val_metric, val_loss=val_loss
+    )
+    history_row["pai_validation_score"] = pai_score
     optimizer, pai_tracker, restructured, training_complete = _run_active_pai_update(
         context=context, optimizer=optimizer, pai_tracker=pai_tracker,
-        val_metric=val_metric,
+        val_metric=pai_score,
     )
     history_row["pai_switch_reason"] = "pai_schedule" if restructured else ""
     history_row["pai_restructured"] = restructured
     history_row["pai_training_complete"] = training_complete
+    if restructured and context.config.lr_schedule == "poly":
+        context.config.lr_schedule_restart_epoch = epoch + 1
     # The model may have been replaced (e.g. best-model import on PAI switch) or
     # restructured, so any buffered tensors referencing the old computation graphs
     # are now stale.  Clear them so the next training epoch starts fresh.
@@ -3944,9 +4440,18 @@ def _run_training_pass_oom_guarded(
     optimizer: Any,
     epoch: int,
     pai_status: "PAIUpdateStatus",
-) -> tuple[float, dict[str, Any]]:
+    intra_epoch_callback: Any | None = None,
+    intra_epoch_interval: int | None = None,
+) -> tuple[float, dict[str, Any], Any, bool, bool]:
     try:
-        return _run_training_pass(context, optimizer, epoch, pai_status)
+        return _run_training_pass(
+            context,
+            optimizer,
+            epoch,
+            pai_status,
+            intra_epoch_callback,
+            intra_epoch_interval,
+        )
     except RuntimeError as exc:
         if "out of memory" in str(exc).lower():
             _release_accelerator_cache(context.torch)
@@ -4051,6 +4556,8 @@ def _apply_lr_schedule(
     optimizer: Any, config: "TrainingConfig", epoch: int, max_epochs: int
 ) -> None:
     """Set each param group's lr from the schedule, floored for dendrites."""
+    if config.use_dendrites and _pai_updates_enabled(config) and config.pai_owns_lr_schedule:
+        return
     target_lr = _scheduled_learning_rate(config, epoch, max_epochs)
     if target_lr is None:
         return
@@ -4060,6 +4567,54 @@ def _apply_lr_schedule(
             if group.get(PAI_DENDRITE_PARAM_GROUP_KEY, False)
             else target_lr
         )
+
+
+def _pai_owns_the_scheduler(config: "TrainingConfig", pai_tracker: Any | None) -> bool:
+    """Whether ``_setup_pai_optimizer`` actually handed the schedule to PAI.
+
+    ``pai_owns_lr_schedule`` is a property of the *recipe*, so it is set for
+    every condition of a model whose upstream example lets PAI replay the
+    schedule across restructures.  Only the dendritic conditions of that model
+    reach ``tracker.setup_optimizer``; the dense arms (``base_*``,
+    ``base_more_training_*``, ``capacity_dense_*``) never do, and for them the
+    trainer has to own the scheduler itself or there is no schedule at all.
+    """
+    return (
+        pai_tracker is not None
+        and config.pai_owns_lr_schedule
+        and config.pai_setup_optimizer
+        and config.use_dendrites
+        and config.max_epochs > 0
+        and _pai_updates_enabled(config)
+    )
+
+
+def _build_trainer_scheduler(
+    optimizer: Any,
+    torch: Any,
+    config: "TrainingConfig",
+    pai_tracker: Any | None = None,
+) -> Any | None:
+    """The trainer-side ReduceLROnPlateau, for runs PAI is not scheduling.
+
+    Carvana is the case that matters: upstream's ``train.py`` steps
+    ``ReduceLROnPlateau(optimizer, 'max', patience=5)`` on the validation Dice
+    at each of the five intra-epoch validations, and its ``train_perforatedai.py``
+    comments that same ``scheduler.step`` out because the tracker replays the
+    schedule instead.  Gating only on the recipe flag would leave the dense
+    arms on a flat 1e-5 for all 40 epochs while the dendritic arm decayed --
+    a difference in the schedule masquerading as a difference from dendrites.
+    """
+    if config.lr_schedule != "plateau":
+        return None
+    if _pai_owns_the_scheduler(config, pai_tracker):
+        return None
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode=config.lr_plateau_mode,
+        factor=config.lr_plateau_factor,
+        patience=config.lr_plateau_patience,
+    )
 
 
 def _capture_capacity_control_fork(context: EpochTrainingContext, epoch: int) -> None:
@@ -4105,6 +4660,9 @@ def _run_training_epochs(
         context.config.train_dendrites_until_complete and pai_tracker is not None
     )
     start_epoch = 0
+    scheduler = _build_trainer_scheduler(
+        optimizer, context.torch, context.config, pai_tracker
+    )
     output_dir = context.output_dir
     if output_dir is not None:
         ckpt = _load_epoch_checkpoint(output_dir, context.torch)
@@ -4112,7 +4670,12 @@ def _run_training_epochs(
             # Restore the dendrite structure first so the checkpoint's tensors
             # and optimizer groups have something shaped like them to land in.
             optimizer = _restore_pai_resume_state(context, optimizer)
-            start_epoch = _apply_epoch_checkpoint(ckpt, state, context.model, optimizer)
+            scheduler = _build_trainer_scheduler(
+                optimizer, context.torch, context.config, pai_tracker
+            )
+            start_epoch = _apply_epoch_checkpoint(
+                ckpt, state, context.model, optimizer, scheduler
+            )
     epoch_progress = _epoch_progress(context, run_until_pai_complete, start_epoch)
     for epoch in epoch_progress:
         epoch_start = time.perf_counter()
@@ -4126,8 +4689,68 @@ def _run_training_epochs(
             pai_status = PAIUpdateStatus(frozen=True, active=False)
         _capture_capacity_control_fork(context, epoch)
         _apply_lr_schedule(optimizer, context.config, epoch, context.max_epochs)
-        train_loss, train_metrics = _run_training_pass_oom_guarded(
-            context, optimizer, epoch, pai_status
+        intra_epoch_callback = None
+        intra_epoch_interval = None
+        if context.model_key == "unet_carvana":
+            # Upstream validates five times per training epoch. Those calls
+            # are also PAI's clock and the ReduceLROnPlateau clock, so moving
+            # them to the epoch boundary changes both dendrite timing and LR.
+            dataset_size = len(context.bundle.train_loader.dataset)
+            batch_size = context.bundle.train_loader.batch_size or 1
+            intra_epoch_interval = max(1, dataset_size // (5 * batch_size))
+
+            def carvana_validation_update(
+                current_model: Any, current_optimizer: Any
+            ) -> tuple[Any, Any, bool, bool]:
+                nonlocal pai_tracker
+                del current_model
+                interval_loss, interval_metrics = _run_validation_pass(context)
+                interval_metric = float(
+                    interval_metrics.get(context.primary_metric_key, 0.0)
+                )
+                restructured = False
+                training_complete = False
+                if pai_status.active and pai_tracker is not None:
+                    current_optimizer, pai_tracker, restructured, training_complete = (
+                        _run_active_pai_update(
+                            context=context,
+                            optimizer=current_optimizer,
+                            pai_tracker=pai_tracker,
+                            val_metric=_pai_validation_score(
+                                context,
+                                val_metric=interval_metric,
+                                val_loss=interval_loss,
+                            ),
+                        )
+                    )
+                    if training_complete:
+                        pai_tracker = None
+                    else:
+                        _set_pai_candidate_graph_for_context(context, True)
+                elif scheduler is not None:
+                    scheduler.step(interval_metric)
+                return (
+                    context.model,
+                    current_optimizer,
+                    restructured,
+                    training_complete,
+                )
+
+            intra_epoch_callback = carvana_validation_update
+
+        (
+            train_loss,
+            train_metrics,
+            optimizer,
+            intra_epoch_restructured,
+            intra_epoch_complete,
+        ) = _run_training_pass_oom_guarded(
+            context,
+            optimizer,
+            epoch,
+            pai_status,
+            intra_epoch_callback,
+            intra_epoch_interval,
         )
         val_loss, val_metrics = _run_validation_pass(context)
         history_row, val_metric = _record_epoch_result(
@@ -4136,10 +4759,23 @@ def _run_training_epochs(
             train_metrics=train_metrics, val_loss=val_loss,
             val_metrics=val_metrics, pai_status=pai_status,
         )
-        optimizer, pai_tracker, pai_training_complete = _apply_pai_epoch_update(
-            context=context, optimizer=optimizer, pai_tracker=pai_tracker,
-            history_row=history_row, val_metric=val_metric, pai_status=pai_status,
-        )
+        if intra_epoch_callback is not None:
+            history_row["pai_restructured"] = intra_epoch_restructured
+            history_row["pai_training_complete"] = intra_epoch_complete
+            history_row["pai_switch_reason"] = (
+                "pai_schedule" if intra_epoch_restructured else ""
+            )
+            pai_training_complete = intra_epoch_complete
+        else:
+            if pai_status.active:
+                _add_upstream_pai_extra_score(context, pai_tracker, train_metrics)
+            optimizer, pai_tracker, pai_training_complete = _apply_pai_epoch_update(
+                context=context, optimizer=optimizer, pai_tracker=pai_tracker,
+                history_row=history_row, val_metric=val_metric, val_loss=val_loss,
+                epoch=epoch, pai_status=pai_status,
+            )
+        if scheduler is not None and intra_epoch_callback is None:
+            scheduler.step(val_metric)
         _run_memory_guard_cleanup_if_needed(
             model=context.model,
             torch=context.torch,
@@ -4152,7 +4788,8 @@ def _run_training_epochs(
             # state_dict is captured, keeping the two files consistent.
             _save_pai_resume_state(context)
             _save_epoch_checkpoint(
-                output_dir, epoch, state, optimizer, context.model, context.torch
+                output_dir, epoch, state, optimizer, context.model, context.torch,
+                scheduler,
             )
         _update_epoch_progress(epoch_progress, context, state, val_metric)
         # In either PAI-controlled mode (the capacity diagnostic or production
@@ -4746,17 +5383,48 @@ def train_and_evaluate(
         skip_reason=skip_reason,
         stage_name="after_pqat" if pqat_enabled else None,
     )
-    final_checkpoint_path = output_dir / _MODEL_PT
     _final_clean_stats = None
     if use_dendrites:
-        # PAI removes a final bit of branch scaffolding in the final-clean
-        # file emitted by ``save_system``, not in ``prepare_final_model`` or
-        # ``save_pai_net``. Copy it first, then derive all topology evidence
-        # from the exact bytes the benchmark will publish.
+        # Two accounting sources for one question -- how many parameters does
+        # the model about to be published actually have -- tried in preference
+        # order.
+        #
+        # PAI strips its last branch scaffolding *during serialization*, not in
+        # ``prepare_final_model`` and not in ``save_pai_net``. So when its
+        # final-clean export exists, that file's tensor header is the only
+        # source that agrees with PAI's own ``param_counts.csv``; counting the
+        # in-process wrapper instead over-reported MPNN by 7,494 parameters and
+        # actor_critic by 384 (information/results_analysis/
+        # 2026-09-01-mpnn-actor-critic-audit-repair.md). That is the benefit
+        # ``9de8880`` was after and it is preserved here.
+        #
+        # But that file exists only for runs that reached PAI's
+        # TRAINING_COMPLETE -- i.e. capacity-check and dynamic runs, never a
+        # default fixed-budget run. For those, fall back to the in-process
+        # ``prepare_final_model`` count, which touches no filesystem and is
+        # well-defined for a zero-dendrite model. That is the pre-``9de8880``
+        # path that produced distilbert's valid ``no_retained_insertion``
+        # artifact. It can be slightly generous, never silently wrong: the
+        # audit below still refuses ``verified_retained`` unless PAI's raw
+        # switch log and raw architecture log independently agree, so an
+        # over-counted scaffolding tensor cannot manufacture a retained
+        # dendrite -- it can only fail closed.
+        #
+        # The copy lands on a sibling filename, never on model.pt, so the
+        # published checkpoint stays a ``torch.save`` state dict for every
+        # downstream ``dendrites_q*`` condition to load.
         if not pai_save_name:
             raise RuntimeError("dendritic final export requires a PAI save name")
-        _export_final_pai_artifact(pai_save_name, final_checkpoint_path)
-        _final_clean_stats = _final_pai_artifact_stats(final_checkpoint_path)
+        final_clean_export_path = output_dir / _FINAL_CLEAN_PAI_EXPORT
+        if _export_final_pai_artifact(pai_save_name, final_clean_export_path):
+            _final_clean_stats = _final_pai_artifact_stats(final_clean_export_path)
+        else:
+            print(
+                f"[pai] {run_label}: PerforatedAI did not reach training-complete, "
+                "so it wrote no final-clean inference artifact; the benchmark "
+                "serialized its own prepared model and counted that instead."
+            )
+            _final_clean_stats = _final_clean_pai_parameter_stats(_plain_model)
     final_parameter_stats = (
         _final_clean_stats[:2] if _final_clean_stats is not None else None
     )
@@ -4817,7 +5485,6 @@ def train_and_evaluate(
         payload=payload,
         parameter_stats=final_parameter_stats,
         topology_hash=final_topology_hash,
-        checkpoint_already_written=use_dendrites,
     )
 
     record = TrainingRecord(
