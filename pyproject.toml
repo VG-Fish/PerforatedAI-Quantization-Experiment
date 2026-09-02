@@ -27,6 +27,11 @@ dependencies = [
     "wfdb>=4.1.2",
     "torchcodec>=0.11.1",
     "pillow>=11.0.0",
+    # Upstream's segmentation-image-resolution dataloader is written against
+    # cv2 (INTER_LINEAR/INTER_NEAREST resize, warpAffine rotation). Using the
+    # same library keeps that augmentation pipeline identical rather than
+    # approximating it with PIL.
+    "opencv-python-headless>=4.10.0",
     "tonic>=1.5.0",
     "torch-geometric>=2.6.0",
     "perforatedai>=3.2.7",
