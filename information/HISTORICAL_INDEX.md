@@ -22,24 +22,33 @@ recorded in that document's own banner.
 | [CURRENT_GUIDE.md](CURRENT_GUIDE.md) | current (generated) | model roster, condition grid, reportability rules, command reference |
 | [EVIDENCE_INDEX.md](EVIDENCE_INDEX.md) | current (generated) | what generated evidence exists on disk, in which run namespace, with which manifest verdict |
 | [RETENTION_POLICY.md](RETENTION_POLICY.md) | current | which generated trees may be archived or deleted, and what must exist first |
-| [DENDRITE_EFFECT_AUDIT_2026-08-30.md](DENDRITE_EFFECT_AUDIT_2026-08-30.md) | current | the standing verdict on whether the dendrite effect beats noise and more training |
 | [MEASUREMENT_CAVEATS.md](MEASUREMENT_CAVEATS.md) | current (dated line numbers) | the eleven measurement caveats, their root causes, and which results each one invalidates |
-| [audit/audit_report.md](audit/audit_report.md) | current | the cleanup priority ledger, what P0–P2 built, what is still open, and the dead-code ledger |
 | [CAPACITY_MATCHED_DENSE_CONTROLS.md](CAPACITY_MATCHED_DENSE_CONTROLS.md) | current (proposal) | the topology-matched dense-control design — not yet implemented in the runner |
 
-## Optimization plan (2026-08-31)
+## Upstream base models (2026-09-02)
 
-`information/optimization/` is the working memory for the next selection/optimization
-loop. Read it in the order its README gives; it is a plan, not a record of results.
+`information/base_examples/` is the working record of porting the five PerforatedAI
+`examples/base_examples` models into this benchmark. Read it in numeric order.
 
 | document | status | cite it for |
 |---|---|---|
-| [optimization/README.md](optimization/README.md) | current | the launch cohort, the reading order, and the reportability rule |
-| [optimization/00_assessment.md](optimization/00_assessment.md) | current | machine profile, model-selection reasoning, and the five-step validity protocol |
-| [optimization/01_initial_five_plan.md](optimization/01_initial_five_plan.md) | current | per-model starting recipes, tuning spaces, gates, and the advancement checklist |
-| [optimization/02_research_and_sources.md](optimization/02_research_and_sources.md) | current | external sources consulted and the explicit non-conclusions |
-| [optimization/03_execution_matrix.md](optimization/03_execution_matrix.md) | current | the exact sweep trials, current-code limits, and required manifest fields |
-| [optimization/04_implementation_review.md](optimization/04_implementation_review.md) | current | whether the runner actually implements 03's requirements, the defects fixed, and what is still open before a sweep |
+| [UPSTREAM_BASE_MODELS_CHANGE_SUMMARY.md](UPSTREAM_BASE_MODELS_CHANGE_SUMMARY.md) | historical (2026-09-02) | the handoff written at the end of the port: what was added, and the recipe table as of that day |
+| [base_examples/01_UPSTREAM_AUDIT.md](base_examples/01_UPSTREAM_AUDIT.md) | current | the pinned upstream commit and, per example, its architecture, targets, recipe and reported numbers |
+| [base_examples/02_OPEN_DECISIONS.md](base_examples/02_OPEN_DECISIONS.md) | current | which departures from upstream are the user's decision (D1, D2, D5) and which are the implementation's |
+| [base_examples/03_IMPLEMENTATION_RECORD.md](base_examples/03_IMPLEMENTATION_RECORD.md) | historical | what the first implementation pass built, module by module |
+| [base_examples/04_DIAGNOSIS_pai_final_artifact.md](base_examples/04_DIAGNOSIS_pai_final_artifact.md) | historical | why the final PAI artifact export was missing, and the fix |
+| [base_examples/05_STATUS_AND_HANDOFF.md](base_examples/05_STATUS_AND_HANDOFF.md) | historical | the state of the port at that handoff |
+| [base_examples/06_DIAGNOSIS_control_conditions_abort_the_sweep.md](base_examples/06_DIAGNOSIS_control_conditions_abort_the_sweep.md) | historical | why an unsupported control condition used to kill a whole sweep, and the skip-and-record fix |
+| [base_examples/IMPLEMENTATION_FINDINGS.md](base_examples/IMPLEMENTATION_FINDINGS.md) | historical | the discovery pass that preceded any code change |
+
+## Problems and analyses
+
+| document | status | cite it for |
+|---|---|---|
+| [problems/2026-09-01-distilbert-no-retained-dendrite.md](problems/2026-09-01-distilbert-no-retained-dendrite.md) | historical (2026-09-01) | why DistilBERT finished with no retained dendrite |
+| [problems/2026-09-01-storage-exhaustion-and-monitoring.md](problems/2026-09-01-storage-exhaustion-and-monitoring.md) | historical (2026-09-01) | the disk exhaustion that stopped that sweep and what was added to catch it |
+| [problems/live-monitor-events.md](problems/live-monitor-events.md) | historical (append-only log) | raw worker errors as they were emitted; not a diagnosis |
+| [results_analysis/2026-09-01-mpnn-actor-critic-audit-repair.md](results_analysis/2026-09-01-mpnn-actor-critic-audit-repair.md) | historical (2026-09-01) | the audit verdict on the two non-reportable dendritic artifacts from that sweep |
 
 ## Historical
 
@@ -49,16 +58,12 @@ loop. Read it in the order its README gives; it is a plan, not a record of resul
 | [MODEL_REFERENCE.md](MODEL_REFERENCE.md) | historical | per-model hyperparameters, preprocessing, and PAI targeting narrative | metrics, metric directions, or which models are in the default roster |
 | [CLI_DIAGRAMS.md](CLI_DIAGRAMS.md) | historical | command flowcharts and the generated-output directory layout | flags, defaults, or the list of subcommands |
 | [REMAINING_FIXES.md](REMAINING_FIXES.md) | historical (2026-08-07) | why the baseline-quality pass changed what it changed | the outstanding-work list; the audit ledger owns that now |
-| [CODE_REVIEW_2026-08-28.md](CODE_REVIEW_2026-08-28.md) | historical (2026-08-28) | the bugs found and fixed in that pass | current open findings |
-| [DYNAMIC8_RUN_2026-08-28.md](DYNAMIC8_RUN_2026-08-28.md) | historical run report | what dynamic8 ran and observed | reportable results — it predates the artifact manifest |
-| [DYNAMIC9_RUN_2026-08-28.md](DYNAMIC9_RUN_2026-08-28.md) | historical run report | what dynamic9 ran and observed | reportable results — it predates the artifact manifest |
 | [DYNAMIC_DENDRITIC_MIGRATION.md](DYNAMIC_DENDRITIC_MIGRATION.md) | historical | the reasoning behind moving from fixed-interval to HISTORY scheduling, and the PerforatedAI 3.2.3 `save_name` constraint | schedule values — `compat.py::PAI_DYNAMIC_SCHEDULE_DEFAULTS` is the live one |
 
 ## Superseded
 
 | document | superseded by | what specifically was overturned |
 |---|---|---|
-| [DYNAMIC9_PAI_GRAPH_AUDIT.md](DYNAMIC9_PAI_GRAPH_AUDIT.md) | [DENDRITE_EFFECT_AUDIT_2026-08-30.md](DENDRITE_EFFECT_AUDIT_2026-08-30.md) | "perforation is working correctly on every model far enough along to judge". Dendrites *are* inserted and retained — that part stands — but the audit never tested the score change against run noise. |
 | [MODEL_SELECTION.md](MODEL_SELECTION.md) | [CURRENT_GUIDE.md](CURRENT_GUIDE.md) | criterion 1's exclusion of `pointnet_modelnet40` and `resnet18_cifar10`, which rested on an expired PerforatedAI token that has since been renewed. Its cost table and diversity reasoning still hold. |
 
 ## Rules

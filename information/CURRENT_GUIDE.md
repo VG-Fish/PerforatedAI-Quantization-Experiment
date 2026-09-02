@@ -13,7 +13,7 @@ Sources of truth: `src/dendritic_benchmark/specs.py`, `model_adapters.py`, `arti
 
 ## Model roster
 
-24 models are registered. A bare `dqb run` trains only the 5 evidence-backed default models; the rest are exploratory and need `--models all` or an explicit key.
+29 models are registered. A bare `dqb run` trains only the 10 evidence-backed default models; the rest are exploratory and need `--models all` or an explicit key.
 
 | key | display name | dataset | metric | direction | task | default roster |
 |---|---|---|---|---|---|---|
@@ -41,6 +41,11 @@ Sources of truth: `src/dendritic_benchmark/specs.py`, `model_adapters.py`, `arti
 | `mobilenetv2_cifar10` | MobileNetV2 | CIFAR-10 | Accuracy | maximize | classification | no |
 | `saint_adult` | SAINT | Adult Income | Accuracy | maximize | classification | yes |
 | `capsnet_mnist` | CapsNet | MNIST | Accuracy | maximize | classification | no |
+| `mnist_pai` | PAI MNIST CNN | MNIST | Accuracy | maximize | classification | yes |
+| `resnet18_hf_perforated_cifar100` | HF Perforated ResNet-18 (CIFAR-100) | CIFAR-100 | Accuracy | maximize | classification | yes |
+| `resnet18_kd_cifar100` | ResNet-18 + KD | CIFAR-100 | Accuracy | maximize | classification | yes |
+| `unet_carvana` | U-Net (Carvana) | Carvana | Dice | maximize | segmentation | yes |
+| `unet_supervisely` | MobileNetV2 U-Net | Supervisely Person | mIoU | maximize | segmentation | yes |
 
 ## Condition grid
 
@@ -73,11 +78,12 @@ Sources of truth: `src/dendritic_benchmark/specs.py`, `model_adapters.py`, `arti
 | `capacity_dense_q1_58` | Topology-Matched Dense + Q1.58 | `capacity_dense_fp32` | 2 | ternary | no | no | yes |
 | `capacity_dense_q1` | Topology-Matched Dense + Q1 | `capacity_dense_fp32` | 1 | binary | no | no | yes |
 
-The full matrix is 24 models × 24 conditions − 6 unsupported pairs = **570 attempts**.
+The full matrix is 29 models × 24 conditions − 36 unsupported pairs = **660 attempts**.
 
 Unsupported pairs (skipped rather than trained):
 
-- `resnet18_hf_perforated_cifar10`: `dendrites_fp32`, `dendrites_q8`, `dendrites_q4`, `dendrites_q2`, `dendrites_q1_58`, `dendrites_q1`
+- `resnet18_hf_perforated_cifar10`: `dendrites_fp32`, `dendrites_q8`, `dendrites_q4`, `dendrites_q2`, `dendrites_q1_58`, `dendrites_q1`, `base_more_training_fp32`, `base_more_training_q8`, `base_more_training_q4`, `base_more_training_q2`, `base_more_training_q1_58`, `base_more_training_q1`, `capacity_dense_fp32`, `capacity_dense_q8`, `capacity_dense_q4`, `capacity_dense_q2`, `capacity_dense_q1_58`, `capacity_dense_q1`
+- `resnet18_hf_perforated_cifar100`: `dendrites_fp32`, `dendrites_q8`, `dendrites_q4`, `dendrites_q2`, `dendrites_q1_58`, `dendrites_q1`, `base_more_training_fp32`, `base_more_training_q8`, `base_more_training_q4`, `base_more_training_q2`, `base_more_training_q1_58`, `base_more_training_q1`, `capacity_dense_fp32`, `capacity_dense_q8`, `capacity_dense_q4`, `capacity_dense_q2`, `capacity_dense_q1_58`, `capacity_dense_q1`
 
 ## What makes a result reportable
 
@@ -137,6 +143,17 @@ Downloads and caches all datasets required by the selected models.
 |---|---|---|
 | `--models` | — | Space-separated list of model keys whose datasets should be downloaded. |
 | `--strict` | flag | Abort immediately on the first download failure instead of continuing and reporting all failures at the end. |
+
+### `dqb pretrain_kd_teacher`
+
+Reproduces `train_perforated_resnet_KD.py --pre-train-teacher` from PerforatedAI's resnet example: an ImageNet ResNet-50 with a fresh 100-way head, fine-tuned on the same CIFAR-100 train subset the student sees, checkpointed at its best validation accuracy.
+
+| option | default | purpose |
+|---|---|---|
+| `--epochs` | `90` | Teacher fine-tuning epochs (upstream default: 90). |
+| `--batch-size` | `32` | Teacher batch size (upstream: 32). |
+| `--lr` | `0.0125` | Teacher SGD learning rate (upstream: 0.0125 with StepLR(30, 0.1)). |
+| `--force` | flag | Retrain and overwrite an existing teacher checkpoint. |
 
 ### `dqb compare`
 

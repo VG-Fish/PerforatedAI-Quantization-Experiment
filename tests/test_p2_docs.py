@@ -8,6 +8,7 @@ to say so at the top and be listed in the index, so nothing reads as current
 guidance by accident.
 """
 
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -92,9 +93,11 @@ class GeneratedGuideTests(unittest.TestCase):
 
 class DocumentationIndexTests(unittest.TestCase):
     def _documents(self) -> list[Path]:
-        return sorted(_INFORMATION.glob("*.md")) + sorted(
-            (_INFORMATION / "audit").glob("*.md")
-        )
+        # The whole tree, not just the top level: the index's own rule 1 says
+        # "every document under information/", and the working sets that live
+        # in subdirectories (base_examples/, problems/, results_analysis/) are
+        # exactly the ones that go stale unnoticed.
+        return sorted(_INFORMATION.rglob("*.md"))
 
     def test_every_hand_written_document_declares_its_status(self) -> None:
         for path in sorted(_INFORMATION.glob("*.md")):
@@ -123,12 +126,41 @@ class DocumentationIndexTests(unittest.TestCase):
             self.assertIn(status, index)
 
     def test_superseded_documents_name_their_replacement(self) -> None:
+        """Every Superseded row names a replacement, and it is a real file.
+
+        Asserted as an invariant rather than against a fixed pair of filenames:
+        a superseded document is eventually deleted, and a test that named one
+        of them started failing the day that happened while saying nothing
+        about whether the rule still held.
+        """
         index = _HISTORICAL_INDEX.read_text()
         superseded_section = index.split("## Superseded", 1)[1]
-        self.assertIn("DYNAMIC9_PAI_GRAPH_AUDIT.md", superseded_section)
-        self.assertIn("DENDRITE_EFFECT_AUDIT_2026-08-30.md", superseded_section)
-        graph_audit = (_INFORMATION / "DYNAMIC9_PAI_GRAPH_AUDIT.md").read_text()
-        self.assertIn("DENDRITE_EFFECT_AUDIT_2026-08-30.md", graph_audit)
+        rows = [
+            line
+            for line in superseded_section.splitlines()
+            if line.startswith("| [")
+        ]
+        self.assertTrue(rows, "the Superseded section has no rows")
+        for row in rows:
+            with self.subTest(row=row):
+                targets = re.findall(r"\]\(([^)]+\.md)\)", row)
+                self.assertGreaterEqual(
+                    len(targets), 2, "a superseded row must name a replacement"
+                )
+                for target in targets:
+                    self.assertTrue(
+                        (_INFORMATION / target).exists(),
+                        f"{target} is linked from the index but does not exist",
+                    )
+
+    def test_the_index_links_only_to_documents_that_exist(self) -> None:
+        index = _HISTORICAL_INDEX.read_text()
+        for target in sorted(set(re.findall(r"\]\(([^)]+\.md)\)", index))):
+            with self.subTest(link=target):
+                self.assertTrue(
+                    (_INFORMATION / target).exists(),
+                    f"information/HISTORICAL_INDEX.md links to a missing {target}",
+                )
 
     def test_the_retention_policy_is_indexed_and_names_the_evidence_index(self) -> None:
         policy = (_INFORMATION / "RETENTION_POLICY.md").read_text()
