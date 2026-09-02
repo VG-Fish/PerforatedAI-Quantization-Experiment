@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import torch
 
+from dendritic_benchmark import compat
 from dendritic_benchmark.artifacts import (
     finalize_artifact_manifest,
     write_artifact_manifest,
@@ -91,13 +92,25 @@ def _write_test_artifact(
 
 
 class _RecordingPC:
+    """Stands in for ``GPA.pc``: records ``set_*`` calls, answers ``get_*``.
+
+    ``live`` is what the installed library is running with. It has to be
+    readable through ``get_<name>()`` because that -- not a fresh
+    ``PAIConfig()`` attribute -- is where the benchmark now reads PAI's own
+    defaults from; see ``compat._pai_live_config_value``.
+    """
+
     DOING_HISTORY = "history"
     DOING_FIXED_SWITCH = "fixed"
 
-    def __init__(self) -> None:
+    def __init__(self, live: dict[str, object] | None = None) -> None:
         self.values: dict[str, object] = {}
+        self.live: dict[str, object] = dict(live or {})
 
     def __getattr__(self, name: str):
+        if name.startswith("get_") and name[4:] in self.live:
+            field = name[4:]
+            return lambda: self.live[field]
         if not name.startswith("set_"):
             raise AttributeError(name)
 
@@ -347,8 +360,15 @@ class DynamicPAIFollowupTests(unittest.TestCase):
         self.assertEqual(pc.values, {})
 
     def test_library_schedule_defaults_are_restored_without_copied_values(self) -> None:
-        pc = _RecordingPC()
-        library_values = {
+        """Every schedule field is restored, and from the library, not constants.
+
+        The values come from the *live* config rather than a fresh
+        ``PAIConfig()``: ``p_epochs_to_switch`` is absent on a fresh instance
+        and present on the live one, so reading the fresh instance skipped it
+        and let one model's override survive into the next model the same
+        worker perforates.
+        """
+        library_values: dict[str, object] = {
             "switch_mode": "library-history",
             "first_fixed_switch_num": 7,
             "fixed_switch_num": 70,
@@ -361,23 +381,46 @@ class DynamicPAIFollowupTests(unittest.TestCase):
             "candidate_weight_initialization_multiplier": 0.25,
             "max_dendrites": 17,
         }
-
-        class _LibraryConfig:
-            def __init__(self) -> None:
-                for name, value in library_values.items():
-                    setattr(self, name, value)
+        pc = _RecordingPC(live=library_values)
 
         class _GPA:
-            PAIConfig = _LibraryConfig
-
             def __init__(self, pai_config: _RecordingPC) -> None:
                 self.pc = pai_config
 
-        _configure_pai_training_schedule(_GPA(pc))
+        with patch.object(compat, "_PAI_SCHEDULE_BASELINE", None):
+            _configure_pai_training_schedule(_GPA(pc))
 
         self.assertEqual(
             pc.values,
             {f"set_{name}": value for name, value in library_values.items()},
+        )
+        # No field is skipped -- p_epochs_to_switch above is the one that was.
+        self.assertEqual(
+            set(pc.values), {f"set_{n}" for n in compat._PAI_LIBRARY_SCHEDULE_FIELDS}
+        )
+
+    def test_schedule_baseline_is_snapshotted_before_any_model_configures_it(
+        self,
+    ) -> None:
+        """The restore target is the library's value, not the previous model's."""
+        pc = _RecordingPC(live={"n_epochs_to_switch": 10, "p_epochs_to_switch": 2})
+
+        class _GPA:
+            def __init__(self, pai_config: _RecordingPC) -> None:
+                self.pc = pai_config
+
+        gpa = _GPA(pc)
+        with patch.object(
+            compat, "_PAI_LIBRARY_SCHEDULE_FIELDS",
+            ("n_epochs_to_switch", "p_epochs_to_switch"),
+        ), patch.object(compat, "_PAI_SCHEDULE_BASELINE", None):
+            _configure_pai_training_schedule(gpa)  # first model: snapshot taken
+            pc.live.update(n_epochs_to_switch=40, p_epochs_to_switch=40)  # its override
+            pc.values.clear()
+            _configure_pai_training_schedule(gpa)  # second model in the worker
+
+        self.assertEqual(
+            pc.values, {"set_n_epochs_to_switch": 10, "set_p_epochs_to_switch": 2}
         )
 
     def test_dynamic_completion_stops_immediately(self) -> None:

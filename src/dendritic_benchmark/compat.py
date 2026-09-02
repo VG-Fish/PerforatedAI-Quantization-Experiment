@@ -10,7 +10,7 @@ from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Literal
 
 import torch
 from dotenv import dotenv_values
@@ -167,6 +167,11 @@ class PAIRuntimeOptions:
     # PAI's built-in seven-epoch integration diagnostic.  This must be an
     # explicit opt-in: it deliberately replaces the normal search policy.
     testing_dendrite_capacity: bool = False
+    weight_decay_accepted: bool | None = None
+    cap_at_n: bool | None = None
+    test_saves: bool | None = None
+    perforated_backpropagation: bool | None = None
+    pai_forward_function: Literal["relu", "sigmoid", "tanh"] | None = None
 
 
 def _call_if_available(target: Any, method_name: str, *args: Any) -> None:
@@ -249,6 +254,76 @@ def _configure_pai_trackers(
     _call_if_available(pc, "set_no_backward_workaround", no_backward_workaround)
 
 
+#: ``PAIRuntimeOptions`` field -> the ``pc`` setter that applies it.
+_PAI_RUNTIME_OPTION_SETTERS: tuple[tuple[str, str], ...] = (
+    ("weight_decay_accepted", "set_weight_decay_accepted"),
+    ("cap_at_n", "set_cap_at_n"),
+    ("test_saves", "set_test_saves"),
+    ("perforated_backpropagation", "set_perforated_backpropagation"),
+)
+
+#: The live values of the fields above, read once before this process has
+#: configured anything.  See ``_pai_runtime_option_baseline``.
+_PAI_RUNTIME_OPTION_BASELINE: dict[str, Any] | None = None
+
+
+def _pai_live_config_value(pc: Any, field_name: str) -> Any:
+    """Read ``field_name`` as PerforatedAI itself would evaluate it.
+
+    ``pc.<name>`` is the value the library *declares* as that setting's
+    default; the value in force is ``pc.get_<name>()``, and for at least one
+    setting they disagree.  ``perforated_backpropagation`` reads False as an
+    attribute on a licensed install whose getter returns True -- Perforated
+    Backpropagation is on, which is the whole independent variable of this
+    benchmark -- so treating the attribute as the current value and writing it
+    back through ``set_perforated_backpropagation`` silently downgrades every
+    dendritic run to gradient-descent dendrites.  Always prefer the getter.
+    """
+    getter = getattr(pc, f"get_{field_name}", None)
+    if getter is not None:
+        try:
+            return getter()
+        except Exception:
+            pass
+    return getattr(pc, field_name, None)
+
+
+def _pai_runtime_option_baseline(pc: Any) -> dict[str, Any]:
+    """Snapshot the live runtime-option values, once per process.
+
+    PerforatedAI's configuration is global, so a model that opts into
+    ``cap_at_n`` or ``perforated_backpropagation`` must not leave those set for
+    whatever runs next in the same worker.  The restore target is this
+    snapshot, taken before any model has configured anything -- not a fresh
+    ``PAIConfig()``, whose attributes are declared defaults rather than the
+    values the installed library is actually running with.
+    """
+    global _PAI_RUNTIME_OPTION_BASELINE
+    if _PAI_RUNTIME_OPTION_BASELINE is None:
+        _PAI_RUNTIME_OPTION_BASELINE = {
+            field_name: _pai_live_config_value(pc, field_name)
+            for field_name, _ in _PAI_RUNTIME_OPTION_SETTERS
+        }
+    return _PAI_RUNTIME_OPTION_BASELINE
+
+
+def _configure_pai_runtime_options(gpa: Any, options: PAIRuntimeOptions) -> None:
+    pc = gpa.pc
+    baseline = _pai_runtime_option_baseline(pc)
+    for field_name, setter_name in _PAI_RUNTIME_OPTION_SETTERS:
+        value = getattr(options, field_name)
+        if value is None:
+            value = baseline.get(field_name)
+        if value is not None:
+            _call_if_available(pc, setter_name, value)
+    if options.pai_forward_function is not None:
+        _call_if_available(
+            pc,
+            "set_pai_forward_function",
+            getattr(torch, options.pai_forward_function),
+        )
+
+
 def _call_pai_setter(pc: Any, setter_name: str, value: Any) -> None:
     setter = getattr(pc, setter_name, None)
     if setter is not None:
@@ -314,21 +389,45 @@ _PAI_LIBRARY_SCHEDULE_FIELDS = (
 )
 
 
-def _restore_pai_library_schedule_defaults(gpa: Any) -> None:
-    """Reset schedule state from a fresh library config, without copied values.
+#: The live values of ``_PAI_LIBRARY_SCHEDULE_FIELDS``, read once before this
+#: process has configured anything.  See ``_restore_pai_library_schedule_defaults``.
+_PAI_SCHEDULE_BASELINE: dict[str, Any] | None = None
 
-    PerforatedAI stores configuration globally.  An explicit override from an
-    earlier run in the same process must not leak into a later default run, but
-    spelling the defaults here would merely move ownership back into the
-    benchmark.  Read them from a new library-owned config instead.
+
+def _restore_pai_library_schedule_defaults(gpa: Any) -> None:
+    """Reset schedule state to the values the library started this process with.
+
+    PerforatedAI stores configuration globally and a worker perforates several
+    models in one process, so an explicit override from an earlier model must
+    not leak into a later default one.  Spelling the defaults here would move
+    ownership of them back into the benchmark, so they are read from the
+    library instead -- but from the *live* config, not a fresh ``PAIConfig()``.
+
+    A fresh config is not a complete stand-in for the installed library.
+    ``p_epochs_to_switch`` (and ``cap_at_n``) exist only once ``perforatedbp``
+    has initialised the live config; on a fresh instance they are absent, so
+    the previous ``getattr(PAIConfig(), field, None)`` read ``None`` and
+    skipped the field entirely -- ``resnet18_kd_cifar100``'s
+    ``p_epochs_to_switch=40`` and
+    ``unet_carvana``'s ``25`` would survive into every model the same worker
+    perforates afterwards, stretching their dendrite-training phase 20x past
+    the library default of 2.
+
+    The snapshot is taken on the first call, which happens before any model has
+    written a schedule field: ``_configure_pai_trackers`` and
+    ``_configure_pai_runtime_options`` run first but touch none of these, and
+    every writer (``_configure_dynamic_pai_schedule``, the fixed-switch path)
+    runs after this restore.
     """
-    config_factory = getattr(gpa, "PAIConfig", None)
-    if config_factory is None:
-        return
-    defaults = config_factory()
+    global _PAI_SCHEDULE_BASELINE
     current = gpa.pc
+    if _PAI_SCHEDULE_BASELINE is None:
+        _PAI_SCHEDULE_BASELINE = {
+            field: _pai_live_config_value(current, field)
+            for field in _PAI_LIBRARY_SCHEDULE_FIELDS
+        }
     for field in _PAI_LIBRARY_SCHEDULE_FIELDS:
-        value = getattr(defaults, field, None)
+        value = _PAI_SCHEDULE_BASELINE.get(field)
         setter = getattr(current, f"set_{field}", None)
         if value is not None and setter is not None:
             setter(deepcopy(value))
@@ -749,6 +848,7 @@ def perforate_model(
                     runtime_options.testing_dendrite_capacity
                 ),
             )
+            _configure_pai_runtime_options(GPA, runtime_options)
             if dendrite_training_max_epochs is not None:
                 _configure_pai_training_schedule(
                     GPA,
